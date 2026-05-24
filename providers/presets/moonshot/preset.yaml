@@ -1,0 +1,22 @@
+id: moonshot
+display_name: 月之暗面 Kimi
+protocol: openai_compat
+base_url: https://api.moonshot.cn/v1
+registration_url: https://platform.moonshot.cn
+reasoning_style: thinking_extra_body
+
+models:
+  - id: kimi-k2-instruct
+    display_name: Kimi K2 Instruct
+    capabilities: [chat, tool_call]
+    context_length: 256000
+
+  - id: moonshot-v1-128k
+    display_name: Moonshot V1 128K
+    capabilities: [chat, tool_call]
+    context_length: 128000
+
+  - id: moonshot-v1-32k
+    display_name: Moonshot V1 32K
+    capabilities: [chat, tool_call]
+    context_length: 32000

@@ -1,0 +1,17 @@
+id: siliconflow
+display_name: SiliconFlow（硅基流动）
+protocol: openai_compat
+base_url: https://api.siliconflow.cn/v1
+registration_url: https://siliconflow.cn
+reasoning_style: thinking_extra_body
+
+models:
+  - id: deepseek-ai/DeepSeek-V3.2-Exp
+    display_name: DeepSeek V3.2 (SiliconFlow)
+    capabilities: [chat, tool_call]
+    context_length: 128000
+
+  - id: Qwen/Qwen3-Max-Preview
+    display_name: Qwen3 Max Preview (SiliconFlow)
+    capabilities: [chat, tool_call]
+    context_length: 256000

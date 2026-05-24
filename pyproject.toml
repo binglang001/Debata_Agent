@@ -1,19 +1,99 @@
 [project]
-name = "diana"
-version = "0.1.0"
-description = "Diana QQ 机器人 —— 基于 NoneBot2 和 DeepSeek 的主动式 AI 机器人"
+name = "diana_agent"
+version = "0.2.0-dev"
+description = "Diana_Agent —— 让虚拟角色真正活过来的通用聊天智能体框架"
 requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "binglang" }]
+readme = "README.md"
+
 dependencies = [
-    "nonebot2[fastapi]>=2.3.0",
-    "nonebot-adapter-onebot>=2.4.0",
-    "openai>=1.0.0",
-    "python-dotenv>=1.0.0",
-    "openai-whisper>=20250625",
-    "httpx>=0.24.0",
-    "requests>=2.28.0",
-    "duckduckgo-search>=8.0.0",
+    # === 网络与协议 ===
+    "websockets>=12.0",       # NapCat WebSocket 直连
+    "httpx>=0.27.0",          # 异步 HTTP（替代 requests）
+    "aiofiles>=23.2.0",       # 异步文件 I/O
+
+    # === LLM 提供商 SDK（按需懒加载）===
+    "openai>=1.50.0",         # OpenAI 协议（DeepSeek/GLM/Moonshot/Qwen 等都用此）
+    "anthropic>=0.40.0",      # Anthropic Claude
+    "google-genai>=0.3.0",    # Google Gemini
+
+    # === 配置与数据 ===
+    "pydantic>=2.6.0",        # 配置 schema 校验
+    "pydantic-settings>=2.2.0",
+    "pyyaml>=6.0.1",
+    "orjson>=3.10.0",         # 高速 JSON
+
+    # === 加密与密钥管理 ===
+    "cryptography>=42.0.0",   # AES-GCM + RSA
+    "keyring>=24.0.0",        # 跨平台系统密钥环
+
+    # === 工具 ===
+    "ddgs>=8.0.0",            # DuckDuckGo 搜索
+    "platformdirs>=4.2.0",    # 跨平台用户数据目录
+    "python-dotenv>=1.0.0",   # 旧 .env 迁移时使用
+
+    # === GUI（Phase 2 引入，先列出占位）===
+    # "PySide6>=6.7.0",
 ]
 
-[tool.nonebot]
-adapters = [{ name = "OneBot V11", module_name = "nonebot.adapters.onebot.v11" }]
-plugins = ["diana_agent"]
+[project.optional-dependencies]
+# 性能优化（Linux/Mac 自动使用 uvloop）
+perf = [
+    "uvloop>=0.19.0 ; sys_platform != 'win32'",
+]
+
+# 本地 ASR 插件（Phase 3）
+asr-local = [
+    "faster-whisper>=1.0.0",
+]
+
+# 本地 TTS 插件（Phase 3）
+tts-local = [
+    # VoxCPM2 依赖按需安装
+]
+
+# GUI（Phase 2）
+gui = [
+    "PySide6>=6.7.0",
+    "qasync>=0.27.0",  # PySide6 + asyncio 桥接
+]
+
+# 开发依赖
+dev = [
+    "ruff>=0.5.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+diana = "main:main"
+
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = [
+    "core",
+    "adapters", "adapters.napcat",
+    "providers", "providers.protocols",
+    "agents",
+    "memory",
+    "features", "features.vision", "features.asr", "features.tts",
+    "features.weather", "features.web_search",
+    "tools",
+    "app_config",
+    "ui", "ui.dashboard", "ui.wizard", "ui.settings",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

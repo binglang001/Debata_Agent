@@ -1,0 +1,17 @@
+id: deepseek
+display_name: DeepSeek
+protocol: openai_compat
+base_url: https://api.deepseek.com
+registration_url: https://platform.deepseek.com
+reasoning_style: thinking_extra_body
+
+models:
+  - id: deepseek-chat
+    display_name: DeepSeek V4
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 128000
+
+  - id: deepseek-reasoner
+    display_name: DeepSeek Reasoner
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 128000

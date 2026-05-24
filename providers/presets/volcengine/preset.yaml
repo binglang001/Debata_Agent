@@ -1,0 +1,22 @@
+id: volcengine
+display_name: 火山方舟（豆包）
+protocol: openai_compat
+base_url: https://ark.cn-beijing.volces.com/api/v3
+registration_url: https://www.volcengine.com/product/ark
+reasoning_style: thinking_extra_body
+
+models:
+  - id: doubao-seed-1-6-vision-250815
+    display_name: 豆包 Seed 1.6 Vision
+    capabilities: [chat, vision]
+    context_length: 32000
+
+  - id: doubao-pro-256k
+    display_name: 豆包 Pro 256K
+    capabilities: [chat, tool_call]
+    context_length: 256000
+
+  - id: doubao-lite-128k
+    display_name: 豆包 Lite 128K
+    capabilities: [chat]
+    context_length: 128000

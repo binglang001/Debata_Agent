@@ -1,0 +1,26 @@
+"""Diana_Agent 记忆系统。
+
+公开 API：
+    HistoryManager            —— 对话历史（JSONL 增量追加）
+    ImportantMemoryManager    —— 重要记忆（整体 JSON）
+    JsonStore / JsonlStore    —— 底层存储基类（如有特殊需求可直接用）
+
+per-persona 实例化：
+    paths = AppPaths(project_root)
+    history = HistoryManager(paths.memory_dir_for("yuexi") / "history.jsonl")
+    important = ImportantMemoryManager(paths.memory_dir_for("yuexi") / "important.json")
+    await history.load()
+    await important.load()
+"""
+
+from .history import HistoryManager
+from .important import ImportantMemoryManager
+from .store import JsonStore, JsonlStore, StoreError
+
+__all__ = [
+    "HistoryManager",
+    "ImportantMemoryManager",
+    "JsonStore",
+    "JsonlStore",
+    "StoreError",
+]

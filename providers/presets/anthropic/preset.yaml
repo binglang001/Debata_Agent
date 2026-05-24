@@ -1,0 +1,21 @@
+id: anthropic
+display_name: Anthropic Claude
+protocol: anthropic
+base_url: https://api.anthropic.com
+registration_url: https://console.anthropic.com
+
+models:
+  - id: claude-opus-4-7
+    display_name: Claude Opus 4.7
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 1000000
+
+  - id: claude-sonnet-4-6
+    display_name: Claude Sonnet 4.6
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 1000000
+
+  - id: claude-haiku-4-5-20251001
+    display_name: Claude Haiku 4.5
+    capabilities: [chat, tool_call, vision]
+    context_length: 200000

@@ -1,0 +1,22 @@
+id: openrouter
+display_name: OpenRouter
+protocol: openai_compat
+base_url: https://openrouter.ai/api/v1
+registration_url: https://openrouter.ai
+reasoning_style: openai_native
+
+models:
+  - id: anthropic/claude-sonnet-4-6
+    display_name: Claude Sonnet 4.6 (via OpenRouter)
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 1000000
+
+  - id: deepseek/deepseek-chat
+    display_name: DeepSeek Chat (via OpenRouter)
+    capabilities: [chat, tool_call]
+    context_length: 128000
+
+  - id: meta-llama/llama-3.3-70b-instruct
+    display_name: Llama 3.3 70B Instruct
+    capabilities: [chat, tool_call]
+    context_length: 128000

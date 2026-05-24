@@ -1,0 +1,42 @@
+"""Agent 通用类型定义。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Literal
+
+# 工具执行器签名
+ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+
+
+FinishReason = Literal[
+    "no_action",
+    "send_only_complete",
+    "all_no_feedback",
+    "no_tool_after_retry",
+    "max_loops",
+    "api_error",
+    "no_response",
+]
+
+
+@dataclass(slots=True)
+class AgentRunResult:
+    """Agent 一次完整运行的结果。"""
+
+    final_content: str = ""
+    """最后一轮 assistant 的 content（仅在无工具调用结束或全部 send_only=True 时有意义）"""
+
+    records: list[dict[str, Any]] = field(default_factory=list)
+    """完整记录：assistant 消息（含 tool_calls）+ tool 响应 + 中间系统补正"""
+
+    loop_count: int = 0
+
+    finish_reason: FinishReason = "max_loops"
+    """循环结束的原因，用于上层决策"""
+
+    reasoning_logs: list[str] = field(default_factory=list)
+    """每轮 reasoning_content 的拼接（用于 UI 展示思考过程）"""
+
+    def has_records(self) -> bool:
+        return bool(self.records)

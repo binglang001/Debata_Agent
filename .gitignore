@@ -1,26 +1,66 @@
+# ============================================================
+# Diana_Agent .gitignore
+# ============================================================
+
 # === Python ===
 venv/
+.venv/
+env/
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 *.egg-info/
-dist/
 *.egg
+dist/
+build/
 .python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# === 密钥 & 配置 ===
+# === 旧配置（V0 时代，已被 app_config/secrets.py 接管）===
 .env
 .env.*
 !.env.example
 config.yaml
+!config.example.yaml
 
-# === 记忆数据（运行时生成） ===
+# === 运行时数据（用户私有，绝不上传）===
+data/
+!data/.gitkeep
+
+# === 用户人格（个人私设，不上传）===
+# 所有人格平级放 personas/ 下。仓库自带的（diana）入 git，其余排除。
+personas/*
+!personas/__init__.py
+!personas/diana/
+!personas/diana/**
+# 上面 negate 会把 __pycache__ 也带入，显式排除
+personas/*/__pycache__/
+
+# === 归档（V1 时期的私设、旧备份）===
+archived/
+
+# === 旧版残留（Phase 1 完成后清理）===
+diana_agent/__pycache__/
+backups/
 memory.json
 memory_test.json
 important_memory.json
 important_memory_test.json
-personas/*/memory.json
-personas/*/important_memory.json
+uploads/
+
+# === 表情包（个人选择，不上传通用资源）===
+emoji/
+
+# === 模型 / 大文件 ===
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.gguf
+F:/.models/
 
 # === IDE / 编辑器 ===
 .vscode/
@@ -30,24 +70,25 @@ personas/*/important_memory.json
 *~
 .project
 .pydevproject
-
-# === OS ===
-Thumbs.db
 .DS_Store
+Thumbs.db
 Desktop.ini
-$RECYCLE.BIN/
 
-# === Claude Code ===
+# === Claude Code / AI 工具 ===
 .claude/
+.aider*
+.cursor*
 
-# === 备份 & 临时文件 ===
-backups/
+# === 日志 / 临时 ===
+*.log
 *.tmp
 *.bak
-*.log
+tmp-*
+nohup.out
 
-# === 模型文件（本地过大） ===
-*.pt
-*.bin
-*.safetensors
-*.onnx
+# === 操作系统 ===
+$RECYCLE.BIN/
+
+# === Qt / PySide ===
+*.qmlc
+*.jsc

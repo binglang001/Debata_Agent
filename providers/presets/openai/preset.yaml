@@ -1,0 +1,37 @@
+id: openai
+display_name: OpenAI
+protocol: openai_compat
+base_url: https://api.openai.com/v1
+registration_url: https://platform.openai.com
+reasoning_style: openai_native
+
+models:
+  - id: gpt-5
+    display_name: GPT-5
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 400000
+
+  - id: gpt-5-mini
+    display_name: GPT-5 mini
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 400000
+
+  - id: gpt-4o
+    display_name: GPT-4o
+    capabilities: [chat, tool_call, vision]
+    context_length: 128000
+
+  - id: gpt-4o-mini
+    display_name: GPT-4o mini
+    capabilities: [chat, tool_call, vision]
+    context_length: 128000
+
+  - id: o3
+    display_name: o3
+    capabilities: [chat, reasoning]
+    context_length: 200000
+
+  - id: o3-mini
+    display_name: o3-mini
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 200000
