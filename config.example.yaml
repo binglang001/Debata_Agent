@@ -1,0 +1,31 @@
+# Diana Bot 配置文件
+# 所有可调参数集中管理，修改后重启生效
+
+persona: yuexi
+
+model:
+  pro: deepseek-v4-pro
+  flash: deepseek-v4-flash
+  temperature: 0.6
+  max_tokens: 384000
+  first_token_timeout: 30
+
+agent:
+  max_loops: 15
+  merge_window: 0.5
+  recall_merge_window: 2.0
+  greeting_interval: 600
+
+typing:
+  chars_per_second: 3
+  max_delay: 2.0
+
+summarize:
+  trigger_at: 20000
+  range_start: 9000
+  range_end: 11000
+  chat_history_count: 10000
+
+rate_limit:
+  window: 60
+  max_messages: 5

@@ -1,0 +1,53 @@
+# === Python ===
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+.python-version
+
+# === 密钥 & 配置 ===
+.env
+.env.*
+!.env.example
+config.yaml
+
+# === 记忆数据（运行时生成） ===
+memory.json
+memory_test.json
+important_memory.json
+important_memory_test.json
+personas/*/memory.json
+personas/*/important_memory.json
+
+# === IDE / 编辑器 ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# === OS ===
+Thumbs.db
+.DS_Store
+Desktop.ini
+$RECYCLE.BIN/
+
+# === Claude Code ===
+.claude/
+
+# === 备份 & 临时文件 ===
+backups/
+*.tmp
+*.bak
+*.log
+
+# === 模型文件（本地过大） ===
+*.pt
+*.bin
+*.safetensors
+*.onnx
