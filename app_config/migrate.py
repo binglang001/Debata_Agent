@@ -239,9 +239,9 @@ def build_config_from_legacy(
             max_messages=int(old_rate_limit.get("max_messages", 5)),
         ),
         summarize=SummarizeConfig(
-            trigger_at=int(old_summarize.get("trigger_at", 20000)),
-            range_start=int(old_summarize.get("range_start", 9000)),
-            range_end=int(old_summarize.get("range_end", 11000)),
+            trigger_at_messages=int(old_summarize.get("trigger_at", 200)),
+            range_start_messages=int(old_summarize.get("range_start", 50)),
+            range_end_messages=int(old_summarize.get("range_end", 150)),
             chat_history_count=int(old_summarize.get("chat_history_count", 10000)),
         ),
     )

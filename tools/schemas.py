@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _ToolArgs(BaseModel):
@@ -143,14 +143,20 @@ class DeleteMemoryArgs(_ToolArgs):
 
 
 class ListContactsArgs(_ToolArgs):
-    """list_contacts 工具参数。"""
+    """list_contacts 工具参数。scope=group_members 时 group_id 必填。"""
 
     scope: Literal["friends", "groups", "group_members"] = Field(
-        ..., description="查询范围"
+        ..., description="查询范围：friends=好友列表, groups=群列表, group_members=指定群的成员"
     )
     group_id: int | None = Field(
-        default=None, description="scope=group_members 时必填的群号"
+        default=None, description="scope=group_members 时必填，填目标群号"
     )
+
+    @model_validator(mode="after")
+    def validate_group_id(self) -> ListContactsArgs:
+        if self.scope == "group_members" and self.group_id is None:
+            raise ValueError("scope=group_members 时 group_id 必填，请提供目标群号")
+        return self
 
 
 class GetUserInfoArgs(_ToolArgs):

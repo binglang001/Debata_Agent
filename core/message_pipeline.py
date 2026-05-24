@@ -611,15 +611,15 @@ class MessagePipeline:
             return
 
         length = await self.history.length()
-        if length < self.behavior_cfg.summarize.trigger_at:
+        if length < self.behavior_cfg.summarize.trigger_at_messages:
             return
 
         logger.info(
-            f"对话历史达 {length} 条 ≥ trigger_at={self.behavior_cfg.summarize.trigger_at}，触发总结"
+            f"对话历史达 {length} 条 ≥ {self.behavior_cfg.summarize.trigger_at_messages}，触发总结"
         )
 
         slice_records = await self.history.get_slice(
-            0, self.behavior_cfg.summarize.range_end
+            0, self.behavior_cfg.summarize.range_end_messages
         )
 
         result = await self.summary_agent.summarize(slice_records, self.important.text())

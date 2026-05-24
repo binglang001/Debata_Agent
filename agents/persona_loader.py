@@ -104,6 +104,7 @@ def list_available_personas(paths: AppPaths) -> list[str]:
     found: set[str] = set()
     base = paths.PERSONAS_DIR
     if not base.exists():
+        logger.warning(f"personas 目录 {base} 不存在，请检查项目结构")
         return []
     for d in base.iterdir():
         if (
@@ -114,4 +115,9 @@ def list_available_personas(paths: AppPaths) -> list[str]:
             and _PERSONA_NAME_RE.match(d.name)
         ):
             found.add(d.name)
+    if not found:
+        logger.warning(
+            f"personas 目录 {base} 下没有任何可用人格。"
+            f"请克隆仓库自带的 diana/ 或新建一个（参考 docs/persona_writing_guide.md）。"
+        )
     return sorted(found)

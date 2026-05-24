@@ -97,3 +97,7 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "-m 'not live'"
+markers = [
+    "live: 需要真实 API 密钥的端到端测试（默认不跑）",
+]

@@ -81,6 +81,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="启动 NapCat adapter 5 秒，看能不能连上对端，然后退出",
     )
+    parser.add_argument(
+        "--list-secrets",
+        action="store_true",
+        help="列出 secrets.enc 中存储的所有密钥 ID（不显示值）",
+    )
     return parser.parse_args()
 
 
@@ -131,6 +136,10 @@ def main() -> None:
 
     if args.test_adapter:
         asyncio.run(_test_adapter(project_root))
+        return
+
+    if args.list_secrets:
+        _run_list_secrets(paths)
         return
 
     # 检测旧 V1 配置
@@ -400,6 +409,26 @@ def _run_cli_wizard(paths) -> None:
         print(f"在 PERSONA_VARS['admins'] 中追加 {{'name': '...', 'qq': '{admin_qq}'}}。")
     print("\n现在可以启动：python main.py --no-gui")
     print("=" * 60)
+
+
+# ============================================================
+# --list-secrets：列出所有密钥 ID
+# ============================================================
+
+
+def _run_list_secrets(paths) -> None:
+    """列出 secrets.enc 中保存的所有密钥 ID（不显示值）。"""
+    from app_config import SecretsManager
+
+    secrets = SecretsManager(paths)
+    secrets.initialize()
+    ids = secrets.list_ids()
+    if not ids:
+        print("secrets 为空。")
+    else:
+        print(f"secrets 中已存储 {len(ids)} 条密钥：")
+        for sid in ids:
+            print(f"  - {sid}")
 
 
 # ============================================================

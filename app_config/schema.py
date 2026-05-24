@@ -19,9 +19,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class StrictModel(BaseModel):
+    """所有配置模型基类。
+
+    use_attribute_docstrings=True 让 Pydantic 把"字段后紧跟的 docstring"
+    作为 `Field.description`，避免在每个字段重复写 `Field(description=...)`。
+    GUI 编辑器 / JSON schema 生成器可以直接读到说明。
+    """
     """禁止未知字段，避免拼写错误被静默吞掉。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
 
 
 # ============================================================
@@ -48,7 +54,10 @@ class WhitelistConfig(StrictModel):
     whitelist = 仅响应配置列表中的 QQ/群"""
 
     qq_ids: list[int] = Field(default_factory=list)
+    """仅在 mode=whitelist 下生效：允许的好友 QQ 号列表。"""
+
     group_ids: list[int] = Field(default_factory=list)
+    """仅在 mode=whitelist 下生效：允许的群号列表。"""
 
 
 class NapCatAdapterConfig(StrictModel):
@@ -219,6 +228,7 @@ class ProviderConfig(StrictModel):
             raise ValueError(
                 "未指定 preset 时，必须同时填写 protocol 和 base_url"
             )
+        # preset + protocol/base_url 可共存（preset 提供默认，字段值覆盖；常见于代理 URL 场景）
         return self
 
 
@@ -243,12 +253,20 @@ class AgentConfig(StrictModel):
     """模型 ID，如 'deepseek-chat'、'claude-sonnet-4-5'、'glm-4-flash'"""
 
     temperature: float = Field(default=0.6, ge=0.0, le=2.0)
+    """采样温度。聊天主体推荐 0.6；总结/路由用 0.1~0.3。"""
+
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
+    """nucleus sampling 阈值。通常保持 1.0。"""
+
     max_tokens: int = Field(default=16384, ge=1)
+    """单次响应最长 token 数。chat agent 推荐 16k；proactive 64 就够。"""
 
     reasoning: ReasoningConfig | None = None
+    """思考/推理配置（DeepSeek R1、Claude thinking 等）。不填则不启用。"""
 
     first_token_timeout: float = 30.0
+    """首 token 超时（秒）。流式模式下，首字未到即超时重试。"""
+
     max_loops: int = 15
     """工具循环最大轮次（仅 chat agent 用）。"""
 
@@ -278,51 +296,112 @@ class AgentsConfig(StrictModel):
 
 
 class VisionFeatureConfig(StrictModel):
+    """图像理解。type=api 走 provider/api_key_id；type=local 走 model_dir。"""
+
     enabled: bool = False
     type: Literal["api", "local"] = "api"
 
+    # type=api 字段
     provider: str | None = None
-    """type=api 时，引用 providers 字典中的 ID（也可独立配置）"""
-
+    """type=api 时引用 providers 字典中的 ID（也可独立配置）。"""
     model: str = ""
-
     api_key_id: str | None = None
-    """直接指定密钥（不走 provider 时使用）。"""
-
     base_url: str | None = None
-    """直接指定 base URL（不走 provider 时使用）。"""
+
+    # type=local 字段（P3 启用）
+    model_dir: str = ""
+
+    @model_validator(mode="after")
+    def validate_enabled_fields(self) -> VisionFeatureConfig:
+        if not self.enabled:
+            return self
+        if self.type == "api":
+            if not self.provider and not self.api_key_id:
+                raise ValueError(
+                    "features.vision.enabled=True 且 type=api，但 provider 和 api_key_id 都为空。\n"
+                    "  请指定 provider（引用 providers 段中的 ID）或填 api_key_id + base_url。"
+                )
+        else:  # local
+            if not self.model_dir:
+                raise ValueError(
+                    "features.vision.enabled=True 且 type=local，但 model_dir 为空。\n"
+                    "  请填本地模型目录路径（如 F:/.models/qwen-vl/）。"
+                )
+        return self
 
 
 class ASRFeatureConfig(StrictModel):
+    """语音识别。type=api 走 provider+extra_credentials；type=local 走 local_model+model_dir。"""
+
     enabled: bool = False
     type: Literal["api", "local"] = "api"
 
+    # type=api 字段
     provider: str | None = None
     """支持 'xfyun'、'baidu'、'mimo' 等。"""
-
     api_key_id: str | None = None
     extra_credentials: dict[str, str] = Field(default_factory=dict)
 
-    # 本地模式
+    # type=local 字段
     local_model: str = "faster-whisper-large-v3"
     device: Literal["cuda", "cpu", "auto"] = "auto"
     language: str = "zh"
     model_dir: str = ""
-    """本地模型存放路径，留空使用默认。"""
+
+    @model_validator(mode="after")
+    def validate_enabled_fields(self) -> ASRFeatureConfig:
+        if not self.enabled:
+            return self
+        if self.type == "api":
+            if not self.provider:
+                raise ValueError(
+                    "features.asr.enabled=True 且 type=api，但 provider 为空。\n"
+                    "  请填 provider（如 'xfyun'）+ 对应的 api_key_id / extra_credentials。"
+                )
+        else:  # local
+            if not self.local_model:
+                raise ValueError(
+                    "features.asr.enabled=True 且 type=local，但 local_model 为空。"
+                )
+        return self
 
 
 class TTSFeatureConfig(StrictModel):
-    enabled: bool = False
-    type: Literal["api", "local"] = "local"
+    """语音合成。type=api 走 provider/api_key_id；type=local 走 local_model+model_dir。
 
+    默认 type=api 因为大多数用户没有 GPU 跑本地 TTS。
+    """
+
+    enabled: bool = False
+    type: Literal["api", "local"] = "api"
+
+    # type=api 字段
     provider: str | None = None
     api_key_id: str | None = None
 
-    # 本地模式
+    # type=local 字段
     local_model: str = "voxcpm2"
     reference_audio: str = ""
     default_prompt: str = ""
     model_dir: str = ""
+
+    @model_validator(mode="after")
+    def validate_enabled_fields(self) -> TTSFeatureConfig:
+        if not self.enabled:
+            return self
+        if self.type == "api":
+            if not self.provider and not self.api_key_id:
+                raise ValueError(
+                    "features.tts.enabled=True 且 type=api，但 provider 和 api_key_id 都为空。\n"
+                    "  请指定 provider 或填 api_key_id。"
+                )
+        else:  # local
+            if not self.local_model or not self.model_dir:
+                raise ValueError(
+                    "features.tts.enabled=True 且 type=local，但 local_model 或 model_dir 为空。\n"
+                    "  请填本地模型名 + 模型目录路径。"
+                )
+        return self
 
 
 class WeatherFeatureConfig(StrictModel):
@@ -410,21 +489,69 @@ class PersonaConfig(StrictModel):
 
 
 class TypingConfig(StrictModel):
+    """模拟真人打字速度（决定多条消息之间的发送间隔）。"""
+
     chars_per_second: float = 3.0
+    """每秒打几个字。3 字/秒贴近真人正常聊天速度。"""
+
     max_delay: float = 2.0
+    """单条消息最大延迟（秒）。再长的消息也不会等超过这个时间。"""
 
 
 class RateLimitConfig(StrictModel):
+    """对非好友的速率限制（防被陌生人刷屏）。好友/管理员不受限。"""
+
     window: int = 60
+    """滑动窗口（秒）。"""
+
     max_messages: int = 5
+    """窗口内允许的最大消息数。"""
+
     enabled: bool = True
+    """关闭后所有用户都不限速。"""
 
 
 class SummarizeConfig(StrictModel):
-    trigger_at: int = 20000
-    range_start: int = 9000
-    range_end: int = 11000
-    chat_history_count: int = 10000
+    """历史总结触发阈值（按 history 消息条数计）。
+
+    达到 trigger_at_messages 条记录时触发 SummaryAgent，
+    在 [range_start_messages, range_end_messages] 区间内择一个语义完整点截断。
+
+    旧版字段名（trigger_at / range_start / range_end / chat_history_count）会自动迁移。
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_fields(cls, values):
+        if not isinstance(values, dict):
+            return values
+        values = dict(values)
+        # 旧字段名 → 新字段名
+        if "trigger_at" in values and "trigger_at_messages" not in values:
+            values["trigger_at_messages"] = values.pop("trigger_at")
+        else:
+            values.pop("trigger_at", None)
+        if "range_start" in values and "range_start_messages" not in values:
+            values["range_start_messages"] = values.pop("range_start")
+        else:
+            values.pop("range_start", None)
+        if "range_end" in values and "range_end_messages" not in values:
+            values["range_end_messages"] = values.pop("range_end")
+        else:
+            values.pop("range_end", None)
+        return values
+
+    trigger_at_messages: int = 200
+    """达到多少条 history 记录后触发总结。"""
+
+    range_start_messages: int = 50
+    """SummaryAgent 选择 cut_point 的下限（保留这之后的对话）。"""
+
+    range_end_messages: int = 150
+    """SummaryAgent 选择 cut_point 的上限。"""
+
+    chat_history_count: int = 100
+    """获取群历史消息时的默认 count 参数（不属于总结流程）。"""
 
 
 class BehaviorConfig(StrictModel):

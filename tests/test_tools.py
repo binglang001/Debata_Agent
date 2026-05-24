@@ -165,7 +165,10 @@ def _make_config(
             chat=AgentConfig(provider="deepseek", model="deepseek-chat"),
         ),
         features=FeaturesConfig(
-            vision=VisionFeatureConfig(enabled=vision_enabled),
+            vision=VisionFeatureConfig(
+                enabled=vision_enabled,
+                provider="deepseek" if vision_enabled else None,
+            ),
             web_search=WebSearchFeatureConfig(enabled=web_search_enabled),
             weather=WeatherFeatureConfig(
                 enabled=weather_enabled,

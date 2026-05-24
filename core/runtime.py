@@ -89,7 +89,7 @@ class Runtime:
         self.secrets = SecretsManager(self.paths)
         self.secrets.initialize()
         self.config = load_config(self.paths)
-        logger.info(f"配置已加载（persona={self.config.persona.active}）")
+        logger.debug(f"配置已加载（persona={self.config.persona.active}）")
 
         # ----- 2. 人格 -----
         from agents import list_available_personas, load_persona
@@ -109,7 +109,7 @@ class Runtime:
                 f"  请编辑 {self.paths.CONFIG_FILE} 把 persona.active 改成上述之一，"
                 f"然后重新启动。"
             ) from None
-        logger.info(f"人格已加载: {self.persona.name}")
+        logger.debug(f"人格已加载: {self.persona.name}")
 
         # ----- 3. 记忆 -----
         from memory import HistoryManager, ImportantMemoryManager
@@ -120,9 +120,9 @@ class Runtime:
         self.important = ImportantMemoryManager(mem_dir / "important.json")
         await self.history.load()
         await self.important.load()
-        hist_len = await self.history.length()
-        logger.info(
-            f"记忆已加载（history={hist_len} 条，important={len(self.important.items())} 条）"
+        self._hist_len = await self.history.length()
+        logger.debug(
+            f"记忆已加载（history={self._hist_len} 条，important={len(self.important.items())} 条）"
         )
 
         # ----- 4. Providers（用 ProviderRegistry 统一管理便于 close_all）-----
@@ -135,7 +135,7 @@ class Runtime:
             name: self.provider_registry.get(name)
             for name in self.provider_registry.list_names()
         }
-        logger.info(f"Provider 已实例化: {list(self.providers.keys())}")
+        logger.debug(f"Provider 已实例化: {list(self.providers.keys())}")
 
         # ----- 5. Agents -----
         from agents import ChatAgent, ProactiveRouterAgent, SummaryAgent
@@ -180,12 +180,21 @@ class Runtime:
             raise RuntimeError("配置中没有任何 adapter")
         adapter_name, adapter_cfg = next(iter(self.config.adapters.items()))
         self.adapter = NapCatAdapter.from_config(adapter_name, adapter_cfg, self.secrets)
-        logger.info(f"Adapter 已实例化: {adapter_name}")
+        logger.debug(f"Adapter 已实例化: {adapter_name}")
 
         # ----- 8. Tools -----
         from tools import build_default_registry
 
         self.tool_registry = build_default_registry(self.config)
+
+        # 启动摘要：一行涵盖人格/记忆/provider/adapter/tools
+        logger.info(
+            f"启动配置：persona={self.persona.name}, "
+            f"adapter={adapter_name}, "
+            f"providers={len(self.providers)}, "
+            f"tools={len(self.tool_registry)}, "
+            f"history={self._hist_len}条"
+        )
 
         # ----- 9. State -----
         from .state import PendingRequestStore, RateLimiter

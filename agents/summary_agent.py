@@ -51,8 +51,8 @@ class SummaryAgent:
             f"[{m.get('role', '?')}] {m.get('content', '') or ''}"
             for m in history_slice
         )
-        range_start = self.summarize_cfg.range_start
-        range_end = self.summarize_cfg.range_end
+        range_start = self.summarize_cfg.range_start_messages
+        range_end = self.summarize_cfg.range_end_messages
 
         prompt = (
             f"你是当前角色的记忆管理系统。以下是该角色的前 {len(history_slice)} 条对话历史。\n\n"
