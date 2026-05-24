@@ -68,7 +68,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
             delay = typing_delay(
                 t.content or "",
                 chars_per_second=ctx.typing_chars_per_second,
-                max_delay=ctx.typing_max_delay,
+                max_delay=ctx.typing_max_delay_seconds,
             ) if t.content else 0.5
 
         ctx.collected.append(
@@ -125,7 +125,7 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
             delay = typing_delay(
                 t.content or "",
                 chars_per_second=ctx.typing_chars_per_second,
-                max_delay=ctx.typing_max_delay,
+                max_delay=ctx.typing_max_delay_seconds,
             ) if t.content else 0.5
 
         ctx.collected.append(

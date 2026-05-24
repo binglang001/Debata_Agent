@@ -49,7 +49,7 @@ from typing import Awaitable, Callable
 from adapters.base import IAdapter
 from adapters.types import IncomingMessage, MediaType, Target
 from agents import ChatAgent, Persona, SummaryAgent, build_messages
-from app_config.schema import BehaviorConfig, FeaturesConfig
+from app_config.schema import BehaviorConfig, FeaturesConfig, WhitelistConfig
 from memory import HistoryManager, ImportantMemoryManager
 from tools import (
     IVisionService,
@@ -67,8 +67,8 @@ from .wakeup import WakeupScheduler
 logger = logging.getLogger(__name__)
 
 
-# 速率超限时的提示
-RATE_LIMIT_REPLY = "已超出速率限制（每分钟最多 5 条），请添加机器人为好友后继续使用"
+# 速率超限时的提示模板（占位符运行时替换）
+_RATE_LIMIT_REPLY_TEMPLATE = "已超出速率限制（{window_seconds} 秒内最多 {max_messages} 条），请添加机器人为好友后继续使用"
 
 
 class MessagePipeline:
@@ -93,6 +93,7 @@ class MessagePipeline:
         pending_requests: PendingRequestStore,
         behavior_cfg: BehaviorConfig,
         features_cfg: FeaturesConfig,
+        whitelist: WhitelistConfig | None = None,
         emoji_dir: Path | None = None,
         upload_allowed_dir: Path | None = None,
         rate_limiter: RateLimiter | None = None,
@@ -111,6 +112,10 @@ class MessagePipeline:
         self.pending_requests = pending_requests
         self.behavior_cfg = behavior_cfg
         self.features_cfg = features_cfg
+        # whitelist=None 时按 verify 默认行为（不主动过滤入站）
+        self.whitelist = whitelist or WhitelistConfig()
+        self._whitelist_qq_ids = set(self.whitelist.qq_ids)
+        self._whitelist_group_ids = set(self.whitelist.group_ids)
         self.emoji_dir = emoji_dir
         self.upload_allowed_dir = upload_allowed_dir
         self.rate_limiter = rate_limiter
@@ -135,6 +140,29 @@ class MessagePipeline:
             # 空消息（无文本无媒体）忽略
             return
 
+        # 白名单拦截（仅 mode=whitelist 时严格按名单过滤；open/verify 都放行）
+        if self.whitelist.mode == "whitelist":
+            if event.is_group():
+                try:
+                    gid = int(event.group_id or 0)
+                except (TypeError, ValueError):
+                    gid = 0
+                if gid not in self._whitelist_group_ids:
+                    logger.debug(
+                        f"群消息被白名单拦截：group_id={event.group_id} 不在 {self._whitelist_group_ids}"
+                    )
+                    return
+            else:
+                try:
+                    uid = int(event.user_id or 0)
+                except (TypeError, ValueError):
+                    uid = 0
+                if uid not in self._whitelist_qq_ids:
+                    logger.debug(
+                        f"私聊消息被白名单拦截：user_id={event.user_id} 不在 {self._whitelist_qq_ids}"
+                    )
+                    return
+
         # 速率限制
         if self.rate_limiter and await self.rate_limiter.check_and_log(event.user_id):
             await self._send_rate_limit_reply(event)
@@ -145,7 +173,7 @@ class MessagePipeline:
             await try_save_from_user(
                 event.text,
                 self.important,
-                enabled=self.features_cfg.long_term_memory.keyword_force_save,
+                enabled=self.features_cfg.long_term_memory.keyword_trigger_save,
             )
 
         # 重建可读文本（CQ 码 + 媒体）
@@ -174,7 +202,7 @@ class MessagePipeline:
 
         return_target 用于"如果发送被打断，剩余 actions 失败的回执发去哪"等场景。
         """
-        await asyncio.sleep(self.behavior_cfg.merge_window)
+        await asyncio.sleep(self.behavior_cfg.merge_window_seconds)
 
         while True:
             items = await self.batch.drain()
@@ -191,7 +219,7 @@ class MessagePipeline:
                 break
 
             # 被中断说明有新消息插入，再等一个窗口
-            await asyncio.sleep(self.behavior_cfg.merge_window)
+            await asyncio.sleep(self.behavior_cfg.merge_window_seconds)
 
         # 退出前异步回查：处理期间可能有新消息正好入队
         async def _requeue_check():
@@ -456,6 +484,14 @@ class MessagePipeline:
 
         collected 是 per-call 的（绝不复用），所以每次新建实例。
         """
+        # SummaryAgent 启用时把它的 provider/model 注入给 summarize_chat_history 工具用
+        if self.summary_agent is not None:
+            summary_provider = self.summary_agent.provider
+            summary_model = self.summary_agent.cfg.model
+        else:
+            summary_provider = None
+            summary_model = ""
+
         return ToolContext(
             adapter=self.adapter,
             important=self.important,
@@ -467,10 +503,10 @@ class MessagePipeline:
             upload_allowed_dir=self.upload_allowed_dir,
             emoji_dir=self.emoji_dir,
             typing_chars_per_second=self.behavior_cfg.typing.chars_per_second,
-            typing_max_delay=self.behavior_cfg.typing.max_delay,
-            chat_history_count=self.behavior_cfg.summarize.chat_history_count,
-            # summary_provider / summary_model 由 Runtime 在构造 pipeline 后通过属性补齐
-            # （否则会引入对 IProvider 的额外依赖；放在这里保持构造器整洁）
+            typing_max_delay_seconds=self.behavior_cfg.typing.max_delay_seconds,
+            default_history_fetch_count=self.behavior_cfg.default_history_fetch_count,
+            summary_provider=summary_provider,
+            summary_model=summary_model,
             collected=[],
         )
 
@@ -511,19 +547,18 @@ class MessagePipeline:
     async def _build_readable_text(self, event: IncomingMessage) -> str:
         """把 IncomingMessage 重建为人类可读文本（CQ 解析 + 媒体 URL/转录附加）。
 
-        基础：先用 utils.parse_raw_cq 把 CQ 码渲染成占位（[图片] / [语音] / [文件]）
-        增强：扫描 event.media，把占位升级为含 URL / 转录的版本：
+        events.parse_napcat_event 已经把 raw_message 走过 parse_raw_cq，
+        结果存在 event.text 里。这里只在 event.text 为空（异常路径）时回退重算。
+        然后扫描 event.media，把占位升级为含 URL / 转录的版本：
             - 图片：[图片] → [图片 url=...]
             - 语音：[语音] → [音频消息: 转录文本]（通过 adapter.fetch_voice_text）
             - 文件：[文件] → [文件 url=...]（通过 adapter.get_file_url）
         """
-        bot_qq = str(getattr(event, "self_id", ""))
-        # 输入源优先用 raw_message（含 CQ 码），缺则用 text；
-        # 注意 parse_raw_cq 合法返回空字符串时不应错落回 event.text
-        source = event.raw_message if event.raw_message else event.text
-        parsed = parse_raw_cq(source, bot_qq) if source else ""
-        # parse_raw_cq 返回 None 才回落到 event.text；空字符串是有效输出（消息无可读内容）
-        text = parsed if parsed is not None else (event.text or "")
+        text = event.text
+        if not text and event.raw_message:
+            bot_qq = str(getattr(event, "self_id", ""))
+            text = parse_raw_cq(event.raw_message, bot_qq)
+        text = text or ""
 
         # 升级媒体占位为含 URL / 转录的版本
         for seg in event.media:
@@ -585,9 +620,13 @@ class MessagePipeline:
         )
 
     async def _send_rate_limit_reply(self, event: IncomingMessage) -> None:
-        """非好友超限时发一条限速提示（不入历史）。"""
+        """非好友超限时发一条限速提示（不入历史）。文案根据当前 rate_limit 配置渲染。"""
+        rl = self.behavior_cfg.rate_limit
+        text = _RATE_LIMIT_REPLY_TEMPLATE.format(
+            window_seconds=rl.window_seconds, max_messages=rl.max_messages
+        )
         try:
-            await self.adapter.send_text(event.source_target, RATE_LIMIT_REPLY)
+            await self.adapter.send_text(event.source_target, text)
         except Exception:
             pass
 

@@ -127,11 +127,11 @@ class ToolContext:
     emoji_dir: Path | None = None
     """表情包目录（send_* 工具通过 image 参数引用文件名时用）。"""
 
-    chat_history_count: int = 10000
-    """summarize_chat_history 拉取群历史的条数。"""
+    default_history_fetch_count: int = 100
+    """summarize_chat_history 工具拉取群历史的默认 count 参数。"""
 
-    typing_chars_per_second: float = 3.0
-    typing_max_delay: float = 2.0
+    typing_chars_per_second: float = 1.0
+    typing_max_delay_seconds: float = 2.0
 
     collected: list[dict[str, Any]] = field(default_factory=list)
     """发送类工具攒起来的动作列表（由 message_pipeline 真正执行）。

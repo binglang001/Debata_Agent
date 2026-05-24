@@ -130,8 +130,8 @@ def test_build_config_from_legacy(tmp_paths, fake_keyring):
     assert cfg.agents.chat.temperature == 0.7
     assert cfg.agents.chat.max_tokens == 32768
     assert cfg.agents.chat.max_loops == 20
-    assert cfg.behavior.merge_window == 1.0
-    assert cfg.behavior.greeting_interval == 300
+    assert cfg.behavior.merge_window_seconds == 1.0
+    assert cfg.behavior.proactive_think_interval_seconds == 300
     assert cfg.behavior.summarize.trigger_at_messages == 15000
 
     # NapCat 适配器从 .env 取 host/port，按 V1 NoneBot 行为设 mode=server

@@ -48,13 +48,13 @@ class ProactiveLoop:
             return
         self._task = asyncio.create_task(self._loop())
         logger.info(
-            f"ProactiveLoop 已启动，间隔 {self.behavior_cfg.greeting_interval}s"
+            f"ProactiveLoop 已启动，间隔 {self.behavior_cfg.proactive_think_interval_seconds}s"
         )
 
     async def _loop(self) -> None:
         while not self._stopping:
             try:
-                await asyncio.sleep(self.behavior_cfg.greeting_interval)
+                await asyncio.sleep(self.behavior_cfg.proactive_think_interval_seconds)
             except asyncio.CancelledError:
                 break
 

@@ -74,6 +74,7 @@ class SummaryAgent:
         )
 
         try:
+            # 总结一次性吐 8k+ tokens，整体 timeout 比首 token 宽得多
             result = await self.provider.chat_completion(
                 [
                     {
@@ -90,8 +91,8 @@ class SummaryAgent:
                 max_tokens=self.cfg.max_tokens,
                 reasoning=self._to_provider_reasoning(),
                 stream=False,
-                timeout=180.0,
-                first_token_timeout=60.0,
+                timeout=self.cfg.first_token_timeout_seconds * 6 + 60.0,
+                first_token_timeout=self.cfg.first_token_timeout_seconds * 2,
             )
         except ProviderError as e:
             logger.error(f"记忆总结失败（API）: {e}")
@@ -166,17 +167,18 @@ class DuplicateChecker:
         )
 
         try:
+            # 去重判定只要一个布尔结果，用 cfg 的温度和窗口
             result = await self.provider.chat_completion(
                 [{"role": "user", "content": prompt}],
                 model=self.cfg.model,
                 tools=None,
-                temperature=0.1,
-                top_p=1.0,
+                temperature=self.cfg.temperature,
+                top_p=self.cfg.top_p,
                 max_tokens=64,
                 reasoning=None,
                 stream=False,
-                timeout=20.0,
-                first_token_timeout=15.0,
+                timeout=self.cfg.first_token_timeout_seconds,
+                first_token_timeout=self.cfg.first_token_timeout_seconds,
             )
         except Exception as e:
             logger.warning(f"去重检查失败: {e}，默认不跳过")

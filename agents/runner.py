@@ -47,10 +47,10 @@ DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
 }
 
 # 发送类工具：send_only=True 时同样算作终止信号
+# 注：send_voice_message 当前未注册（features.tts 是 P3 占位），等 TTS 实装后再加回
 SEND_TOOL_NAMES: set[str] = {
     "send_private_messages",
     "send_group_message",
-    "send_voice_message",
 }
 
 
@@ -133,8 +133,8 @@ class AgentRunner:
                     max_tokens=self.cfg.max_tokens,
                     reasoning=reasoning,
                     stream=True,
-                    timeout=self.cfg.first_token_timeout * 4 + 60.0,
-                    first_token_timeout=self.cfg.first_token_timeout,
+                    timeout=self.cfg.first_token_timeout_seconds * 4 + 60.0,
+                    first_token_timeout=self.cfg.first_token_timeout_seconds,
                 )
             except ProviderTimeoutError as e:
                 logger.error(f"AgentRunner 超时（轮次 {loop_count}）: {e}")

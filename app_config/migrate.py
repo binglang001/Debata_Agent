@@ -187,7 +187,7 @@ def build_config_from_legacy(
             model=chat_model,
             temperature=temperature,
             max_tokens=max_tokens,
-            first_token_timeout=first_token_timeout,
+            first_token_timeout_seconds=first_token_timeout,
             max_loops=max_loops,
         ),
         proactive=AgentConfig(
@@ -227,22 +227,22 @@ def build_config_from_legacy(
     )
 
     behavior = BehaviorConfig(
-        merge_window=float(old_agent.get("merge_window", 0.5)),
-        recall_merge_window=float(old_agent.get("recall_merge_window", 2.0)),
-        greeting_interval=float(old_agent.get("greeting_interval", 600)),
+        merge_window_seconds=float(old_agent.get("merge_window", 0.5)),
+        recall_merge_window_seconds=float(old_agent.get("recall_merge_window", 2.0)),
+        proactive_think_interval_seconds=float(old_agent.get("greeting_interval", 600)),
+        default_history_fetch_count=int(old_summarize.get("chat_history_count", 100)),
         typing=TypingConfig(
-            chars_per_second=float(old_typing.get("chars_per_second", 3)),
-            max_delay=float(old_typing.get("max_delay", 2.0)),
+            chars_per_second=float(old_typing.get("chars_per_second", 1)),
+            max_delay_seconds=float(old_typing.get("max_delay", 2.0)),
         ),
         rate_limit=RateLimitConfig(
-            window=int(old_rate_limit.get("window", 60)),
+            window_seconds=int(old_rate_limit.get("window", 60)),
             max_messages=int(old_rate_limit.get("max_messages", 5)),
         ),
         summarize=SummarizeConfig(
             trigger_at_messages=int(old_summarize.get("trigger_at", 200)),
             range_start_messages=int(old_summarize.get("range_start", 50)),
             range_end_messages=int(old_summarize.get("range_end", 150)),
-            chat_history_count=int(old_summarize.get("chat_history_count", 10000)),
         ),
     )
 

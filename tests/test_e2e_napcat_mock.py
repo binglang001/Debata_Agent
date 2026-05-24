@@ -129,7 +129,7 @@ def _make_persona() -> Persona:
 def _make_agent_cfg() -> AgentConfig:
     return AgentConfig(
         provider="fake", model="fake-1", temperature=0.6, max_tokens=512,
-        max_loops=2, refocus_interval=0, first_token_timeout=5.0,
+        max_loops=2, refocus_interval=0, first_token_timeout_seconds=5.0,
     )
 
 
@@ -142,20 +142,20 @@ def _make_config() -> RootConfig:
         adapters={"fake": NapCatAdapterConfig()},
         agents=AgentsConfig(chat=_make_agent_cfg()),
         features=FeaturesConfig(
-            long_term_memory=LongTermMemoryConfig(mode="file", keyword_force_save=True),
+            long_term_memory=LongTermMemoryConfig(mode="file", keyword_trigger_save=True),
         ),
         persona=PersonaConfig(active="test"),
         behavior=BehaviorConfig(
-            merge_window=0.05,
-            recall_merge_window=0.05,
-            greeting_interval=600.0,
-            typing=TypingConfig(chars_per_second=999.0, max_delay=0.01),
-            rate_limit=RateLimitConfig(window=60, max_messages=100, enabled=False),
+            merge_window_seconds=0.05,
+            recall_merge_window_seconds=0.05,
+            proactive_think_interval_seconds=600.0,
+            default_history_fetch_count=100,
+            typing=TypingConfig(chars_per_second=999.0, max_delay_seconds=0.01),
+            rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
             summarize=SummarizeConfig(
                 trigger_at_messages=99999,
                 range_start_messages=50,
                 range_end_messages=150,
-                chat_history_count=100,
             ),
         ),
     )

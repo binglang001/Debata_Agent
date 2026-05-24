@@ -56,7 +56,7 @@ def _write_minimal_config(paths):
                 "protocol": "openai_compat",
                 "base_url": "https://example.com",
                 "api_key_id": None,
-                "timeout": 120.0,
+                "timeout_seconds": 120.0,
             }
         },
         "agents": {
@@ -67,7 +67,7 @@ def _write_minimal_config(paths):
                 "max_tokens": 1024,
                 "max_loops": 3,
                 "refocus_interval": 0,
-                "first_token_timeout": 5.0,
+                "first_token_timeout_seconds": 5.0,
             },
             "proactive": {
                 "provider": "fake_main",
@@ -83,15 +83,15 @@ def _write_minimal_config(paths):
             },
         },
         "features": {
-            "long_term_memory": {"mode": "file", "keyword_force_save": True},
+            "long_term_memory": {"mode": "file", "keyword_trigger_save": True},
             "web_search": {"enabled": False},
         },
         "persona": {"active": "test_bot"},
         "behavior": {
-            "merge_window": 0.05,
-            "recall_merge_window": 0.05,
-            "greeting_interval": 9999.0,
-            "rate_limit": {"window": 60, "max_messages": 100, "enabled": False},
+            "merge_window_seconds": 0.05,
+            "recall_merge_window_seconds": 0.05,
+            "proactive_think_interval_seconds": 9999.0,
+            "rate_limit": {"window_seconds": 60, "max_messages": 100, "enabled": False},
         },
     }
     paths.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)

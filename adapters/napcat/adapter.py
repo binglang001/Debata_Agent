@@ -58,12 +58,16 @@ class NapCatAdapter(IAdapter):
         connection: NapCatConnection,
         *,
         process_manager: NapCatProcessManager | None = None,
-        api_timeout: float = 30.0,
+        api_timeout_seconds: float = 30.0,
+        process_warmup_seconds: float = 2.0,
+        voice_fetch_delay_seconds: float = 1.0,
     ) -> None:
         super().__init__(name)
         self._connection = connection
-        self._api = NapCatApiCaller(connection, default_timeout=api_timeout)
+        self._api = NapCatApiCaller(connection, default_timeout=api_timeout_seconds)
         self._process = process_manager
+        self._process_warmup_seconds = process_warmup_seconds
+        self._voice_fetch_delay_seconds = voice_fetch_delay_seconds
 
         # 安装消息分发
         connection.on_message(self._on_napcat_message)
@@ -78,10 +82,8 @@ class NapCatAdapter(IAdapter):
         name: str,
         cfg: NapCatAdapterConfig,
         secrets: SecretsManager,
-        *,
-        api_timeout: float = 30.0,
     ) -> NapCatAdapter:
-        """从配置构造。"""
+        """从配置构造。所有 timeout / heartbeat / 重连参数均来自 cfg。"""
         access_token = None
         if cfg.access_token_id:
             access_token = secrets.get(cfg.access_token_id)
@@ -108,8 +110,12 @@ class NapCatAdapter(IAdapter):
             connection: NapCatConnection = ReverseWSConnection(
                 ws_url=ws_url,
                 access_token=access_token,
-                reconnect_interval=cfg.reconnect_interval,
+                reconnect_interval=cfg.reconnect_interval_seconds,
                 max_reconnect_attempts=cfg.max_reconnect_attempts,
+                reconnect_backoff_max=cfg.reconnect_backoff_max_seconds,
+                ping_interval=cfg.ping_interval_seconds,
+                ping_timeout=cfg.ping_timeout_seconds,
+                initial_connect_timeout=cfg.initial_connect_timeout_seconds,
             )
         else:  # mode == "server"
             # 程序作为 WS 服务端，监听 {host}:{port}{path} 等 NapCat 反向连入
@@ -118,6 +124,8 @@ class NapCatAdapter(IAdapter):
                 port=cfg.port,
                 path=cfg.path,
                 access_token=access_token,
+                ping_interval=cfg.ping_interval_seconds,
+                ping_timeout=cfg.ping_timeout_seconds,
             )
 
         process_manager: NapCatProcessManager | None = None
@@ -132,7 +140,9 @@ class NapCatAdapter(IAdapter):
             name=name,
             connection=connection,
             process_manager=process_manager,
-            api_timeout=api_timeout,
+            api_timeout_seconds=cfg.api_timeout_seconds,
+            process_warmup_seconds=cfg.process_warmup_seconds,
+            voice_fetch_delay_seconds=cfg.voice_fetch_delay_seconds,
         )
 
     # ============================================================
@@ -143,7 +153,7 @@ class NapCatAdapter(IAdapter):
         if self._process is not None:
             await self._process.start()
             # 给 NapCat 一点启动时间再尝试连接
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(self._process_warmup_seconds)
         await self._connection.start()
 
     async def stop(self) -> None:
@@ -302,8 +312,8 @@ class NapCatAdapter(IAdapter):
 
     async def fetch_voice_text(self, message_id: str) -> str:
         """NapCat 的 fetch_ptt_text Action。"""
-        # NapCat 处理需要约 1 秒
-        await asyncio.sleep(1.0)
+        # NapCat 处理需要短暂等待
+        await asyncio.sleep(self._voice_fetch_delay_seconds)
         try:
             data = await self._api.call(
                 "fetch_ptt_text", {"message_id": int(message_id)}

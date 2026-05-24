@@ -263,5 +263,5 @@ class GetWeatherArgs(_ToolArgs):
         ..., min_length=1, description="城市名称，如 宁德、北京"
     )
     days: int = Field(
-        default=1, ge=1, le=30, description="预报天数 1-30，默认 1"
+        default=1, ge=1, le=7, description="预报天数 1-7，默认 1（和风天气免费版上限）"
     )

@@ -247,7 +247,7 @@ async def summarize_chat_history(args: SummarizeChatArgs, ctx: ToolContext) -> d
     try:
         history = await ctx.adapter.get_group_history(
             str(args.group_id),
-            count=ctx.chat_history_count,
+            count=ctx.default_history_fetch_count,
         )
     except NotImplementedError:
         return {"ok": False, "error": "当前适配器不支持群历史拉取"}
@@ -263,6 +263,7 @@ async def summarize_chat_history(args: SummarizeChatArgs, ctx: ToolContext) -> d
     ]
 
     try:
+        # 复用 summary agent 的 timeout 配置；temperature/max_tokens 用总结合理默认
         result = await ctx.summary_provider.chat_completion(
             messages,
             model=ctx.summary_model,
@@ -270,7 +271,7 @@ async def summarize_chat_history(args: SummarizeChatArgs, ctx: ToolContext) -> d
             temperature=0.3,
             max_tokens=4096,
             stream=False,
-            timeout=60.0,
+            timeout=ctx.summary_provider.timeout if hasattr(ctx.summary_provider, "timeout") else 60.0,
         )
     except ProviderError as e:
         return {"ok": False, "error": f"总结失败: {e}"}

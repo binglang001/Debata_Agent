@@ -75,7 +75,7 @@ def _make_agent_cfg() -> AgentConfig:
         max_tokens=512,
         max_loops=2,
         refocus_interval=0,
-        first_token_timeout=15.0,
+        first_token_timeout_seconds=15.0,
     )
 
 

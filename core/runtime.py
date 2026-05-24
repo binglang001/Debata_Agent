@@ -89,6 +89,13 @@ class Runtime:
         self.secrets = SecretsManager(self.paths)
         self.secrets.initialize()
         self.config = load_config(self.paths)
+        # 按 config 调整全局日志级别（main.py 启动时只设了 INFO）
+        try:
+            logging.getLogger().setLevel(
+                getattr(logging, self.config.app.log_level, logging.INFO)
+            )
+        except Exception:
+            pass
         logger.debug(f"配置已加载（persona={self.config.persona.active}）")
 
         # ----- 2. 人格 -----
@@ -171,7 +178,51 @@ class Runtime:
                 self.config.behavior.summarize,
             )
 
-        # ----- 6. Features (P1.8 留 None；P2/3 实装 vision/web_search/weather)-----
+        # ----- 6. Features service（按 enabled 实例化；asr/tts/embedding 是 P3 占位）-----
+        from features import VisionService, WeatherService, WebSearchService
+
+        if self.config.features.vision.enabled:
+            vcfg = self.config.features.vision
+            if vcfg.type != "api":
+                logger.warning(
+                    "features.vision.type=local 当前未实装（P3），vision 服务跳过实例化"
+                )
+            elif vcfg.provider and vcfg.provider in self.providers:
+                self.vision = VisionService(
+                    provider=self.providers[vcfg.provider],
+                    model=vcfg.model or "",
+                )
+                logger.info(
+                    f"VisionService 已启用：provider={vcfg.provider}, model={vcfg.model}"
+                )
+            else:
+                logger.warning(
+                    f"features.vision.enabled=True 但 provider={vcfg.provider!r} "
+                    f"不在 providers 中，vision 服务跳过实例化"
+                )
+
+        if self.config.features.web_search.enabled:
+            wscfg = self.config.features.web_search
+            self.web_search = WebSearchService(
+                max_results=wscfg.max_results,
+                timeout_seconds=wscfg.timeout_seconds,
+            )
+            logger.info("WebSearchService 已启用（DuckDuckGo）")
+
+        if self.config.features.weather.enabled:
+            wcfg = self.config.features.weather
+            api_key = self.secrets.get(wcfg.api_key_id) if wcfg.api_key_id else None
+            if api_key:
+                self.weather = WeatherService(
+                    api_key=api_key,
+                    host=wcfg.host,
+                )
+                logger.info(f"WeatherService 已启用：host={wcfg.host}")
+            else:
+                logger.warning(
+                    f"features.weather.enabled=True 但 api_key_id={wcfg.api_key_id!r} "
+                    f"没找到密钥，weather 服务跳过实例化"
+                )
 
         # ----- 7. Adapter -----
         from adapters.napcat.adapter import NapCatAdapter
@@ -203,7 +254,7 @@ class Runtime:
         self.pending_requests = PendingRequestStore()
         if self.config.behavior.rate_limit.enabled:
             self.rate_limiter = RateLimiter(
-                window_seconds=self.config.behavior.rate_limit.window,
+                window_seconds=self.config.behavior.rate_limit.window_seconds,
                 max_messages=self.config.behavior.rate_limit.max_messages,
                 whitelist_provider=self._friend_whitelist_provider,
             )
@@ -228,6 +279,7 @@ class Runtime:
             pending_requests=self.pending_requests,
             behavior_cfg=self.config.behavior,
             features_cfg=self.config.features,
+            whitelist=adapter_cfg.whitelist,
             emoji_dir=self.paths.EMOJI_DIR,
             upload_allowed_dir=self.paths.UPLOADS_DIR,
             rate_limiter=self.rate_limiter,

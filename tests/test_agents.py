@@ -442,7 +442,7 @@ def test_schema_long_term_memory_config_defaults():
 
     c = LongTermMemoryConfig()
     assert c.mode == "file"
-    assert c.keyword_force_save is True
+    assert c.keyword_trigger_save is True
     assert c.rag_top_k == 5
 
 

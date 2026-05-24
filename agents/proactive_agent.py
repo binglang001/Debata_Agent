@@ -1,7 +1,7 @@
 """主动思考路由 Agent —— 用小模型判断是否需要主动发言。
 
 行为（沿用 V1 语义）：
-    每隔 greeting_interval 触发一次。给模型当前历史 + "想聊天就回 TAKE_ACTIONS"。
+    每隔 behavior.proactive_think_interval_seconds 触发一次。给模型当前历史 + "想聊天就回 TAKE_ACTIONS"。
     如果模型说 TAKE_ACTIONS，再用主 ChatAgent 跑一次完整循环。
 
 为了节省 token，proactive 用单次（非工具循环）调用，不带 tools。
@@ -54,8 +54,8 @@ class ProactiveRouterAgent:
                 max_tokens=self.cfg.max_tokens,
                 reasoning=self._to_provider_reasoning(),
                 stream=False,
-                timeout=self.cfg.first_token_timeout * 2,
-                first_token_timeout=self.cfg.first_token_timeout,
+                timeout=self.cfg.first_token_timeout_seconds * 2,
+                first_token_timeout=self.cfg.first_token_timeout_seconds,
             )
         except ProviderError as e:
             logger.warning(f"主动路由判断失败: {e}，默认不操作")

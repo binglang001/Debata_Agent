@@ -77,7 +77,7 @@ def _make_agent_cfg() -> AgentConfig:
         max_tokens=1024,
         max_loops=3,
         refocus_interval=0,
-        first_token_timeout=5.0,
+        first_token_timeout_seconds=5.0,
     )
 
 
@@ -95,17 +95,18 @@ def _make_root_config() -> RootConfig:
         adapters={"napcat": NapCatAdapterConfig()},
         agents=AgentsConfig(chat=_make_agent_cfg()),
         features=FeaturesConfig(
-            long_term_memory=LongTermMemoryConfig(mode="file", keyword_force_save=True),
+            long_term_memory=LongTermMemoryConfig(mode="file", keyword_trigger_save=True),
         ),
         persona=PersonaConfig(active="test_persona"),
         behavior=BehaviorConfig(
-            merge_window=0.05,
-            recall_merge_window=0.05,
-            greeting_interval=600.0,
-            typing=TypingConfig(chars_per_second=999.0, max_delay=0.01),
-            rate_limit=RateLimitConfig(window=60, max_messages=100, enabled=False),
+            merge_window_seconds=0.05,
+            recall_merge_window_seconds=0.05,
+            proactive_think_interval_seconds=600.0,
+            default_history_fetch_count=10000,
+            typing=TypingConfig(chars_per_second=999.0, max_delay_seconds=0.01),
+            rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
             summarize=SummarizeConfig(
-                trigger_at=99999, range_start=9000, range_end=11000, chat_history_count=10000
+                trigger_at_messages=99999, range_start_messages=9000, range_end_messages=11000,
             ),
         ),
     )

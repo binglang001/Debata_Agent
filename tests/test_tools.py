@@ -172,7 +172,8 @@ def _make_config(
             web_search=WebSearchFeatureConfig(enabled=web_search_enabled),
             weather=WeatherFeatureConfig(
                 enabled=weather_enabled,
-                host="devapi.qweather.com" if weather_enabled else "",
+                api_key_id="fake_qweather" if weather_enabled else None,
+                host="devapi.qweather.com",
             ),
             long_term_memory=LongTermMemoryConfig(mode=memory_mode),
         ),

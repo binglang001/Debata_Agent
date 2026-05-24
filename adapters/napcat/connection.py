@@ -79,6 +79,7 @@ class ReverseWSConnection(NapCatConnection):
         *,
         reconnect_interval: float = 3.0,
         max_reconnect_attempts: int = -1,
+        reconnect_backoff_max: float = 60.0,
         ping_interval: float = 20.0,
         ping_timeout: float = 20.0,
         initial_connect_timeout: float = 10.0,
@@ -88,6 +89,7 @@ class ReverseWSConnection(NapCatConnection):
         self.access_token = access_token
         self.reconnect_interval = reconnect_interval
         self.max_reconnect_attempts = max_reconnect_attempts
+        self.reconnect_backoff_max = reconnect_backoff_max
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.initial_connect_timeout = initial_connect_timeout
@@ -203,7 +205,7 @@ class ReverseWSConnection(NapCatConnection):
                 break  # stop 信号到达
             except asyncio.TimeoutError:
                 pass
-            backoff = min(backoff * 2, 60.0)
+            backoff = min(backoff * 2, self.reconnect_backoff_max)
 
 
 class ForwardWSConnection(NapCatConnection):

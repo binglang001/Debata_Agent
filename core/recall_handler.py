@@ -57,7 +57,7 @@ class RecallHandler:
 
     async def _flush_after_delay(self) -> None:
         """等合并窗口结束后一次性处理。"""
-        await asyncio.sleep(self.behavior_cfg.recall_merge_window)
+        await asyncio.sleep(self.behavior_cfg.recall_merge_window_seconds)
 
         async with self._lock:
             notes = self._pending[:]

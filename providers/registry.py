@@ -96,7 +96,7 @@ def build_provider(
         "name": provider_id,
         "base_url": base_url,
         "api_key": api_key,
-        "timeout": cfg.timeout,
+        "timeout": cfg.timeout_seconds,
         "extra_headers": dict(cfg.extra_headers),
     }
 
