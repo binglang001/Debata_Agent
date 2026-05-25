@@ -6,18 +6,18 @@
 
 ### A. 用已有协议（最常见）
 
-兼容下列协议之一即可只写 `preset.yaml`，无需写代码：
+当前只有两个协议（`app_config/schema.py::ProtocolType`）：
 
 | 协议 | 适用 |
 |------|------|
-| `openai_compat` | OpenAI / DeepSeek / GLM / Moonshot / Qwen / 零一 / SiliconFlow / OpenRouter |
+| `openai_compat` | OpenAI / DeepSeek / GLM / Moonshot / Qwen / Gemini（兼容端点）/ 火山方舟（兼容端点）/ SiliconFlow / OpenRouter |
 | `anthropic` | Claude |
-| `gemini` | Google Gemini |
-| `volcengine` | 火山方舟 |
 
-### B. 新协议
+只要新厂商提供 OpenAI 兼容端点（绝大多数都提供），写一份 `preset.yaml` 即可，无需写 Python 代码。
 
-需要在 `providers/protocols/` 写实现。
+### B. 新协议（极少需要）
+
+只有当上游 API 与 OpenAI/Anthropic 都不兼容、且也没法做兼容层时，才在 `providers/registry.py::PROTOCOL_REGISTRY` 中新增协议实现。
 
 ---
 

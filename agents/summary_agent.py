@@ -90,7 +90,7 @@ class SummaryAgent:
                 top_p=self.cfg.top_p,
                 max_tokens=self.cfg.max_tokens,
                 reasoning=self._to_provider_reasoning(),
-                stream=False,
+                stream=True,
                 timeout=self.cfg.first_token_timeout_seconds * 6 + 60.0,
                 first_token_timeout=self.cfg.first_token_timeout_seconds * 2,
             )
@@ -176,7 +176,7 @@ class DuplicateChecker:
                 top_p=self.cfg.top_p,
                 max_tokens=64,
                 reasoning=None,
-                stream=False,
+                stream=True,
                 timeout=self.cfg.first_token_timeout_seconds,
                 first_token_timeout=self.cfg.first_token_timeout_seconds,
             )

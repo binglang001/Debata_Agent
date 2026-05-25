@@ -51,9 +51,9 @@ IAdapter.send_text() → 用户收到消息
 | `memory` | - | `HistoryManager`, `ImportantMemoryManager` | ✅ |
 | `agents` | `providers`, `memory`, `app_config` | `ChatAgent`, `Persona`, `build_messages()`, prompts | ✅ |
 | `tools` | `adapters`, `memory`, `providers`, `app_config` | `ToolRegistry`, `ToolContext`, `build_default_registry()` | ✅ |
-| `core` | 上面全部 | `Runtime`, `MessagePipeline`, `EventBus` | 🚧 P1.8 |
-| `features` | `providers` | `IVisionService`, ... | 🚧 P2 |
-| `ui` | `core`, `app_config` | `WizardWindow`, `DashboardWindow`, `Tray` | 🚧 P2 |
+| `core` | 上面全部 | `Runtime`, `MessagePipeline`, `EventBus` | ✅ |
+| `features` | `providers` | `IVisionService`, `IWebSearchService`, `IWeatherService` | ✅（ASR/TTS/Embedding 仍 P3 占位） |
+| `ui` | `core`, `app_config` | `WizardWindow`, `DashboardWindow`, `Tray` | ✅ |
 | `utils` | - | `parse_raw_cq`, `MetricsProvider`, `get_time` | ✅ |
 
 ---

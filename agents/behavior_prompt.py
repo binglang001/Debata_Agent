@@ -191,10 +191,6 @@ def build_tool_use_protocol(memory_mode: str = "file") -> str:
     )
 
 
-# 默认导出（向后兼容旧引用 + 没传 memory_mode 时的默认）：文件模式
-TOOL_USE_PROTOCOL = build_tool_use_protocol("file")
-
-
 # ============================================================
 # 3) HUMAN_CHAT_PATTERNS —— priority="high"，真人聊天形态规则
 #
@@ -422,14 +418,3 @@ QQ_FORMAT_REFERENCE = """<qq_format priority="reference">
 </qq_format>"""
 
 
-# ============================================================
-# 向后兼容（旧 BEHAVIOR_PROMPT / PRO_TOOLS_PROMPT 引用）
-# ============================================================
-
-BEHAVIOR_PROMPT = (
-    CORE_RULES + "\n\n"
-    + CONVERSATION_PROTOCOL + "\n\n"
-    + SELF_REFLECTION
-)
-
-PRO_TOOLS_PROMPT = TOOL_USE_PROTOCOL + "\n\n" + QQ_FORMAT_REFERENCE

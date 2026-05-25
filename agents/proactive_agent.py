@@ -53,7 +53,7 @@ class ProactiveRouterAgent:
                 top_p=self.cfg.top_p,
                 max_tokens=self.cfg.max_tokens,
                 reasoning=self._to_provider_reasoning(),
-                stream=False,
+                stream=True,
                 timeout=self.cfg.first_token_timeout_seconds * 2,
                 first_token_timeout=self.cfg.first_token_timeout_seconds,
             )

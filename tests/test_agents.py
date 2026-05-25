@@ -6,7 +6,6 @@ import pytest
 
 from agents.behavior_prompt import (
     CORE_RULES,
-    TOOL_USE_PROTOCOL,
     build_tool_use_protocol,
 )
 from agents.context_builder import (
@@ -32,10 +31,15 @@ from agents.persona_loader import (
 def test_validate_persona_name_ok():
     validate_persona_name("yuexi")
     validate_persona_name("a_b-c123")
+    # 中文与混合应通过（人格名常用中文）
+    validate_persona_name("冰狼")
+    validate_persona_name("寒月-01")
+    validate_persona_name("小桃")
 
 
 def test_validate_persona_name_rejects_bad():
-    for bad in ["", "..", "hi/x", "中文", "a" * 65, "with space"]:
+    # 拒：空 / 长 / 路径敏感字符 / 空格 / 特殊符号
+    for bad in ["", "..", "hi/x", "a\\b", "a:b", 'a"b', "a*b", "a?b", "a<b", "a|b", "a b", "a" * 65]:
         with pytest.raises(ValueError):
             validate_persona_name(bad)
 
@@ -132,11 +136,6 @@ def test_tool_use_protocol_unknown_mode_defaults_to_file():
     """未知 mode 应回退到 file 模式（健壮性）。"""
     s = build_tool_use_protocol("nonexistent")
     assert "必须主动保存" in s
-
-
-def test_legacy_tool_use_protocol_constant_is_file_mode():
-    """向后兼容：TOOL_USE_PROTOCOL 常量等同于 file 模式。"""
-    assert TOOL_USE_PROTOCOL == build_tool_use_protocol("file")
 
 
 def test_emoji_hint_in_protocol():

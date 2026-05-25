@@ -72,6 +72,8 @@ class Runtime:
         self.vision: Any = None
         self.web_search: Any = None
         self.weather: Any = None
+        self.embedding_service: Any = None
+        self.rag_store: Any = None
 
     # ============================================================
     # 启动流程
@@ -224,6 +226,10 @@ class Runtime:
                     f"没找到密钥，weather 服务跳过实例化"
                 )
 
+        # ----- 6.5 RAG 长期记忆（embedding + 向量存储）-----
+        if self.config.features.long_term_memory.mode == "rag":
+            await self._setup_rag(mem_dir)
+
         # ----- 7. Adapter -----
         from adapters.napcat.adapter import NapCatAdapter
 
@@ -368,6 +374,8 @@ class Runtime:
             await _close("wakeup_scheduler", self.wakeup_scheduler.cancel_all)
         if self.pipeline is not None:
             await _close("pipeline", self.pipeline.shutdown)
+        if self.embedding_service is not None:
+            await _close("embedding_service", self.embedding_service.aclose)
         if self.provider_registry is not None:
             await _close("provider_registry", self.provider_registry.close_all)
 
@@ -387,3 +395,44 @@ class Runtime:
         except Exception as e:
             logger.warning(f"获取好友列表失败: {e}")
             return set()
+
+    async def _setup_rag(self, mem_dir) -> None:
+        """RAG 模式装配 EmbeddingService + RagStore，并 attach 到 important。
+
+        失败仅 warn，不阻塞主流程（pipeline 会自动 fallback 到 text() 全部注入）。
+        """
+        ecfg = self.config.features.embedding
+        if not ecfg.enabled:
+            logger.warning("long_term_memory.mode=rag 但 features.embedding.enabled=False；RAG 召回不可用")
+            return
+        if ecfg.type != "api":
+            logger.warning("features.embedding.type=local 当前未实装（P3），RAG 召回跳过")
+            return
+        if not ecfg.provider or ecfg.provider not in self.providers:
+            logger.warning(
+                f"features.embedding.provider={ecfg.provider!r} 未在 providers 中；RAG 召回跳过"
+            )
+            return
+        api_key = self.secrets.get(ecfg.api_key_id) if ecfg.api_key_id else None
+        if ecfg.api_key_id and not api_key:
+            logger.warning(f"embedding api_key_id={ecfg.api_key_id!r} 找不到密钥；RAG 召回跳过")
+            return
+        try:
+            from features.embedding import OpenAICompatEmbeddingService
+            provider = self.providers[ecfg.provider]
+            base_url = getattr(provider, "base_url", None) or ""
+            self.embedding_service = OpenAICompatEmbeddingService(
+                base_url=base_url,
+                api_key=api_key or "",
+                model=ecfg.api_model or "text-embedding-v1",
+            )
+            from memory.rag_store import RagStore
+            self.rag_store = RagStore(mem_dir / "rag.jsonl")
+            await self.rag_store.load()
+            self.important.attach_rag(self.embedding_service, self.rag_store)
+            logger.info(
+                f"RAG 已就位：provider={ecfg.provider}, model={ecfg.api_model}, "
+                f"索引条目={len(self.rag_store)}"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"RAG 装配失败：{e}")

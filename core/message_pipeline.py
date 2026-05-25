@@ -255,10 +255,20 @@ class MessagePipeline:
         # 构造给 LLM 的 messages（emoji_hint / pending_requests 已在 _build_task_context 内拼装）
         task_context = self._build_task_context(now)
 
+        # RAG 模式下用最新一条 user 消息作 query 召回 top-k；否则注入全部
+        if (
+            self.features_cfg.long_term_memory.mode == "rag"
+            and self.important.rag_enabled
+            and items
+        ):
+            important_text = await self.important.retrieve_for_query(items[-1].text)
+        else:
+            important_text = self.important.text()
+
         messages = build_messages(
             persona=self.persona,
             history=await self.history.records(),
-            important_memory_text=self.important.text(),
+            important_memory_text=important_text,
             current_context=task_context,
             memory_mode=self.features_cfg.long_term_memory.mode,
         )

@@ -57,12 +57,6 @@ class AppPaths:
         # === 仓库内置资源（git 追踪） ===
         self.PROVIDER_PRESETS_DIR: Path = project_root / "providers" / "presets"
 
-        # === 旧路径（仅用于一次性迁移） ===
-        self.LEGACY_ENV_FILE: Path = project_root / ".env"
-        self.LEGACY_CONFIG_FILE: Path = project_root / "config.yaml"
-        self.LEGACY_PERSONAS_DIR: Path = project_root / "personas"
-        self.LEGACY_EMOJI_DIR: Path = project_root / "emoji"
-
     def ensure_data_dirs(self) -> None:
         """确保所有 data 子目录存在。幂等。"""
         for d in (

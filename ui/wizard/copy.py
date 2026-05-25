@@ -235,7 +235,7 @@ COPY: dict[str, str] = {
     ),
     "persona_create.never_say_label": "他/她绝不会说出口的话",
     "persona_create.never_say_placeholder": (
-        "比"会说什么"更能定义一个人。比如：\n"
+        "比「会说什么」更能定义一个人。比如：\n"
         "「绝不说'宝贝'『亲爱的'。绝不主动夸别人。绝不在群里发那种'转发给 5 个好友'的东西。」"
     ),
     "persona_create.relation_matrix_label": "对不同人，说话方式有什么差别",
@@ -248,7 +248,7 @@ COPY: dict[str, str] = {
     ),
     "persona_create.sensitive_topics_label": "什么话题会让 ta 破防 / 跑题 / 沉默",
     "persona_create.sensitive_topics_placeholder": (
-        "性格的"裂缝"是立体感的来源。比如：\n"
+        "性格的「裂缝」是立体感的来源。比如：\n"
         "「聊到她妈妈会突然回避。聊到画展会忘记时间一直聊。被问感情状态会装没看见。」\n"
         "可以省。"
     ),

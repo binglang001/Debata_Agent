@@ -393,8 +393,9 @@ class PersonaGenAgent:
             top_p=self.cfg.top_p,
             max_tokens=self.cfg.max_tokens,
             reasoning=self._reasoning(),
-            stream=False,
-            timeout=120.0,
+            stream=True,
+            timeout=180.0,
+            first_token_timeout=60.0,
         )
 
         persona_xml = (result.content or "").strip()
@@ -433,8 +434,9 @@ class PersonaGenAgent:
             top_p=self.cfg.top_p,
             max_tokens=self.cfg.max_tokens,
             reasoning=self._reasoning(),
-            stream=False,
-            timeout=120.0,
+            stream=True,
+            timeout=180.0,
+            first_token_timeout=60.0,
         )
 
         persona_xml = (result.content or "").strip()

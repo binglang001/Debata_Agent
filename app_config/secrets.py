@@ -84,6 +84,31 @@ class SecretsManager:
         self._initialized = True
         logger.info(f"密钥管理器已加载，{len(self._records)} 条密钥")
 
+    def reset_all(self) -> None:
+        """彻底清空密钥基础设施（用于换环境/keyring 损坏导致解密失败的恢复）。
+
+        清掉：keyring 的 RSA 私钥（所有段）、rsa_public.pem、secrets.meta、secrets.enc。
+        清掉后下次 initialize() 会按首次启动流程重建。
+        所有用户密钥（API key 等）会丢失，需要用户重新填。
+        """
+        # keyring 中的 RSA 私钥分段
+        try:
+            self._clear_rsa_private_from_keyring()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"清 keyring 时出错（忽略继续）：{e}")
+        # 文件
+        for f in (self.paths.RSA_PUBLIC_KEY_FILE, self.paths.SECRETS_META_FILE, self.paths.SECRETS_FILE):
+            try:
+                if f.exists():
+                    f.unlink()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"删除 {f} 失败：{e}")
+        # 内存状态
+        self._aes_key = None
+        self._records = {}
+        self._initialized = False
+        logger.info("SecretsManager 已重置，下次 initialize() 会全部重建")
+
     def set(self, key_id: str, plaintext: str) -> None:
         """加密并保存一条密钥。已存在则覆盖。"""
         self._require_initialized()

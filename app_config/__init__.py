@@ -7,8 +7,6 @@
     load_config           —— 从磁盘加载并校验配置
     save_config           —— 保存配置到磁盘（原子写入）
     get_config            —— 获取已加载的全局单例
-    detect_legacy         —— 检测旧配置（.env + config.yaml）是否存在
-    run_full_migration    —— 一站式从 V1 迁移到 V2
 """
 
 from .loader import (
@@ -18,7 +16,6 @@ from .loader import (
     save_config,
     set_active_config,
 )
-from .migrate import detect_legacy, run_full_migration
 from .paths import AppPaths
 from .schema import (
     AdapterConfig,
@@ -81,7 +78,4 @@ __all__ = [
     # secrets
     "SecretsManager",
     "SecretsError",
-    # migrate
-    "detect_legacy",
-    "run_full_migration",
 ]

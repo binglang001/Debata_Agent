@@ -13,14 +13,11 @@
 
 from .base import AgentRunResult, FinishReason, ToolExecutor
 from .behavior_prompt import (
-    BEHAVIOR_PROMPT,
     CONVERSATION_PROTOCOL,
     CORE_RULES,
     HUMAN_CHAT_PATTERNS,
-    PRO_TOOLS_PROMPT,
     QQ_FORMAT_REFERENCE,
     SELF_REFLECTION,
-    TOOL_USE_PROTOCOL,
     build_tool_use_protocol,
 )
 from .chat_agent import ChatAgent
@@ -55,13 +52,10 @@ __all__ = [
     "validate_persona_name",
     # prompts
     "CORE_RULES",
-    "TOOL_USE_PROTOCOL",
     "CONVERSATION_PROTOCOL",
     "HUMAN_CHAT_PATTERNS",
     "SELF_REFLECTION",
     "QQ_FORMAT_REFERENCE",
-    "BEHAVIOR_PROMPT",
-    "PRO_TOOLS_PROMPT",
     "build_tool_use_protocol",
     # context
     "build_messages",

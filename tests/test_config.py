@@ -15,44 +15,6 @@ from app_config.schema import (
 )
 
 
-def test_napcat_legacy_field_migration():
-    """旧字段（ws_url / listen_* / mode=reverse_ws|forward_ws）应自动转新字段。
-
-    这是 schema-level migration：用户的旧 data/config.yaml 不需要手改字段名，
-    加载时自动 normalize。
-    """
-    # 旧 client 形式
-    cfg1 = NapCatAdapterConfig.model_validate(
-        {"mode": "reverse_ws", "ws_url": "ws://192.168.1.10:3001/foo"}
-    )
-    assert cfg1.mode == "client"
-    assert cfg1.host == "192.168.1.10"
-    assert cfg1.port == 3001
-    assert cfg1.path == "/foo"
-
-    # 旧 server 形式
-    cfg2 = NapCatAdapterConfig.model_validate(
-        {
-            "mode": "forward_ws",
-            "listen_host": "0.0.0.0",
-            "listen_port": 8080,
-            "listen_path": "/onebot/v11/ws",
-        }
-    )
-    assert cfg2.mode == "server"
-    assert cfg2.host == "0.0.0.0"
-    assert cfg2.port == 8080
-    assert cfg2.path == "/onebot/v11/ws"
-
-    # 同时给新旧字段时，新字段优先
-    cfg3 = NapCatAdapterConfig.model_validate(
-        {"ws_url": "ws://old:1111/old", "host": "new", "port": 2222, "path": "/new"}
-    )
-    assert cfg3.host == "new"
-    assert cfg3.port == 2222
-    assert cfg3.path == "/new"
-
-
 def _minimal_config() -> RootConfig:
     return RootConfig(
         agents=AgentsConfig(

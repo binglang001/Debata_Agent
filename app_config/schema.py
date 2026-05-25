@@ -64,58 +64,6 @@ class NapCatAdapterConfig(StrictModel):
     type: Literal["napcat"] = "napcat"
     enabled: bool = True
 
-    @model_validator(mode="before")
-    @classmethod
-    def _migrate_legacy_fields(cls, values):
-        """兼容 V2 早期字段名 —— 旧 yaml 不需要手改，加载时自动转换。
-
-        旧 → 新：
-            mode: "reverse_ws" → "client"
-            mode: "forward_ws" → "server"
-            ws_url: "ws://host:port/path" → host + port + path（拆分）
-            listen_host / listen_port / listen_path → host / port / path
-        """
-        if not isinstance(values, dict):
-            return values
-        values = dict(values)
-
-        # mode 旧名
-        if values.get("mode") == "reverse_ws":
-            values["mode"] = "client"
-        elif values.get("mode") == "forward_ws":
-            values["mode"] = "server"
-
-        # listen_* → host/port/path
-        if "listen_host" in values:
-            values.setdefault("host", values.pop("listen_host"))
-        else:
-            values.pop("listen_host", None)
-        if "listen_port" in values:
-            values.setdefault("port", values.pop("listen_port"))
-        else:
-            values.pop("listen_port", None)
-        if "listen_path" in values:
-            values.setdefault("path", values.pop("listen_path"))
-        else:
-            values.pop("listen_path", None)
-
-        # ws_url → host/port/path（拆 URL）
-        if "ws_url" in values:
-            ws_url = values.pop("ws_url")
-            if ws_url:
-                from urllib.parse import urlparse
-
-                parsed = urlparse(ws_url)
-                if parsed.hostname and "host" not in values:
-                    values["host"] = parsed.hostname
-                if parsed.port and "port" not in values:
-                    values["port"] = parsed.port
-                # path 为空时 urlparse 给 ""，回落到 "/"
-                if "path" not in values:
-                    values["path"] = parsed.path or "/"
-
-        return values
-
     mode: Literal["client", "server"] = "client"
     """连接模式（从 Diana_Agent 视角命名，符合直觉）：
 
@@ -133,8 +81,8 @@ class NapCatAdapterConfig(StrictModel):
     host: str = "127.0.0.1"
     port: int = 3001
     path: str = "/"
-    """WebSocket 路径。NapCat 正向 WS 默认 "/"；
-    旧 NoneBot 反向 WS 用户通常用 "/onebot/v11/ws"（与 NapCat 那边配的目标地址保持一致）。"""
+    """WebSocket 路径。client 模式（NapCat 正向 WS）默认 "/"；
+    server 模式时与 NapCat 那边配的目标地址保持一致即可。"""
 
     # 鉴权：填 SecretsManager 中的【密钥 ID】，不是 token 本身。
     # 例如 "napcat_default_token" 这种短标识，对应 secrets 中保存的实际 token。
@@ -274,7 +222,7 @@ class AgentConfig(StrictModel):
     """provider ID（必须在顶层 providers 字典中存在）"""
 
     model: str
-    """模型 ID，如 'deepseek-chat'、'claude-sonnet-4-5'、'glm-4-flash'"""
+    """模型 ID，如 'deepseek-v4-flash'、'claude-sonnet-4-5'、'glm-4.7-flash'"""
 
     temperature: float = Field(default=0.6, ge=0.0, le=2.0)
     """采样温度。聊天主体推荐 0.6；总结/路由用 0.1~0.3。"""
