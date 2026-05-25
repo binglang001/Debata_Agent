@@ -69,11 +69,44 @@ class OpenAICompatEmbeddingService(IEmbeddingService):
         self._client: httpx.AsyncClient | None = None
         self._dim: int = 0
 
+    def _get_client(self) -> httpx.AsyncClient:
+        """懒创建 httpx 客户端。"""
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=self.timeout,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+        return self._client
+
+    async def _request(self, inputs: str | list[str]) -> list[dict]:
+        """发送 POST /embeddings 请求，返回 data 列表。"""
+        client = self._get_client()
+        try:
+            resp = await client.post(
+                "/embeddings",
+                json={"model": self.model, "input": inputs},
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise EmbeddingError(
+                f"embedding 请求失败：{e.response.status_code} {inputs}"
+            ) from e
+        except (httpx.TimeoutException, httpx.RequestError) as e:
+            raise EmbeddingError(f"embedding 请求失败：{e}") from e
+        data = resp.json()["data"]
+        # 缓存维度
+        if data and self._dim == 0:
+            self._dim = len(data[0]["embedding"])
+        return data
+
     async def embed_one(self, text: str) -> list[float]:
-        raise NotImplementedError("DS 任务 1：实装 embed_one")
+        data = await self._request(text)
+        return data[0]["embedding"]
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        raise NotImplementedError("DS 任务 1：实装 embed_batch")
+        data = await self._request(texts)
+        return [item["embedding"] for item in data]
 
     async def aclose(self) -> None:
         if self._client is not None:

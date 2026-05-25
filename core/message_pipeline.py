@@ -101,6 +101,7 @@ class MessagePipeline:
         vision: IVisionService | None = None,
         web_search: IWebSearchService | None = None,
         weather: IWeatherService | None = None,
+        tts: Any = None,
     ) -> None:
         self.adapter = adapter
         self.chat_agent = chat_agent
@@ -123,6 +124,7 @@ class MessagePipeline:
         self.vision = vision
         self.web_search = web_search
         self.weather = weather
+        self.tts = tts
 
         self.batch = MessageBatch()
         self.reply_lock = asyncio.Lock()
@@ -510,6 +512,7 @@ class MessagePipeline:
             vision=self.vision,
             web_search=self.web_search,
             weather=self.weather,
+            tts=self.tts,
             upload_allowed_dir=self.upload_allowed_dir,
             emoji_dir=self.emoji_dir,
             typing_chars_per_second=self.behavior_cfg.typing.chars_per_second,

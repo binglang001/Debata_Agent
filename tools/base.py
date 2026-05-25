@@ -73,6 +73,21 @@ class IWeatherService(Protocol):
     async def query(self, city: str, days: int = 1) -> str: ...
 
 
+class ITTSService(Protocol):
+    """文字转语音服务接口（重声明，避免 features.tts 在主路径循环 import）。
+
+    具体定义在 features/tts/__init__.py；此处 Protocol 仅供 ToolContext 类型注解用。
+    """
+
+    async def synthesize(
+        self,
+        text: str,
+        *,
+        reference_audio: Any = None,
+        prompt: str = "",
+    ) -> Any: ...
+
+
 # ============================================================
 # 唤醒回调签名
 # ============================================================
@@ -117,6 +132,8 @@ class ToolContext:
     vision: IVisionService | None = None
     web_search: IWebSearchService | None = None
     weather: IWeatherService | None = None
+    tts: ITTSService | None = None
+    """TTS 服务实例。启用本地 TTS 插件时由 Runtime 注入。"""
 
     wakeup_cb: WakeupCallback | None = None
     """schedule_wakeup 工具触发时调用。"""
@@ -299,9 +316,11 @@ class ToolRegistry:
         return len(self._specs)
 
     def names(self) -> list[str]:
+        """返回所有已注册工具名列表。"""
         return list(self._specs.keys())
 
     def get_spec(self, name: str) -> ToolSpec | None:
+        """按名获取工具规格，不存在返回 None。"""
         return self._specs.get(name)
 
     def get_schemas(self) -> list[dict[str, Any]]:

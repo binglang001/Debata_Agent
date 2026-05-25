@@ -62,13 +62,16 @@ class PendingRequestStore:
         self._timeout = timeout_seconds
 
     def put(self, info: PendingRequestInfo) -> None:
+        """存入一条待处理请求。"""
         self._items[info.flag] = info
 
     def get(self, flag: str) -> PendingRequestInfo | None:
+        """按 flag 获取请求，查询前先清过期。"""
         self._purge_expired()
         return self._items.get(flag)
 
     def remove(self, flag: str) -> None:
+        """移除指定请求（批准/拒绝后调用）。"""
         self._items.pop(flag, None)
 
     def to_prompt_text(self) -> str:

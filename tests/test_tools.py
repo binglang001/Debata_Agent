@@ -109,7 +109,7 @@ def test_strip_pydantic_metadata_removes_title():
 
 
 def test_all_expected_tools_registered():
-    """检查 17 个工具都已通过装饰器注册到全局列表。"""
+    """检查 18 个工具都已通过装饰器注册到全局列表。"""
     expected = {
         "send_private_messages", "send_group_message", "recall_message", "upload_file",
         "save_important_memory", "delete_important_memory",
@@ -117,6 +117,7 @@ def test_all_expected_tools_registered():
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
         "no_action", "schedule_wakeup",
         "describe_image", "web_search", "get_weather",
+        "send_voice_message",
     }
     actual = {s.name for s in get_default_specs()}
     assert actual == expected, f"差异：{expected ^ actual}"

@@ -265,3 +265,19 @@ class GetWeatherArgs(_ToolArgs):
     days: int = Field(
         default=1, ge=1, le=7, description="预报天数 1-7，默认 1（和风天气免费版上限）"
     )
+
+
+class SendVoiceMessageArgs(_ToolArgs):
+    """send_voice_message 工具参数。"""
+
+    target_type: Literal["private", "group"] = Field(
+        ..., description="发到私聊还是群"
+    )
+    target_id: int = Field(..., description="对方 QQ 号 / 群号")
+    text: str = Field(
+        ..., min_length=1, description="要合成成语音的文本（保持口语化）"
+    )
+    prompt: str | None = Field(
+        default=None,
+        description="可选：用一句话引导语气，如「带点撒娇」「冷淡的语气」。不填用默认。",
+    )

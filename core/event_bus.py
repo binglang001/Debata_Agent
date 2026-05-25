@@ -31,9 +31,13 @@ logger = logging.getLogger(__name__)
 
 # 各类事件回调签名
 MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
+"""消息事件回调：收到消息时触发。"""
 NoticeHandler = Callable[[IncomingNotice], Awaitable[None]]
+"""通知事件回调：撤回/戳一戳等。"""
 RequestHandler = Callable[[IncomingRequest], Awaitable[None]]
+"""请求事件回调：好友/群申请。"""
 MetaHandler = Callable[[MetaEvent], Awaitable[None]]
+"""元事件回调：心跳/生命周期。"""
 
 
 class EventBus:
@@ -59,15 +63,19 @@ class EventBus:
     # ============================================================
 
     def on_message(self, handler: MessageHandler) -> None:
+        """注册消息事件回调。"""
         self._message_handlers.append(handler)
 
     def on_notice(self, handler: NoticeHandler) -> None:
+        """注册通知事件回调（撤回/戳一戳等）。"""
         self._notice_handlers.append(handler)
 
     def on_request(self, handler: RequestHandler) -> None:
+        """注册请求事件回调（好友/群申请）。"""
         self._request_handlers.append(handler)
 
     def on_meta(self, handler: MetaHandler) -> None:
+        """注册元事件回调（心跳/生命周期）。"""
         self._meta_handlers.append(handler)
 
     # ============================================================

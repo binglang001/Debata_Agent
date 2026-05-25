@@ -115,6 +115,7 @@ FEATURE_TOOL_FEATURES: dict[str, str] = {
     "describe_image": "vision",
     "web_search": "web_search",
     "get_weather": "weather",
+    "send_voice_message": "tts",
 }
 """feature 工具名 → features 字典里的字段名。"""
 

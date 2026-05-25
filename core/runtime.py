@@ -74,6 +74,9 @@ class Runtime:
         self.weather: Any = None
         self.embedding_service: Any = None
         self.rag_store: Any = None
+        self.plugin_manager: Any = None
+        self.asr: Any = None
+        self.tts: Any = None
 
     # ============================================================
     # 启动流程
@@ -230,6 +233,9 @@ class Runtime:
         if self.config.features.long_term_memory.mode == "rag":
             await self._setup_rag(mem_dir)
 
+        # ----- 6.6 插件扫描（ASR / TTS / 本地 embedding，按需）-----
+        await self._setup_plugins()
+
         # ----- 7. Adapter -----
         from adapters.napcat.adapter import NapCatAdapter
 
@@ -293,6 +299,7 @@ class Runtime:
             vision=self.vision,
             web_search=self.web_search,
             weather=self.weather,
+            tts=self.tts,
         )
         # 回填 wakeup 双向依赖
         self.wakeup_scheduler._on_fire = self.pipeline.run_wakeup_turn
@@ -376,6 +383,8 @@ class Runtime:
             await _close("pipeline", self.pipeline.shutdown)
         if self.embedding_service is not None:
             await _close("embedding_service", self.embedding_service.aclose)
+        if self.plugin_manager is not None:
+            await _close("plugin_manager", self.plugin_manager.shutdown_all)
         if self.provider_registry is not None:
             await _close("provider_registry", self.provider_registry.close_all)
 
@@ -436,3 +445,61 @@ class Runtime:
             )
         except Exception as e:  # noqa: BLE001
             logger.exception(f"RAG 装配失败：{e}")
+
+    async def _setup_plugins(self) -> None:
+        """扫描 plugins/ 并按 features.asr/tts 决定要不要 build。
+
+        失败仅 warn，不阻塞主流程。
+        """
+        from plugins import PluginManager
+
+        plugins_dir = self.project_root / "plugins"
+        self.plugin_manager = PluginManager(plugins_dir)
+        try:
+            self.plugin_manager.scan()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"插件扫描失败：{e}")
+            return
+        records = self.plugin_manager.list_all()
+        if records:
+            logger.info(f"已扫描 {len(records)} 个插件：{[r.meta.name for r in records]}")
+
+        # ASR：local 模式且 enabled 时尝试 build
+        acfg = self.config.features.asr
+        if acfg.enabled and acfg.type == "local":
+            plugin_name = acfg.local_model.split("-")[0].lower()  # "faster-whisper-large-v3" → "faster"
+            # 优先用 local_model 第一段当 name，找不到再尝试 'whisper'
+            if not self.plugin_manager.get(plugin_name):
+                plugin_name = "whisper"
+            try:
+                self.asr = self.plugin_manager.build(
+                    plugin_name,
+                    {
+                        "model_size": acfg.local_model,
+                        "device": acfg.device,
+                        "language": acfg.language,
+                        "model_dir": acfg.model_dir,
+                    },
+                )
+                logger.info(f"ASR 插件已启用：{plugin_name}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"ASR 插件 {plugin_name!r} 启用失败（保留 NapCat 自带转录）：{e}")
+
+        # TTS：同理
+        tcfg = self.config.features.tts
+        if tcfg.enabled and tcfg.type == "local":
+            plugin_name = tcfg.local_model.lower()
+            if not self.plugin_manager.get(plugin_name):
+                plugin_name = "voxcpm2"
+            try:
+                self.tts = self.plugin_manager.build(
+                    plugin_name,
+                    {
+                        "model_dir": tcfg.model_dir,
+                        "reference_audio": tcfg.reference_audio,
+                        "default_prompt": tcfg.default_prompt,
+                    },
+                )
+                logger.info(f"TTS 插件已启用：{plugin_name}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"TTS 插件 {plugin_name!r} 启用失败：{e}")

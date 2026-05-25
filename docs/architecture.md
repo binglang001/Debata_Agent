@@ -52,7 +52,8 @@ IAdapter.send_text() → 用户收到消息
 | `agents` | `providers`, `memory`, `app_config` | `ChatAgent`, `Persona`, `build_messages()`, prompts | ✅ |
 | `tools` | `adapters`, `memory`, `providers`, `app_config` | `ToolRegistry`, `ToolContext`, `build_default_registry()` | ✅ |
 | `core` | 上面全部 | `Runtime`, `MessagePipeline`, `EventBus` | ✅ |
-| `features` | `providers` | `IVisionService`, `IWebSearchService`, `IWeatherService` | ✅（ASR/TTS/Embedding 仍 P3 占位） |
+| `features` | `providers` | `IVisionService`, `IWebSearchService`, `IWeatherService`, `IEmbeddingService`, `IASRService`, `ITTSService` | ✅（Vision/WebSearch/Weather/Embedding 已实装；ASR/TTS 接口已定义，实装走插件） |
+| `plugins` | `features` | `PluginManager`, `PluginMeta`, `PluginStatus` | ✅（机制就绪；Whisper/VoxCPM2 待 DS 装实） |
 | `ui` | `core`, `app_config` | `WizardWindow`, `DashboardWindow`, `Tray` | ✅ |
 | `utils` | - | `parse_raw_cq`, `MetricsProvider`, `get_time` | ✅ |
 
@@ -92,9 +93,49 @@ IAdapter.send_text() → 用户收到消息
 `features.long_term_memory.mode`：
 
 - **`file`**（默认）：AI 主动调 `save_important_memory` + 关键词强制保存（"记住"/"约定"/"我叫"）。零开销、完全透明。
-- **`rag`**（P2）：被动抽取 + 向量库 + 语义检索。AI 不调主动保存工具。需要 `features.embedding` 启用。
+- **`rag`**：被动抽取 + 向量库 + 语义检索。AI 不调主动保存工具。需要 `features.embedding` 启用。
 
 切换模式时，`build_tool_use_protocol(memory_mode)` 会动态注入不同的工具说明，避免在 RAG 模式下还告诉 AI 主动保存。
+
+### RAG 装配
+
+`core/runtime.py::_setup_rag` 在 `mode=rag` 时按顺序装：
+
+```
+features.embedding.provider → 复用现有 LLM provider 的 base_url
+                            → OpenAICompatEmbeddingService(base_url, key, model)
+mem_dir / rag.jsonl         → RagStore（cosine top-k 检索）
+ImportantMemoryManager.attach_rag(svc, store)
+```
+
+之后 `ImportantMemoryManager.save()` 会自动给新条目算 embedding 并存 rag.jsonl。
+`message_pipeline` 拼上下文时用最后一条用户消息当 query 调 `retrieve_for_query()`，
+只把 top-k 相关条目注入 system prompt，省 token。
+
+向量算法（`memory/rag_store.cosine_similarity`）固定用余弦相似度；
+不做归一化（外面传进来的向量保留原长度，cosine 公式自带归一化）。
+
+---
+
+## 插件机制
+
+`plugins/` 给「重依赖 / 本地模型」类能力一个统一安装入口。Runtime 启动时扫描 `plugins/{name}/__plugin__.py`，
+按 `features.{asr,tts}.type=local` 决定要不要 build 实例并注入到 `pipeline.{asr,tts}` 上。
+
+```
+plugins/{name}/
+  __plugin__.py    # PLUGIN_META + build(config) -> service
+  whisper_impl.py  # 真正的实现（lazy import 重依赖）
+F:/.models/{name}/  # 模型文件，不入仓库
+```
+
+主程序只依赖 `features/` 的轻量接口（`IASRService` / `ITTSService` / `IEmbeddingService`），
+插件实现这些接口即可。完整规格见 [plugins/PLUGIN_SPEC.md](../plugins/PLUGIN_SPEC.md)。
+
+UI 入口在仪表盘「插件」页：列表 + 详情 + 启停 + 配置表单（按 `PLUGIN_META.config_schema` 动态生成）。
+
+工具系统挂钩：TTS 启用时 `tools/feature_tools.send_voice_message` 才生效。
+ASR 不出现在工具里 —— 由 `message_pipeline` 在处理语音段时透明调用。
 
 ---
 
@@ -109,6 +150,8 @@ main.py → Runtime.start()
   5. build providers (各 LLM)
   6. ChatAgent / ProactiveRouterAgent / SummaryAgent
   7. features 服务（vision/web_search/weather, 按配置）
+  7.5 RAG（embedding + rag_store）若 mode=rag
+  7.6 PluginManager.scan() + build ASR/TTS（若 type=local）
   8. NapCatAdapter
   9. ToolRegistry（按 features 启用）
   10. WakeupScheduler / PendingRequestStore / RateLimiter
