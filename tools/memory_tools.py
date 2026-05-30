@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 
+from memory.important import normalize_scope, scope_from_conversation_id
+
 from .base import ToolContext, tool
 from .schemas import DeleteMemoryArgs, SaveMemoryArgs
 
@@ -27,8 +29,15 @@ async def save_important_memory(args: SaveMemoryArgs, ctx: ToolContext) -> dict:
     if ctx.important is None:
         return {"ok": False, "error": "重要记忆管理器未注入"}
 
+    scope = normalize_scope(args.scope) if args.scope else (
+        scope_from_conversation_id(ctx.conversation_id) or "global"
+    )
     try:
-        result = await ctx.important.save(args.memory_text)
+        result = await ctx.important.save(
+            args.memory_text,
+            scope=scope,
+            pinned=args.pinned,
+        )
     except RuntimeError as e:
         return {"ok": False, "error": str(e)}
 
@@ -36,6 +45,8 @@ async def save_important_memory(args: SaveMemoryArgs, ctx: ToolContext) -> dict:
         "ok": True,
         "saved": result["saved"],
         "duplicate": result.get("duplicate", False),
+        "scope": scope,
+        "pinned": args.pinned,
     }
 
 

@@ -129,7 +129,7 @@ _MEMORY_BLOCK_FILE_MODE = """<memory>
 - 你做了自我反思，发现要改进的地方
 - 管理员给了反馈或指示
 
-保存时用一句话概括核心信息，不存日常闲聊。系统会自动去重。
+保存时用一句话概括核心信息，不存日常闲聊。scope 通常留空由系统按当前私聊/群聊推断；只有跨会话稳定事实才用 global，需要任何场景都常驻时才 pinned=true。系统会自动去重。
 
 记忆过时或不再需要 → delete_important_memory（关键词模糊匹配）。
 </memory>
@@ -148,7 +148,7 @@ _MEMORY_BLOCK_RAG_MODE = """<memory>
 - 你做了自我反思，发现要改进的地方
 - 管理员给了反馈或指示
 
-保存时用一句话概括核心信息，不存日常寒暄、临时测试、工具执行结果或已经过期的信息。
+保存时用一句话概括核心信息，不存日常寒暄、临时测试、工具执行结果或已经过期的信息。scope 通常留空由系统按当前私聊/群聊推断；只有跨会话稳定事实才用 global，需要任何场景都常驻时才 pinned=true。
 如果用户只是笼统说“随便记”，但没有给出可保存的事实、偏好或约定，应追问要记什么。
 
 记忆过时、错误、重复或不再需要 → delete_important_memory（关键词模糊匹配）。删除会同步移除 RAG 索引。
@@ -170,7 +170,8 @@ _TOOL_USE_PROTOCOL_FOOTER = """<no_action>
 - recall_message：撤回（仅 2 分钟内的消息）
 - get_forward_msg：提取合并转发内容
 - get_user_info：查 QQ 用户公开信息
-- summarize_chat_history：拉取并总结群历史
+- summarize_conversation：总结本地归档和活跃历史，私聊/群聊都可用
+- summarize_chat_history：拉取并总结 NapCat 服务器侧近期群历史，仅群聊可用
 - upload_file：发送本地文件
 - send_voice_message：发送语音。调用时必须填写 prompt，用一句话写清语气/音色/节奏；不要省略语气提示词
 - set_friend_add_request / set_group_add_request：处理验证请求（必须管理员同意后才调）

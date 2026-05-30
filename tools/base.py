@@ -128,6 +128,9 @@ class ToolContext:
     important: ImportantMemoryManager | None = None
     """重要记忆管理器。"""
 
+    conversation_id: str | None = None
+    """当前工具调用所属会话标签，如 private:123 / group:456。"""
+
     history: HistoryManager | None = None
     """对话历史管理器（部分工具如总结需要）。"""
 

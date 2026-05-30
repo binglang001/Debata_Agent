@@ -25,6 +25,7 @@ async def try_save_from_user(
     *,
     enabled: bool = True,
     keywords: list[str] | None = None,
+    scope: str | None = None,
 ) -> dict | None:
     """如果命中关键词，强制保存到重要记忆。
 
@@ -42,7 +43,7 @@ async def try_save_from_user(
         return None
 
     try:
-        result = await important.force_save_from_keyword(text, keywords)
+        result = await important.force_save_from_keyword(text, keywords, scope=scope)
     except RuntimeError as e:
         # ImportantMemoryManager 未 load
         logger.warning(f"关键词保存跳过（重要记忆未加载）: {e}")

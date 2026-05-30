@@ -15,7 +15,7 @@ from utils.token_budget import TokenEstimator
 
 
 _LINE_TOOLS = {"run_python", "get_forward_msg"}
-_SUMMARY_TOOLS = {"summarize_chat_history"}
+_SUMMARY_TOOLS = {"summarize_chat_history", "summarize_conversation"}
 
 
 def shrink_tool_result(tool_name: str, result: dict[str, Any], ctx: Any) -> dict[str, Any]:

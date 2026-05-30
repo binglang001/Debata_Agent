@@ -62,7 +62,7 @@ def build_combined_system_prompt(
 
     Args:
         persona: 已加载的人格
-        important_memory_text: 重要记忆文本（仅文件模式下从 ImportantMemoryManager.text() 拼接）
+        important_memory_text: 已按当前会话 scope / RAG 规则选出的重要记忆文本
         memory_mode: "file" = 文件模式（默认）；"rag" = RAG 模式（不告诉 AI 主动保存）
 
     稳定性递减顺序：
@@ -164,7 +164,7 @@ def build_messages(
     Args:
         persona: 已加载的人格
         history: 历史对话（来自 HistoryManager）
-        important_memory_text: 重要记忆（文件模式下来自 ImportantMemoryManager.text()）
+        important_memory_text: 已按当前会话 scope / RAG 规则选出的重要记忆文本
         current_context: 本次调用的临时上下文（时间、表情包等）
         system_override: 完全自定义的 system prompt（仅特殊用途，如 proactive 路由）
         memory_mode: "file" / "rag"，决定 tool_use_protocol 内的 memory 块写法

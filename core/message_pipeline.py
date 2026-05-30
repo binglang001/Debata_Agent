@@ -717,6 +717,8 @@ class MessagePipeline:
             await self._send_rate_limit_reply(event)
             return
 
+        conversation_id = self._conversation_id_from_event(event)
+
         # 关键词强制保存（命中即写入重要记忆）
         keyword_saved = False
         if event.text and self.features_cfg.long_term_memory.mode != "rag":
@@ -724,6 +726,7 @@ class MessagePipeline:
                 event.text,
                 self.important,
                 enabled=self.features_cfg.long_term_memory.keyword_trigger_save,
+                scope=conversation_id,
             )
             keyword_saved = bool(keyword_result and keyword_result.get("saved"))
 
@@ -732,7 +735,6 @@ class MessagePipeline:
         self._inbound_seq += 1
         inbound_seq = self._inbound_seq
         received_at = time.monotonic()
-        conversation_id = self._conversation_id_from_event(event)
         logger.debug(
             "入站消息 received_at_ms=%s conversation_id=%s msg_id=%s user_id=%s",
             int(time.time() * 1000),
@@ -878,15 +880,10 @@ class MessagePipeline:
         # 构造给 LLM 的 messages（emoji_hint / pending_requests 已在 _build_task_context 内拼装）
         task_context = self._build_task_context(now, conversation_id)
 
-        # RAG 模式下用最新一条 user 消息作 query 召回 top-k；否则注入全部
-        if (
-            self.features_cfg.long_term_memory.mode == "rag"
-            and self.important.rag_enabled
-            and items
-        ):
-            important_text = await self.important.retrieve_for_query(items[-1].text)
-        else:
-            important_text = self.important.text()
+        important_text = await self._important_memory_text(
+            conversation_id,
+            query=items[-1].text if items else None,
+        )
 
         history_window = await self._select_working_history(conversation_id)
         estimator = self._token_estimator()
@@ -1075,7 +1072,7 @@ class MessagePipeline:
             messages = build_messages(
                 persona=self.persona,
                 history=await self._select_working_history(conversation_id),
-                important_memory_text=self.important.text(),
+                important_memory_text=await self._important_memory_text(conversation_id),
                 rolling_summary_text=self._rolling_summary_text(),
                 current_context=task_context,
                 memory_mode=self.features_cfg.long_term_memory.mode,
@@ -1165,6 +1162,32 @@ class MessagePipeline:
             text,
             self._context_budget().summary_token_budget,
             estimator,
+        )
+
+    async def _important_memory_text(
+        self,
+        conversation_id: str | None,
+        *,
+        query: str | None = None,
+    ) -> str:
+        """按当前会话选择重要记忆注入文本。"""
+        estimator = self._token_estimator()
+        budget = self._context_budget().memory_token_budget
+        if (
+            self.features_cfg.long_term_memory.mode == "rag"
+            and self.important.rag_enabled
+            and query
+        ):
+            return await self.important.retrieve_for_query(
+                query,
+                conversation_id=conversation_id,
+                token_budget=budget,
+                estimator=estimator,
+            )
+        return self.important.text_for_context(
+            conversation_id,
+            token_budget=budget,
+            estimator=estimator,
         )
 
     @staticmethod
@@ -1441,7 +1464,7 @@ class MessagePipeline:
         messages = build_messages(
             persona=self.persona,
             history=await self._select_working_history(conversation_id),
-            important_memory_text=self.important.text(),
+            important_memory_text=await self._important_memory_text(conversation_id),
             rolling_summary_text=self._rolling_summary_text(),
             current_context=task_context,
             memory_mode=self.features_cfg.long_term_memory.mode,
@@ -1506,7 +1529,7 @@ class MessagePipeline:
         messages = build_messages(
             persona=self.persona,
             history=await self._select_working_history(None),
-            important_memory_text=self.important.text(),
+            important_memory_text=await self._important_memory_text(conversation_id),
             rolling_summary_text=self._rolling_summary_text(),
             current_context=task_context,
             memory_mode=self.features_cfg.long_term_memory.mode,
@@ -1597,6 +1620,7 @@ class MessagePipeline:
         return ToolContext(
             adapter=self.adapter,
             important=self.important,
+            conversation_id=conversation_id,
             history=self.history,
             archive=self.archive,
             wakeup_cb=self.wakeup_scheduler.schedule,

@@ -85,7 +85,7 @@ python main.py --no-gui   # 纯 CLI 模式
 - 接管 QQ 账号在群里 / 私聊里聊天，**看起来像本人在打字**
 - 记住你告诉它的承诺（"下周记得提醒我交报告"）
 - 看图、查天气、网上搜东西（按需开启）
-- 长期对话自动总结老历史 + 重要记忆 RAG 召回
+- 长期对话自动归档总结 + 带 scope / pinned 的重要记忆注入与 RAG 召回
 - 主动找你聊（"在干嘛？" — 但只在合理时刻）
 
 ## 项目结构
@@ -96,7 +96,7 @@ Debata_Agent/
 ├── providers/       LLM 提供商（含 10 个预设 + 教程）
 ├── agents/          主聊天 / 主动思考 / 总结 / 人格生成
 ├── memory/          历史 + 重要记忆（文件 + RAG 向量）
-├── tools/           17 个 AI 工具 + 装饰器注册
+├── tools/           AI 工具 + 装饰器注册
 ├── features/        视觉 / ASR / TTS / 天气 / 搜索 / Embedding
 ├── core/            事件总线 / 消息管道 / Runtime 生命周期
 ├── app_config/      配置 + AES/RSA 加密密钥
@@ -126,7 +126,7 @@ Debata_Agent/
 | 3 本地模型可选插件（Whisper / VoxCPM2 / 本地 embedding） | 🚧 | 插件机制 + UI 已就位，具体模型实装进行中 |
 | 4 文档完善 + 开源发布（CHANGELOG / CI / 模板） | 🚧 | CHANGELOG / CI / Issue 模板已就位 |
 
-当前 **279/279 单元测试通过**，含 RAG / KV 缓存 / 跨模块集成测试。
+当前全量测试覆盖 RAG / KV 缓存 / 跨模块集成 / 上下文重构链路；具体命令见归档测试流程文档。
 
 ## 一份默认人格的快速演示
 

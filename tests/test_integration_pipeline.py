@@ -1175,6 +1175,26 @@ async def test_recall_history_reads_archive(build_pipeline):
     assert "周一补玩法文档" in joined
 
 
+@pytest.mark.asyncio
+async def test_pipeline_injects_scope_filtered_important_memory(build_pipeline):
+    pipeline, provider, _, _, important = await build_pipeline([_ai_no_action()])
+    await important.save("全局偏好", scope="global")
+    await important.save("群 42 约定", scope="group:42")
+    await important.save("群 99 约定", scope="group:99")
+    await important.save("置顶跨会话事实", scope="user:123", pinned=True)
+
+    await pipeline.enqueue(_msg(text="触发上下文", group_id="42"))
+    await _drain_pipeline(pipeline)
+
+    joined = "\n".join(
+        str(message.get("content", "")) for message in provider.calls[0]["messages"]
+    )
+    assert "全局偏好" in joined
+    assert "群 42 约定" in joined
+    assert "置顶跨会话事实" in joined
+    assert "群 99 约定" not in joined
+
+
 class _FakeEmbedding:
     async def warmup(self):
         pass

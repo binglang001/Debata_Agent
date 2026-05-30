@@ -7,7 +7,8 @@
     messaging           —— send_private / send_group / recall / upload_file
     memory_tools        —— save / delete_important_memory（仅 file 模式）
     platform_tools      —— list_contacts / get_user_info / get_forward_msg /
-                           set_*_add_request / summarize_chat_history
+                           set_*_add_request / summarize_chat_history /
+                           summarize_conversation / recall_history
     control_tools       —— no_action / schedule_wakeup
     feature_tools       —— describe_image / web_search / get_weather
     keyword_save        —— 关键词强制保存联动

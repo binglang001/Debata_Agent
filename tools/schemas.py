@@ -132,6 +132,16 @@ class SaveMemoryArgs(_ToolArgs):
             "不要保存普通寒暄、一次性请求或已经过期的信息。"
         ),
     )
+    scope: str | None = Field(
+        default=None,
+        description=(
+            "记忆适用范围。默认由当前会话自动推断；可填 global、user:QQ号 或 group:群号。"
+        ),
+    )
+    pinned: bool = Field(
+        default=False,
+        description="是否置顶。置顶记忆会在任何会话中注入，只用于非常稳定且全局重要的信息。",
+    )
 
 
 class DeleteMemoryArgs(_ToolArgs):
@@ -216,6 +226,32 @@ class SummarizeChatArgs(_ToolArgs):
     custom_prompt: str | None = Field(
         default=None,
         description="自定义总结目标。不填会总结群成员概况、群聊基本信息、日常话题和成员印象。",
+    )
+
+
+class SummarizeConversationArgs(_ToolArgs):
+    """summarize_conversation 工具参数。"""
+
+    conversation_id: str | None = Field(
+        default=None,
+        description=(
+            "要总结的本地会话标签，如 private:430666862 或 group:1087440069。"
+            "不填则使用当前会话；仍无法判断时总结本地全局历史。"
+        ),
+    )
+    range_hint: str | None = Field(
+        default=None,
+        description="用户给出的范围线索，如 2026-05-30、昨晚、某个话题关键词；按本地原文/metadata 简单匹配。",
+    )
+    goal: str | None = Field(
+        default=None,
+        description="总结目标或关注点。不填则按时间线概括关键事实、决定、未完成事项和人物偏好。",
+    )
+    max_tokens: int = Field(
+        default=4096,
+        ge=512,
+        le=16384,
+        description="总结模型最大输出 token，默认 4096。",
     )
 
 

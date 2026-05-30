@@ -6,7 +6,8 @@
     - get_forward_msg: 提取合并转发
     - set_friend_add_request: 处理加好友请求
     - set_group_add_request: 处理加群请求
-    - summarize_chat_history: 拉取群历史并交给 LLM 总结
+    - summarize_chat_history: 拉取 NapCat/QQ 服务器侧近期群历史并交给 LLM 总结
+    - summarize_conversation: 总结本地归档和活跃历史
     - recall_history: 从本地永久归档检索较早上下文
 """
 
@@ -14,8 +15,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict, is_dataclass
+from typing import Any
 
 from providers.base import ProviderError
+from utils.token_budget import TokenEstimator
 
 from .base import ToolContext, tool
 from .schemas import (
@@ -26,6 +29,7 @@ from .schemas import (
     SetFriendRequestArgs,
     SetGroupRequestArgs,
     SummarizeChatArgs,
+    SummarizeConversationArgs,
 )
 
 logger = logging.getLogger(__name__)
@@ -269,8 +273,8 @@ _DEFAULT_SUMMARIZE_PROMPT = (
 @tool(
     name="summarize_chat_history",
     description=(
-        "拉取指定群的近期聊天记录并交给总结模型整理。"
-        "当用户要求了解某个群、总结群历史、分析成员印象时使用；必须知道 group_id。"
+        "从 NapCat/QQ 服务器侧拉取指定群的近期群消息并交给总结模型整理。"
+        "只适合补充本地归档之外的群聊近期历史；必须知道 group_id，不支持私聊。"
     ),
     args_model=SummarizeChatArgs,
     category="platform",
@@ -314,6 +318,91 @@ async def summarize_chat_history(args: SummarizeChatArgs, ctx: ToolContext) -> d
         return {"ok": False, "error": f"总结失败: {e}"}
 
     return {"ok": True, "summary": result.content}
+
+
+# ============================================================
+# summarize_conversation
+# ============================================================
+
+
+_DEFAULT_LOCAL_SUMMARY_GOAL = (
+    "请按时间线总结本地对话，提炼关键事实、长期约定、用户偏好、已经完成的决定、"
+    "仍未完成的事项，以及可能需要后续主动跟进的内容。"
+)
+
+
+@tool(
+    name="summarize_conversation",
+    description=(
+        "总结本地永久归档和当前活跃历史中的对话，私聊和群聊都可用。"
+        "当用户要总结过去对话、查本地归档、或总结私聊历史时优先使用。"
+    ),
+    args_model=SummarizeConversationArgs,
+    category="platform",
+)
+async def summarize_conversation(args: SummarizeConversationArgs, ctx: ToolContext) -> dict:
+    if ctx.archive is None:
+        return {"ok": False, "error": "未配置本地历史归档"}
+    if ctx.summary_provider is None or not ctx.summary_model:
+        return {"ok": False, "error": "未配置总结模型"}
+
+    conversation_id = args.conversation_id or ctx.conversation_id
+    range_hint = (args.range_hint or "").strip()
+    records = await _local_summary_records(ctx, conversation_id, range_hint)
+    if not records:
+        return {
+            "ok": True,
+            "summary": "没有找到符合范围的本地对话记录。",
+            "count": 0,
+            "source": "local_archive",
+            "conversation_id": conversation_id,
+        }
+
+    estimator = TokenEstimator()
+    selected = _select_summary_records(records, estimator=estimator)
+    transcript = _format_summary_records(selected)
+    goal = (args.goal or "").strip() or _DEFAULT_LOCAL_SUMMARY_GOAL
+    scope_text = conversation_id or "全局本地历史"
+    range_text = range_hint or "未指定"
+    messages = [
+        {
+            "role": "system",
+            "content": "你是本地对话归档总结器。只根据提供的本地记录总结，不臆测未出现的信息。",
+        },
+        {
+            "role": "user",
+            "content": (
+                f"总结范围：{scope_text}\n"
+                f"范围线索：{range_text}\n"
+                f"总结目标：{goal}\n\n"
+                "<本地对话记录>\n"
+                f"{transcript}\n"
+                "</本地对话记录>"
+            ),
+        },
+    ]
+
+    try:
+        result = await ctx.summary_provider.chat_completion(
+            messages,
+            model=ctx.summary_model,
+            tools=None,
+            temperature=0.3,
+            max_tokens=args.max_tokens,
+            stream=False,
+            timeout=ctx.summary_provider.timeout if hasattr(ctx.summary_provider, "timeout") else 90.0,
+        )
+    except ProviderError as e:
+        return {"ok": False, "error": f"总结失败: {e}"}
+
+    return {
+        "ok": True,
+        "summary": result.content,
+        "count": len(selected),
+        "matched_count": len(records),
+        "source": "local_archive",
+        "conversation_id": conversation_id,
+    }
 
 
 # ============================================================
@@ -391,3 +480,98 @@ def _history_record_matches(
     if time_range and time_range not in text:
         return False
     return True
+
+
+async def _local_summary_records(
+    ctx: ToolContext,
+    conversation_id: str | None,
+    range_hint: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if ctx.archive is not None:
+        for record in await ctx.archive.records():
+            if _summary_record_matches(
+                record,
+                conversation_id=conversation_id,
+                range_hint=range_hint,
+            ):
+                copied = dict(record)
+                copied["_source"] = "archive"
+                records.append(copied)
+    if ctx.history is not None:
+        for record in await ctx.history.records():
+            if _summary_record_matches(
+                record,
+                conversation_id=conversation_id,
+                range_hint=range_hint,
+            ):
+                copied = dict(record)
+                copied["_source"] = "active"
+                records.append(copied)
+    return records
+
+
+def _summary_record_matches(
+    record: dict[str, Any],
+    *,
+    conversation_id: str | None,
+    range_hint: str,
+) -> bool:
+    if conversation_id and record.get("conversation_id") != conversation_id:
+        return False
+    if not range_hint:
+        return True
+    text = "\n".join(
+        [
+            str(record.get("content") or ""),
+            str(record.get("metadata") or ""),
+        ]
+    )
+    return range_hint in text
+
+
+def _select_summary_records(
+    records: list[dict[str, Any]],
+    *,
+    estimator: TokenEstimator,
+    input_budget: int = 60000,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    used = 0
+    for record in reversed(records):
+        cost = estimator.estimate_text(_format_summary_record(record))
+        if selected and used + cost > input_budget:
+            break
+        selected.append(record)
+        used += cost
+    selected.reverse()
+    return selected
+
+
+def _format_summary_records(records: list[dict[str, Any]]) -> str:
+    return "\n\n".join(_format_summary_record(record) for record in records)
+
+
+def _format_summary_record(record: dict[str, Any]) -> str:
+    source = str(record.get("_source") or "unknown")
+    conversation_id = str(record.get("conversation_id") or "unknown")
+    role = str(record.get("role") or "?")
+    timestamp = _summary_timestamp(record)
+    content = str(record.get("content") or "").strip()
+    head = f"[{source}] [{conversation_id}] [{role}]"
+    if timestamp:
+        head += f" [{timestamp}]"
+    return f"{head}\n{content}"
+
+
+def _summary_timestamp(record: dict[str, Any]) -> str:
+    meta = record.get("metadata")
+    if isinstance(meta, dict):
+        if meta.get("timestamp") is not None:
+            return str(meta.get("timestamp"))
+        messages = meta.get("messages")
+        if isinstance(messages, list) and messages:
+            last = messages[-1]
+            if isinstance(last, dict) and last.get("timestamp") is not None:
+                return str(last.get("timestamp"))
+    return ""

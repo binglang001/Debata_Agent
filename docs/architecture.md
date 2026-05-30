@@ -28,13 +28,13 @@ MessagePipeline / RecallHandler / RequestHandler
   ↓
 ChatAgent.run(messages, tools, executor)
   ├─ IProvider.chat_completion() → 多轮工具循环
-  └─ ToolRegistry.executor → 工具执行（17 个工具）
-       ├─ messaging tools → ctx.collected
-       ├─ memory tools → ImportantMemoryManager
+  └─ ToolRegistry.executor → 工具执行（按配置启用）
+       ├─ messaging tools → MessagePipeline 异步发送队列
+       ├─ memory tools → ImportantMemoryManager（scope / pinned 元数据）
        ├─ platform tools → IAdapter.list_friends / get_user_info / ...
        └─ feature tools → IVisionService / IWebSearchService / ...
   ↓
-MessagePipeline._execute_collected()（真实发送 + 中断检测）
+MessagePipeline.SendManager（真实发送 + 中断检测 + send_receipt）
   ↓
 IAdapter.send_text() → 用户收到消息
 ```
@@ -112,9 +112,16 @@ IAdapter.send_text() → 用户收到消息
 `features.long_term_memory.mode`：
 
 - **`file`**（默认）：AI 主动调 `save_important_memory` + 关键词强制保存（"记住"/"约定"/"我叫"）。零开销、完全透明。
-- **`rag`**：被动抽取 + 向量库 + 语义检索。AI 不调主动保存工具。需要 `features.embedding` 启用。
+- **`rag`**：同样保存重要记忆，并给新条目维护向量索引；上下文注入时按语义检索相关条目。需要 `features.embedding` 启用。
 
-切换模式时，`build_tool_use_protocol(memory_mode)` 会动态注入不同的工具说明，避免在 RAG 模式下还告诉 AI 主动保存。
+切换模式时，`build_tool_use_protocol(memory_mode)` 会动态注入不同的工具说明，区分文件直写与 RAG 语义检索的使用方式。
+
+重要记忆是一份全局存储，不按会话拆库。每条记忆有两个呈现层元数据：
+
+- `scope`：`global` / `user:{qq}` / `group:{gid}`，只决定当前轮优先注入哪些记忆。
+- `pinned`：置顶记忆永远注入，不受当前会话 scope 过滤；普通记忆受 `memory_token_budget` 控制。
+
+`MessagePipeline` 会把当前 `conversation_id` 映射到记忆 scope：`private:123 → user:123`，`group:456 → group:456`。关键词保存与 `save_important_memory` 默认使用当前会话 scope，除非工具参数显式指定。
 
 ### RAG 装配
 
@@ -128,11 +135,22 @@ ImportantMemoryManager.attach_rag(svc, store)
 ```
 
 之后 `ImportantMemoryManager.save()` 会自动给新条目算 embedding 并存 rag.jsonl。
-`message_pipeline` 拼上下文时用最后一条用户消息当 query 调 `retrieve_for_query()`，
-只把 top-k 相关条目注入 system prompt，省 token。
+`message_pipeline` 拼上下文时用最后一条用户消息当 query 调 `retrieve_for_query()`：
+先按当前 scope 过滤候选，再做 cosine top-k，最后合并 pinned 常驻记忆，省 token 且减少跨群/私聊误召回。
 
 向量算法（`memory/rag_store.cosine_similarity`）固定用余弦相似度；
 不做归一化（外面传进来的向量保留原长度，cosine 公式自带归一化）。
+
+---
+
+## 本地归档总结
+
+`recall_history` 和 `summarize_conversation` 读取本地 `ArchiveStore` + 当前活跃 `HistoryManager`：
+
+- `recall_history` 返回匹配原文片段，用于找旧 msg_id、旧约定或精确上下文。
+- `summarize_conversation(conversation_id?, range_hint?, goal?, max_tokens?)` 用总结模型整理本地归档，私聊和群聊都可用。
+
+`summarize_chat_history` 是另一个工具：它通过 NapCat/QQ 服务器侧接口拉取指定群的近期群消息，只适合补充本地归档以外的群历史，不支持私聊。
 
 ---
 

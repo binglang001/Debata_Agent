@@ -135,6 +135,31 @@ async def test_important_with_rag(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_rag_retrieve_filters_by_scope_and_keeps_pinned(tmp_path: Path):
+    counter = [0]
+
+    def now() -> str:
+        counter[0] += 1
+        return f"T{counter[0]:04d}"
+
+    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=now)
+    await im.load()
+    rs = RagStore(tmp_path / "rag.jsonl")
+    await rs.load()
+    im.attach_rag(_FakeEmbedding(), rs)
+
+    await im.save("群 B 的茶会安排", scope="group:B")
+    await im.save("群 C 的茶会安排", scope="group:C")
+    await im.save("任何场景都要保留的置顶事项", scope="group:C", pinned=True)
+
+    out = await im.retrieve_for_query("茶会安排", top_k=5, conversation_id="group:B")
+
+    assert "群 B 的茶会安排" in out
+    assert "任何场景都要保留的置顶事项" in out
+    assert "群 C 的茶会安排" not in out
+
+
+@pytest.mark.asyncio
 async def test_rag_delete_propagates(tmp_path: Path):
     # 用递增 timestamp 模拟，避免默认 now_fn 秒级精度让两条记录同 id
     counter = [0]

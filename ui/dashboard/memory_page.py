@@ -8,6 +8,7 @@ from typing import Any
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -54,6 +55,7 @@ class MemoryPage(QWidget):
         outer.addWidget(self._rag_status)
 
         self._list = QListWidget()
+        self._list.itemSelectionChanged.connect(self._on_selection_changed)
         outer.addWidget(self._list, 1)
 
         # 删除按钮
@@ -67,6 +69,23 @@ class MemoryPage(QWidget):
         action_row.addStretch(1)
         self._action_row_widget.setLayout(action_row)
         outer.addWidget(self._action_row_widget)
+
+        # scope / pinned 元数据
+        self._metadata_row_widget = QWidget()
+        metadata_row = QHBoxLayout()
+        metadata_row.setContentsMargins(0, 0, 0, 0)
+        metadata_row.addWidget(QLabel("Scope"))
+        self._scope_edit = QLineEdit()
+        self._scope_edit.setPlaceholderText("global / user:QQ / group:群号")
+        metadata_row.addWidget(self._scope_edit, 1)
+        self._pinned_check = QCheckBox("置顶")
+        metadata_row.addWidget(self._pinned_check)
+        self._metadata_btn = QPushButton("保存范围")
+        self._metadata_btn.setProperty("role", "secondary")
+        self._metadata_btn.clicked.connect(self._on_update_metadata)
+        metadata_row.addWidget(self._metadata_btn)
+        self._metadata_row_widget.setLayout(metadata_row)
+        outer.addWidget(self._metadata_row_widget)
 
         # 添加一条
         self._add_row_widget = QWidget()
@@ -119,29 +138,21 @@ class MemoryPage(QWidget):
             return
         self._show_empty(False)
         for item in items:
-            ts = item.get("timestamp", "")
-            content = item.get("content", "")
-            line = f"{ts}  ·  {content}" if ts else content
-            li = QListWidgetItem(line)
-            li.setData(
-                Qt.ItemDataRole.UserRole,
-                {
-                    "id": str(item.get("id") or item.get("timestamp") or ""),
-                    "content": content,
-                },
-            )
-            self._list.addItem(li)
+            self._add_memory_item(item)
+        self._on_selection_changed()
 
     def _refresh_rag_mode(self, rt: Any) -> None:
         self._title.setText("RAG 记忆索引")
         self._action_row_widget.hide()
         self._add_row_widget.hide()
+        self._metadata_row_widget.show()
         self._rag_status.show()
 
         rag_store = getattr(rt, "rag_store", None)
         embedding = getattr(rt, "embedding_service", None)
         entries = rag_store.all_entries() if rag_store is not None else []
-        fallback_count = len(rt.important.items()) if rt.important is not None else 0
+        items = rt.important.items() if rt.important is not None else []
+        fallback_count = len(items)
         if rag_store is None or embedding is None:
             self._rag_status.setText(
                 f"RAG 当前未就绪，运行时会暂时退回全文记忆。已有文件记忆 {fallback_count} 条。"
@@ -151,21 +162,13 @@ class MemoryPage(QWidget):
                 f"按语义向量检索长期记忆。索引 {len(entries)} 条，原始记忆 {fallback_count} 条。"
             )
 
-        if not entries:
+        if not items:
             self._show_empty(True)
             return
         self._show_empty(False)
-        for entry in entries:
-            timestamp = ""
-            try:
-                timestamp = str((entry.meta or {}).get("timestamp") or entry.id or "")
-            except Exception:
-                timestamp = ""
-            text = getattr(entry, "text", "")
-            line = f"{timestamp}  ·  {text}" if timestamp else text
-            li = QListWidgetItem(line)
-            li.setToolTip("RAG 索引条目")
-            self._list.addItem(li)
+        for item in items:
+            self._add_memory_item(item, rag_mode=True)
+        self._on_selection_changed()
 
     def _is_rag_mode(self) -> bool:
         try:
@@ -178,10 +181,44 @@ class MemoryPage(QWidget):
         if self._is_rag_mode():
             self._action_row_widget.hide()
             self._add_row_widget.hide()
+            self._metadata_row_widget.setVisible(not on)
         else:
             self._delete_btn.setVisible(not on)
+            self._metadata_row_widget.setVisible(not on)
         self._empty.setVisible(on and not self._is_rag_mode())
         self._rag_empty.setVisible(on and self._is_rag_mode())
+
+    def _add_memory_item(self, item: dict, *, rag_mode: bool = False) -> None:
+        ts = item.get("timestamp", "")
+        content = item.get("content", "")
+        scope = item.get("scope", "global")
+        pinned = bool(item.get("pinned"))
+        flags = f"[{scope}{' / 置顶' if pinned else ''}]"
+        line = f"{ts}  ·  {flags}  {content}" if ts else f"{flags}  {content}"
+        li = QListWidgetItem(line)
+        if rag_mode:
+            li.setToolTip("RAG 模式下编辑原始重要记忆的 scope / pinned，保存后会重建索引。")
+        li.setData(
+            Qt.ItemDataRole.UserRole,
+            {
+                "id": str(item.get("id") or item.get("timestamp") or ""),
+                "content": content,
+                "scope": scope,
+                "pinned": pinned,
+            },
+        )
+        self._list.addItem(li)
+
+    def _on_selection_changed(self) -> None:
+        item = self._list.currentItem()
+        data = item.data(Qt.ItemDataRole.UserRole) if item is not None else {}
+        data = data or {}
+        self._scope_edit.setText(str(data.get("scope") or "global"))
+        self._pinned_check.setChecked(bool(data.get("pinned")))
+        has_item = bool(data.get("id"))
+        self._scope_edit.setEnabled(has_item)
+        self._pinned_check.setEnabled(has_item)
+        self._metadata_btn.setEnabled(has_item)
 
     def _on_delete(self) -> None:
         item = self._list.currentItem()
@@ -253,8 +290,49 @@ class MemoryPage(QWidget):
 
         loop.create_task(_do())
 
+    def _on_update_metadata(self) -> None:
+        item = self._list.currentItem()
+        if item is None:
+            show_message(self, "先选一条", "请先在列表里选中要修改的记忆。")
+            return
+        data = item.data(Qt.ItemDataRole.UserRole) or {}
+        item_id = data.get("id", "")
+        if not item_id:
+            show_message(self, "无法保存", "这条记忆缺少唯一时间戳，请刷新后再试。")
+            return
+        rt = self._runtime
+        if rt is None or rt.important is None:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
+
+        async def _do() -> None:
+            self._set_busy(True)
+            try:
+                ok = await rt.important.update_metadata(
+                    item_id,
+                    scope=self._scope_edit.text().strip(),
+                    pinned=self._pinned_check.isChecked(),
+                )
+                if not ok:
+                    show_message(self, "没有保存", "未找到这条记忆，可能已经被刷新。")
+            except Exception as e:
+                logger.warning(f"更新重要记忆元数据失败: {e}")
+                show_message(self, "保存失败", str(e), is_danger=True)
+            finally:
+                self._set_busy(False)
+                self.refresh()
+
+        loop.create_task(_do())
+
     def _set_busy(self, busy: bool) -> None:
         self._delete_btn.setEnabled(not busy)
         self._add_btn.setEnabled(not busy)
         self._refresh_btn.setEnabled(not busy)
         self._new_edit.setEnabled(not busy)
+        current = self._list.currentItem() is not None
+        self._scope_edit.setEnabled(not busy and current)
+        self._pinned_check.setEnabled(not busy and current)
+        self._metadata_btn.setEnabled(not busy and current)

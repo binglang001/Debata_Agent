@@ -139,7 +139,7 @@ def test_all_expected_tools_registered():
         "save_important_memory", "delete_important_memory",
         "list_contacts", "get_user_info", "get_forward_msg",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
-        "recall_history",
+        "summarize_conversation", "recall_history",
         "no_action", "schedule_wakeup",
         "describe_image", "web_search", "get_weather",
         "send_voice_message",
@@ -1169,14 +1169,39 @@ async def test_save_memory_with_manager(tmp_path):
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
-    ctx = ToolContext(important=im)
+    ctx = ToolContext(important=im, conversation_id="private:123")
     executor = reg.get_executor(ctx)
     result = await executor(
         "save_important_memory", {"memory_text": "记住张三是朋友"}
     )
     assert result["ok"] is True
     assert result["saved"] is True
+    assert result["scope"] == "user:123"
     assert len(im.items()) == 1
+    assert im.items()[0]["scope"] == "user:123"
+
+
+@pytest.mark.asyncio
+async def test_save_memory_explicit_scope_and_pinned(tmp_path):
+    from memory import ImportantMemoryManager
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(important=im, conversation_id="private:123")
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "save_important_memory",
+        {"memory_text": "全局稳定约定", "scope": "global", "pinned": True},
+    )
+
+    assert result["ok"] is True
+    assert result["scope"] == "global"
+    assert result["pinned"] is True
+    assert im.items()[0]["scope"] == "global"
+    assert im.items()[0]["pinned"] is True
 
 
 @pytest.mark.asyncio
@@ -1197,6 +1222,68 @@ async def test_delete_memory_with_manager(tmp_path):
     )
     assert result["ok"] is True
     assert result["deleted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_summarize_conversation_uses_local_archive_and_history(tmp_path):
+    from memory import ArchiveStore, HistoryManager
+    from providers.base import CompletionResult
+
+    class FakeSummaryProvider:
+        timeout = 12.0
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def chat_completion(self, messages, *, model, tools=None, **kwargs):
+            self.calls.append(
+                {
+                    "messages": messages,
+                    "model": model,
+                    "tools": tools,
+                    "kwargs": kwargs,
+                }
+            )
+            return CompletionResult(content="本地摘要")
+
+    archive = ArchiveStore(tmp_path / "archive.jsonl")
+    history = HistoryManager(tmp_path / "history.jsonl")
+    await archive.append_many(
+        [
+            {
+                "role": "user",
+                "content": "归档里提到茶会安排",
+                "conversation_id": "group:42",
+            }
+        ]
+    )
+    await history.add_user_message("活跃区继续讨论茶会", conversation_id="group:42")
+    provider = FakeSummaryProvider()
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        archive=archive,
+        history=history,
+        summary_provider=provider,  # type: ignore[arg-type]
+        summary_model="summary-model",
+        conversation_id="group:42",
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "summarize_conversation",
+        {"range_hint": "茶会", "max_tokens": 512},
+    )
+
+    assert result["ok"] is True
+    assert result["summary"] == "本地摘要"
+    assert result["count"] == 2
+    assert result["source"] == "local_archive"
+    assert provider.calls[0]["model"] == "summary-model"
+    prompt = "\n".join(m["content"] for m in provider.calls[0]["messages"])
+    assert "归档里提到茶会安排" in prompt
+    assert "活跃区继续讨论茶会" in prompt
 
 
 # ============================================================

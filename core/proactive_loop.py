@@ -339,11 +339,15 @@ class ProactiveLoop:
                 try:
                     router_history = await self.pipeline._select_proactive_router_history()
                     router_context_parts: list[str] = []
-                    important_memory = self.pipeline.important.text()
+                    important_memory = self.pipeline.important.text_for_context(
+                        None,
+                        token_budget=2048,
+                        estimator=self.pipeline._token_estimator(),
+                    )
                     if important_memory:
                         router_context_parts.append(
                             '<long_term_memory priority="medium">\n'
-                            f"{_trim_router_text(_clean_router_text(important_memory), 2048)}\n"
+                            f"{_clean_router_text(important_memory)}\n"
                             "</long_term_memory>"
                         )
                     rolling_summary = self.pipeline._rolling_summary_text()
@@ -368,7 +372,7 @@ class ProactiveLoop:
                     router_messages = build_messages(
                         persona=self.pipeline.persona,
                         history=[],
-                        important_memory_text=self.pipeline.important.text(),
+                        important_memory_text="",
                         current_context="\n\n".join(router_context_parts),
                         system_override=(
                             "<proactive_router_system priority=\"critical\">\n"
