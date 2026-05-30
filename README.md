@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-279%20passing-brightgreen.svg)](#)
+[![Tests](https://img.shields.io/badge/tests-431%20passing-brightgreen.svg)](#)
 [![GUI](https://img.shields.io/badge/UI-PySide6-blueviolet.svg)](#)
 
 </div>
@@ -93,7 +93,7 @@ python main.py --no-gui   # 纯 CLI 模式
 ```
 Debata_Agent/
 ├── adapters/        渠道适配器（NapCat / 未来 Discord / ...）
-├── providers/       LLM 提供商（含 10 个预设 + 教程）
+├── providers/       LLM 提供商（含 13 个预设 + 教程）
 ├── agents/          主聊天 / 主动思考 / 总结 / 人格生成
 ├── memory/          历史 + 重要记忆（文件 + RAG 向量）
 ├── tools/           AI 工具 + 装饰器注册
@@ -104,7 +104,7 @@ Debata_Agent/
 ├── personas/        人格目录（debata 入 git，其他 gitignore）
 ├── utils/           CQ 解析 / KV 缓存测量 / 时间
 ├── docs/            开发者文档
-├── tests/           279 个单元测试
+├── tests/           431 个单元 / 集成测试
 └── main.py          入口
 ```
 
@@ -123,7 +123,7 @@ Debata_Agent/
 |------|------|------|
 | 1.0~1.9 基础架构 / 适配器 / 提供商 / 记忆 / Agent / 工具 / 集成测试 | ✅ | |
 | 2 PySide6 GUI（向导 + 仪表盘 + 托盘） | ✅ | 圆角窗口 / 即时保存 / 主题切换 |
-| 3 本地模型可选插件（Whisper / VoxCPM2 / 本地 embedding） | 🚧 | 插件机制 + UI 已就位，具体模型实装进行中 |
+| 3 本地模型可选插件（VoxCPM2 / 本地 embedding / ASR 预留） | 🚧 | VoxCPM2 与本地 embedding 已接入；Whisper 本地 ASR 仍待插件实装 |
 | 4 文档完善 + 开源发布（CHANGELOG / CI / 模板） | 🚧 | CHANGELOG / CI / Issue 模板已就位 |
 
 当前全量测试覆盖 RAG / KV 缓存 / 跨模块集成 / 上下文重构链路；具体命令见归档测试流程文档。

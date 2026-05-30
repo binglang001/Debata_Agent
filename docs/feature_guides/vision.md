@@ -7,14 +7,16 @@
 3. 选择独立视觉 provider，填模型 ID 和 API Key。
 4. 点「测试连接」，通过后保存并重启 Runtime。
 
-## 当前推荐模型
+## 模型选择
 
-- 智谱：[模型文档](https://docs.bigmodel.cn/)：`glm-5v-turbo`
-- 阿里百炼：[Qwen 模型文档](https://help.aliyun.com/zh/model-studio/)：`qwen3.6-plus`
-- 火山方舟：[模型列表](https://www.volcengine.com/docs/82379)：`doubao-seed-2-0-lite-260428`
-- OpenAI：[模型文档](https://platform.openai.com/docs/models)：`gpt-5.5`
-- Anthropic：[模型文档](https://docs.anthropic.com/en/docs/about-claude/models/overview)：`claude-sonnet-4-6`，更强可用 `claude-opus-4-8`
-- Gemini：[模型文档](https://ai.google.dev/gemini-api/docs/models)：`gemini-3-pro`
+选择带 vision / image understanding 能力的多模态模型即可。具体模型 ID 经常变化，优先以 provider 预设、设置页模型列表和各平台官方文档为准：
+
+- 智谱：[模型文档](https://docs.bigmodel.cn/)
+- 阿里百炼：[Qwen 模型文档](https://help.aliyun.com/zh/model-studio/)
+- 火山方舟：[模型列表](https://www.volcengine.com/docs/82379)
+- OpenAI：[模型文档](https://platform.openai.com/docs/models)
+- Anthropic：[模型文档](https://docs.anthropic.com/en/docs/about-claude/models/overview)
+- Gemini：[模型文档](https://ai.google.dev/gemini-api/docs/models)
 
 ## 常见问题
 

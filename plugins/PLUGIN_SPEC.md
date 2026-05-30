@@ -83,7 +83,7 @@ NOT_INSTALLED  ──按安装指引手动放模型──>  INSTALLED  ──bui
   ERROR  ← 任何阶段失败都跳到这里，error 字段记简述
 ```
 
-UI（Plugins 页）渲染状态时：
+UI（模型管理页）渲染状态时：
 - NOT_INSTALLED：灰色 / 「未安装」/ 「安装指引」按钮
 - INSTALLED：白色 / 「未启用」/ 「启用」按钮（弹详情页填配置 → 调 PluginManager.build()）
 - ENABLED：青瓷青 / 「使用中」/ 「停用」按钮
@@ -116,5 +116,5 @@ ASR 不出现在 tools 里。QQ/NapCat 渠道使用 NapCat 内置 `fetch_ptt_tex
 1. 在 `plugins/{你的插件名}/__plugin__.py` 按上面格式写 `PLUGIN_META` 和 `build(config)`
 2. 实装类放在同目录其它 `.py`，lazy import
 3. 模型文件放 `data/models/{你的 model_dir}/`
-4. 启动 Debata → Plugins 页应能看到你的插件，按「启用」→ 配置→ 测试
-5. 设置页对应 feature 节会出现你的插件名（下拉选择）
+4. 启动 Debata → 模型管理页应能看到你的插件，并能打开安装指引
+5. 设置页对应 feature 节会出现你的插件名（下拉选择），在这里启用并配置

@@ -57,6 +57,7 @@ async def call_api(self, action: str, **params) -> dict
 
 ```python
 async def fetch_voice_text(self, message_id) -> str
+async def send_voice(self, target, audio_path) -> str | None
 async def get_file_url(self, file_id) -> str | None
 async def upload_file(self, target, file_path, *, display_name=None)
 async def get_forward_msg(self, forward_id) -> list[dict]
@@ -179,7 +180,7 @@ async def test_send_text(adapter):
     assert msg_id == "..."
 ```
 
-参考 `tests/test_adapters_napcat.py`。
+参考 `tests/test_napcat_adapter.py`。
 
 ## 提交 PR
 

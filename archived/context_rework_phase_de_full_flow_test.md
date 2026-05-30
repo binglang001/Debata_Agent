@@ -152,4 +152,4 @@ venv\Scripts\python -m pytest tests\ -q --ignore=tests\test_kv_cache_real.py
 ## 本轮自动化结果
 
 - `venv\Scripts\python -m compileall memory tools core ui agents tests -q`：通过。
-- `venv\Scripts\python -m pytest tests\ -q --ignore=tests\test_kv_cache_real.py`：431 passed in 14.80s。
+- `venv\Scripts\python -m pytest tests\ -q --ignore=tests\test_kv_cache_real.py`：431 passed in 14.69s。

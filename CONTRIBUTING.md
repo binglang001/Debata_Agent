@@ -115,9 +115,9 @@ venv/Scripts/python -m ruff format .
 
 2. **在对应分类文件里加 `@tool(...)` 函数**。分类文件对应：
    - `tools/messaging.py`：消息类（send / recall / upload）
-   - `tools/memory_tools.py`：记忆类（保存 / 删除 / 查询）
-   - `tools/platform_tools.py`：平台类（好友列表 / 群信息等）
-   - `tools/control_tools.py`：控制类（审批请求等）
+   - `tools/memory_tools.py`：重要记忆类（保存 / 删除）
+   - `tools/platform_tools.py`：平台类（好友列表 / 群信息 / 验证请求 / 历史召回与总结等）
+   - `tools/control_tools.py`：控制类（no_action / 延迟唤醒）
    - `tools/feature_tools.py`：功能类（天气 / 搜索 / 视觉 / 语音 等）
    - `tools/workspace_tools.py`：文件类（read / write / edit / run_python 等）
 
@@ -131,7 +131,7 @@ venv/Scripts/python -m ruff format .
 
 ## 报 bug
 
-用 [Issue Template](.github/ISSUE_TEMPLATE/bug.md)。最少给：
+用 [Issue Template](.github/ISSUE_TEMPLATE/bug_report.md)。最少给：
 - 复现步骤
 - 期望行为 vs 实际行为
 - 环境（OS、Python 版本、Debata 版本/commit hash）

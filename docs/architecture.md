@@ -47,13 +47,13 @@ IAdapter.send_text() → 用户收到消息
 |------|------|------|---------|
 | `app_config` | - | `RootConfig`, `AppPaths`, `SecretsManager` | ✅ |
 | `adapters` | `app_config` | `IAdapter`, `NapCatAdapter`, `Target`, `IncomingMessage` | ✅ |
-| `providers` | - | `IProvider`, `build_provider()`, 10 个预设 | ✅ |
+| `providers` | - | `IProvider`, `build_provider()`, 13 个预设 | ✅ |
 | `memory` | - | `HistoryManager`, `ImportantMemoryManager` | ✅ |
 | `agents` | `providers`, `memory`, `app_config` | `ChatAgent`, `Persona`, `build_messages()`, prompts | ✅ |
 | `tools` | `adapters`, `memory`, `providers`, `app_config` | `ToolRegistry`, `ToolContext`, `build_default_registry()` | ✅ |
 | `core` | 上面全部 | `Runtime`, `MessagePipeline`, `EventBus` | ✅ |
-| `features` | `providers` | `IVisionService`, `IWebSearchService`, `IWeatherService`, `IEmbeddingService`, `IASRService`, `ITTSService` | ✅（Vision/WebSearch/Weather/Embedding 已实装；ASR/TTS 接口已定义，实装走插件） |
-| `plugins` | `features` | `PluginManager`, `PluginMeta`, `PluginStatus` | ✅（机制就绪；Whisper/VoxCPM2 待 DS 装实） |
+| `features` | `providers` | `IVisionService`, `IWebSearchService`, `IWeatherService`, `IEmbeddingService`, `IASRService`, `ITTSService` | ✅（Vision/WebSearch/Weather/Embedding 已实装；TTS 支持 API 与本地 VoxCPM2；ASR 支持 API，Whisper 本地插件预留） |
+| `plugins` | `features` | `PluginManager`, `PluginMeta`, `PluginStatus` | ✅（VoxCPM2 与本地 embedding 已接入；Whisper 本地 ASR 待插件实装） |
 | `ui` | `core`, `app_config` | `WizardWindow`, `DashboardWindow`, `Tray` | ✅ |
 | `utils` | - | `parse_raw_cq`, `MetricsProvider`, `get_time` | ✅ |
 
@@ -169,7 +169,7 @@ data/models/{name}/  # 模型文件，不入仓库
 主程序只依赖 `features/` 的轻量接口（`ITTSService` / `IEmbeddingService`），
 插件实现这些接口即可。完整规格见 [plugins/PLUGIN_SPEC.md](../plugins/PLUGIN_SPEC.md)。
 
-UI 入口在仪表盘「插件」页：列表 + 详情 + 启停 + 配置表单（按 `PLUGIN_META.config_schema` 动态生成）。
+UI 入口在仪表盘「模型管理」页：列表 + 详情 + 安装指引。实际启用与参数配置在设置页对应 feature 区域完成。
 
 工具系统挂钩：TTS 启用时 `tools/feature_tools.send_voice_message` 才生效。
 ASR 不出现在工具里。QQ/NapCat 渠道使用 NapCat 内置 `fetch_ptt_text`。
@@ -208,15 +208,14 @@ Runtime.shutdown() → 反序关闭
 
 ## 测试策略
 
-- **单元测试**（`tests/`）：每模块独立，用 fake 替身注入依赖
-- **集成测试**（P1.10 待做）：跑完整 message pipeline，验证收消息 → Agent → 发消息全链路
+- **单元 / 集成测试**（`tests/`）：每模块独立测试，同时覆盖完整 message pipeline、工具执行、发送队列、RAG、UI 配置等链路
 - **Live 测试**（`tests/test_kv_cache_real.py`）：需真实 API 密钥，标记 `@pytest.mark.live`。默认不跑
-- **KV 缓存命中率实测**（P1.10 必做）：验证连续 10 轮对话整体命中率 > 90%
+- **KV 缓存命中率实测**：验证稳定 system 前缀、tools 参数、变化 task_context 等场景的缓存命中情况
 
 跑测试：
 
 ```bash
-venv/Scripts/python -m pytest tests/ -q
+venv/Scripts/python -m pytest tests/ -q --ignore=tests/test_kv_cache_real.py
 ```
 
 ---
@@ -230,4 +229,4 @@ venv/Scripts/python -m pytest tests/ -q
 - **KV 缓存前缀稳定**（context_builder）
 - **WebSocket 长连接 + 心跳**（NapCatAdapter）
 
-详见 Phase 1.9 完成后的实测数据。
+详见 [KV 缓存基准](kv_cache_benchmark.md)。

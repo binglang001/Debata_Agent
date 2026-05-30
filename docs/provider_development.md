@@ -10,7 +10,7 @@
 
 | 协议 | 适用 |
 |------|------|
-| `openai_compat` | OpenAI / DeepSeek / GLM / Moonshot / Qwen / Gemini（兼容端点）/ 火山方舟（兼容端点）/ SiliconFlow / OpenRouter |
+| `openai_compat` | OpenAI / DeepSeek / GLM / Moonshot / Qwen / Gemini（兼容端点）/ 火山方舟（兼容端点）/ SiliconFlow / OpenRouter / xAI / Together / Groq |
 | `anthropic` | Claude |
 
 只要新厂商提供 OpenAI 兼容端点（绝大多数都提供），写一份 `preset.yaml` 即可，无需写 Python 代码。
