@@ -182,6 +182,18 @@ async def test_history_basic_operations(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_history_preserves_empty_reasoning_content(tmp_path):
+    h = HistoryManager(tmp_path / "history.jsonl")
+
+    await h.add_assistant_message("hello", reasoning_content="")
+
+    records = await h.records()
+    assert records == [
+        {"role": "assistant", "content": "hello", "reasoning_content": ""}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_history_truncate(tmp_path):
     h = HistoryManager(tmp_path / "history.jsonl")
     for i in range(20):

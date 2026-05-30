@@ -42,6 +42,7 @@ class ChatAgent:
         tools: list[dict[str, Any]] | None,
         tool_executor: ToolExecutor,
         task_contract: str | None = None,
+        pending_context_provider=None,
     ) -> AgentRunResult:
         """执行一次完整对话循环（直到工具调用收尾）。
 
@@ -54,4 +55,5 @@ class ChatAgent:
             tools=tools,
             tool_executor=tool_executor,
             task_contract=task_contract,
+            pending_context_provider=pending_context_provider,
         )

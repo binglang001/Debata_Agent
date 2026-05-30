@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from app_config.schema import AgentConfig, ReasoningConfig as CfgReasoning
 from providers.base import (
@@ -44,13 +44,14 @@ DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "no_action",
     "set_friend_add_request",
     "set_group_add_request",
+    "schedule_wakeup",
 }
 
 # 发送类工具：send_only=True 时同样算作终止信号
-# 注：send_voice_message 当前未注册（features.tts 是 P3 占位），等 TTS 实装后再加回
 SEND_TOOL_NAMES: set[str] = {
     "send_private_messages",
     "send_group_message",
+    "send_voice_message",
 }
 
 
@@ -77,6 +78,7 @@ class AgentRunner:
         tools: list[dict[str, Any]] | None,
         tool_executor: ToolExecutor,
         task_contract: str | None = None,
+        pending_context_provider: Callable[[], Awaitable[list[dict[str, Any]]]] | None = None,
     ) -> AgentRunResult:
         """执行多轮工具循环。
 
@@ -90,7 +92,9 @@ class AgentRunner:
         final_content = ""
         finish_reason: FinishReason = "max_loops"
         loop_count = 0
+        prompt_tokens_total = 0
         refocus_interval = self.cfg.refocus_interval
+        has_pending_send_actions = False
 
         reasoning = self._to_provider_reasoning(self.cfg.reasoning)
         tool_names_dbg = [t["function"]["name"] for t in tools] if tools else []
@@ -100,8 +104,23 @@ class AgentRunner:
             f"task_contract={task_contract[:60] if task_contract else None!r}"
         )
 
+        async def append_pending_context() -> bool:
+            if pending_context_provider is None:
+                return False
+            pending = await pending_context_provider()
+            if not pending:
+                return False
+            msgs.extend(pending)
+            records.extend(pending)
+            logger.info("注入发送回执/新消息上下文 %s 条", len(pending))
+            return True
+
         while loop_count < self.cfg.max_loops:
             loop_count += 1
+
+            if await append_pending_context():
+                # 不额外消耗一次模型调用；只是保证下一次调用前上下文已追平。
+                pass
 
             # Task Contract 重注入：每 refocus_interval 轮，在末尾追加焦点提醒
             # 放在 messages 末尾不破坏前缀 KV 缓存
@@ -144,6 +163,7 @@ class AgentRunner:
                     loop_count=loop_count,
                     finish_reason="api_error",
                     reasoning_logs=reasoning_logs,
+                    prompt_tokens=prompt_tokens_total,
                 )
             except ProviderError as e:
                 logger.error(f"AgentRunner API 错误（轮次 {loop_count}）: {e}")
@@ -153,6 +173,7 @@ class AgentRunner:
                     loop_count=loop_count,
                     finish_reason="api_error",
                     reasoning_logs=reasoning_logs,
+                    prompt_tokens=prompt_tokens_total,
                 )
             except Exception as e:
                 logger.exception(f"AgentRunner 未知错误（轮次 {loop_count}）: {e}")
@@ -162,8 +183,10 @@ class AgentRunner:
                     loop_count=loop_count,
                     finish_reason="api_error",
                     reasoning_logs=reasoning_logs,
+                    prompt_tokens=prompt_tokens_total,
                 )
 
+            prompt_tokens_total += result.usage.prompt_tokens
             if result.reasoning_content:
                 reasoning_logs.append(result.reasoning_content)
 
@@ -178,7 +201,13 @@ class AgentRunner:
 
             # === 分支 1：无工具调用 → 引导重试或终止 ===
             if not result.tool_calls:
+                if await append_pending_context() and loop_count < self.cfg.max_loops:
+                    continue
                 content = (result.content or "").strip()
+                if has_pending_send_actions:
+                    final_content = content
+                    finish_reason = "send_only_complete"
+                    break
                 if loop_count < self.cfg.max_loops:
                     # 还有下一轮：插入系统纠正后继续
                     err = {
@@ -198,6 +227,11 @@ class AgentRunner:
 
             # === 分支 2：执行所有工具调用 ===
             tc_results = await self._execute_tools(result.tool_calls, tool_executor)
+            if any(
+                r["name"] in SEND_TOOL_NAMES and r["result"].get("ok", True)
+                for r in tc_results
+            ):
+                has_pending_send_actions = True
             for tcr in tc_results:
                 tool_record = {
                     "role": "tool",
@@ -206,6 +240,9 @@ class AgentRunner:
                 }
                 msgs.append(tool_record)
                 records.append(tool_record)
+
+            if await append_pending_context() and loop_count < self.cfg.max_loops:
+                continue
 
             # === 终止条件检查 ===
             if any(r["name"] == "no_action" for r in tc_results):
@@ -227,6 +264,7 @@ class AgentRunner:
             loop_count=loop_count,
             finish_reason=finish_reason,
             reasoning_logs=reasoning_logs,
+            prompt_tokens=prompt_tokens_total,
         )
 
     # ============================================================
@@ -251,8 +289,10 @@ class AgentRunner:
             "role": "assistant",
             "content": result.content or "",
         }
-        if result.reasoning_content:
+        if result.reasoning_content or result.reasoning_blocks:
             record["reasoning_content"] = result.reasoning_content
+        if result.reasoning_blocks:
+            record["reasoning_blocks"] = result.reasoning_blocks
         if result.tool_calls:
             record["tool_calls"] = [
                 {
@@ -298,7 +338,10 @@ class AgentRunner:
             name = r["name"]
             ok = r["result"].get("ok", True)
             if name in SEND_TOOL_NAMES:
-                if not r["args"].get("send_only", False) or not ok:
+                if name == "send_voice_message":
+                    if not ok:
+                        return False
+                elif not r["args"].get("send_only", False) or not ok:
                     return False
             elif name in self.no_feedback_tools:
                 if not ok:

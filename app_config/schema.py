@@ -36,8 +36,9 @@ class StrictModel(BaseModel):
 
 
 class AppMeta(StrictModel):
-    name: str = "Diana_Agent"
+    name: str = "Debata_Agent"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    theme: Literal["auto", "light", "dark"] = "auto"
 
 
 # ============================================================
@@ -65,7 +66,7 @@ class NapCatAdapterConfig(StrictModel):
     enabled: bool = True
 
     mode: Literal["client", "server"] = "client"
-    """连接模式（从 Diana_Agent 视角命名，符合直觉）：
+    """连接模式（从 Debata_Agent 视角命名，符合直觉）：
 
         - "client"：程序作为 WebSocket **客户端**，主动连 NapCat 的 WS 端口。
           对应 NapCat 那边配置「正向 WS」（NapCat 监听，等程序连入）。
@@ -306,30 +307,28 @@ class VisionFeatureConfig(StrictModel):
             if not self.model_dir:
                 raise ValueError(
                     "features.vision.enabled=True 且 type=local，但 model_dir 为空。\n"
-                    "  请填本地模型目录路径（如 F:/.models/qwen-vl/）。"
+                    "  请填本地模型目录路径（如 data/models/qwen-vl/）。"
                 )
         return self
 
 
 class ASRFeatureConfig(StrictModel):
-    """语音识别（P3 占位，当前未实装）。
+    """语音识别旧配置。
 
-    ⚠️ Runtime 当前不实例化 ASRService。enabled=True 时工具不会被注册，
-    fetch_voice_text 仍走 NapCat 自带的语音转文字（如 NapCat 配了的话）。
-    本配置块为 Phase 3 本地 Whisper / 远程 ASR API 实装预留。
+    当前 QQ/NapCat 渠道统一使用 NapCat 内置 fetch_ptt_text；这些字段仅为兼容旧配置保留。
     """
 
     enabled: bool = False
-    type: Literal["api", "local"] = "api"
+    type: Literal["api", "local"] = "local"
 
     # type=api 字段
     provider: str | None = None
-    """支持 'xfyun'、'baidu'、'mimo' 等。"""
+    """支持 'baidu'、'xfyun'、'volcengine' 等。"""
     api_key_id: str | None = None
     extra_credentials: dict[str, str] = Field(default_factory=dict)
 
     # type=local 字段
-    local_model: str = "faster-whisper-large-v3"
+    local_model: str = "large-v3"
     device: Literal["cuda", "cpu", "auto"] = "auto"
     language: str = "zh"
     model_dir: str = ""
@@ -353,24 +352,25 @@ class ASRFeatureConfig(StrictModel):
 
 
 class TTSFeatureConfig(StrictModel):
-    """语音合成（P3 占位，当前未实装）。
-
-    ⚠️ Runtime 当前不实例化 TTSService，send_voice_message 工具未注册。
-    本配置块为 Phase 3 本地 VoxCPM2 / 远程 TTS API 实装预留。
-    """
+    """语音合成配置。本地模式走 VoxCPM2 插件；API 模式支持百度/讯飞/火山引擎。"""
 
     enabled: bool = False
-    type: Literal["api", "local"] = "api"
+    type: Literal["api", "local"] = "local"
 
     # type=api 字段
     provider: str | None = None
     api_key_id: str | None = None
+    extra_credentials: dict[str, str] = Field(default_factory=dict)
 
     # type=local 字段
     local_model: str = "voxcpm2"
     reference_audio: str = ""
     default_prompt: str = ""
     model_dir: str = ""
+    device: Literal["cuda", "cpu", "auto"] = "auto"
+    load_denoiser: bool = False
+    cfg_value: float = Field(default=2.0, gt=0.0)
+    inference_timesteps: int = Field(default=10, ge=1)
 
     @model_validator(mode="after")
     def validate_enabled_fields(self) -> TTSFeatureConfig:
@@ -383,10 +383,9 @@ class TTSFeatureConfig(StrictModel):
                     "  请指定 provider 或填 api_key_id。"
                 )
         else:  # local
-            if not self.local_model or not self.model_dir:
+            if not self.local_model:
                 raise ValueError(
-                    "features.tts.enabled=True 且 type=local，但 local_model 或 model_dir 为空。\n"
-                    "  请填本地模型名 + 模型目录路径。"
+                    "features.tts.enabled=True 且 type=local，但 local_model 为空。"
                 )
         return self
 
@@ -448,11 +447,7 @@ class LongTermMemoryConfig(StrictModel):
 
 
 class EmbeddingFeatureConfig(StrictModel):
-    """Embedding 服务配置（P2 占位，当前未实装）。
-
-    ⚠️ long_term_memory.mode='rag' 时本配置才会被读取。
-    Runtime 当前不实例化 EmbeddingService，rag 模式实际不工作。
-    """
+    """Embedding 服务配置。API 模式复用已有 provider /embeddings，本地模式走 sentence-transformers。"""
 
     enabled: bool = False
     type: Literal["api", "local"] = "api"
@@ -485,9 +480,9 @@ class FeaturesConfig(StrictModel):
 
 
 class PersonaConfig(StrictModel):
-    active: str = "diana"
+    active: str = "debata"
     """当前激活的人格目录名。从 personas/{name}/ 加载（所有人格平级，仓库自带 + 用户自创共存）。
-    仓库自带 diana（开箱即用），用户自创的人格放同级目录。"""
+    仓库自带 debata（开箱即用），用户自创的人格放同级目录。"""
 
 
 # ============================================================
@@ -519,10 +514,9 @@ class RateLimitConfig(StrictModel):
 
 
 class SummarizeConfig(StrictModel):
-    """历史总结触发阈值（按 history 消息条数计）。
+    """历史总结触发阈值。
 
-    达到 trigger_at_messages 条记录时触发 SummaryAgent，
-    在 [range_start_messages, range_end_messages] 区间内择一个语义完整点截断。
+    Phase A 起按 token 触发 compaction；旧的消息条数字段保留为兼容配置。
     """
 
     trigger_at_messages: int = 200
@@ -533,6 +527,37 @@ class SummarizeConfig(StrictModel):
 
     range_end_messages: int = 150
     """SummaryAgent 选择 cut_point 的上限。"""
+
+    trigger_at_tokens: int | None = None
+    """活跃 history 估算 token 达到此值时触发 compaction。None 表示按模型工作预算自动推导。"""
+
+    target_after_tokens: int | None = None
+    """compaction 后活跃 history 目标 token。None 表示按模型工作预算自动推导。"""
+
+
+class ContextConfig(StrictModel):
+    """上下文预算配置。max_context_tokens 是工作预算，不是模型硬上限。"""
+
+    max_context_tokens: int | None = None
+    """None = 根据当前模型预设 context_length 推导工作预算。"""
+
+    reserve_output_tokens: int = Field(default=8192, ge=1024)
+    """为模型输出保留的 token。"""
+
+    memory_token_budget: int = Field(default=4096, ge=256)
+    """长期重要记忆注入预算。Phase A 先作为预算字段预留，Phase D 精细使用。"""
+
+    summary_token_budget: int = Field(default=4096, ge=256)
+    """滚动摘要注入预算。"""
+
+    tool_result_soft_limit_tokens: int = Field(default=600, ge=64)
+    """单条工具结果的软阈值；超过后按工具特定规则精简。"""
+
+    tool_result_hard_cap_tokens: int = Field(default=1500, ge=128)
+    """单条工具结果的中央硬上限；未被特判的结果超过后通用截断。"""
+
+    tool_result_soft_overrides: dict[str, int] = Field(default_factory=dict)
+    """按工具名覆盖软阈值，如 {"describe_image": 900}。"""
 
 
 class BehaviorConfig(StrictModel):
@@ -556,6 +581,7 @@ class BehaviorConfig(StrictModel):
     typing: TypingConfig = Field(default_factory=TypingConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     summarize: SummarizeConfig = Field(default_factory=SummarizeConfig)
+    context: ContextConfig = Field(default_factory=ContextConfig)
 
 
 # ============================================================

@@ -6,6 +6,21 @@ registration_url: https://open.bigmodel.cn
 reasoning_style: thinking_extra_body
 
 models:
+  - id: glm-5.1
+    display_name: GLM-5.1
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 128000
+
+  - id: glm-5v-turbo
+    display_name: GLM-5V-Turbo
+    capabilities: [chat, vision]
+    context_length: 64000
+
+  - id: glm-4.5v
+    display_name: GLM-4.5V
+    capabilities: [chat, vision]
+    context_length: 64000
+
   - id: glm-4.7
     display_name: GLM-4.7
     capabilities: [chat, tool_call, reasoning]

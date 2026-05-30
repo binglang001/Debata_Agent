@@ -23,7 +23,6 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QButtonGroup,
-    QDialog,
     QDialogButtonBox,
     QFrame,
     QHBoxLayout,
@@ -31,14 +30,17 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
+    QSizePolicy,
 )
 
 from ..theme import FontSize, Spacing
+from ..widgets.window_chrome import FramelessDialog
 
 
 # ============================================================
@@ -56,19 +58,22 @@ class SectionCard(QFrame):
         self,
         title: str,
         subtitle: str = "",
+        compact: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("SectionCard")
         self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
-        outer.setSpacing(Spacing.MD)
+        margin = Spacing.MD if compact else Spacing.LG
+        outer.setContentsMargins(margin, margin, margin, margin)
+        outer.setSpacing(Spacing.SM if compact else Spacing.MD)
 
         if title:
             title_lbl = QLabel(title)
-            title_lbl.setProperty("role", "title-2")
+            title_lbl.setProperty("role", "title-3" if compact else "title-2")
             title_lbl.setWordWrap(True)
             outer.addWidget(title_lbl)
 
@@ -88,7 +93,6 @@ class SectionCard(QFrame):
         self._body = QVBoxLayout()
         self._body.setSpacing(Spacing.MD)
         outer.addLayout(self._body)
-        outer.addStretch(1)
 
     def add_content(self, widget: QWidget) -> None:
         """把一个 widget 加入卡片内容区。"""
@@ -166,9 +170,11 @@ class ApiKeyInput(QWidget):
         self,
         placeholder: str = "",
         test_button_text: str = "测试连接",
+        allow_empty_test: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._allow_empty_test = allow_empty_test
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -207,10 +213,30 @@ class ApiKeyInput(QWidget):
 
         outer.addLayout(row2)
 
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setTextVisible(False)
+        self._progress.setFixedHeight(4)
+        self._progress.setVisible(False)
+
+        progress_slot = QWidget()
+        progress_slot.setFixedHeight(Spacing.SM)
+        progress_slot_lay = QVBoxLayout(progress_slot)
+        progress_slot_lay.setContentsMargins(0, 0, 0, 0)
+        progress_slot_lay.setSpacing(0)
+        progress_slot_lay.addStretch(1)
+        progress_slot_lay.addWidget(self._progress)
+        progress_slot_lay.addStretch(1)
+        outer.addWidget(progress_slot)
+
         self._state: TestState = "idle"
 
     def text(self) -> str:
         return self._edit.text().strip()
+
+    def is_test_success(self) -> bool:
+        return self._state == "success"
 
     def set_text(self, value: str) -> None:
         self._edit.setText(value)
@@ -222,20 +248,32 @@ class ApiKeyInput(QWidget):
             self._status_lbl.setText("")
             self._status_lbl.setProperty("role", "secondary")
             self._edit.setProperty("state", "")
+            self._test_btn.setEnabled(True)
+            self._progress.setVisible(False)
+            self._progress.setRange(0, 100)
+            self._progress.setValue(0)
         elif state == "testing":
             self._status_lbl.setText(message or "正在尝试连接……")
             self._status_lbl.setProperty("role", "secondary")
             self._test_btn.setEnabled(False)
+            self._progress.setVisible(True)
+            self._progress.setRange(0, 0)
         elif state == "success":
             self._status_lbl.setText(message or "已就位")
             self._status_lbl.setProperty("role", "success")
             self._edit.setProperty("state", "success")
             self._test_btn.setEnabled(True)
+            self._progress.setVisible(False)
+            self._progress.setRange(0, 100)
+            self._progress.setValue(100)
         elif state == "error":
             self._status_lbl.setText(message or "未能完成")
             self._status_lbl.setProperty("role", "error")
             self._edit.setProperty("state", "error")
             self._test_btn.setEnabled(True)
+            self._progress.setVisible(False)
+            self._progress.setRange(0, 100)
+            self._progress.setValue(0)
         # 触发样式重算
         self._status_lbl.style().unpolish(self._status_lbl)
         self._status_lbl.style().polish(self._status_lbl)
@@ -260,7 +298,7 @@ class ApiKeyInput(QWidget):
 
     def _on_test_clicked(self) -> None:
         key = self.text()
-        if not key:
+        if not key and not self._allow_empty_test:
             self.set_test_state("error", "先填一下密钥")
             return
         self.set_test_state("testing")
@@ -425,7 +463,7 @@ class WhitelistEditor(QWidget):
         self._rb_open = self._make_mode_row(
             "open",
             "对所有人开放",
-            "⚠ 谁都可以触发 Diana。可能产生意外的 API 费用。",
+            "⚠ 谁都可以触发 Debata。可能产生意外的 API 费用。",
         )
         for r in (self._rb_verify, self._rb_whitelist, self._rb_open):
             outer.addWidget(r)
@@ -629,7 +667,7 @@ class WhitelistEditor(QWidget):
 # ============================================================
 
 
-class TutorialDialog(QDialog):
+class TutorialDialog(FramelessDialog):
     """教程弹窗。接 Markdown 字符串，用 QTextBrowser 渲染。"""
 
     def __init__(
@@ -638,22 +676,32 @@ class TutorialDialog(QDialog):
         markdown: str,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.setMinimumSize(640, 520)
+        super().__init__(title, parent)
+        self.setMinimumSize(620, 480)
+        self.resize(700, 560)
         self.setModal(True)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
-        layout.setSpacing(Spacing.MD)
-
-        title_lbl = QLabel(title)
-        title_lbl.setProperty("role", "title-2")
-        layout.addWidget(title_lbl)
+        layout = self.body_layout()
+        layout.setContentsMargins(18, 12, 18, 14)
+        layout.setSpacing(Spacing.SM)
 
         browser = QTextBrowser()
+        browser.setObjectName("TutorialBrowser")
         browser.setOpenExternalLinks(True)
-        browser.setMarkdown(markdown)
+        browser.document().setDocumentMargin(12)
+        browser.document().setDefaultStyleSheet(
+            """
+            h1 { font-size: 20px; margin: 0 0 10px 0; }
+            h2 { font-size: 17px; margin: 12px 0 6px 0; }
+            h3 { font-size: 15px; margin: 10px 0 4px 0; }
+            p { margin: 4px 0 8px 0; line-height: 1.35; }
+            ul, ol { margin-top: 4px; margin-bottom: 8px; }
+            li { margin: 3px 0; }
+            code { font-family: Consolas, monospace; }
+            a { color: #6FA39A; }
+            """
+        )
+        browser.setMarkdown(_strip_leading_h1(markdown))
         f = browser.font()
         f.setPointSize(11)
         browser.setFont(f)
@@ -665,6 +713,47 @@ class TutorialDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         btn_box.addButton(close_btn, QDialogButtonBox.ButtonRole.AcceptRole)
         layout.addWidget(btn_box)
+
+
+def _strip_leading_h1(markdown: str) -> str:
+    lines = markdown.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and lines[0].startswith("# "):
+        lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def open_feature_guide(guide_name: str, parent: QWidget | None = None) -> None:
+    """打开 docs/feature_guides/{name}.md 教程。
+
+    找不到文件时显示一个友好的占位。
+    """
+    from pathlib import Path
+
+    # docs 在项目根：ui/wizard/components.py → ui → 项目根 → docs/
+    project_root = Path(__file__).resolve().parent.parent.parent
+    md_path = project_root / "docs" / "feature_guides" / f"{guide_name}.md"
+    if not md_path.exists():
+        markdown = (
+            f"# {guide_name}\n\n"
+            f"教程文件 `docs/feature_guides/{guide_name}.md` 尚未撰写。\n\n"
+            "欢迎贡献：请在该路径下创建 Markdown 文档。"
+        )
+        title = guide_name
+    else:
+        markdown = md_path.read_text(encoding="utf-8")
+        # 标题取第一个 # 行
+        title = guide_name
+        for line in markdown.splitlines():
+            if line.startswith("# "):
+                title = line[2:].strip()
+                break
+
+    dlg = TutorialDialog(title, markdown, parent=parent)
+    dlg.exec()
 
 
 # ============================================================
@@ -682,4 +771,5 @@ __all__ = [
     "WhitelistState",
     "TutorialDialog",
     "TestState",
+    "open_feature_guide",
 ]

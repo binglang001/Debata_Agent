@@ -11,21 +11,29 @@ PluginManager 负责：
     - 按需 build() 实例（由 Runtime 在装配 features 时调用）
     - 提供 UI 查询接口（列出全部插件 + 状态 + 安装/启停 hook）
 
-实际实现（Whisper / VoxCPM2 / sentence-transformers）由 DeepSeek 在 Phase 3 完成，
-详见 docs/deepseek_tasks.md 任务 2/3/4。
+VoxCPM2 / sentence-transformers 插件实装位于对应 plugins/{name}/ 目录下。
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import logging
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
+
+
+def _default_models_root() -> Path:
+    configured = os.getenv("DEBATA_MODELS_DIR", "").strip()
+    if configured:
+        return Path(configured)
+    return Path.cwd() / "data" / "models"
 
 
 class PluginError(Exception):
@@ -49,23 +57,48 @@ class PluginStatus(str, Enum):
 
 
 @dataclass(slots=True)
+class DownloadSource:
+    """单个待下载文件。一个插件的模型可能由多个文件组成（权重 + tokenizer + config 等）。
+
+    字段约定：
+        url             —— 下载地址（HTTPS）；HuggingFace 仓库可以用 https://huggingface.co/<repo>/resolve/main/<file>
+        dest_filename   —— 保存到 `meta.resolved_model_dir / dest_filename` 的相对路径，支持子目录
+        sha256          —— 文件 SHA-256；不空时下载完会校验，校验失败则删除并 raise
+        size_bytes      —— 大致体积，UI 进度条用；不必精确
+        required        —— True 表示必下；False 表示可选（如 fp16/fp32 二选一时，只要一个齐就算齐）
+    """
+
+    url: str
+    dest_filename: str
+    sha256: str = ""
+    size_bytes: int = 0
+    required: bool = True
+
+
+# 下载进度回调签名：(filename, bytes_done, bytes_total, message) -> None
+# bytes_total < 0 表示未知总量；message 是简短状态描述（"开始" / "下载中" / "完成" / "失败"）
+DownloadProgressCallback = Callable[[str, int, int, str], None]
+
+
+@dataclass(slots=True)
 class PluginMeta:
     """插件元数据。每个 plugins/{name}/__plugin__.py 必须定义 `PLUGIN_META = PluginMeta(...)`。
 
     字段约定：
-        name              —— 唯一标识，小写英文（whisper / voxcpm2 / bge-zh）
+        name              —— 唯一标识，小写英文（voxcpm2 / bge-zh）
         display_name      —— UI 显示名
         kind              —— 'asr' | 'tts' | 'embedding'
-        model_dir         —— 模型文件目录（绝对路径或相对 F:/.models 的子目录）
+        model_dir         —— 模型文件目录（绝对路径或相对项目 data/models 的子目录）
         size_mb           —— 模型大致体积（MB），UI 提示用
         description       —— 中文简述，给 UI 详情页用
-        python_deps       —— 需要 pip install 的依赖列表（UI 提示用，不自动装）
-        download_url      —— 模型下载页/教程链接（UI 跳转用）
+        python_deps       —— 插件运行依赖列表；UI 打开安装指引时会缺包后台安装
+        download_url      —— 模型下载页/教程链接（UI 跳转用，当 auto_download=False 时显示）
+        download_sources  —— 手动安装指引用的文件清单，也用于拖入文件夹自动识别
         config_schema     —— 该插件支持的配置项（UI 详情页表单用）
                               结构：{key: {"type": str, "default": Any, "label": str, "help": str}}
                               支持 type: "string" | "int" | "float" | "bool" | "select"
                               select 类型再加 "options": [...]
-        auto_download     —— UI 上按"下载"按钮时是否能自动拉模型；False 表示只能跳转教程让用户手动放
+        auto_download     —— 历史兼容字段；当前 UI 不再自动下载模型，统一走手动安装指引
     """
 
     name: str
@@ -76,8 +109,16 @@ class PluginMeta:
     description: str = ""
     python_deps: list[str] = field(default_factory=list)
     download_url: str = ""
+    download_sources: list[DownloadSource] = field(default_factory=list)
     config_schema: dict[str, dict[str, Any]] = field(default_factory=dict)
     auto_download: bool = False
+
+    def resolve_model_dir(self) -> Path:
+        """解析为绝对路径。相对路径默认放项目 data/models/ 下。"""
+        p = Path(self.model_dir) if self.model_dir else Path("")
+        if not p.is_absolute() and self.model_dir:
+            p = _default_models_root() / p
+        return p
 
 
 @dataclass(slots=True)
@@ -105,8 +146,7 @@ class PluginManager:
         pm = PluginManager(plugins_dir=Path("plugins"))
         pm.scan()
         # 按配置启用某个插件：
-        if cfg.features.asr.enabled and cfg.features.asr.type == "local":
-            asr_service = pm.build("whisper", cfg.features.asr.plugin_config)
+        # ASR 使用 NapCat 内置转写，不再通过本地插件加载。
 
     UI 用法：
         for record in pm.list_all():
@@ -115,6 +155,10 @@ class PluginManager:
 
     def __init__(self, plugins_dir: Path) -> None:
         self.plugins_dir = plugins_dir
+        os.environ.setdefault(
+            "DEBATA_MODELS_DIR",
+            str((plugins_dir.parent / "data" / "models").resolve()),
+        )
         self._records: dict[str, PluginRecord] = {}
 
     # ============================================================
@@ -125,7 +169,14 @@ class PluginManager:
         """扫描 plugins/ 下所有 `__plugin__.py`，填充 _records。
 
         失败的插件记为 ERROR 状态，不影响其它插件。
+        已 ENABLED 的插件在重新扫描后保留状态和实例。
         """
+        # 保存已启用的记录，扫描后恢复（避免 UI refresh → scan 清掉 Runtime 刚 build 的状态）
+        enabled_backup: dict[str, tuple[PluginStatus, Any]] = {}
+        for name, r in self._records.items():
+            if r.status == PluginStatus.ENABLED and r.instance is not None:
+                enabled_backup[name] = (r.status, r.instance)
+
         self._records.clear()
         if not self.plugins_dir.exists():
             logger.debug(f"plugins 目录不存在：{self.plugins_dir}")
@@ -141,7 +192,6 @@ class PluginManager:
                 meta = self._load_meta(plugin_file)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"插件 {plugin_pkg.name} 加载元数据失败：{e}")
-                # 用目录名占位，状态 ERROR
                 fallback = PluginMeta(
                     name=plugin_pkg.name,
                     display_name=plugin_pkg.name,
@@ -157,11 +207,21 @@ class PluginManager:
                 continue
 
             status = self._detect_install_status(meta)
-            self._records[meta.name] = PluginRecord(
-                meta=meta,
-                status=status,
-                module_path=plugin_file,
-            )
+            # 如果之前是 ENABLED 且有实例，保留
+            if meta.name in enabled_backup:
+                status, instance = enabled_backup[meta.name]
+                self._records[meta.name] = PluginRecord(
+                    meta=meta,
+                    status=status,
+                    module_path=plugin_file,
+                    instance=instance,
+                )
+            else:
+                self._records[meta.name] = PluginRecord(
+                    meta=meta,
+                    status=status,
+                    module_path=plugin_file,
+                )
 
     def _load_meta(self, plugin_file: Path) -> PluginMeta:
         """从 __plugin__.py 加载 PLUGIN_META 常量。"""
@@ -183,13 +243,18 @@ class PluginManager:
             return PluginStatus.INSTALLED  # 不需要模型文件的插件
         p = Path(meta.model_dir)
         if not p.is_absolute():
-            # 相对路径 → 默认放 F:/.models（Windows）或 ~/.models
-            p = Path("F:/.models") / p
+            p = _default_models_root() / p
         if not p.exists():
             return PluginStatus.NOT_INSTALLED
-        # 非空（至少有一个文件）
+        if meta.download_sources:
+            required = [s for s in meta.download_sources if s.required]
+            if required and all((p / s.dest_filename).is_file() for s in required):
+                return PluginStatus.INSTALLED
+            if required:
+                return PluginStatus.NOT_INSTALLED
+        # 无下载清单的插件退化为非空目录判断
         try:
-            has_file = any(p.rglob("*"))
+            has_file = any(child.is_file() for child in p.rglob("*"))
         except OSError:
             return PluginStatus.NOT_INSTALLED
         return PluginStatus.INSTALLED if has_file else PluginStatus.NOT_INSTALLED
@@ -239,6 +304,62 @@ class PluginManager:
         record.instance = instance
         logger.info(f"插件 {name!r} 已启用")
         return instance
+
+    # ============================================================
+    # install / 下载模型（历史兼容；当前 UI 不再调用）
+    # ============================================================
+
+    async def install(
+        self,
+        name: str,
+        on_progress: DownloadProgressCallback | None = None,
+    ) -> None:
+        """下载 PLUGIN_META.download_sources 中所有 required 文件到模型目录。
+
+        Args:
+            name: 插件名
+            on_progress: 进度回调；签名 (filename, bytes_done, bytes_total, msg) -> None。
+                        每个文件下载过程中会被多次调用；filename 全程不变。
+
+        Raises:
+            PluginError: 插件不存在 / auto_download=False / 下载失败 / sha256 校验失败
+
+        具体下载逻辑由 plugins.downloader.download_sources 实装（DeepSeek 任务 10）。
+        """
+        record = self._records.get(name)
+        if record is None:
+            raise PluginError(f"插件 {name!r} 未找到")
+        meta = record.meta
+        if not meta.auto_download:
+            raise PluginError(
+                f"插件 {name!r} 不支持自动下载（auto_download=False），"
+                f"请按 {meta.download_url or '其文档'} 手动放置模型"
+            )
+        if not meta.download_sources:
+            raise PluginError(
+                f"插件 {name!r} 标记 auto_download=True 但 download_sources 为空，"
+                f"这是插件 metadata 的 bug"
+            )
+
+        from . import downloader  # 延迟 import，避免没装 aiohttp 等依赖时 plugins 整体崩
+
+        target_dir = meta.resolve_model_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            await downloader.download_sources(
+                meta.download_sources, target_dir, on_progress
+            )
+        except asyncio.CancelledError:
+            record.status = self._detect_install_status(meta)
+            record.error = ""
+            raise
+        except Exception as e:  # noqa: BLE001
+            record.status = PluginStatus.ERROR
+            record.error = f"下载失败：{e}"
+            raise PluginError(f"插件 {name!r} 下载失败：{e}") from e
+
+        # 重扫状态
+        record.status = self._detect_install_status(meta)
 
     async def shutdown(self, name: str) -> None:
         """关闭一个已启用插件（如果它有 aclose）。"""

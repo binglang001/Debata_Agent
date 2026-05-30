@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -16,23 +16,31 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ..theme import Spacing
+from ..widgets import show_message
 from .copy import DASHBOARD_COPY
+from agents.persona_import import (
+    PersonaImportError,
+    copy_persona_dir,
+    import_persona_zip,
+)
+from agents.persona_loader import validate_persona_name
 
 logger = logging.getLogger(__name__)
 
 
-_BUILTIN = {"diana"}  # 仓库自带的，不允许删除
+_BUILTIN = {"debata"}  # 仓库自带的，不允许删除
 
 
 class PersonasPage(QWidget):
     """人格管理。"""
+
+    restart_requested = Signal()
 
     def __init__(self, runtime: Any, parent=None) -> None:
         super().__init__(parent)
@@ -75,10 +83,15 @@ class PersonasPage(QWidget):
         self._export_btn.clicked.connect(self._on_export)
         actions.addWidget(self._export_btn)
 
-        self._import_btn = QPushButton(DASHBOARD_COPY["personas.import_button"])
+        self._import_btn = QPushButton("导入 zip")
         self._import_btn.setProperty("role", "secondary")
-        self._import_btn.clicked.connect(self._on_import)
+        self._import_btn.clicked.connect(self._on_import_zip)
         actions.addWidget(self._import_btn)
+
+        self._import_dir_btn = QPushButton("导入目录")
+        self._import_dir_btn.setProperty("role", "secondary")
+        self._import_dir_btn.clicked.connect(self._on_import_dir)
+        actions.addWidget(self._import_dir_btn)
 
         self._delete_btn = QPushButton(DASHBOARD_COPY["personas.delete_button"])
         self._delete_btn.setProperty("role", "danger")
@@ -91,7 +104,7 @@ class PersonasPage(QWidget):
         outer.addLayout(body, 1)
 
         # 注解
-        note = QLabel("切换当前角色后需重启 Diana 才能生效。")
+        note = QLabel("切换当前角色后需重启 Debata 才能生效。")
         note.setProperty("role", "secondary")
         outer.addWidget(note)
 
@@ -133,6 +146,13 @@ class PersonasPage(QWidget):
             self._list.addItem(item)
         self._update_button_states()
 
+    def _select_name(self, name: str) -> None:
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == name:
+                self._list.setCurrentRow(i)
+                return
+
     def _selected(self) -> str | None:
         it = self._list.currentItem()
         if it is None:
@@ -161,15 +181,20 @@ class PersonasPage(QWidget):
             cfg.persona.active = name
             from app_config.loader import save_config
             save_config(self._runtime.paths, cfg)
-            QMessageBox.information(
+            restart_now = show_message(
                 self,
                 "已记住",
-                f"已切换到「{name}」。重启 Diana 后生效。",
+                f"已切换到「{name}」。是否立即重启 Debata 服务让它生效？",
+                confirm_text="重启",
+                cancel_text="稍后",
             )
             self.refresh()
+            self._select_name(name)
+            if restart_now:
+                self.restart_requested.emit()
         except Exception as e:
             logger.exception("激活人格失败")
-            QMessageBox.warning(self, "未能完成", str(e))
+            show_message(self, "未能完成", str(e), is_danger=True)
 
     def _on_duplicate(self) -> None:
         name = self._selected()
@@ -179,16 +204,23 @@ class PersonasPage(QWidget):
         if not ok or not new_name.strip():
             return
         new_name = new_name.strip()
+        try:
+            validate_persona_name(new_name)
+        except ValueError as e:
+            show_message(self, "名称不合法", str(e), is_danger=True)
+            return
         src = self._personas_dir / name
         dst = self._personas_dir / new_name
         if dst.exists():
-            QMessageBox.warning(self, "已存在", f"目录「{new_name}」已存在")
+            show_message(self, "已存在", f"目录「{new_name}」已存在", is_danger=True)
             return
         try:
             shutil.copytree(src, dst)
             self.refresh()
+            self._select_name(new_name)
+            show_message(self, "已复制", f"已创建角色「{new_name}」。")
         except Exception as e:
-            QMessageBox.warning(self, "未能完成", str(e))
+            show_message(self, "未能完成", str(e), is_danger=True)
 
     def _on_export(self) -> None:
         name = self._selected()
@@ -205,56 +237,66 @@ class PersonasPage(QWidget):
                 for p in src.rglob("*"):
                     if p.is_file():
                         zf.write(p, p.relative_to(src.parent))
-            QMessageBox.information(self, "已导出", f"已写入：{target}")
+            show_message(self, "已导出", f"已写入：{target}")
         except Exception as e:
-            QMessageBox.warning(self, "未能完成", str(e))
+            show_message(self, "未能完成", str(e), is_danger=True)
 
-    def _on_import(self) -> None:
+    def _on_import_zip(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "导入角色", "", "Zip (*.zip);;目录文件 (*)"
+            self, "导入角色 zip", "", "Zip (*.zip)"
         )
         if not path:
             return
-        src = Path(path)
         try:
-            if src.suffix.lower() == ".zip":
-                with zipfile.ZipFile(src, "r") as zf:
-                    zf.extractall(self._personas_dir)
-            else:
-                # 当作目录处理
-                dst = self._personas_dir / src.parent.name
-                shutil.copytree(src.parent, dst, dirs_exist_ok=True)
-            self.refresh()
-            QMessageBox.information(self, "已导入", "完成")
+            self._finish_import(import_persona_zip(Path(path), self._personas_dir))
+        except PersonaImportError as e:
+            show_message(self, "无法导入", str(e), is_danger=True)
         except Exception as e:
-            QMessageBox.warning(self, "未能完成", str(e))
+            show_message(self, "未能完成", str(e), is_danger=True)
+
+    def _on_import_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "导入角色目录")
+        if not path:
+            return
+        try:
+            self._finish_import(copy_persona_dir(Path(path), self._personas_dir))
+        except PersonaImportError as e:
+            show_message(self, "无法导入", str(e), is_danger=True)
+        except Exception as e:
+            show_message(self, "未能完成", str(e), is_danger=True)
+
+    def _finish_import(self, imported_name: str) -> None:
+        self.refresh()
+        self._select_name(imported_name)
+        show_message(self, "已导入", f"已导入角色「{imported_name}」。")
 
     def _on_delete(self) -> None:
         name = self._selected()
         if not name:
             return
         if name in _BUILTIN:
-            QMessageBox.warning(self, "不能删除", "仓库自带的角色不允许删除")
+            show_message(self, "不能删除", "仓库自带的角色不允许删除")
             return
         if name == self._active_name:
-            QMessageBox.warning(
+            show_message(
                 self,
                 "不能删除",
                 DASHBOARD_COPY["personas.delete_active_warning"],
             )
             return
 
-        box = QMessageBox(self)
-        box.setWindowTitle(DASHBOARD_COPY["personas.delete_confirm_title"])
-        box.setText(DASHBOARD_COPY["personas.delete_confirm_body"])
-        yes = box.addButton("删除", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("算了", QMessageBox.ButtonRole.RejectRole)
-        box.exec()
-        if box.clickedButton() is not yes:
+        if not show_message(
+            self,
+            DASHBOARD_COPY["personas.delete_confirm_title"],
+            DASHBOARD_COPY["personas.delete_confirm_body"],
+            confirm_text="删除",
+            cancel_text="算了",
+            is_danger=True,
+        ):
             return
 
         try:
             shutil.rmtree(self._personas_dir / name)
             self.refresh()
         except Exception as e:
-            QMessageBox.warning(self, "未能完成", str(e))
+            show_message(self, "未能完成", str(e), is_danger=True)

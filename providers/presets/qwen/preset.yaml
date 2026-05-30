@@ -6,6 +6,21 @@ registration_url: https://dashscope.console.aliyun.com
 reasoning_style: qwen_enable_thinking
 
 models:
+  - id: qwen3.7-max
+    display_name: Qwen3.7 Max
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 1000000
+
+  - id: qwen3.6-plus
+    display_name: Qwen3.6 Plus
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 1000000
+
+  - id: qwen3.6-flash
+    display_name: Qwen3.6 Flash
+    capabilities: [chat, tool_call, vision]
+    context_length: 1000000
+
   - id: qwen3-max
     display_name: Qwen3 Max
     capabilities: [chat, tool_call, reasoning]
@@ -21,7 +36,12 @@ models:
     capabilities: [chat, tool_call]
     context_length: 128000
 
-  - id: qwen-vl-max
-    display_name: Qwen-VL Max
+  - id: qwen3-vl-plus
+    display_name: Qwen3-VL Plus
     capabilities: [chat, vision]
-    context_length: 32000
+    context_length: 128000
+
+  - id: qwen3-vl-max
+    display_name: Qwen3-VL Max
+    capabilities: [chat, vision]
+    context_length: 128000

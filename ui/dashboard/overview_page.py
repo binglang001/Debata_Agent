@@ -2,8 +2,8 @@
 
 卡片：
     1. 渠道状态（NapCat 连接、地址、可重连）
-    2. 模型健康（所有 provider 的连通性 + 大致延迟）
-    3. 近 24 小时（消息/工具/token —— 当前简化为"已收/已发"两项）
+    2. 模型健康（显示 Runtime 启动时的 provider 连通性检测）
+    3. 累计概况（当前可统计的历史条数 / 重要记忆）
     4. 当前人格（仅显示名称，提示去 personas 页切换）
 """
 
@@ -152,15 +152,41 @@ class OverviewPage(QWidget):
         # —— 模型健康 ——
         self._providers_card.clear_body()
         try:
+            health = getattr(rt, "provider_health", {}) or {}
+            ok_count = 0
+            err_count = 0
             for name in (rt.providers or {}):
-                self._providers_card.add_line(name, DASHBOARD_COPY["overview.provider_status_ok"])
+                item = health.get(name)
+                if item is None:
+                    self._providers_card.add_line(name, "检测中")
+                    continue
+                if getattr(item, "status", "") == "ok":
+                    ok_count += 1
+                    latency = getattr(item, "latency_ms", 0)
+                    value = f"可用 · {latency}ms" if latency else "可用"
+                else:
+                    err_count += 1
+                    value = getattr(item, "message", "无响应")
+                self._providers_card.add_line(name, value)
             if not rt.providers:
                 self._providers_card.add_line("—", "未装配")
-            self._providers_card.set_badge("", "badge-idle")
+                self._providers_card.set_badge("未装配", "badge-idle")
+            elif err_count:
+                self._providers_card.set_badge(
+                    DASHBOARD_COPY["overview.provider_status_error"],
+                    "badge-error",
+                )
+            elif ok_count == len(rt.providers):
+                self._providers_card.set_badge(
+                    DASHBOARD_COPY["overview.provider_status_ok"],
+                    "badge-success",
+                )
+            else:
+                self._providers_card.set_badge("检测中", "badge-idle")
         except Exception as e:  # noqa: BLE001
             self._providers_card.add_line("出错", str(e)[:80])
 
-        # —— 近 24 小时（简化：只显示历史长度）——
+        # —— 累计概况（当前只显示已能可靠统计的数据）——
         self._stats_card.clear_body()
         try:
             # 这里走 best-effort：直接读 history 缓存长度（不发起 IO）

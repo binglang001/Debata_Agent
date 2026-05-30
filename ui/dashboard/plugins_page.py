@@ -1,13 +1,9 @@
-"""插件页 —— 列表 + 详情。
+"""插件页 —— 列表 + 详情 + 启停 + 安装指引。
 
 布局：
     [插件列表表格]              [插件详情面板（右侧 ~40%）]
        name / kind / 状态        描述 / 依赖 / 模型目录 / 配置表单
-       size / 操作按钮            操作区（启用/停用/下载）
-
-UI 框架由 Claude 写，具体实现由 DeepSeek 在 Phase 3 完成：
-    - 装/卸载具体调用（auto_download=True 时的真实下载）
-    - 配置表单与各插件 PLUGIN_META.config_schema 的双向绑定
+       size / 操作按钮            操作区（启用/停用/安装指引）
 """
 
 from __future__ import annotations
@@ -39,6 +35,7 @@ from PySide6.QtWidgets import (
 from plugins import PluginManager, PluginRecord, PluginStatus
 
 from ..theme import Spacing
+from ..widgets import show_model_install_guide
 from ..widgets.window_chrome import show_message
 from ..wizard.components import EmptyState, SectionCard
 
@@ -97,7 +94,7 @@ class PluginsPage(QWidget):
         # 内容栈：empty / split
         self._empty = EmptyState(
             "暂无插件",
-            "Phase 3 上线后这里可以装本地 Whisper / VoxCPM2 / sentence-transformers 等。",
+            "尚未发现插件。确认 plugins/ 目录下有插件目录且模型文件就位。",
         )
         outer.addWidget(self._empty, 1)
 
@@ -223,55 +220,39 @@ class PluginsPage(QWidget):
             self._detail.set_record(record)
 
     def _on_install(self, name: str) -> None:
-        """下载/安装插件（具体实装由 DS 在 Phase 3 完成）。
-
-        当前占位：弹窗提示用户手动放模型到 model_dir。
-        """
+        """打开模型安装指引。"""
         record = self._get_record(name)
         if record is None:
             return
-        if not record.meta.auto_download:
-            show_message(
-                self,
-                "需要手动放置模型",
-                f"该插件不支持自动下载。\n"
-                f"请把模型放到：{record.meta.model_dir}\n"
-                f"教程：{record.meta.download_url or '（无）'}",
-                "info",
-            )
-            return
-        # DS 待实装：调 plugin_install_worker 异步下载，进度条由本页弹窗显示
-        show_message(
-            self,
-            "下载暂未接入",
-            "自动下载功能将在 Phase 3 完整接入。当前请手动放置模型文件。",
-            "warning",
-        )
+        show_model_install_guide(self, record)
 
     def _on_enable(self, name: str, config: dict[str, Any]) -> None:
-        """启用插件（调 PluginManager.build()）。"""
+        """启用插件。同步更新 config 确保重启 Runtime 后仍生效。"""
         pm = self._get_pm()
         if pm is None:
             return
         try:
             pm.build(name, config)
         except Exception as e:  # noqa: BLE001
-            show_message(self, "启用失败", str(e), "error")
+            show_message(self, "启用失败", str(e), is_danger=True)
             return
+        # 同步写入 config（含表单配置），重启 Runtime 后 _setup_plugins 才能重新 build
+        record = pm.get(name)
+        if record:
+            self._sync_feature_enabled(record.meta.kind, True, config)
         show_message(
             self,
             "已启用",
             f"插件 {name} 已启用。某些功能可能需要重启 Runtime 才完全生效。",
-            "info",
         )
         self.refresh()
 
     def _on_disable(self, name: str) -> None:
-        """停用插件。"""
+        """停用插件，同步关掉 config 开关。"""
         pm = self._get_pm()
         if pm is None:
             return
-        # 调 async shutdown —— 用 QtAsyncio 或交给 runtime；当前用同步占位（DS 完善）
+        record = pm.get(name)
         import asyncio
 
         try:
@@ -281,9 +262,38 @@ class PluginsPage(QWidget):
             else:
                 loop.run_until_complete(pm.shutdown(name))
         except Exception as e:  # noqa: BLE001
-            show_message(self, "停用失败", str(e), "error")
+            show_message(self, "停用失败", str(e), is_danger=True)
             return
+        if record:
+            self._sync_feature_enabled(record.meta.kind, False)
         self.refresh()
+
+    def _sync_feature_enabled(self, kind: str, enabled: bool, form_data: dict | None = None) -> None:
+        """按插件 kind 同步 config.features.{kind} 字段并保存。"""
+        from app_config.loader import save_config
+
+        cfg = self._runtime.config
+        fd = form_data or {}
+        if kind == "asr":
+            cfg.features.asr.enabled = enabled
+            if enabled:
+                cfg.features.asr.type = "local"
+                cfg.features.asr.device = fd.get("device", cfg.features.asr.device)
+                cfg.features.asr.language = fd.get("language", cfg.features.asr.language)
+                cfg.features.asr.model_dir = fd.get("model_dir", cfg.features.asr.model_dir)
+        elif kind == "tts":
+            cfg.features.tts.enabled = enabled
+            if enabled:
+                cfg.features.tts.type = "local"
+                cfg.features.tts.reference_audio = fd.get("reference_audio", cfg.features.tts.reference_audio)
+                cfg.features.tts.default_prompt = fd.get("default_prompt", cfg.features.tts.default_prompt)
+                if not cfg.features.tts.model_dir:
+                    cfg.features.tts.model_dir = "data/models/VoxCPM2/"
+        elif kind == "embedding":
+            cfg.features.embedding.enabled = enabled
+        else:
+            return
+        save_config(self._runtime.paths, cfg)
 
 
 # ============================================================
@@ -371,7 +381,7 @@ class _PluginDetail(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(Spacing.SM)
 
-        self._btn_install = QPushButton("下载模型")
+        self._btn_install = QPushButton("安装指引")
         self._btn_install.clicked.connect(self._on_install_clicked)
         btn_row.addWidget(self._btn_install)
 
@@ -433,12 +443,10 @@ class _PluginDetail(QWidget):
         self._build_form(meta.config_schema, record.status == PluginStatus.ENABLED)
 
         # 按钮态
-        not_installed = record.status == PluginStatus.NOT_INSTALLED
+        can_install = record.status in (PluginStatus.NOT_INSTALLED, PluginStatus.ERROR)
         enabled_state = record.status == PluginStatus.ENABLED
-        self._btn_install.setEnabled(not_installed)
-        self._btn_install.setText(
-            "下载模型" if meta.auto_download else "查看安装教程"
-        )
+        self._btn_install.setEnabled(can_install)
+        self._btn_install.setText("安装指引")
         self._btn_enable.setEnabled(
             record.status == PluginStatus.INSTALLED
             or record.status == PluginStatus.ERROR

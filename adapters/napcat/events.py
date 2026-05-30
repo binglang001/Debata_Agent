@@ -10,6 +10,8 @@ NapCat 上报符合 OneBot V11 规范的 JSON。这里负责：
 from __future__ import annotations
 
 import logging
+import re
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
 from adapters.types import (
@@ -74,10 +76,13 @@ def _parse_message(adapter_name: str, raw: dict[str, Any]) -> IncomingMessage | 
     group_id = str(raw["group_id"]) if msg_type == "group" else None
 
     raw_message_str = raw.get("raw_message", "") or ""
-    message_segments = raw.get("message", []) or []
+    message_payload = raw.get("message", []) or []
+    message_segments = message_payload if isinstance(message_payload, list) else []
 
     # 提取媒体段
     media = _extract_media(message_segments)
+    if not media and raw_message_str:
+        media = _extract_media_from_cq(raw_message_str)
 
     # 提取 reply_to（如果有）
     reply_to: str | None = None
@@ -144,12 +149,15 @@ def _extract_media(segments: list[Any]) -> list[MediaSegment]:
                 )
             )
         elif seg_type == "file":
+            url = data.get("url") or data.get("path") or data.get("file_path")
+            file_id = data.get("file_id") or data.get("file")
+            name = data.get("file_name") or data.get("name") or _basename(url or file_id)
             out.append(
                 MediaSegment(
                     type=MediaType.FILE,
-                    file_id=data.get("file") or data.get("file_id"),
-                    name=data.get("file_name") or data.get("name"),
-                    url=data.get("url"),
+                    file_id=file_id,
+                    name=name,
+                    url=url,
                 )
             )
         elif seg_type == "forward":
@@ -160,6 +168,85 @@ def _extract_media(segments: list[Any]) -> list[MediaSegment]:
                 )
             )
     return out
+
+
+_CQ_SEGMENT_RE = re.compile(r"\[CQ:(?P<body>[^\]]+)\]")
+_PARAM_SPLIT_RE = re.compile(r",(?=\w+=)")
+
+
+def _extract_media_from_cq(raw_message: str) -> list[MediaSegment]:
+    """兼容 message 为字符串时的 CQ 媒体段。
+
+    NapCat/OneBot 可以按字符串或数组上报 message。数组模式会带结构化 data；
+    字符串模式只能从 raw_message 的 CQ 参数兜底提取 file/url/name。
+    """
+    out: list[MediaSegment] = []
+    for match in _CQ_SEGMENT_RE.finditer(raw_message):
+        body = match.group("body")
+        if "," in body:
+            cq_type, params_str = body.split(",", 1)
+        else:
+            cq_type, params_str = body, ""
+        params = _parse_cq_params(params_str)
+        if cq_type == "image":
+            file_id = params.get("file")
+            out.append(
+                MediaSegment(
+                    type=MediaType.IMAGE,
+                    file_id=file_id,
+                    url=params.get("url") or file_id,
+                )
+            )
+        elif cq_type == "record":
+            file_id = params.get("file")
+            out.append(
+                MediaSegment(
+                    type=MediaType.VOICE,
+                    file_id=file_id,
+                    url=params.get("url"),
+                )
+            )
+        elif cq_type == "video":
+            file_id = params.get("file")
+            out.append(
+                MediaSegment(
+                    type=MediaType.VIDEO,
+                    file_id=file_id,
+                    url=params.get("url"),
+                )
+            )
+        elif cq_type == "file":
+            url = params.get("url") or params.get("path") or params.get("file_path")
+            file_id = params.get("file_id") or params.get("file")
+            name = params.get("file_name") or params.get("name") or _basename(url or file_id)
+            out.append(
+                MediaSegment(
+                    type=MediaType.FILE,
+                    file_id=file_id,
+                    name=name,
+                    url=url,
+                )
+            )
+    return out
+
+
+def _parse_cq_params(params_str: str) -> dict[str, str]:
+    if not params_str:
+        return {}
+    params: dict[str, str] = {}
+    for part in _PARAM_SPLIT_RE.split(params_str):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            params[key] = value
+    return params
+
+
+def _basename(value: str | None) -> str | None:
+    if not value:
+        return None
+    if "\\" in value or re.match(r"^[A-Za-z]:", value):
+        return PureWindowsPath(value).name
+    return PurePosixPath(value).name
 
 
 # ============================================================

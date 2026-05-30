@@ -28,7 +28,7 @@ def _list_builtin_personas() -> list[str]:
     """列出 personas/ 下的目录名（不含 __init__ / __pycache__）。"""
     root = Path(__file__).resolve().parent.parent.parent.parent / "personas"
     if not root.exists():
-        return ["diana"]
+        return ["debata"]
     out = []
     for p in sorted(root.iterdir()):
         if not p.is_dir():
@@ -38,7 +38,7 @@ def _list_builtin_personas() -> list[str]:
             continue
         if (p / "persona_prompt.py").exists():
             out.append(name)
-    return out or ["diana"]
+    return out or ["debata"]
 
 
 class PersonaStepView(BaseStepView):
@@ -54,7 +54,7 @@ class PersonaStepView(BaseStepView):
         card = SectionCard(
             title="赋予一个角色",
             subtitle=(
-                "Diana 不是单一角色——你给它什么人格，它就活成谁。\n"
+                "Debata 不是单一角色——你给它什么人格，它就活成谁。\n"
                 "可以用内置的示范角色快速开始，或者花十分钟创造一个属于你的。"
             ),
         )
@@ -102,10 +102,14 @@ class PersonaStepView(BaseStepView):
         self._import_widget.setLayout(import_row)
         card.add_content(self._wrap_field("导入路径", self._import_widget))
 
-        # admin QQ（可选）
+        # admin（可选）
         sep = QFrame()
         sep.setProperty("role", "separator")
         card.add_content(sep)
+
+        self._admin_name_edit = QLineEdit()
+        self._admin_name_edit.setPlaceholderText("可选 —— 角色称呼你的名字")
+        card.add_content(self._wrap_field("管理员名称", self._admin_name_edit))
 
         self._admin_edit = QLineEdit()
         self._admin_edit.setPlaceholderText("可选 —— 用于审核陌生人加好友/加群")
@@ -180,6 +184,7 @@ class PersonaStepView(BaseStepView):
         if idx >= 0:
             self._builtin_combo.setCurrentIndex(idx)
         self._import_path.setText(p.import_path)
+        self._admin_name_edit.setText(self.context.admin_name)
         self._admin_edit.setText(self.context.admin_qq)
         self._update_visibility()
 
@@ -189,7 +194,7 @@ class PersonaStepView(BaseStepView):
         p.source = src  # type: ignore[assignment]
 
         if src == "builtin":
-            p.active = self._builtin_combo.currentData() or "diana"
+            p.active = self._builtin_combo.currentData() or "debata"
         elif src == "import":
             path = self._import_path.text().strip()
             if not path or not Path(path).is_dir():
@@ -207,4 +212,5 @@ class PersonaStepView(BaseStepView):
             self.invalid_input.emit("管理员 QQ 应该是纯数字")
             return False
         self.context.admin_qq = admin
+        self.context.admin_name = self._admin_name_edit.text().strip()
         return True

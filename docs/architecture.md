@@ -1,6 +1,6 @@
 # 架构总览
 
-Diana_Agent 各模块职责与依赖关系。
+Debata_Agent 各模块职责与依赖关系。
 
 ---
 
@@ -88,6 +88,25 @@ IAdapter.send_text() → 用户收到消息
 
 ---
 
+## 工具结果创建即定型
+
+工具结果只在刚返回时做一次精简，写入 `history` 后不再回改。这样旧 `tool` record 的字节稳定，避免为了清理长结果而破坏 KV 缓存前缀。
+
+入口：
+
+- 工具内部做语义明确的精简，例如 `describe_image` 保存完整描述、`get_user_info` 丢弃二进制 buffer、`read_file` 分页。
+- `tools.result_shrink.shrink_tool_result()` 在 `ToolRegistry` executor 出口做统一兜底，例如搜索结果、合并转发、Python 输出、超长未知工具结果。
+
+相关配置位于 `behavior.context`：
+
+- `tool_result_soft_limit_tokens`：默认 600，超过后走工具特定精简策略。
+- `tool_result_hard_cap_tokens`：默认 1500，超过后做中央 head/tail 截断。
+- `tool_result_soft_overrides`：按工具名覆盖软阈值，如 `describe_image=900`。
+
+设置页「高级 → 上下文预算」提供对应入口。
+
+---
+
 ## 长期记忆双模式
 
 `features.long_term_memory.mode`：
@@ -120,22 +139,22 @@ ImportantMemoryManager.attach_rag(svc, store)
 ## 插件机制
 
 `plugins/` 给「重依赖 / 本地模型」类能力一个统一安装入口。Runtime 启动时扫描 `plugins/{name}/__plugin__.py`，
-按 `features.{asr,tts}.type=local` 决定要不要 build 实例并注入到 `pipeline.{asr,tts}` 上。
+按 `features.{tts,embedding}.type=local` 决定要不要 build 实例并注入运行时。
 
 ```
 plugins/{name}/
   __plugin__.py    # PLUGIN_META + build(config) -> service
-  whisper_impl.py  # 真正的实现（lazy import 重依赖）
-F:/.models/{name}/  # 模型文件，不入仓库
+  voxcpm_impl.py   # 真正的实现（lazy import 重依赖）
+data/models/{name}/  # 模型文件，不入仓库
 ```
 
-主程序只依赖 `features/` 的轻量接口（`IASRService` / `ITTSService` / `IEmbeddingService`），
+主程序只依赖 `features/` 的轻量接口（`ITTSService` / `IEmbeddingService`），
 插件实现这些接口即可。完整规格见 [plugins/PLUGIN_SPEC.md](../plugins/PLUGIN_SPEC.md)。
 
 UI 入口在仪表盘「插件」页：列表 + 详情 + 启停 + 配置表单（按 `PLUGIN_META.config_schema` 动态生成）。
 
 工具系统挂钩：TTS 启用时 `tools/feature_tools.send_voice_message` 才生效。
-ASR 不出现在工具里 —— 由 `message_pipeline` 在处理语音段时透明调用。
+ASR 不出现在工具里。QQ/NapCat 渠道使用 NapCat 内置 `fetch_ptt_text`。
 
 ---
 
@@ -151,7 +170,7 @@ main.py → Runtime.start()
   6. ChatAgent / ProactiveRouterAgent / SummaryAgent
   7. features 服务（vision/web_search/weather, 按配置）
   7.5 RAG（embedding + rag_store）若 mode=rag
-  7.6 PluginManager.scan() + build ASR/TTS（若 type=local）
+  7.6 PluginManager.scan() + build TTS/Embedding（若 type=local）
   8. NapCatAdapter
   9. ToolRegistry（按 features 启用）
   10. WakeupScheduler / PendingRequestStore / RateLimiter

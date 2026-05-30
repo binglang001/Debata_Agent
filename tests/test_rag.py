@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import httpx
 import pytest
 
 from memory.important import ImportantMemoryManager
@@ -42,6 +43,34 @@ def test_cosine_basic():
     assert cosine_similarity([], [1, 2]) == 0.0
     assert cosine_similarity([1, 2], [1, 2, 3]) == 0.0
     assert cosine_similarity([0, 0], [0, 0]) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_embedding_uses_list_input_and_reports_body():
+    from features.embedding import EmbeddingError, OpenAICompatEmbeddingService
+
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        seen.append({"path": request.url.path, "body": body})
+        return httpx.Response(400, json={"code": "1210", "message": "参数调用有误"})
+
+    service = OpenAICompatEmbeddingService(
+        base_url="https://embedding.example.com/v1",
+        api_key="key",
+        model="embed-model",
+    )
+    service._client = httpx.AsyncClient(
+        base_url=service.base_url,
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(EmbeddingError, match="1210"):
+        await service.embed_one("test")
+
+    assert seen[0]["path"] == "/v1/embeddings"
+    assert b'"input":["test"]' in seen[0]["body"].replace(b" ", b"")
 
 
 @pytest.mark.asyncio
@@ -128,3 +157,51 @@ async def test_rag_delete_propagates(tmp_path: Path):
     # RAG 索引也应同步删除
     assert len(rs) == 1
     assert "狗" in rs.all_entries()[0].text
+
+
+@pytest.mark.asyncio
+async def test_keyword_force_save_indexes_rag(tmp_path: Path):
+    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=lambda: "T-keyword")
+    await im.load()
+    rs = RagStore(tmp_path / "rag.jsonl")
+    await rs.load()
+    im.attach_rag(_FakeEmbedding(), rs)
+
+    result = await im.force_save_from_keyword("请记住用户喜欢茶", keywords=["请记住"])
+
+    assert result["saved"] is True
+    assert len(rs) == 1
+    entry = rs.all_entries()[0]
+    assert entry.id == "T-keyword"
+    assert entry.text == "用户喜欢茶"
+
+
+@pytest.mark.asyncio
+async def test_replace_all_rebuilds_rag_index(tmp_path: Path):
+    counter = [0]
+
+    def now() -> str:
+        counter[0] += 1
+        return f"T{counter[0]:04d}"
+
+    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=now)
+    await im.load()
+    rs = RagStore(tmp_path / "rag.jsonl")
+    await rs.load()
+    im.attach_rag(_FakeEmbedding(), rs)
+
+    await im.save("旧记忆 A")
+    await im.save("旧记忆 B")
+    assert len(rs) == 2
+
+    await im.replace_all(
+        [
+            {"timestamp": "T-new", "content": "新记忆"},
+            {"timestamp": "T-empty", "content": ""},
+        ]
+    )
+
+    entries = rs.all_entries()
+    assert len(entries) == 1
+    assert entries[0].id == "T-new"
+    assert entries[0].text == "新记忆"

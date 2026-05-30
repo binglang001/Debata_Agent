@@ -20,6 +20,7 @@ class WelcomeStepView(BaseStepView):
 
     def __init__(self, context: WizardContext, parent=None) -> None:
         super().__init__(context, parent)
+        self._selected_path: str | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -62,6 +63,10 @@ class WelcomeStepView(BaseStepView):
         outer.addLayout(row)
 
         outer.addStretch(1)
+        self._path_cards = {
+            WIZARD_PATH_RECOMMENDED: self._rec_card,
+            WIZARD_PATH_CUSTOM: self._cus_card,
+        }
 
     def _build_path_card(self, title: str, desc: str, path_value: str) -> QFrame:
         card = QFrame()
@@ -88,14 +93,24 @@ class WelcomeStepView(BaseStepView):
         return card
 
     def _on_path_clicked(self, value: str) -> None:
+        self._select_path(value)
         self.context.path = value
         self.request_advance.emit()
+
+    def _select_path(self, value: str) -> None:
+        self._selected_path = value
+        for path_value, card in self._path_cards.items():
+            if path_value == value:
+                card.setStyleSheet("QFrame#SectionCard { border: 2px solid #6FA39A; }")
+            else:
+                card.setStyleSheet("")
 
     def refresh(self) -> None:
         pass  # welcome 不需要回填
 
     def save(self) -> bool:
-        # path 由按钮点击时写入；这里只确保有值
-        if self.context.path not in (WIZARD_PATH_RECOMMENDED, WIZARD_PATH_CUSTOM):
-            self.context.path = WIZARD_PATH_RECOMMENDED
+        if self._selected_path not in (WIZARD_PATH_RECOMMENDED, WIZARD_PATH_CUSTOM):
+            self.invalid_input.emit("请先选择推荐路径或自定义路径。")
+            return False
+        self.context.path = self._selected_path
         return True

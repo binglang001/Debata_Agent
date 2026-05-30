@@ -22,7 +22,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..theme import DARK, LIGHT, Spacing, build_qss
+from app_config.loader import save_config
+
+from ..theme import Spacing, build_qss, palette_for_theme, resolve_theme_name
 from .copy import DASHBOARD_COPY
 from .layout import DEFAULT_LAYOUT, NAV_ITEMS, STATUS_BADGE_MAP
 from .chats_page import ChatsPage
@@ -30,7 +32,7 @@ from .logs_page import LogsPage
 from .memory_page import MemoryPage
 from .overview_page import OverviewPage
 from .personas_page import PersonasPage
-from .plugins_page import PluginsPage
+from .models_page import ModelsPage
 from .settings_page import SettingsPage
 
 logger = logging.getLogger(__name__)
@@ -51,9 +53,11 @@ class DashboardWindow(QMainWindow):
         # 无边框 + 自定义标题栏 + 透明 root 让 WindowFrame 的圆角 QSS 生效
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setProperty("frameless", True)
 
         self._runtime = runtime
-        self._current_theme = "light"
+        self._theme_choice = self._configured_theme()
+        self._current_theme = resolve_theme_name(self._theme_choice)
 
         # 整窗用 WindowFrame 包一层：QSS 里 QFrame#WindowFrame 设了 border-radius
         root = QFrame()
@@ -90,18 +94,23 @@ class DashboardWindow(QMainWindow):
         from PySide6.QtWidgets import QScrollArea
         from ..widgets import AutoSizeStack
         self._stack = AutoSizeStack()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setWidget(self._stack)
-        content_lay.addWidget(scroll, 1)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.setWidget(self._stack)
+        content_lay.addWidget(self._scroll, 1)
 
         right_lay.addWidget(content_wrap, 1)
 
         root_lay.addWidget(right, 1)
         self.setCentralWidget(root)
+        from ..widgets import attach_size_grip, install_window_drag, install_window_resize
+
+        self._size_grip = attach_size_grip(self)
+        self._window_resize_filter = install_window_resize(root, self)
+        self._window_drag_filter = install_window_drag(root, self)
 
         # 实例化 7 页
         self._pages: dict[str, QWidget] = {
@@ -110,7 +119,7 @@ class DashboardWindow(QMainWindow):
             "memory": MemoryPage(runtime),
             "logs": LogsPage(runtime),
             "personas": PersonasPage(runtime),
-            "plugins": PluginsPage(runtime),
+            "models": ModelsPage(runtime),
             "settings": SettingsPage(runtime),
         }
         for p in self._pages.values():
@@ -119,6 +128,7 @@ class DashboardWindow(QMainWindow):
         # settings 的 theme / restart 请求
         self._pages["settings"].theme_changed.connect(self._on_theme_changed)
         self._pages["settings"].restart_runtime_requested.connect(self.restart_requested.emit)
+        self._pages["personas"].restart_requested.connect(self.restart_requested.emit)
 
         # 默认显示 overview
         self._switch_to("overview")
@@ -129,6 +139,8 @@ class DashboardWindow(QMainWindow):
         self._status_timer.timeout.connect(self._refresh_topbar)
         self._status_timer.start()
         self._refresh_topbar()
+        self._apply_theme(self._theme_choice)
+        QTimer.singleShot(800, self._show_feature_failures)
 
     # ============================================================
     # UI 构造
@@ -144,7 +156,7 @@ class DashboardWindow(QMainWindow):
         lay.setSpacing(Spacing.XS)
 
         # 顶部 Logo / 标题
-        brand = QLabel("Diana_Agent")
+        brand = QLabel("Debata_Agent")
         brand.setProperty("role", "title-3")
         brand.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.MD)
         lay.addWidget(brand)
@@ -212,6 +224,8 @@ class DashboardWindow(QMainWindow):
         if page is None:
             return
         self._stack.setCurrentWidget(page)
+        self._animate_current_page(page)
+        self._scroll.verticalScrollBar().setValue(0)  # 切页回顶
         if hasattr(page, "refresh"):
             try:
                 page.refresh()
@@ -254,6 +268,30 @@ class DashboardWindow(QMainWindow):
         self._adapter_badge.style().unpolish(self._adapter_badge)
         self._adapter_badge.style().polish(self._adapter_badge)
 
+    def _show_feature_failures(self) -> None:
+        failures = getattr(self._runtime, "feature_failures", {}) or {}
+        if not failures:
+            return
+        from ..widgets import show_message
+
+        names = {
+            "asr": "语音识别（ASR）",
+            "tts": "语音合成（TTS）",
+            "embedding": "RAG / Embedding",
+        }
+        lines = [
+            f"{names.get(name, name)}：{msg}"
+            for name, msg in failures.items()
+        ]
+        show_message(
+            self,
+            "本地/云端模型加载失败",
+            "以下功能加载失败，已自动关闭对应配置以避免下次启动继续卡住：\n\n"
+            + "\n".join(lines)
+            + "\n\n请在设置页或模型管理页查看安装指引，重新放置或修复后再启用。",
+            is_danger=True,
+        )
+
     # ============================================================
     # 主题
     # ============================================================
@@ -262,13 +300,63 @@ class DashboardWindow(QMainWindow):
         target = "dark" if self._current_theme == "light" else "light"
         self._on_theme_changed(target)
 
+    def _configured_theme(self) -> str:
+        try:
+            return self._runtime.config.app.theme
+        except Exception:
+            return "auto"
+
     def _on_theme_changed(self, target: str) -> None:
-        palette = DARK if target == "dark" else LIGHT
+        self._persist_theme(target)
+        self._apply_theme(target)
+        settings = getattr(self, "_pages", {}).get("settings")
+        if settings is not None and hasattr(settings, "refresh"):
+            settings.refresh()
+
+    def _apply_theme(self, target: str) -> None:
+        palette = palette_for_theme(target)
         app = QApplication.instance()
         if app:
             app.setStyleSheet(build_qss(palette))
-        self._current_theme = target
-        self._theme_btn.setText("☀" if target == "dark" else "☾")
+        self._theme_choice = target
+        self._current_theme = resolve_theme_name(target)
+        self._theme_btn.setText("☀" if self._current_theme == "dark" else "☾")
+        self._theme_btn.setToolTip(
+            f"{DASHBOARD_COPY['topbar.theme_toggle']}（当前：{'跟随系统' if target == 'auto' else target}）"
+        )
+
+    def _persist_theme(self, target: str) -> None:
+        try:
+            cfg = self._runtime.config
+            if cfg.app.theme == target:
+                return
+            cfg.app.theme = target
+            save_config(self._runtime.paths, cfg)
+        except Exception:
+            logger.warning("保存主题设置失败", exc_info=True)
+
+    def _animate_current_page(self, page: QWidget) -> None:
+        try:
+            from PySide6.QtCore import QEasingCurve, QPropertyAnimation
+            from PySide6.QtWidgets import QGraphicsOpacityEffect
+
+            effect = QGraphicsOpacityEffect(page)
+            page.setGraphicsEffect(effect)
+            anim = QPropertyAnimation(effect, b"opacity", page)
+            anim.setDuration(120)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            page._page_fade_animation = anim  # type: ignore[attr-defined]
+            anim.finished.connect(lambda: page.setGraphicsEffect(None))
+            anim.start()
+        except Exception:
+            pass
+
+    def notify_runtime_restart_finished(self, ok: bool, message: str = "") -> None:
+        settings = getattr(self, "_pages", {}).get("settings")
+        if settings is not None and hasattr(settings, "on_runtime_restart_finished"):
+            settings.on_runtime_restart_finished(ok, message)
 
     # ============================================================
     # 关闭
@@ -284,8 +372,23 @@ class DashboardWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        from ..widgets import apply_rounded_mask
+        from ..widgets import apply_rounded_mask, position_size_grip
         apply_rounded_mask(self, radius=12)
+        position_size_grip(self, getattr(self, "_size_grip", None))
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        from ..widgets import fade_in_window
+
+        fade_in_window(self)
+
+    def nativeEvent(self, eventType, message):  # type: ignore[override]
+        from ..widgets import native_resize_hit_test
+
+        hit = native_resize_hit_test(self, eventType, message)
+        if hit is not None:
+            return hit
+        return super().nativeEvent(eventType, message)
 
 
 __all__ = ["DashboardWindow"]

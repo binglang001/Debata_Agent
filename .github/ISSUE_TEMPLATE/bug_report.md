@@ -1,6 +1,6 @@
 ---
 name: 报告 Bug
-about: 反馈 Diana 运行中遇到的问题
+about: 反馈 Debata 运行中遇到的问题
 title: "[Bug] "
 labels: bug
 assignees: []
@@ -24,5 +24,5 @@ assignees: []
 
 - OS: [Windows / Linux / macOS / 版本]
 - Python 版本: [3.11 / 3.12 / ...]
-- Diana 版本: [v0.2.0-alpha / develop / ...]
+- Debata 版本: [v0.2.0-alpha / develop / ...]
 - 使用的 LLM 平台: [DeepSeek / OpenAI / Anthropic / ...]

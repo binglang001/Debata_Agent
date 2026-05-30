@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -10,7 +12,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QRadioButton,
     QSpinBox,
     QVBoxLayout,
@@ -64,16 +65,20 @@ class AdapterStepView(BaseStepView):
         form = QFormLayout()
         form.setSpacing(Spacing.SM)
         self._host_edit = QLineEdit("127.0.0.1")
+        self._host_edit.textChanged.connect(lambda *_: self._token_input.set_test_state("idle"))
         form.addRow(QLabel("地址"), self._host_edit)
         self._port_spin = QSpinBox()
         self._port_spin.setRange(1, 65535)
         self._port_spin.setValue(3001)
+        self._port_spin.valueChanged.connect(lambda *_: self._token_input.set_test_state("idle"))
         form.addRow(QLabel("端口"), self._port_spin)
         self._path_edit = QLineEdit("/")
+        self._path_edit.textChanged.connect(lambda *_: self._token_input.set_test_state("idle"))
         form.addRow(QLabel("WebSocket 路径"), self._path_edit)
         self._token_input = ApiKeyInput(
             placeholder="可选；NapCat 那边设了 token 才填",
             test_button_text="测试连接",
+            allow_empty_test=True,
         )
         self._token_input.test_requested.connect(self._on_test_token)
         form.addRow(QLabel(COPY["adapter.token_label"]), self._token_input)
@@ -91,7 +96,7 @@ class AdapterStepView(BaseStepView):
         process_hint.setWordWrap(True)
         card.add_content(process_hint)
         self._process_path_edit = QLineEdit()
-        self._process_path_edit.setPlaceholderText("如 D:/NapCat/NapCatWinBootMain.exe")
+        self._process_path_edit.setPlaceholderText("如 D:/NapCat/start.bat 或 NapCatWinBootMain.exe")
         self._manage_check.toggled.connect(self._process_path_edit.setVisible)
         self._process_path_edit.setVisible(False)
         card.add_content(self._process_path_edit)
@@ -121,6 +126,7 @@ class AdapterStepView(BaseStepView):
         rb = QRadioButton(title)
         rb.setProperty("mode_value", value)
         self._mode_group.addButton(rb)
+        rb.toggled.connect(lambda *_: self._token_input.set_test_state("idle"))
         wl.addWidget(rb)
         d = QLabel(desc)
         d.setProperty("role", "secondary")
@@ -130,33 +136,98 @@ class AdapterStepView(BaseStepView):
         return wrapper
 
     def _confirm_open(self) -> bool:
-        box = QMessageBox(self)
-        box.setWindowTitle(COPY["warning.whitelist_all_title"])
-        box.setText(COPY["warning.whitelist_all_body"])
-        confirm = box.addButton(
-            COPY["warning.whitelist_all_confirm"], QMessageBox.ButtonRole.AcceptRole
+        from ...widgets.window_chrome import show_message
+
+        return show_message(
+            self,
+            COPY["warning.whitelist_all_title"],
+            COPY["warning.whitelist_all_body"],
+            confirm_text=COPY["warning.whitelist_all_confirm"],
+            cancel_text=COPY["warning.whitelist_all_cancel"],
+            is_danger=True,
         )
-        box.addButton(COPY["warning.whitelist_all_cancel"], QMessageBox.ButtonRole.RejectRole)
-        box.exec()
-        return box.clickedButton() is confirm
 
-    def _on_test_token(self, token: str) -> None:
-        """实测 NapCat 连接。
-
-        client 模式：起 WS 客户端连过去，3 秒内连上即 success；
-        server 模式：监听端口等 NapCat 反向连入，3 秒内未连入则给中性提示（端口可用但需 NapCat 主动连）。
-        """
-        import asyncio
-
+    def _current_mode(self) -> str:
         mode = "client"
         for rb in self._mode_group.buttons():
             if isinstance(rb, QRadioButton) and rb.isChecked():
                 mode = rb.property("mode_value") or "client"
                 break
+        return mode
+
+    async def _test_connection(self, token: str) -> tuple[bool, str]:
+        """实测 NapCat 连接。
+
+        client 模式：起 WS 客户端连过去，3 秒内连上即 success；
+        server 模式：监听端口等 NapCat 反向连入，3 秒内未连入则给中性提示（端口可用但需 NapCat 主动连）。
+        """
+        from adapters.napcat.connection import (
+            ForwardWSConnection,
+            ReverseWSConnection,
+        )
+
+        mode = self._current_mode()
         host = self._host_edit.text().strip() or "127.0.0.1"
         port = self._port_spin.value()
         path = self._path_edit.text().strip() or "/"
+        conn = None
+        try:
+            if mode == "client":
+                ws_url = f"ws://{host}:{port}{path}"
+                conn = ReverseWSConnection(
+                    ws_url=ws_url,
+                    access_token=token or None,
+                    reconnect_interval=1.0,
+                    max_reconnect_attempts=1,
+                    reconnect_backoff_max=1.0,
+                    ping_interval=20.0,
+                    ping_timeout=20.0,
+                    initial_connect_timeout=3.0,
+                )
+                await conn.start()
+                for _ in range(8):
+                    if conn.is_connected:
+                        break
+                    await asyncio.sleep(0.25)
+                if conn.is_connected:
+                    return True, f"已连上 NapCat（{ws_url}）"
+                return False, "连不上。检查 NapCat 是否已启动、正向 WS 是否对应同一 host/port/path。"
 
+            conn = ForwardWSConnection(
+                host=host,
+                port=port,
+                path=path,
+                access_token=token or None,
+                ping_interval=20.0,
+                ping_timeout=20.0,
+            )
+            try:
+                await conn.start()
+            except OSError as e:
+                return False, f"端口 {port} 起不来：{e}"
+            for _ in range(12):
+                if conn.is_connected:
+                    break
+                await asyncio.sleep(0.25)
+            if conn.is_connected:
+                return True, f"NapCat 已连入 ws://{host}:{port}{path}"
+            return (
+                True,
+                (
+                    f"端口可用，已在 {host}:{port}{path} 监听。"
+                    "NapCat 还没连入；请去 NapCat 端配置反向 WS 指向这里再触发一次。"
+                ),
+            )
+        except Exception as e:  # noqa: BLE001
+            return False, f"未能完成：{e}"
+        finally:
+            if conn is not None:
+                try:
+                    await conn.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _on_test_token(self, token: str) -> None:
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
@@ -164,83 +235,20 @@ class AdapterStepView(BaseStepView):
             return
 
         async def _do_test() -> None:
-            from adapters.napcat.connection import (
-                ForwardWSConnection,
-                ReverseWSConnection,
-            )
-
-            conn = None
-            try:
-                if mode == "client":
-                    ws_url = f"ws://{host}:{port}{path}"
-                    conn = ReverseWSConnection(
-                        ws_url=ws_url,
-                        access_token=token or None,
-                        reconnect_interval=1.0,
-                        max_reconnect_attempts=1,
-                        reconnect_backoff_max=1.0,
-                        ping_interval=20.0,
-                        ping_timeout=20.0,
-                        initial_connect_timeout=3.0,
-                    )
-                    await conn.start()
-                    # 短等以容忍 connect/握手抖动
-                    for _ in range(8):
-                        if conn.is_connected:
-                            break
-                        await asyncio.sleep(0.25)
-                    if conn.is_connected:
-                        self._token_input.set_test_state(
-                            "success", f"已连上 NapCat（{ws_url}）"
-                        )
-                    else:
-                        self._token_input.set_test_state(
-                            "error",
-                            "连不上。检查 NapCat 是否已启动、正向 WS 是否对应同一 host/port/path。",
-                        )
-                else:  # server
-                    conn = ForwardWSConnection(
-                        host=host,
-                        port=port,
-                        path=path,
-                        access_token=token or None,
-                        ping_interval=20.0,
-                        ping_timeout=20.0,
-                    )
-                    try:
-                        await conn.start()
-                    except OSError as e:
-                        self._token_input.set_test_state(
-                            "error", f"端口 {port} 起不来：{e}"
-                        )
-                        return
-                    # 监听 3 秒看 NapCat 有没有真的连入
-                    for _ in range(12):
-                        if conn.is_connected:
-                            break
-                        await asyncio.sleep(0.25)
-                    if conn.is_connected:
-                        self._token_input.set_test_state(
-                            "success", f"NapCat 已连入 ws://{host}:{port}{path}"
-                        )
-                    else:
-                        self._token_input.set_test_state(
-                            "success",
-                            (
-                                f"端口可用，已在 {host}:{port}{path} 监听。"
-                                "NapCat 还没连入；请去 NapCat 端配置反向 WS 指向这里再触发一次。"
-                            ),
-                        )
-            except Exception as e:  # noqa: BLE001
-                self._token_input.set_test_state("error", f"未能完成：{e}")
-            finally:
-                if conn is not None:
-                    try:
-                        await conn.stop()
-                    except Exception:  # noqa: BLE001
-                        pass
+            ok, msg = await self._test_connection(token)
+            self._token_input.set_test_state("success" if ok else "error", msg)
 
         loop.create_task(_do_test())
+
+    async def validate_before_next(self) -> bool:
+        if self._token_input.is_test_success():
+            return True
+        self._token_input.set_test_state("testing", "正在自动测试 NapCat 连接……")
+        ok, msg = await self._test_connection(self._token_input.text())
+        self._token_input.set_test_state("success" if ok else "error", msg)
+        if not ok:
+            self.invalid_input.emit(msg)
+        return ok
 
     def refresh(self) -> None:
         a = self.context.adapter
@@ -269,9 +277,8 @@ class AdapterStepView(BaseStepView):
             self.invalid_input.emit("请填一下地址")
             return False
         if self._manage_check.isChecked() and not self._process_path_edit.text().strip():
-            self.invalid_input.emit("勾了「托管 NapCat 进程」就要填可执行文件路径")
+            self.invalid_input.emit("勾了「托管 NapCat 进程」就要填启动脚本或可执行文件路径")
             return False
-
         a = self.context.adapter
         a.mode = mode  # type: ignore[assignment]
         a.host = host

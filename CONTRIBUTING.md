@@ -1,13 +1,13 @@
 # 贡献指南
 
-感谢愿意为 Diana_Agent 添砖加瓦。本文写给希望提 PR、加 provider、加工具、报 bug 或重写文档的人。
+感谢愿意为 Debata_Agent 添砖加瓦。本文写给希望提 PR、加 provider、加工具、报 bug 或重写文档的人。
 读完前 3 节即可开始动手；后两节是「加 provider」「加 Tool」的实操指引。
 
 ---
 
 ## 项目准则
 
-Diana 不是 ChatGPT 套壳，也不是「能多就多」的 AI 全家桶。她有边界、有取舍。
+Debata 不是 ChatGPT 套壳，也不是「能多就多」的 AI 全家桶。她有边界、有取舍。
 
 **保留的：**
 - 全会话统一上下文（不隔离不同用户/群聊）
@@ -17,7 +17,7 @@ Diana 不是 ChatGPT 套壳，也不是「能多就多」的 AI 全家桶。她�
 - 用户配置全 GUI 可改（除 persona 文件本身）
 
 **不接受的 PR：**
-- 把 Diana 改成「全平台多账号 SaaS」
+- 把 Debata 改成「全平台多账号 SaaS」
 - 加「礼貌话术润色器」「敬语自动检测」之类破坏人格的「礼貌补丁」
 - 把单一 system prompt 拆成多 system 段（破坏 KV 缓存）
 - 引入「记忆数据库 ORM 层」「插件市场后端」等过度抽象
@@ -79,17 +79,53 @@ venv/Scripts/python -m ruff format .
 
 ## 加一个 provider preset
 
-> **本节由 DeepSeek 补充。** 见 `docs/deepseek_tasks.md` 任务 8。
+1. **在 `providers/presets/{name}/` 下新建 `preset.yaml`**。最少填 `id` / `display_name` / `protocol` / `base_url` / `models` 列表。照 `providers/presets/deepseek/preset.yaml` 葫芦画瓢即可。示例：
+   ```yaml
+   id: my_platform
+   display_name: My Platform
+   protocol: openai_compat
+   base_url: https://api.myplatform.com/v1
+   registration_url: https://myplatform.com/console
+   reasoning_style: none
+   models:
+     - id: my-model-v1
+       display_name: My Model V1
+       capabilities: [chat, tool_call]
+       context_length: 131072
+   ```
+   `reasoning_style` 可选值：`none`（无思考）、`thinking_extra_body`（DeepSeek 风格）、`thinking_extra_header`（Anthropic 风格）。
 
-<!-- DS-INSERT-PROVIDER-PRESET -->
+2. **写 `providers/presets/{name}/tutorial/get_api_key.md`**。3~5 段简短中文教程，覆盖：官网注册地址 → 如何获取 API Key → 计费说明 → 填到 Debata 的步骤。
+
+3. **验证**：启动 Debata → 向导或设置页 Model 节，下拉菜单应能看到新 provider。或用脚本：
+   ```bash
+   venv/Scripts/python -c "from providers.presets_loader import load_all_presets; from app_config import AppPaths; from pathlib import Path; print(load_all_presets(AppPaths(project_root=Path('.')).PROVIDER_PRESETS_DIR).keys())"
+   ```
 
 ---
 
 ## 加一个 Tool
 
-> **本节由 DeepSeek 补充。** 见 `docs/deepseek_tasks.md` 任务 8。
+1. **在 `tools/schemas.py` 加 Pydantic args 模型**。继承 `_ToolArgs`（已在 schemas.py 顶部定义；核心约束：`extra="forbid"` + `strict=False`）。示例：
+   ```python
+   class MyToolArgs(_ToolArgs):
+       target_id: str = Field(..., description="目标 QQ 号")
+       message: str = Field(..., description="要发送的内容", min_length=1, max_length=2000)
+   ```
 
-<!-- DS-INSERT-NEW-TOOL -->
+2. **在对应分类文件里加 `@tool(...)` 函数**。分类文件对应：
+   - `tools/messaging.py`：消息类（send / recall / upload）
+   - `tools/memory_tools.py`：记忆类（保存 / 删除 / 查询）
+   - `tools/platform_tools.py`：平台类（好友列表 / 群信息等）
+   - `tools/control_tools.py`：控制类（审批请求等）
+   - `tools/feature_tools.py`：功能类（天气 / 搜索 / 视觉 / 语音 等）
+   - `tools/workspace_tools.py`：文件类（read / write / edit / run_python 等）
+
+   函数签名固定为 `async def my_tool(args: MyToolArgs, ctx: ToolContext) -> dict`。返回值固定 `{"ok": True, ...}` 或 `{"ok": False, "error": "..."}`。照 `tools/feature_tools.py` 的 `web_search` 葫芦画瓢。
+
+3. **若需要 ToolContext 新字段**：在 `tools/base.py::ToolContext` 加字段 → 在 `core/runtime.py` 装配时注入值。不要直接在工具函数内 import 全局单例。
+
+4. **验证**：启动 Debata → 设置页确认工具已出现在 schema 中（按 feature 开关决定是否暴露）。运行 pytest 确保全过。
 
 ---
 
@@ -98,7 +134,7 @@ venv/Scripts/python -m ruff format .
 用 [Issue Template](.github/ISSUE_TEMPLATE/bug.md)。最少给：
 - 复现步骤
 - 期望行为 vs 实际行为
-- 环境（OS、Python 版本、Diana 版本/commit hash）
+- 环境（OS、Python 版本、Debata 版本/commit hash）
 - 相关日志（脱敏后）
 
 ---

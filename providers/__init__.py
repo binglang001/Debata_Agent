@@ -1,4 +1,4 @@
-"""Diana_Agent 多提供商系统。
+"""Debata_Agent 多提供商系统。
 
 公开 API：
     IProvider             —— 提供商抽象
@@ -23,6 +23,13 @@ from .base import (
     Usage,
 )
 from .presets_loader import ModelInfo, ProviderPreset, load_all_presets
+from .health import (
+    ProviderHealth,
+    probe_embedding_endpoint,
+    probe_embedding_provider_instance,
+    probe_provider_endpoint,
+    probe_provider_instance,
+)
 from .protocols import AnthropicProvider, OpenAICompatProvider
 from .registry import (
     PROTOCOL_REGISTRY,
@@ -48,6 +55,11 @@ __all__ = [
     "ProviderPreset",
     "ModelInfo",
     "load_all_presets",
+    "ProviderHealth",
+    "probe_embedding_endpoint",
+    "probe_embedding_provider_instance",
+    "probe_provider_endpoint",
+    "probe_provider_instance",
     # protocols
     "OpenAICompatProvider",
     "AnthropicProvider",

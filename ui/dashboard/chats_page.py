@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
@@ -41,6 +42,8 @@ class ChatsPage(QWidget):
         super().__init__(parent)
         self._runtime = runtime
         self._records: list[dict] = []
+        self._conversations: list[dict] = []
+        self._current_key: str | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -61,11 +64,11 @@ class ChatsPage(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self._list = QListWidget()
-        self._list.itemClicked.connect(self._on_item_clicked)
+        self._list.currentItemChanged.connect(self._on_item_changed)
         splitter.addWidget(self._list)
 
         self._detail = QTextBrowser()
-        self._detail.setPlaceholderText("点选左侧某一条查看")
+        self._detail.setPlaceholderText("点选左侧某个会话查看")
         splitter.addWidget(self._detail)
 
         splitter.setStretchFactor(0, 1)
@@ -116,31 +119,48 @@ class ChatsPage(QWidget):
         self._empty.setVisible(on)
 
     def _render_list(self) -> None:
+        selected_key = self._current_key
+        list_scroll = self._list.verticalScrollBar().value()
+        detail_scroll = self._detail.verticalScrollBar().value()
+
+        self._conversations = _group_records_by_conversation(self._records)
         self._list.clear()
-        if not self._records:
+        if not self._conversations:
             self._show_empty(True)
             return
         self._show_empty(False)
-        for i, rec in enumerate(self._records):
-            role = rec.get("role", "?")
-            content = (rec.get("content") or "")[:40].replace("\n", " ")
-            prefix = {
-                "user": "你",
-                "assistant": "她",
-                "tool": "工具",
-                "system": "系统",
-            }.get(role, role)
-            item = QListWidgetItem(f"{prefix} · {content}")
-            item.setData(Qt.ItemDataRole.UserRole, i)
+        restore_row = -1
+        for i, conv in enumerate(self._conversations):
+            preview = (conv.get("preview") or "").replace("\n", " ")[:48]
+            count = len(conv.get("records") or [])
+            item = QListWidgetItem(f"{conv['label']}\n  {count} 条 · {preview}")
+            item.setData(Qt.ItemDataRole.UserRole, conv["key"])
             self._list.addItem(item)
+            if conv["key"] == selected_key:
+                restore_row = i
+        if restore_row < 0:
+            restore_row = 0
+        self._list.setCurrentRow(restore_row)
+        self._list.verticalScrollBar().setValue(list_scroll)
+        if self._current_key == selected_key:
+            QTimer.singleShot(0, lambda: self._detail.verticalScrollBar().setValue(detail_scroll))
 
-    def _on_item_clicked(self, item: QListWidgetItem) -> None:
-        idx = item.data(Qt.ItemDataRole.UserRole)
-        if idx is None or idx >= len(self._records):
+    def _on_item_changed(self, item: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if item is None:
             return
-        rec = self._records[idx]
-        html = self._render_record(rec)
-        self._detail.setHtml(html)
+        key = item.data(Qt.ItemDataRole.UserRole)
+        conv = next((c for c in self._conversations if c["key"] == key), None)
+        if conv is None:
+            return
+        self._current_key = key
+        self._detail.setHtml(self._render_conversation(conv))
+
+    def _render_conversation(self, conv: dict) -> str:
+        parts = [f"<h3 style='margin:0 0 12px 0'>{_escape(conv['label'])}</h3>"]
+        for rec in conv.get("records") or []:
+            parts.append(self._render_record(rec))
+            parts.append("<hr/>")
+        return "".join(parts)
 
     def _render_record(self, rec: dict) -> str:
         role = rec.get("role", "?")
@@ -156,7 +176,7 @@ class ChatsPage(QWidget):
             "system": "系统",
         }.get(role, role)
 
-        parts = [f"<h3 style='margin:0'>{head}</h3>"]
+        parts = [f"<h4 style='margin:8px 0 4px 0'>{head}</h4>"]
         if reasoning:
             parts.append(
                 "<details><summary style='color:#6B635A'>思考过程</summary>"
@@ -173,6 +193,76 @@ class ChatsPage(QWidget):
                 parts.append(f"<li><b>{name}</b><pre style='white-space:pre-wrap'>{_escape(args)}</pre></li>")
             parts.append("</ul>")
         return "".join(parts)
+
+
+_LEGACY_HEADER_RE = re.compile(
+    r"^【(?P<timestamp>.*?) (?P<location>群聊 (?P<group_id>\S+)|私聊) "
+    r"(?P<nickname>.*?)\((?P<user_id>.*?)\) msg_id=(?P<message_id>.*?)】",
+    re.S,
+)
+
+
+def _group_records_by_conversation(records: list[dict]) -> list[dict]:
+    """把线性 history 分组成会话。
+
+    新记录优先读 metadata；旧记录从 MessagePipeline 写入的正文头部解析。
+    assistant/tool/system 记录归入最近的 user 会话，避免刷新时只看到全局流水。
+    """
+    conversations: dict[str, dict] = {}
+    order: list[str] = []
+    current_key: str | None = None
+
+    def _ensure(key: str, label: str) -> dict:
+        if key not in conversations:
+            conversations[key] = {
+                "key": key,
+                "label": label,
+                "records": [],
+                "preview": "",
+            }
+            order.append(key)
+        return conversations[key]
+
+    for rec in records:
+        if rec.get("role") == "user":
+            info = _conversation_info(rec)
+            current_key = info["key"]
+            conv = _ensure(info["key"], info["label"])
+        else:
+            if current_key is None:
+                current_key = "system:global"
+            conv = _ensure(current_key, "系统记录" if current_key == "system:global" else current_key)
+        conv["records"].append(rec)
+        content = (rec.get("content") or "").strip()
+        if content:
+            conv["preview"] = content
+
+    # 最近活跃的会话排前面。
+    return [conversations[k] for k in reversed(order)]
+
+
+def _conversation_info(rec: dict) -> dict[str, str]:
+    meta_messages = (rec.get("metadata") or {}).get("messages") or []
+    first = meta_messages[0] if meta_messages else None
+    if isinstance(first, dict):
+        scope = first.get("scope") or "private"
+        if scope == "group":
+            group_id = str(first.get("group_id") or first.get("target_id") or "未知群")
+            return {"key": f"group:{group_id}", "label": f"群聊 {group_id}"}
+        user_id = str(first.get("user_id") or first.get("target_id") or "未知用户")
+        nickname = str(first.get("nickname") or "私聊")
+        return {"key": f"private:{user_id}", "label": f"私聊 {nickname}({user_id})"}
+
+    content = rec.get("content") or ""
+    match = _LEGACY_HEADER_RE.match(content)
+    if match:
+        if match.group("group_id"):
+            group_id = match.group("group_id")
+            return {"key": f"group:{group_id}", "label": f"群聊 {group_id}"}
+        user_id = match.group("user_id")
+        nickname = match.group("nickname")
+        return {"key": f"private:{user_id}", "label": f"私聊 {nickname}({user_id})"}
+    return {"key": "unknown:history", "label": "未标记来源"}
 
 
 def _escape(s: str) -> str:

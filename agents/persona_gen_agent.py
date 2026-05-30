@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -81,6 +82,12 @@ class PersonaBrief:
     relation_detail: str = ""
     """relation=special 时的补充描述"""
 
+    admin_name: str = ""
+    """管理员/用户的显示名。生成时用于定义角色与用户的起点关系。"""
+
+    admin_qq: str = ""
+    """管理员/用户的 QQ 号。生成时作为身份锚点。"""
+
     extra_notes: str = ""
     """其它任何用户想补充的"""
 
@@ -96,6 +103,7 @@ class PersonaBrief:
             ("关系矩阵（对不同关系的人怎么说话）", self.relation_matrix),
             ("敏感话题 / 破防点 / 跑题诱因", self.sensitive_topics),
             ("用户和角色的关系", _resolve_relation(self.relation, self.relation_detail)),
+            ("管理员/用户信息", _admin_info(self.admin_name, self.admin_qq)),
             ("其它补充", self.extra_notes),
         ]
         lines: list[str] = []
@@ -117,6 +125,17 @@ def _resolve_relation(rel: str, detail: str) -> str:
     if rel == "special" and detail:
         return detail
     return base + (f"（补充：{detail}）" if detail else "")
+
+
+def _admin_info(name: str, qq: str) -> str:
+    parts: list[str] = []
+    if name:
+        parts.append(f"名称：{name}")
+    if qq:
+        parts.append(f"QQ：{qq}")
+    if not parts:
+        return ""
+    return "这是配置 Debata 的管理员/用户身份。生成 <relation_with_user> 时要使用这些信息，不要把用户写成泛泛的陌生人。\n" + "\n".join(parts)
 
 
 # ============================================================
@@ -465,7 +484,11 @@ class PersonaGenAgent:
 # ============================================================
 
 
-def render_persona_file(result: PersonaGenResult, brief: PersonaBrief) -> str:
+def render_persona_file(
+    result: PersonaGenResult,
+    brief: PersonaBrief,
+    admins: list[dict[str, Any]] | None = None,
+) -> str:
     """把 PersonaGenResult 渲染成 persona_prompt.py 文件内容。
 
     输出格式：
@@ -474,6 +497,8 @@ def render_persona_file(result: PersonaGenResult, brief: PersonaBrief) -> str:
     """
     # 三引号字符串中如有连续三个单引号需要转义；这里用替换处理
     safe_prompt = result.persona_prompt.replace("'''", "\\'\\'\\'")
+    admins_text = json.dumps(admins or [], ensure_ascii=False, indent=4)
+    admins_text = "\n".join("    " + line for line in admins_text.splitlines())
     return (
         '"""自动生成的人格档案。可手动调整。"""\n\n'
         "PERSONA_PROMPT = '''\n"
@@ -481,7 +506,7 @@ def render_persona_file(result: PersonaGenResult, brief: PersonaBrief) -> str:
         "'''\n\n"
         "PERSONA_VARS = {\n"
         f"    \"name\": \"{result.display_name}\",\n"
-        "    \"admins\": [],\n"
+        f"    \"admins\": {admins_text},\n"
         "}\n"
     )
 

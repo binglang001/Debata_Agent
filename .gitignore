@@ -1,5 +1,5 @@
 # ============================================================
-# Diana_Agent .gitignore
+# Debata_Agent .gitignore
 # ============================================================
 
 # === Python ===
@@ -30,11 +30,11 @@ data/
 !data/.gitkeep
 
 # === 用户人格（个人私设，不上传）===
-# 所有人格平级放 personas/ 下。仓库自带的（diana）入 git，其余排除。
+# 所有人格平级放 personas/ 下。仓库自带的（debata）入 git，其余排除。
 personas/*
 !personas/__init__.py
-!personas/diana/
-!personas/diana/**
+!personas/debata/
+!personas/debata/**
 # 上面 negate 会把 __pycache__ 也带入，显式排除
 personas/*/__pycache__/
 
@@ -51,7 +51,6 @@ emoji/
 *.safetensors
 *.onnx
 *.gguf
-F:/.models/
 
 # === IDE / 编辑器 ===
 .vscode/

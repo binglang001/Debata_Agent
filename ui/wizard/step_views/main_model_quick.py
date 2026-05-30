@@ -18,7 +18,7 @@ _DEEPSEEK_TUTORIAL_MD = """
 
 1. 打开 [platform.deepseek.com](https://platform.deepseek.com/) 并注册 / 登录
 2. 左侧菜单 → **API Keys** → **创建新 API Key**
-3. 给密钥取个名字（如 "Diana"），创建后**立刻复制**（页面关闭后看不到完整 key）
+3. 给密钥取个名字（如 "Debata"），创建后**立刻复制**（页面关闭后看不到完整 key）
 4. 回到本向导粘贴进密钥框
 
 ## 默认模型与计费
@@ -101,7 +101,6 @@ class MainModelQuickStepView(BaseStepView):
         if not key:
             self.invalid_input.emit("先填一下 DeepSeek API 密钥")
             return False
-        # 写回 context（不强制要求测试通过，用户可能离线后再补）
         self.context.main.preset = "deepseek"
         self.context.main.display_name = "DeepSeek"
         self.context.main.api_key = key
@@ -110,7 +109,44 @@ class MainModelQuickStepView(BaseStepView):
         self.context.main.max_tokens = 16384
         return True
 
+    async def validate_before_next(self) -> bool:
+        if self._key_input.is_test_success():
+            return True
+        key = self._key_input.text().strip()
+        self._key_input.set_test_state("testing", "正在自动测试主模型连接……")
+        ok, message = await self._test_key(key)
+        self._key_input.set_test_state("success" if ok else "error", message)
+        if not ok:
+            self.invalid_input.emit(message)
+        return ok
+
     # ---- 内部 ----
+
+    async def _test_key(self, key: str) -> tuple[bool, str]:
+        try:
+            from providers import probe_provider_endpoint
+
+            result = await probe_provider_endpoint(
+                protocol="openai_compat",
+                base_url="https://api.deepseek.com/v1",
+                api_key=key,
+                model="deepseek-v4-flash",
+                timeout_seconds=8.0,
+            )
+            if result.status == "ok":
+                return True, COPY["main_model_quick.test_success"]
+            return False, result.message
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            if "401" in msg or "unauthorized" in msg or "invalid" in msg:
+                text = COPY["main_model_quick.test_fail_401"]
+            elif "402" in msg or "balance" in msg or "insufficient" in msg:
+                text = COPY["main_model_quick.test_fail_balance"]
+            elif "timeout" in msg or "network" in msg or "connect" in msg:
+                text = COPY["main_model_quick.test_fail_network"]
+            else:
+                text = f"未能完成：{e}"
+            return False, text
 
     def _on_test(self, key: str) -> None:
         """启动一个 asyncio 任务测试 DeepSeek 连接。
@@ -124,47 +160,8 @@ class MainModelQuickStepView(BaseStepView):
             return
 
         async def _do_test() -> None:
-            try:
-                from providers import OpenAICompatProvider
-
-                provider = OpenAICompatProvider(
-                    "wizard_test",
-                    base_url="https://api.deepseek.com/v1",
-                    api_key=key,
-                    timeout=20.0,
-                )
-                try:
-                    result = await provider.chat_completion(
-                        messages=[{"role": "user", "content": "hi"}],
-                        model="deepseek-v4-flash",
-                        tools=None,
-                        temperature=0.1,
-                        max_tokens=5,
-                        stream=False,
-                        timeout=20.0,
-                    )
-                finally:
-                    await provider.aclose()
-
-                if result.content is not None or result.tool_calls:
-                    self._key_input.set_test_state(
-                        "success", COPY["main_model_quick.test_success"]
-                    )
-                else:
-                    self._key_input.set_test_state(
-                        "error", "已连接，但响应为空"
-                    )
-            except Exception as e:  # noqa: BLE001
-                msg = str(e).lower()
-                if "401" in msg or "unauthorized" in msg or "invalid" in msg:
-                    text = COPY["main_model_quick.test_fail_401"]
-                elif "402" in msg or "balance" in msg or "insufficient" in msg:
-                    text = COPY["main_model_quick.test_fail_balance"]
-                elif "timeout" in msg or "network" in msg or "connect" in msg:
-                    text = COPY["main_model_quick.test_fail_network"]
-                else:
-                    text = f"未能完成：{e}"
-                self._key_input.set_test_state("error", text)
+            ok, message = await self._test_key(key)
+            self._key_input.set_test_state("success" if ok else "error", message)
 
         loop.create_task(_do_test())
 

@@ -1,18 +1,16 @@
 """消息类工具：发送私聊/群消息、撤回、上传文件。
 
-发送类工具特殊性：
-    - 不立即发送，而是把构造好的动作攒到 `ctx.collected` 列表。
-    - 调用方（message_pipeline）在工具循环结束后读取 collected，
-      逐条真实发送（保留旧版"中断检测 + typing delay"语义）。
-    - 这样设计让 AgentRunner 与发送时序解耦，便于 P1.8 实现"发送中断"。
-
-撤回 / 上传文件直接调用 adapter，无延迟逻辑。
+发送类工具保留 order / delay / typing_delay 的节奏。运行在 MessagePipeline
+内时交给 Phase 0 异步发送队列；没有队列回调的独立调用退回同步直发兜底。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
+
+from adapters.types import Target
 
 from .base import ToolContext, tool
 from .message_builder import build_message, contains_forbidden, typing_delay
@@ -24,6 +22,11 @@ from .schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _mark_activity(ctx: ToolContext) -> None:
+    if ctx.activity_cb is not None:
+        ctx.activity_cb()
 
 
 # ============================================================
@@ -42,8 +45,11 @@ logger = logging.getLogger(__name__)
     category="messaging",
 )
 async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict:
-    """收集私聊发送动作到 ctx.collected。"""
-    valid = 0
+    """按 order 即时发送私聊消息，返回每条真实 msg_id。"""
+    if ctx.adapter is None:
+        return {"ok": False, "error": "未连接适配器"}
+
+    actions: list[dict] = []
     errors: list[str] = []
 
     # 按 order 升序排序，保证逐条发送顺序与 LLM 意图一致
@@ -71,19 +77,52 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
                 max_delay=ctx.typing_max_delay_seconds,
             ) if t.content else 0.5
 
-        ctx.collected.append(
+        actions.append(
             {
-                "action": "private",
-                "target": str(t.target_qq),
+                "order": t.order,
+                "target_scope": "private",
+                "target_id": str(t.target_qq),
                 "content": msg,
                 "label": label or "",
                 "delay": delay,
-                "send_only": args.send_only,
+                "kind": "text",
             }
         )
-        valid += 1
 
-    result: dict = {"ok": True, "count": valid}
+    if ctx.send_actions_cb is not None:
+        result = await ctx.send_actions_cb(actions, "send_private_messages")
+        if errors:
+            result["errors"] = [*result.get("errors", []), *errors]
+        return result
+
+    sent: list[dict[str, str | int | None]] = []
+    for i, action in enumerate(actions):
+        target = Target(
+            adapter=ctx.adapter.name,
+            scope="private",
+            target_id=str(action["target_id"]),
+        )
+        try:
+            msg_id = await ctx.adapter.send_text(target, str(action["content"]))
+            _mark_activity(ctx)
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"send_private_messages 发送失败 target={target.target_id}: {e}")
+            errors.append(f"target_qq={target.target_id}: 发送失败：{e}")
+            continue
+
+        sent.append(
+            {
+                "order": int(action["order"]),
+                "target_qq": target.target_id,
+                "msg_id": str(msg_id) if msg_id is not None else None,
+            }
+        )
+
+        delay = float(action.get("delay") or 0.0)
+        if delay > 0 and i < len(actions) - 1:
+            await asyncio.sleep(delay)
+
+    result: dict = {"ok": bool(sent) or not actions, "count": len(sent), "sent": sent}
     if errors:
         result["errors"] = errors
     return result
@@ -105,8 +144,11 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
     category="messaging",
 )
 async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
-    """收集群聊发送动作到 ctx.collected。"""
-    valid = 0
+    """按 order 即时发送群消息，返回每条真实 msg_id。"""
+    if ctx.adapter is None:
+        return {"ok": False, "error": "未连接适配器"}
+
+    actions: list[dict] = []
     errors: list[str] = []
 
     sorted_targets = sorted(args.targets, key=lambda t: t.order)
@@ -128,19 +170,52 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
                 max_delay=ctx.typing_max_delay_seconds,
             ) if t.content else 0.5
 
-        ctx.collected.append(
+        actions.append(
             {
-                "action": "group",
-                "target": str(args.group_id),
+                "order": t.order,
+                "target_scope": "group",
+                "target_id": str(args.group_id),
                 "content": msg,
                 "label": label or "",
                 "delay": delay,
-                "send_only": args.send_only,
+                "kind": "text",
             }
         )
-        valid += 1
 
-    result: dict = {"ok": True, "count": valid}
+    if ctx.send_actions_cb is not None:
+        result = await ctx.send_actions_cb(actions, "send_group_message")
+        if errors:
+            result["errors"] = [*result.get("errors", []), *errors]
+        return result
+
+    sent: list[dict[str, str | int | None]] = []
+    for i, action in enumerate(actions):
+        target = Target(
+            adapter=ctx.adapter.name,
+            scope="group",
+            target_id=str(action["target_id"]),
+        )
+        try:
+            msg_id = await ctx.adapter.send_text(target, str(action["content"]))
+            _mark_activity(ctx)
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"send_group_message 发送失败 group={target.target_id}: {e}")
+            errors.append(f"group_id={target.target_id}: 发送失败：{e}")
+            continue
+
+        sent.append(
+            {
+                "order": int(action["order"]),
+                "group_id": target.target_id,
+                "msg_id": str(msg_id) if msg_id is not None else None,
+            }
+        )
+
+        delay = float(action.get("delay") or 0.0)
+        if delay > 0 and i < len(actions) - 1:
+            await asyncio.sleep(delay)
+
+    result: dict = {"ok": bool(sent) or not actions, "count": len(sent), "sent": sent}
     if errors:
         result["errors"] = errors
     return result
@@ -165,6 +240,7 @@ async def recall_message(args: RecallMessageArgs, ctx: ToolContext) -> dict:
     ok = await ctx.adapter.recall(str(args.message_id))
     if not ok:
         return {"ok": False, "error": "撤回失败（可能已超时或消息不存在）"}
+    _mark_activity(ctx)
     return {"ok": True}
 
 
@@ -175,42 +251,29 @@ async def recall_message(args: RecallMessageArgs, ctx: ToolContext) -> dict:
 
 @tool(
     name="upload_file",
-    description="向私聊或群聊发送本地文件。文件路径必须在白名单目录下。",
+    description=(
+        "向私聊或群聊发送本地文件。file_path 可以是相对 workspace 的路径"
+        "（如 'report.pdf'）或绝对路径——但**必须**在 workspace 目录下，否则拒绝。"
+        "file_name 是发到 QQ 后显示的文件名，可不填，系统会自动使用源文件名。"
+    ),
     args_model=UploadFileArgs,
     category="messaging",
 )
 async def upload_file(args: UploadFileArgs, ctx: ToolContext) -> dict:
-    """通过 adapter.upload_file 上传。
-
-    安全检查：file_path 必须 realpath 后位于 ctx.upload_allowed_dir 之下。
-    """
+    """通过 adapter.upload_file 上传。安全检查：file_path 必须在 workspace 下。"""
     if ctx.adapter is None:
         return {"ok": False, "error": "未连接适配器"}
-    if ctx.upload_allowed_dir is None:
-        return {"ok": False, "error": "未配置上传白名单目录，已禁用"}
+
+    from .workspace import WorkspaceError, resolve_in_workspace
 
     try:
-        file_path = Path(args.file_path).resolve(strict=False)
-    except OSError as e:
-        return {"ok": False, "error": f"路径无效: {e}"}
+        file_path = resolve_in_workspace(args.file_path, ctx.workspace_dir)
+    except WorkspaceError as e:
+        return {"ok": False, "error": str(e)}
 
     if not file_path.exists() or not file_path.is_file():
         return {"ok": False, "error": "文件不存在"}
 
-    # 白名单根目录
-    try:
-        allowed_root = ctx.upload_allowed_dir.resolve(strict=False)
-    except OSError as e:
-        return {"ok": False, "error": f"白名单目录无效: {e}"}
-
-    try:
-        # Path.is_relative_to 是 3.9+ 的 API
-        if not file_path.is_relative_to(allowed_root):
-            return {"ok": False, "error": "文件路径不在允许范围内"}
-    except ValueError:
-        return {"ok": False, "error": "文件路径不在允许范围内"}
-
-    # 构造 Target
     from adapters.types import Target  # 延迟导入避免循环
 
     scope = "private" if args.target_type == "private" else "group"
@@ -224,8 +287,9 @@ async def upload_file(args: UploadFileArgs, ctx: ToolContext) -> dict:
         await ctx.adapter.upload_file(
             target,
             file_path,
-            display_name=args.file_name,
+            display_name=args.file_name or file_path.name,
         )
+        _mark_activity(ctx)
     except NotImplementedError:
         return {"ok": False, "error": "当前适配器不支持上传文件"}
     except Exception as e:

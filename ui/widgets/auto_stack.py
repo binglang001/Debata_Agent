@@ -8,7 +8,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QSize, QTimer
+from PySide6.QtWidgets import QSizePolicy
 from PySide6.QtWidgets import QStackedWidget
 
 
@@ -17,6 +18,7 @@ class AutoSizeStack(QStackedWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.currentChanged.connect(self._on_current_changed)
 
     def sizeHint(self) -> QSize:  # type: ignore[override]
@@ -31,10 +33,23 @@ class AutoSizeStack(QStackedWidget):
             return super().minimumSizeHint()
         return cur.minimumSizeHint()
 
+    def sync_current_size(self) -> None:
+        """按当前页刷新几何信息，避免 QStackedWidget 沿用历史最大 sizeHint。"""
+        cur = self.currentWidget()
+        if cur is None:
+            self.setMinimumHeight(0)
+            return
+        self.setMinimumHeight(0)
+        self.setMaximumHeight(16777215)
+        self.updateGeometry()
+        parent = self.parentWidget()
+        if parent is not None:
+            parent.updateGeometry()
+
     def _on_current_changed(self, _idx: int) -> None:
         # 让外层 ScrollArea 立即重新评估是否需要纵向滚动条
-        self.updateGeometry()
-        self.adjustSize()
+        self.sync_current_size()
+        QTimer.singleShot(0, self.sync_current_size)
 
 
 __all__ = ["AutoSizeStack"]

@@ -15,7 +15,10 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -27,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..theme import Spacing
+from ..widgets import FramelessDialog, show_message
 from .copy import DASHBOARD_COPY
 
 
@@ -102,6 +106,19 @@ class LogsPage(QWidget):
         self._search_edit.textChanged.connect(self._refilter)
         filter_row.addWidget(self._search_edit, 1)
 
+        self._pause_chk = QCheckBox("暂停滚动")
+        filter_row.addWidget(self._pause_chk)
+
+        copy_btn = QPushButton(DASHBOARD_COPY["button.copy"])
+        copy_btn.setProperty("role", "secondary")
+        copy_btn.clicked.connect(self._copy_selected)
+        filter_row.addWidget(copy_btn)
+
+        export_btn = QPushButton(DASHBOARD_COPY["logs.export_button"])
+        export_btn.setProperty("role", "secondary")
+        export_btn.clicked.connect(self._export_filtered)
+        filter_row.addWidget(export_btn)
+
         clear_btn = QPushButton(DASHBOARD_COPY["logs.clear_button"])
         clear_btn.setProperty("role", "secondary")
         clear_btn.clicked.connect(self._on_clear)
@@ -112,6 +129,7 @@ class LogsPage(QWidget):
         # 日志列表
         self._list = QListWidget()
         self._list.setUniformItemSizes(True)
+        self._list.itemDoubleClicked.connect(self._show_record_detail)
         outer.addWidget(self._list, 1)
 
         # 缓冲
@@ -145,7 +163,8 @@ class LogsPage(QWidget):
         if self._should_show(record):
             self._append_item(record)
             # 自动滚到底
-            self._list.scrollToBottom()
+            if not self._pause_chk.isChecked():
+                self._list.scrollToBottom()
 
     def _should_show(self, record: logging.LogRecord) -> bool:
         threshold = self._level_combo.currentData() or 0
@@ -162,13 +181,9 @@ class LogsPage(QWidget):
         return True
 
     def _append_item(self, record: logging.LogRecord) -> None:
-        try:
-            asctime = logging.Formatter("%(asctime)s").format(record).split(",")[0]
-        except Exception:
-            asctime = ""
-        level_name = _LEVEL_NAMES.get(record.levelno, record.levelname)
-        text = f"{asctime}  {level_name:<5}  {record.name}  :  {record.getMessage()}"
+        text = _format_record(record, single_line=True)
         item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, record)
         # 等级染色
         if record.levelno >= logging.ERROR:
             item.setForeground(Qt.GlobalColor.red)
@@ -185,8 +200,83 @@ class LogsPage(QWidget):
         for r in list(self._records):
             if self._should_show(r):
                 self._append_item(r)
-        self._list.scrollToBottom()
+        if not self._pause_chk.isChecked():
+            self._list.scrollToBottom()
 
     def _on_clear(self) -> None:
         self._records.clear()
         self._list.clear()
+
+    def _visible_records(self) -> list[logging.LogRecord]:
+        return [r for r in list(self._records) if self._should_show(r)]
+
+    def _copy_selected(self) -> None:
+        items = self._list.selectedItems()
+        if not items:
+            show_message(self, "没有选中日志", "请先选中一条日志。")
+            return
+        lines = [item.text() for item in items]
+        clipboard = QApplication.clipboard()
+        if clipboard:
+            clipboard.setText("\n".join(lines))
+
+    def _export_filtered(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出当前日志", "debata_logs.txt", "Text (*.txt);;All Files (*)"
+        )
+        if not path:
+            return
+        records = self._visible_records()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for record in records:
+                    f.write(_format_record(record, single_line=False))
+                    f.write("\n\n")
+        except OSError as e:
+            show_message(self, "导出失败", str(e), is_danger=True)
+            return
+        show_message(self, "已导出", f"已写入 {len(records)} 条日志：\n{path}")
+
+    def _show_record_detail(self, item: QListWidgetItem) -> None:
+        record = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(record, logging.LogRecord):
+            return
+        dlg = FramelessDialog("日志详情", self)
+        dlg.setMinimumSize(720, 480)
+        text = QLabel(_format_record(record, single_line=False))
+        text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        text.setWordWrap(True)
+        dlg.body_layout().addWidget(text, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        copy_btn = QPushButton("复制详情")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(text.text()))
+        row.addWidget(copy_btn)
+        close_btn = QPushButton("关闭")
+        close_btn.setProperty("role", "primary")
+        close_btn.clicked.connect(dlg.accept)
+        row.addWidget(close_btn)
+        dlg.body_layout().addLayout(row)
+        dlg.exec()
+
+
+def _format_record(record: logging.LogRecord, *, single_line: bool) -> str:
+    try:
+        asctime = logging.Formatter("%(asctime)s").format(record).split(",")[0]
+    except Exception:
+        asctime = ""
+    level_name = _LEVEL_NAMES.get(record.levelno, record.levelname)
+    msg = record.getMessage()
+    if single_line:
+        msg = " ".join(msg.splitlines())
+        return f"{asctime}  {level_name:<5}  {record.name}  :  {msg}"
+    parts = [
+        f"时间：{asctime}",
+        f"等级：{level_name}",
+        f"模块：{record.name}",
+        "",
+        msg,
+    ]
+    if record.exc_info:
+        parts.extend(["", logging.Formatter().formatException(record.exc_info)])
+    return "\n".join(parts)

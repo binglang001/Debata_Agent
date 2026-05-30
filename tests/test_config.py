@@ -9,6 +9,7 @@ from app_config.loader import ConfigError, load_config, save_config
 from app_config.schema import (
     AgentConfig,
     AgentsConfig,
+    ASRFeatureConfig,
     NapCatAdapterConfig,
     ProviderConfig,
     RootConfig,
@@ -107,6 +108,7 @@ def test_temperature_range():
 
 def test_save_load_roundtrip(tmp_paths, fake_keyring):
     cfg = _minimal_config()
+    cfg.app.theme = "dark"
     save_config(tmp_paths, cfg, backup=False)
 
     assert tmp_paths.CONFIG_FILE.exists()
@@ -114,6 +116,13 @@ def test_save_load_roundtrip(tmp_paths, fake_keyring):
     loaded = load_config(tmp_paths)
     assert loaded.agents.chat.provider == "ds"
     assert loaded.providers["ds"].preset == "deepseek"
+    assert loaded.app.theme == "dark"
+
+
+def test_theme_default_is_auto():
+    cfg = _minimal_config()
+
+    assert cfg.app.theme == "auto"
 
 
 def test_load_missing_config_raises(tmp_paths, fake_keyring):
@@ -139,7 +148,7 @@ def test_load_invalid_schema_raises(tmp_paths, fake_keyring):
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ConfigError, match="配置校验失败"):
+    with pytest.raises(ConfigError, match="配置校验未通过"):
         load_config(tmp_paths)
 
 
@@ -165,5 +174,8 @@ def test_features_default_disabled():
     assert cfg.features.vision.enabled is False
     assert cfg.features.asr.enabled is False
     assert cfg.features.tts.enabled is False
-    assert cfg.features.weather.enabled is False
-    assert cfg.features.web_search.enabled is True  # 默认开启
+
+
+def test_default_asr_legacy_config_is_kept_for_migration():
+    cfg = ASRFeatureConfig()
+    assert cfg.local_model == "large-v3"

@@ -50,7 +50,7 @@ class PersonaCreatorStepView(BaseStepView):
         head_card = SectionCard(
             title="塑造你的角色",
             subtitle=(
-                "回答几个问题，Diana 会和你一起把这个角色具象化。\n"
+                "回答几个问题，Debata 会和你一起把这个角色具象化。\n"
                 "可以多轮调整，直到你满意为止。"
             ),
         )
@@ -83,6 +83,16 @@ class PersonaCreatorStepView(BaseStepView):
         self._name_edit.setPlaceholderText(COPY["persona_create.name_placeholder"])
         layout.addWidget(self._field_label(COPY["persona_create.name_label"]))
         layout.addWidget(self._name_edit)
+
+        admin_row = QHBoxLayout()
+        self._admin_name_edit = QLineEdit()
+        self._admin_name_edit.setPlaceholderText("管理员名称（可选）")
+        admin_row.addWidget(self._admin_name_edit, 1)
+        self._admin_qq_edit = QLineEdit()
+        self._admin_qq_edit.setPlaceholderText("管理员 QQ（可选）")
+        admin_row.addWidget(self._admin_qq_edit, 1)
+        layout.addWidget(self._field_label("管理员信息"))
+        layout.addLayout(admin_row)
 
         self._personality_edit = self._mk_textarea(COPY["persona_create.personality_placeholder"])
         layout.addWidget(self._field_label(COPY["persona_create.personality_label"]))
@@ -149,7 +159,7 @@ class PersonaCreatorStepView(BaseStepView):
 
         # 生成按钮 + 进度条
         btn_row = QHBoxLayout()
-        self._generate_btn = QPushButton("生成")
+        self._generate_btn = QPushButton("生成人格")
         self._generate_btn.setProperty("role", "primary")
         self._generate_btn.clicked.connect(self._on_generate)
         btn_row.addWidget(self._generate_btn)
@@ -230,6 +240,8 @@ class PersonaCreatorStepView(BaseStepView):
                 rel = f"special:{extra}"
         return PersonaBrief(
             name=self._name_edit.text().strip(),
+            admin_name=self._admin_name_edit.text().strip(),
+            admin_qq=self._admin_qq_edit.text().strip(),
             personality=self._personality_edit.toPlainText().strip(),
             background=self._background_edit.toPlainText().strip(),
             voice_samples=self._voice_edit.toPlainText().strip(),
@@ -281,6 +293,11 @@ class PersonaCreatorStepView(BaseStepView):
             self._status_label.setProperty("role", "error")
             self._restyle(self._status_label)
             return
+        if brief.admin_qq and not brief.admin_qq.isdigit():
+            self._status_label.setText("管理员 QQ 应该是纯数字")
+            self._status_label.setProperty("role", "error")
+            self._restyle(self._status_label)
+            return
         # 本地校验：避免向导完成后才发现 persona 目录创不出来
         from agents.persona_loader import validate_persona_name
         try:
@@ -322,6 +339,8 @@ class PersonaCreatorStepView(BaseStepView):
                 self.context.persona.generated_xml = result.persona_prompt
                 self.context.persona.active = brief.name
                 self.context.persona.source = "create"
+                self.context.admin_name = brief.admin_name
+                self.context.admin_qq = brief.admin_qq
                 self._refine_btn.setEnabled(True)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"PersonaGen 失败: {e}")
@@ -370,7 +389,10 @@ class PersonaCreatorStepView(BaseStepView):
                 result = await agent.refine(prev, feedback)
                 brief = self._current_brief()
                 self._render_result(result.persona_prompt, brief)
+                self.context.persona.brief = brief
                 self.context.persona.generated_xml = result.persona_prompt
+                self.context.admin_name = brief.admin_name
+                self.context.admin_qq = brief.admin_qq
                 self._status_label.setText(f"调过了（第 {result.refined_count} 版）")
                 self._status_label.setProperty("role", "success")
                 self._adjust_edit.clear()
@@ -400,8 +422,12 @@ class PersonaCreatorStepView(BaseStepView):
 
     def refresh(self) -> None:
         p = self.context.persona
+        self._admin_name_edit.setText(self.context.admin_name)
+        self._admin_qq_edit.setText(self.context.admin_qq)
         if p.brief:
             self._name_edit.setText(p.brief.name)
+            self._admin_name_edit.setText(p.brief.admin_name or self.context.admin_name)
+            self._admin_qq_edit.setText(p.brief.admin_qq or self.context.admin_qq)
             self._personality_edit.setPlainText(p.brief.personality)
             self._background_edit.setPlainText(p.brief.background)
             self._voice_edit.setPlainText(p.brief.voice_samples)

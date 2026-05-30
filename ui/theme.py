@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 # ============================================================
@@ -183,6 +184,9 @@ QWidget {{
 /* QMainWindow / QDialog 走 WA_TranslucentBackground，自身不绘背景，由内部 WindowFrame 接管。
  * 注意：仍给 QSS 一个透明 fallback，防止某些控件意外画白底。 */
 QMainWindow, QDialog {{
+    background-color: {p.bg_primary};
+}}
+QMainWindow[frameless="true"], QDialog[frameless="true"] {{
     background-color: transparent;
 }}
 
@@ -440,6 +444,54 @@ QPushButton[role="win-close"]:pressed {{
 QFrame#DialogTitleBar {{
     background-color: {p.bg_card};
     border-bottom: 1px solid {p.border};
+}}
+
+/* ============================================================
+ * 模型安装指引浮窗
+ * ============================================================ */
+QFrame#ModelGuideHero {{
+    background-color: {p.bg_card};
+    border: 1px solid {p.border};
+    border-left: 4px solid {p.accent_primary};
+    border-radius: {Radius.SMALL}px;
+}}
+
+QTextBrowser#ModelGuideBrowser {{
+    background-color: {p.bg_card};
+    color: {p.text_primary};
+    border: 1px solid {p.border};
+    border-radius: {Radius.SMALL}px;
+    padding: 14px;
+    selection-background-color: {p.accent_primary};
+    selection-color: white;
+}}
+QTextBrowser#ModelGuideBrowser:focus {{
+    border-color: {p.accent_primary};
+}}
+QTextBrowser#ModelGuideBrowser QWidget {{
+    background-color: {p.bg_card};
+}}
+
+QTextBrowser#TutorialBrowser {{
+    background-color: {p.bg_card};
+    color: {p.text_primary};
+    border: 1px solid {p.border};
+    border-radius: {Radius.SMALL}px;
+    padding: 14px;
+    selection-background-color: {p.accent_primary};
+    selection-color: white;
+}}
+QTextBrowser#TutorialBrowser:focus {{
+    border-color: {p.accent_primary};
+}}
+QTextBrowser#TutorialBrowser QWidget {{
+    background-color: {p.bg_card};
+}}
+
+QFrame#ModelGuideDependencyPanel {{
+    background-color: {_rgba(p.accent_blue, 0.08)};
+    border: 1px solid {_rgba(p.accent_blue, 0.28)};
+    border-radius: {Radius.SMALL}px;
 }}
 
 /* ============================================================
@@ -944,6 +996,10 @@ QProgressBar::chunk {{
     border-radius: 2px;
 }}
 
+QSizeGrip#WindowSizeGrip {{
+    background: transparent;
+}}
+
 /* ============================================================
  * Splitter
  * ============================================================ */
@@ -997,6 +1053,38 @@ def _rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r}, {g}, {b}, {a:.3f})"
 
 
+ThemeName = Literal["auto", "light", "dark"]
+
+
+def system_theme_name() -> Literal["light", "dark"]:
+    """按当前系统/Qt 调色板判断启动主题。"""
+    try:
+        from PySide6.QtGui import QPalette
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        palette = app.palette() if app is not None else QPalette()
+        return (
+            "dark"
+            if palette.color(QPalette.ColorRole.Window).lightness() < 128
+            else "light"
+        )
+    except Exception:
+        return "light"
+
+
+def resolve_theme_name(theme: str | None) -> Literal["light", "dark"]:
+    if theme == "dark":
+        return "dark"
+    if theme == "light":
+        return "light"
+    return system_theme_name()
+
+
+def palette_for_theme(theme: str | None) -> Palette:
+    return DARK if resolve_theme_name(theme) == "dark" else LIGHT
+
+
 # ============================================================
 # 默认导出
 # ============================================================
@@ -1012,6 +1100,10 @@ __all__ = [
     "SERIF_FAMILIES",
     "SANS_FAMILIES",
     "MONO_FAMILIES",
+    "ThemeName",
     "font_family",
     "build_qss",
+    "palette_for_theme",
+    "resolve_theme_name",
+    "system_theme_name",
 ]

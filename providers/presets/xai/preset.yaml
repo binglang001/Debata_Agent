@@ -1,0 +1,17 @@
+id: xai
+display_name: xAI Grok
+protocol: openai_compat
+base_url: https://api.x.ai/v1
+registration_url: https://x.ai/api
+reasoning_style: none
+
+models:
+  - id: grok-2-1212
+    display_name: Grok 2
+    capabilities: [chat, tool_call]
+    context_length: 131072
+
+  - id: grok-2-vision-1212
+    display_name: Grok 2 Vision
+    capabilities: [chat, tool_call, vision]
+    context_length: 131072

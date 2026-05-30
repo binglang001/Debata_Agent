@@ -88,6 +88,16 @@ def test_load_preset_id_lowercased(tmp_path):
     assert preset.id == "upper"
 
 
+def test_builtin_presets_include_current_flagship_models():
+    """这些 ID 来自 2026-05-29 查询的官方模型文档。"""
+    presets = load_all_presets(PRESETS_DIR)
+
+    assert any(m.id == "gpt-5.5" for m in presets["openai"].models)
+    assert any(m.id == "claude-opus-4-8" for m in presets["anthropic"].models)
+    assert any(m.id == "qwen3.7-max" for m in presets["qwen"].models)
+    assert any(m.id == "doubao-seed-2-0-lite-260428" for m in presets["volcengine"].models)
+
+
 def test_load_preset_detects_tutorial_dir(tmp_path):
     (tmp_path / "preset.yaml").write_text(
         "id: p\ndisplay_name: P\nprotocol: openai_compat\nbase_url: https://x",
@@ -101,8 +111,22 @@ def test_load_preset_detects_tutorial_dir(tmp_path):
 
 def test_load_all_presets_smoke(tmp_path):
     """空目录应返回 {}。"""
-    presets = load_all_presets(tmp_path)
+    presets = load_all_presets(tmp_path, force_reload=True)
     assert presets == {}
+
+
+def test_load_all_presets_uses_cache(tmp_path):
+    (tmp_path / "good").mkdir()
+    (tmp_path / "good" / "preset.yaml").write_text(
+        "id: good\ndisplay_name: G\nprotocol: openai_compat\nbase_url: https://g",
+        encoding="utf-8",
+    )
+    first = load_all_presets(tmp_path, force_reload=True)
+    assert "good" in first
+
+    (tmp_path / "good" / "preset.yaml").unlink()
+    second = load_all_presets(tmp_path)
+    assert second.keys() == first.keys()
 
 
 def test_load_all_presets_skips_invalid(tmp_path):

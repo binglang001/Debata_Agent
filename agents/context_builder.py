@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 from typing import Any
 
@@ -39,6 +40,16 @@ from agents.behavior_prompt import (
 from agents.persona_loader import Persona
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class ContextRequest:
+    """构建上下文时的轻量请求对象。"""
+
+    view: Literal["main_reply", "wakeup", "proactive_router", "recall", "request"]
+    conversation_id: str | None = None
+    current_input: str = ""
+    token_budget: Any | None = None
 
 
 def build_combined_system_prompt(
@@ -142,6 +153,7 @@ def build_messages(
     persona: Persona,
     history: list[dict[str, Any]],
     important_memory_text: str = "",
+    rolling_summary_text: str = "",
     current_context: str = "",
     system_override: str | None = None,
     *,
@@ -178,6 +190,18 @@ def build_messages(
     admin_info = build_admin_info(persona)
     if admin_info:
         messages.append({"role": "system", "content": admin_info})
+
+    if rolling_summary_text:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    '<rolling_conversation_summary priority="medium">\n'
+                    f"{rolling_summary_text.strip()}\n"
+                    "</rolling_conversation_summary>"
+                ),
+            }
+        )
 
     messages.extend(history)
 

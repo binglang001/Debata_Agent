@@ -6,7 +6,7 @@
     icon.ico             （可选）
 
 所有人格平级放在 personas/{name}/ 下：
-    - 仓库自带的（如 diana/）随仓库一起发布
+    - 仓库自带的（如 debata/）随仓库一起发布
     - 用户自创的由 .gitignore 排除，不上传
     程序加载时无差别对待。
 """
@@ -125,6 +125,6 @@ def list_available_personas(paths: AppPaths) -> list[str]:
     if not found:
         logger.warning(
             f"personas 目录 {base} 下没有任何可用人格。"
-            f"请克隆仓库自带的 diana/ 或新建一个（参考 docs/persona_writing_guide.md）。"
+            f"请克隆仓库自带的 debata/ 或新建一个（参考 docs/persona_writing_guide.md）。"
         )
     return sorted(found)

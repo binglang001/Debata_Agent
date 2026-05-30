@@ -11,7 +11,7 @@ DASHBOARD_COPY: dict[str, str] = {
     # ============================================================
     # 窗口标题
     # ============================================================
-    "window.title": "Diana_Agent",
+    "window.title": "Debata_Agent",
 
     # ============================================================
     # 导航
@@ -22,7 +22,7 @@ DASHBOARD_COPY: dict[str, str] = {
     "nav.logs": "日志",
     "nav.personas": "角色",
     "nav.settings": "设置",
-    "nav.plugins": "插件",
+    "nav.models": "模型管理",
 
     # ============================================================
     # 顶部状态栏
@@ -45,11 +45,12 @@ DASHBOARD_COPY: dict[str, str] = {
 
     "overview.providers_title": "模型健康",
     "overview.provider_status_ok": "可用",
+    "overview.provider_status_unknown": "未检测",
     "overview.provider_status_warning": "响应慢",
     "overview.provider_status_error": "无响应",
     "overview.provider_latency_label": "近 5 分钟平均延迟",
 
-    "overview.stats_title": "近 24 小时",
+    "overview.stats_title": "累计概况",
     "overview.stats_messages_in": "收到消息",
     "overview.stats_messages_out": "发出消息",
     "overview.stats_tool_calls": "工具调用",
@@ -86,7 +87,7 @@ DASHBOARD_COPY: dict[str, str] = {
     "memory.edit_button": "编辑",
     "memory.delete_button": "移除",
     "memory.delete_confirm_title": "移除这条记忆？",
-    "memory.delete_confirm_body": "Diana 之后不会再用它做参考。这是不可逆的操作。",
+    "memory.delete_confirm_body": "Debata 之后不会再用它做参考。这是不可逆的操作。",
     "memory.export_button": "导出",
     "memory.import_button": "导入",
 
@@ -117,7 +118,7 @@ DASHBOARD_COPY: dict[str, str] = {
     "settings.unsaved_changes": "有未保存的修改",
     "settings.save_button": "记住",
     "settings.discard_button": "丢弃修改",
-    "settings.restart_required": "改动需要重启 Diana 才能生效",
+    "settings.restart_required": "改动需要重启 Debata 才能生效",
     "settings.restart_button": "立即重启",
 
     "settings.appearance_theme": "主题",
@@ -146,15 +147,13 @@ DASHBOARD_COPY: dict[str, str] = {
     "personas.delete_active_warning": "这是当前角色，请先切换到其它角色再删除。",
 
     # ============================================================
-    # 插件管理
+    # 模型管理
     # ============================================================
-    "plugins.section_installed": "已安装",
-    "plugins.section_available": "可安装",
-    "plugins.install_button": "安装",
-    "plugins.uninstall_button": "卸载",
-    "plugins.update_button": "更新",
-    "plugins.installing": "正在安装……",
-    "plugins.downloading_model": "正在下载模型，请耐心等候",
+    "models.empty_title": "暂无本地模型",
+    "models.empty_subtitle": "插件目录下未发现本地模型。",
+    "models.download_button": "安装指引",
+    "models.open_dir_button": "打开目录",
+    "models.rescan_button": "重新扫描",
 
     # ============================================================
     # 系统托盘
@@ -162,10 +161,10 @@ DASHBOARD_COPY: dict[str, str] = {
     "tray.menu_dashboard": "打开仪表盘",
     "tray.menu_pause": "暂停响应",
     "tray.menu_resume": "继续响应",
-    "tray.menu_restart": "重启 Diana",
+    "tray.menu_restart": "重启 Debata",
     "tray.menu_quit": "退出",
-    "tray.notify_connected": "Diana 已就位",
-    "tray.notify_disconnected": "Diana 断线了",
+    "tray.notify_connected": "Debata 已就位",
+    "tray.notify_disconnected": "Debata 断线了",
     "tray.notify_error_title": "出了点状况",
 
     # ============================================================

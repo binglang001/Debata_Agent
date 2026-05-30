@@ -118,7 +118,7 @@ class SummaryStepView(BaseStepView):
 
         # 渠道
         adapter_lines = [
-            ("连接方式", "Diana 连过去" if c.adapter.mode == "client" else "NapCat 连过来"),
+            ("连接方式", "Debata 连过去" if c.adapter.mode == "client" else "NapCat 连过来"),
             ("地址", f"{c.adapter.host}:{c.adapter.port}{c.adapter.path}"),
             ("白名单", {"open": "对所有人开放", "verify": "管理员审核", "whitelist": "白名单"}[c.adapter.whitelist.mode]),
         ]

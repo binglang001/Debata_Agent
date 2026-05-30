@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 ROUTER_INSTRUCTION = (
     "你现在处于后台主动思考模式。快速判断：是否需要发消息给任何人？"
+    "如果历史里有人明确要求你在“下次主动思考”时发消息、提醒用户或执行明确操作，"
+    "本轮就是执行时机，应回复 TAKE_ACTIONS。"
     "只回复 TAKE_ACTIONS（需要）或 NO_ACTIONS（不需要）。不要解释。"
 )
 
@@ -65,7 +67,7 @@ class ProactiveRouterAgent:
             return False
 
         text = (result.content or "").strip().upper()
-        decision = "TAKE_ACTIONS" in text
+        decision = _is_action_decision(text)
         logger.info(f"主动路由: text={text[:40]!r}, decision={decision}")
         return decision
 
@@ -77,3 +79,17 @@ class ProactiveRouterAgent:
             budget=self.cfg.reasoning.budget,
             max_tokens=self.cfg.reasoning.max_tokens,
         )
+
+
+def _is_action_decision(text: str) -> bool:
+    """解析主动路由输出。
+
+    主动路由只能接受干净的 TAKE_ACTIONS。模型吐 DSML / 工具标记时属于
+    无工具调用场景下的畸形输出，不能当作需要行动，否则会周期性空跑主模型。
+    """
+    normalized = (text or "").strip().upper()
+    if normalized == "TAKE_ACTIONS":
+        return True
+    if normalized == "NO_ACTIONS":
+        return False
+    return False

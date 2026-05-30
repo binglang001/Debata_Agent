@@ -118,6 +118,11 @@ class RagStore:
             await self._rewrite()
         return removed
 
+    async def replace_all(self, entries: list[RagEntry]) -> None:
+        """用给定条目整体替换索引并重写磁盘。"""
+        self._entries = list(entries)
+        await self._rewrite()
+
     def top_k(self, query_vec: list[float], k: int = 5) -> list[tuple[RagEntry, float]]:
         """同步检索 top-k 最相似条目。返回 [(entry, score), ...] 按 score 降序。
 

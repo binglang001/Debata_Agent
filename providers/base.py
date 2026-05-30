@@ -17,6 +17,7 @@
     - content: 文本输出
     - tool_calls: 工具调用列表
     - reasoning_content: 思考内容（如 DeepSeek Reasoner、Claude extended thinking）
+    - reasoning_blocks: 需要原样回传的思考块（如 Claude signed thinking blocks）
     - usage: token 用量
     - finish_reason: stop / tool_calls / length / ...
 """
@@ -68,6 +69,9 @@ class CompletionResult:
 
     reasoning_content: str = ""
     """思考内容（reasoning_content / thinking 等）"""
+
+    reasoning_blocks: list[dict[str, Any]] = field(default_factory=list)
+    """Provider 特定的思考块。仅用于后续请求原样回传，不用于展示。"""
 
     finish_reason: str = ""
     """stop / tool_calls / length / content_filter / ..."""
@@ -181,11 +185,17 @@ class IProvider(ABC):
 # ============================================================
 
 
-def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def normalize_messages(
+    messages: list[dict[str, Any]],
+    *,
+    preserve_reasoning_content: bool = False,
+) -> list[dict[str, Any]]:
     """复制并轻度规整 messages。
 
     - role/content/tool_calls/tool_call_id 之外的字段会被剔除
       （某些 SDK 严格校验未知字段）
+    - preserve_reasoning_content=True 时，assistant 消息中的 reasoning_content
+      会被保留（含空字符串），用于 DeepSeek/Qwen 等思考模式回放
     - tool_calls 内部的 'type': 'function' 缺失时补齐
     """
     out: list[dict[str, Any]] = []
@@ -199,6 +209,13 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             normalized["name"] = m["name"]
         if "tool_call_id" in m:
             normalized["tool_call_id"] = m["tool_call_id"]
+        if (
+            preserve_reasoning_content
+            and m.get("role") == "assistant"
+            and "reasoning_content" in m
+        ):
+            value = m.get("reasoning_content")
+            normalized["reasoning_content"] = "" if value is None else str(value)
         if "tool_calls" in m and m["tool_calls"]:
             normalized_tcs = []
             for tc in m["tool_calls"]:

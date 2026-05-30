@@ -1,0 +1,22 @@
+id: groq
+display_name: Groq
+protocol: openai_compat
+base_url: https://api.groq.com/openai/v1
+registration_url: https://console.groq.com
+reasoning_style: none
+
+models:
+  - id: llama-3.3-70b-versatile
+    display_name: Llama 3.3 70B
+    capabilities: [chat, tool_call]
+    context_length: 131072
+
+  - id: mixtral-8x7b-32768
+    display_name: Mixtral 8x7B
+    capabilities: [chat, tool_call]
+    context_length: 32768
+
+  - id: gemma2-9b-it
+    display_name: Gemma 2 9B
+    capabilities: [chat, tool_call]
+    context_length: 8192

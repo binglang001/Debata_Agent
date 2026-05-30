@@ -13,13 +13,13 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ..theme import Spacing
+from ..widgets import show_message
 from ..wizard.components import EmptyState
 from .copy import DASHBOARD_COPY
 
@@ -38,9 +38,9 @@ class MemoryPage(QWidget):
         outer.setSpacing(Spacing.MD)
 
         head = QHBoxLayout()
-        title = QLabel(DASHBOARD_COPY["memory.important_section"])
-        title.setProperty("role", "title-2")
-        head.addWidget(title)
+        self._title = QLabel(DASHBOARD_COPY["memory.important_section"])
+        self._title.setProperty("role", "title-2")
+        head.addWidget(self._title)
         head.addStretch(1)
         self._refresh_btn = QPushButton(DASHBOARD_COPY["button.refresh"])
         self._refresh_btn.setProperty("role", "text")
@@ -48,29 +48,40 @@ class MemoryPage(QWidget):
         head.addWidget(self._refresh_btn)
         outer.addLayout(head)
 
+        self._rag_status = QLabel("")
+        self._rag_status.setProperty("role", "secondary")
+        self._rag_status.setWordWrap(True)
+        outer.addWidget(self._rag_status)
+
         self._list = QListWidget()
         outer.addWidget(self._list, 1)
 
         # 删除按钮
+        self._action_row_widget = QWidget()
         action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
         self._delete_btn = QPushButton(DASHBOARD_COPY["memory.delete_button"])
         self._delete_btn.setProperty("role", "danger")
         self._delete_btn.clicked.connect(self._on_delete)
         action_row.addWidget(self._delete_btn)
         action_row.addStretch(1)
-        outer.addLayout(action_row)
+        self._action_row_widget.setLayout(action_row)
+        outer.addWidget(self._action_row_widget)
 
         # 添加一条
+        self._add_row_widget = QWidget()
         add_row = QHBoxLayout()
+        add_row.setContentsMargins(0, 0, 0, 0)
         self._new_edit = QLineEdit()
         self._new_edit.setPlaceholderText("手动添加一条重要记忆")
         self._new_edit.returnPressed.connect(self._on_add)
         add_row.addWidget(self._new_edit, 1)
-        add_btn = QPushButton("记住")
-        add_btn.setProperty("role", "primary")
-        add_btn.clicked.connect(self._on_add)
-        add_row.addWidget(add_btn)
-        outer.addLayout(add_row)
+        self._add_btn = QPushButton("记住")
+        self._add_btn.setProperty("role", "primary")
+        self._add_btn.clicked.connect(self._on_add)
+        add_row.addWidget(self._add_btn)
+        self._add_row_widget.setLayout(add_row)
+        outer.addWidget(self._add_row_widget)
 
         # 空状态
         self._empty = EmptyState(
@@ -79,6 +90,12 @@ class MemoryPage(QWidget):
         )
         outer.addWidget(self._empty)
         self._empty.hide()
+        self._rag_empty = EmptyState(
+            "暂无 RAG 索引",
+            "有长期记忆并完成向量化后会显示在这里",
+        )
+        outer.addWidget(self._rag_empty)
+        self._rag_empty.hide()
 
         self.refresh()
 
@@ -88,6 +105,14 @@ class MemoryPage(QWidget):
         if rt is None or rt.important is None:
             self._show_empty(True)
             return
+        if self._is_rag_mode():
+            self._refresh_rag_mode(rt)
+            return
+
+        self._title.setText(DASHBOARD_COPY["memory.important_section"])
+        self._rag_status.hide()
+        self._action_row_widget.show()
+        self._add_row_widget.show()
         items = rt.important.items()
         if not items:
             self._show_empty(True)
@@ -98,28 +123,85 @@ class MemoryPage(QWidget):
             content = item.get("content", "")
             line = f"{ts}  ·  {content}" if ts else content
             li = QListWidgetItem(line)
-            li.setData(Qt.ItemDataRole.UserRole, content)
+            li.setData(
+                Qt.ItemDataRole.UserRole,
+                {
+                    "id": str(item.get("id") or item.get("timestamp") or ""),
+                    "content": content,
+                },
+            )
             self._list.addItem(li)
+
+    def _refresh_rag_mode(self, rt: Any) -> None:
+        self._title.setText("RAG 记忆索引")
+        self._action_row_widget.hide()
+        self._add_row_widget.hide()
+        self._rag_status.show()
+
+        rag_store = getattr(rt, "rag_store", None)
+        embedding = getattr(rt, "embedding_service", None)
+        entries = rag_store.all_entries() if rag_store is not None else []
+        fallback_count = len(rt.important.items()) if rt.important is not None else 0
+        if rag_store is None or embedding is None:
+            self._rag_status.setText(
+                f"RAG 当前未就绪，运行时会暂时退回全文记忆。已有文件记忆 {fallback_count} 条。"
+            )
+        else:
+            self._rag_status.setText(
+                f"按语义向量检索长期记忆。索引 {len(entries)} 条，原始记忆 {fallback_count} 条。"
+            )
+
+        if not entries:
+            self._show_empty(True)
+            return
+        self._show_empty(False)
+        for entry in entries:
+            timestamp = ""
+            try:
+                timestamp = str((entry.meta or {}).get("timestamp") or entry.id or "")
+            except Exception:
+                timestamp = ""
+            text = getattr(entry, "text", "")
+            line = f"{timestamp}  ·  {text}" if timestamp else text
+            li = QListWidgetItem(line)
+            li.setToolTip("RAG 索引条目")
+            self._list.addItem(li)
+
+    def _is_rag_mode(self) -> bool:
+        try:
+            return self._runtime.config.features.long_term_memory.mode == "rag"
+        except Exception:
+            return False
 
     def _show_empty(self, on: bool) -> None:
         self._list.setVisible(not on)
-        self._delete_btn.setVisible(not on)
-        self._empty.setVisible(on)
+        if self._is_rag_mode():
+            self._action_row_widget.hide()
+            self._add_row_widget.hide()
+        else:
+            self._delete_btn.setVisible(not on)
+        self._empty.setVisible(on and not self._is_rag_mode())
+        self._rag_empty.setVisible(on and self._is_rag_mode())
 
     def _on_delete(self) -> None:
         item = self._list.currentItem()
         if item is None:
+            show_message(self, "先选一条", "请先在列表里选中要移除的记忆。")
             return
-        content = item.data(Qt.ItemDataRole.UserRole)
-        if not content:
+        data = item.data(Qt.ItemDataRole.UserRole) or {}
+        item_id = data.get("id", "")
+        content = data.get("content", "")
+        if not item_id:
+            show_message(self, "无法移除", "这条记忆缺少唯一时间戳，请刷新后再试。")
             return
-        box = QMessageBox(self)
-        box.setWindowTitle(DASHBOARD_COPY["memory.delete_confirm_title"])
-        box.setText(DASHBOARD_COPY["memory.delete_confirm_body"])
-        yes = box.addButton("移除", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("算了", QMessageBox.ButtonRole.RejectRole)
-        box.exec()
-        if box.clickedButton() is not yes:
+        if not show_message(
+            self,
+            DASHBOARD_COPY["memory.delete_confirm_title"],
+            DASHBOARD_COPY["memory.delete_confirm_body"],
+            confirm_text="移除",
+            cancel_text="算了",
+            is_danger=True,
+        ):
             return
 
         rt = self._runtime
@@ -129,12 +211,19 @@ class MemoryPage(QWidget):
             return
 
         async def _do() -> None:
+            self._set_busy(True)
             try:
-                deleted = await rt.important.delete_by_keyword(content)
-                logger.info(f"重要记忆删除 {deleted} 条")
+                deleted = await rt.important.delete_by_id(item_id)
+                if deleted:
+                    logger.info(f"重要记忆删除 1 条: {content[:40]}")
+                else:
+                    show_message(self, "没有移除", "未找到这条记忆，可能已经被刷新。")
             except Exception as e:
                 logger.warning(f"删除重要记忆失败: {e}")
-            self.refresh()
+                show_message(self, "移除失败", str(e), is_danger=True)
+            finally:
+                self._set_busy(False)
+                self.refresh()
 
         loop.create_task(_do())
 
@@ -151,11 +240,21 @@ class MemoryPage(QWidget):
             return
 
         async def _do() -> None:
+            self._set_busy(True)
             try:
                 await rt.important.save(text)
+                self._new_edit.clear()
             except Exception as e:
                 logger.warning(f"添加重要记忆失败: {e}")
-            self._new_edit.clear()
-            self.refresh()
+                show_message(self, "添加失败", str(e), is_danger=True)
+            finally:
+                self._set_busy(False)
+                self.refresh()
 
         loop.create_task(_do())
+
+    def _set_busy(self, busy: bool) -> None:
+        self._delete_btn.setEnabled(not busy)
+        self._add_btn.setEnabled(not busy)
+        self._refresh_btn.setEnabled(not busy)
+        self._new_edit.setEnabled(not busy)

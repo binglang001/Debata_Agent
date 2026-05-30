@@ -70,7 +70,7 @@ NAV_ITEMS: list[NavItem] = [
     NavItem(key="memory", icon="note-pencil"),
     NavItem(key="logs", icon="terminal-window"),
     NavItem(key="personas", icon="user-circle"),
-    NavItem(key="plugins", icon="puzzle-piece"),
+    NavItem(key="models", icon="hard-drives"),
     NavItem(key="settings", icon="gear-six"),
 ]
 

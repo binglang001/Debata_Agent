@@ -1,6 +1,6 @@
 ---
 name: 功能建议
-about: 为 Diana 提议新功能
+about: 为 Debata 提议新功能
 title: "[Feature] "
 labels: enhancement
 assignees: []

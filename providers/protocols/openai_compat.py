@@ -51,6 +51,8 @@ class OpenAICompatProvider(IProvider):
         timeout: float = 120.0,
         extra_headers: dict[str, str] | None = None,
         reasoning_style: str = "thinking_extra_body",
+        known_model_ids: set[str] | None = None,
+        reasoning_model_ids: set[str] | None = None,
     ) -> None:
         super().__init__(name)
         self.base_url = base_url.rstrip("/")
@@ -58,6 +60,8 @@ class OpenAICompatProvider(IProvider):
         self.timeout = timeout
         self.extra_headers = extra_headers or {}
         self.reasoning_style = reasoning_style
+        self.known_model_ids = set(known_model_ids or ())
+        self.reasoning_model_ids = set(reasoning_model_ids or ())
         """如何向 API 传达 reasoning 配置：
             'thinking_extra_body'  —— DeepSeek/GLM 风格：extra_body={"thinking": {"type": ...}}
             'openai_native'        —— 不传（OpenAI o1/o3 隐式启用）
@@ -91,7 +95,16 @@ class OpenAICompatProvider(IProvider):
         first_token_timeout: float | None = 30.0,
         extra: dict[str, Any] | None = None,
     ) -> CompletionResult:
-        messages_norm = normalize_messages(messages)
+        reasoning_enabled = bool(reasoning and reasoning.enabled)
+        replay_reasoning_content = self._should_replay_reasoning_content(
+            reasoning, model=model
+        )
+        messages_norm = normalize_messages(
+            messages,
+            preserve_reasoning_content=replay_reasoning_content,
+        )
+        if reasoning_enabled and replay_reasoning_content:
+            self._ensure_assistant_reasoning_content(messages_norm)
 
         kwargs: dict[str, Any] = {
             "model": model,
@@ -110,7 +123,7 @@ class OpenAICompatProvider(IProvider):
             kwargs["stream_options"] = {"include_usage": True}
 
         # === 思考配置翻译 ===
-        extra_body = self._build_reasoning_extra_body(reasoning)
+        extra_body = self._build_reasoning_extra_body(reasoning, model=model)
         if extra:
             extra_body.update(extra)
         if extra_body:
@@ -160,28 +173,26 @@ class OpenAICompatProvider(IProvider):
         stream = await self._client.chat.completions.create(**kwargs)
 
         chunks: list[Any] = []
-        got_first = False
-
-        async def _collect() -> None:
-            nonlocal got_first
-            async for chunk in stream:
-                if not got_first:
-                    got_first = True
-                chunks.append(chunk)
+        iterator = stream.__aiter__()
 
         try:
             if first_token_timeout is not None:
-                await asyncio.wait_for(_collect(), timeout=first_token_timeout)
+                first_chunk = await asyncio.wait_for(
+                    anext(iterator), timeout=first_token_timeout
+                )
             else:
-                await _collect()
+                first_chunk = await anext(iterator)
         except asyncio.TimeoutError:
-            if not got_first:
-                raise ProviderTimeoutError(
-                    f"{self.name}: 首 token 超时 ({first_token_timeout}s)"
-                ) from None
-            logger.warning(
-                f"{self.name}: 流式输出中断（首 token 已收到，后续 {first_token_timeout}s 内无更新）"
-            )
+            raise ProviderTimeoutError(
+                f"{self.name}: 首 token 超时 ({first_token_timeout}s)"
+            ) from None
+        except StopAsyncIteration:
+            first_chunk = None
+
+        if first_chunk is not None:
+            chunks.append(first_chunk)
+            async for chunk in iterator:
+                chunks.append(chunk)
 
         if not chunks:
             raise ProviderError(f"{self.name}: 流式输出无数据")
@@ -247,19 +258,53 @@ class OpenAICompatProvider(IProvider):
     # ============================================================
 
     def _build_reasoning_extra_body(
-        self, reasoning: ReasoningConfig | None
+        self, reasoning: ReasoningConfig | None, *, model: str = ""
     ) -> dict[str, Any]:
-        if reasoning is None:
+        if not self._model_allows_reasoning_controls(model, reasoning):
             return {}
 
         if self.reasoning_style == "thinking_extra_body":
+            enabled = bool(reasoning and reasoning.enabled)
             return {
-                "thinking": {"type": "enabled" if reasoning.enabled else "disabled"}
+                "thinking": {"type": "enabled" if enabled else "disabled"}
             }
         if self.reasoning_style == "qwen_enable_thinking":
-            return {"enable_thinking": reasoning.enabled}
+            return {"enable_thinking": bool(reasoning and reasoning.enabled)}
         # 默认（如 openai_native）不传特殊参数
         return {}
+
+    def _should_replay_reasoning_content(
+        self, reasoning: ReasoningConfig | None, *, model: str = ""
+    ) -> bool:
+        return bool(
+            reasoning
+            and reasoning.enabled
+            and self.reasoning_style in {"thinking_extra_body", "qwen_enable_thinking"}
+            and self._model_allows_reasoning_controls(model, reasoning)
+        )
+
+    def _model_allows_reasoning_controls(
+        self,
+        model: str,
+        reasoning: ReasoningConfig | None,
+    ) -> bool:
+        if not self.known_model_ids:
+            return True
+        if model in self.reasoning_model_ids:
+            return True
+        if model in self.known_model_ids:
+            return False
+        # 未知模型不默认发送关闭参数，避免普通 OpenAI-compatible 服务报未知字段；
+        # 但用户显式开启 reasoning 时仍允许透传给新增的思考模型。
+        return bool(reasoning and reasoning.enabled)
+
+    @staticmethod
+    def _ensure_assistant_reasoning_content(
+        messages: list[dict[str, Any]]
+    ) -> None:
+        for msg in messages:
+            if msg.get("role") == "assistant" and "reasoning_content" not in msg:
+                msg["reasoning_content"] = ""
 
     @staticmethod
     def _extract_tool_calls_object(tool_calls_raw: Any) -> list[ToolCall]:

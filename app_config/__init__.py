@@ -1,4 +1,4 @@
-"""Diana_Agent 配置系统。
+"""Debata_Agent 配置系统。
 
 公开 API：
     AppPaths              —— 跨平台路径管理
@@ -24,6 +24,7 @@ from .schema import (
     AppMeta,
     ASRFeatureConfig,
     BehaviorConfig,
+    ContextConfig,
     EmbeddingFeatureConfig,
     FeaturesConfig,
     LongTermMemoryConfig,
@@ -66,6 +67,7 @@ __all__ = [
     "LongTermMemoryConfig",
     "PersonaConfig",
     "BehaviorConfig",
+    "ContextConfig",
     "TypingConfig",
     "RateLimitConfig",
     "SummarizeConfig",

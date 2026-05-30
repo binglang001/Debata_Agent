@@ -1,6 +1,6 @@
 # Changelog
 
-本文件记录 Diana 所有重要变更，格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+本文件记录 Debata 所有重要变更，格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
 ## [Unreleased] — v0.3.0-alpha（开发中）
 

@@ -11,19 +11,18 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QMessageBox,
     QProgressBar,
     QPushButton,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -31,6 +30,7 @@ from PySide6.QtWidgets import (
 from app_config import AppPaths, SecretsManager
 from app_config.loader import save_config
 from app_config.schema import (
+    ASRFeatureConfig,
     AdapterConfig,
     AgentConfig,
     AgentsConfig,
@@ -43,6 +43,7 @@ from app_config.schema import (
     ProviderConfig,
     ReasoningConfig,
     RootConfig,
+    TTSFeatureConfig,
     VisionFeatureConfig,
     WeatherFeatureConfig,
     WebSearchFeatureConfig,
@@ -94,7 +95,7 @@ class WizardWindow(QMainWindow):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Diana_Agent · 首次配置")
+        self.setWindowTitle("Debata_Agent · 首次配置")
         self.setMinimumSize(960, 720)
         self.resize(1080, 800)
 
@@ -103,10 +104,12 @@ class WizardWindow(QMainWindow):
         self._context = WizardContext()
         self._current: StepId = StepId.WELCOME
         self._completed_emitted = False
+        self._navigating = False
 
         # 无边框 + 自定义标题栏 + 透明 root 让 WindowFrame 的圆角 QSS 生效
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setProperty("frameless", True)
 
         # 整窗用 WindowFrame 包一层：QSS 里 QFrame#WindowFrame 设了 border-radius
         root = QFrame()
@@ -121,20 +124,24 @@ class WizardWindow(QMainWindow):
 
         # 中间：step 视图栈包 ScrollArea，仅在当前 step 溢出时滚动
         from PySide6.QtWidgets import QScrollArea
-        from ..widgets import AutoSizeStack
-        self._stack = AutoSizeStack()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setWidget(self._stack)
+        self._active_view: QWidget | None = None
+        self._page_host = QWidget()
+        self._page_lay = QVBoxLayout(self._page_host)
+        self._page_lay.setContentsMargins(0, 0, 0, 0)
+        self._page_lay.setSpacing(0)
+        self._page_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._wizard_scroll = QScrollArea()
+        self._wizard_scroll.setWidgetResizable(True)
+        self._wizard_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._wizard_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._wizard_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._wizard_scroll.setWidget(self._page_host)
 
         wrap = QWidget()
         wrap_lay = QVBoxLayout(wrap)
         wrap_lay.setContentsMargins(Spacing.XL, Spacing.LG, Spacing.XL, Spacing.LG)
         wrap_lay.setSpacing(0)
-        wrap_lay.addWidget(scroll, 1)
+        wrap_lay.addWidget(self._wizard_scroll, 1)
         root_layout.addWidget(wrap, 1)
 
         # 底部：按钮区
@@ -142,6 +149,11 @@ class WizardWindow(QMainWindow):
         root_layout.addWidget(bottom)
 
         self.setCentralWidget(root)
+        from ..widgets import attach_size_grip, install_window_drag, install_window_resize
+
+        self._size_grip = attach_size_grip(self)
+        self._window_resize_filter = install_window_resize(root, self)
+        self._window_drag_filter = install_window_drag(root, self)
 
         # 实例化所有 view
         self._views: dict[StepId, QWidget] = {
@@ -157,7 +169,6 @@ class WizardWindow(QMainWindow):
             StepId.SUMMARY: SummaryStepView(self._context),
         }
         for v in self._views.values():
-            self._stack.addWidget(v)
             if hasattr(v, "invalid_input"):
                 v.invalid_input.connect(self._show_error)
             if hasattr(v, "request_advance"):
@@ -210,11 +221,11 @@ class WizardWindow(QMainWindow):
     def _build_bottom_bar(self) -> QWidget:
         bar = QFrame()
         bar.setObjectName("Topbar")  # 复用同样的边框样式
-        bar.setMinimumHeight(72)
-        bar.setMaximumHeight(72)
+        bar.setMinimumHeight(80)
+        bar.setMaximumHeight(80)
 
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(Spacing.XL, Spacing.MD, Spacing.XL, Spacing.MD)
+        layout.setContentsMargins(Spacing.XL, Spacing.SM, Spacing.XL, Spacing.LG)
         layout.setSpacing(Spacing.MD)
 
         self._back_btn = QPushButton(COPY["button.back"])
@@ -244,12 +255,29 @@ class WizardWindow(QMainWindow):
         if step not in self._views:
             return
         self._current = step
-        self._stack.setCurrentWidget(self._views[step])
         view = self._views[step]
+        if self._active_view is not view:
+            if self._active_view is not None:
+                self._page_lay.removeWidget(self._active_view)
+                self._active_view.hide()
+                self._active_view.setParent(None)
+            self._page_lay.addWidget(view)
+            self._active_view = view
+            view.show()
+            self._animate_view(view)
+        self._wizard_scroll.verticalScrollBar().setValue(0)  # 切步回顶
         if hasattr(view, "refresh"):
             view.refresh()
         self._update_topbar()
         self._update_buttons()
+        self._sync_scroll_height()
+
+    def _sync_scroll_height(self) -> None:
+        view = self._active_view
+        if view is not None:
+            view.updateGeometry()
+            QTimer.singleShot(0, view.updateGeometry)
+        self._wizard_scroll.widget().adjustSize()
 
     def _update_topbar(self) -> None:
         s = STEPS.get(self._current)
@@ -300,11 +328,42 @@ class WizardWindow(QMainWindow):
             self._jump_to(nxt)
 
     def _on_next(self) -> None:
+        if self._navigating:
+            return
         view = self._views.get(self._current)
         if view is None:
             return
         if hasattr(view, "save") and not view.save():
             return
+        validate = getattr(view, "validate_before_next", None)
+        if validate is not None and callable(validate):
+            self._navigating = True
+            self._next_btn.setEnabled(False)
+
+            async def _validate_and_continue() -> None:
+                try:
+                    ok = await validate()
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("向导切页校验失败")
+                    self._show_error(str(e))
+                    ok = False
+                finally:
+                    self._navigating = False
+                    self._next_btn.setEnabled(True)
+                if ok:
+                    self._advance_after_save()
+
+            try:
+                asyncio.get_event_loop().create_task(_validate_and_continue())
+            except RuntimeError:
+                self._navigating = False
+                self._next_btn.setEnabled(True)
+                self._show_error("事件循环未就绪")
+            return
+
+        self._advance_after_save()
+
+    def _advance_after_save(self) -> None:
         if is_last_step(self._current):
             self._finish()
             return
@@ -315,7 +374,9 @@ class WizardWindow(QMainWindow):
             self._jump_to(nxt)
 
     def _show_error(self, msg: str) -> None:
-        QMessageBox.warning(self, "稍等一下", msg)
+        from ..widgets import show_message
+
+        show_message(self, "稍等一下", msg)
 
     # ============================================================
     # 完成 —— 写配置 + 密钥
@@ -326,10 +387,13 @@ class WizardWindow(QMainWindow):
             self._persist()
         except Exception as e:  # noqa: BLE001
             logger.exception("向导写入配置失败")
-            QMessageBox.critical(
+            from ..widgets import show_message
+
+            show_message(
                 self,
                 "写入配置时出错",
                 f"{e}\n\n配置未保存。可以再试一次，或者关闭后用命令行配置。",
+                is_danger=True,
             )
             return
 
@@ -382,8 +446,28 @@ class WizardWindow(QMainWindow):
 
         embedding_key_id = None
         if c.long_term_memory_mode == "rag" and c.embedding_type == "api" and c.embedding_api_key:
-            embedding_key_id = f"embedding_{c.embedding_provider}"
+            embedding_key_id = (
+                c.embedding_provider
+                if c.embedding_provider.startswith("embedding_")
+                else f"embedding_{c.embedding_provider}"
+            )
             self._secrets.set(embedding_key_id, c.embedding_api_key)
+
+        asr_key_id = None
+        if c.asr.enabled:
+            aextra = c.asr.extra or {}
+            if aextra.get("type") == "api" and aextra.get("api_key"):
+                asr_provider = aextra.get("provider") or "api"
+                asr_key_id = f"asr_{asr_provider}"
+                self._secrets.set(asr_key_id, aextra["api_key"])
+
+        tts_key_id = None
+        if c.tts.enabled:
+            textra = c.tts.extra or {}
+            if textra.get("type") == "api" and textra.get("api_key"):
+                tts_provider = textra.get("provider") or "api"
+                tts_key_id = f"tts_{tts_provider}"
+                self._secrets.set(tts_key_id, textra["api_key"])
 
         napcat_token_id = None
         if c.adapter.token:
@@ -434,6 +518,26 @@ class WizardWindow(QMainWindow):
                         protocol=proto,
                         api_key_id=vision_key_id,
                     )
+
+        if (
+            c.long_term_memory_mode == "rag"
+            and c.embedding_type == "api"
+            and c.embedding_provider_preset
+        ):
+            epreset = c.embedding_provider_preset
+            if epreset == "custom":
+                providers[c.embedding_provider] = ProviderConfig(
+                    display_name=c.embedding_provider_display_name or "Embedding",
+                    protocol=c.embedding_provider_protocol,
+                    base_url=c.embedding_provider_base_url,
+                    api_key_id=embedding_key_id,
+                )
+            else:
+                providers[c.embedding_provider] = ProviderConfig(
+                    preset=epreset,
+                    display_name=c.embedding_provider_display_name or f"Embedding · {epreset}",
+                    api_key_id=embedding_key_id,
+                )
 
         # 3. agents ——
         chat_cfg = self._make_agent_cfg(
@@ -516,7 +620,7 @@ class WizardWindow(QMainWindow):
         features.web_search = WebSearchFeatureConfig(enabled=c.web_search.enabled)
         features.long_term_memory = LongTermMemoryConfig(
             mode=c.long_term_memory_mode,
-            keyword_trigger_save=True,
+            keyword_trigger_save=c.long_term_memory_keyword_trigger_save,
         )
         if c.long_term_memory_mode == "rag":
             features.embedding = EmbeddingFeatureConfig(
@@ -526,6 +630,41 @@ class WizardWindow(QMainWindow):
                 api_key_id=embedding_key_id,
                 api_model=c.embedding_model,
                 local_quality=c.embedding_local_quality,
+                local_model_dir=c.embedding_local_model_dir,
+            )
+
+        # ASR
+        if c.asr.enabled:
+            aextra = c.asr.extra or {}
+            features.asr = ASRFeatureConfig(
+                enabled=True,
+                type=aextra.get("type", "local"),
+                local_model=aextra.get("local_model", "large-v3"),
+                provider=aextra.get("provider") or None,
+                api_key_id=asr_key_id,
+                extra_credentials=aextra.get("extra_credentials", {}),
+                device=aextra.get("device", "auto"),  # type: ignore[arg-type]
+                language=aextra.get("language", "zh"),
+                model_dir=aextra.get("model_dir", ""),
+            )
+
+        # TTS
+        if c.tts.enabled:
+            textra = c.tts.extra or {}
+            features.tts = TTSFeatureConfig(
+                enabled=True,
+                type=textra.get("type", "local"),
+                local_model=textra.get("local_model", "voxcpm2"),
+                provider=textra.get("provider") or None,
+                api_key_id=tts_key_id,
+                extra_credentials=textra.get("extra_credentials", {}),
+                reference_audio=textra.get("reference_audio", ""),
+                default_prompt=textra.get("default_prompt", ""),
+                model_dir=textra.get("model_dir", "") or "data/models/VoxCPM2",
+                device=textra.get("device", "auto"),  # type: ignore[arg-type]
+                load_denoiser=bool(textra.get("load_denoiser", False)),
+                cfg_value=float(textra.get("cfg_value", 2.0)),
+                inference_timesteps=int(textra.get("inference_timesteps", 10)),
             )
 
         # 5. adapter ——
@@ -614,9 +753,14 @@ class WizardWindow(QMainWindow):
         p = self._context.persona
         warning = ""
         if p.source == "create" and p.generated_xml:
+            from agents.persona_import import PersonaImportError
+            from agents.persona_loader import validate_persona_name
             from agents.persona_gen_agent import PersonaGenResult, render_persona_file
 
+            validate_persona_name(p.active)
             target = self._paths.PERSONAS_DIR / p.active
+            if target.exists():
+                raise PersonaImportError(f"角色「{p.active}」已存在，请换一个名字")
             target.mkdir(parents=True, exist_ok=True)
             (target / "__init__.py").touch(exist_ok=True)
             result = PersonaGenResult(
@@ -624,22 +768,22 @@ class WizardWindow(QMainWindow):
                 display_name=p.active,
             )
             brief = p.brief
-            file_text = render_persona_file(result, brief) if brief else _render_minimal_persona(p.active, p.generated_xml)
+            admins = _admin_entries(self._context.admin_qq, self._context.admin_name)
+            file_text = (
+                render_persona_file(result, brief, admins=admins)
+                if brief
+                else _render_minimal_persona(p.active, p.generated_xml, admins=admins)
+            )
             (target / "persona_prompt.py").write_text(file_text, encoding="utf-8")
-            if self._context.admin_qq:
-                warning = f"已为 {p.active} 写入人格档案。管理员 QQ 需要手工编辑 PERSONA_VARS['admins']。"
         elif p.source == "import" and p.import_path:
             # 把导入目录的内容复制到 personas/ 下
-            import shutil
+            from agents.persona_import import copy_persona_dir
 
             src = Path(p.import_path)
-            dst = self._paths.PERSONAS_DIR / src.name
-            if not dst.exists():
-                shutil.copytree(src, dst)
-            p.active = src.name
+            p.active = copy_persona_dir(src, self._paths.PERSONAS_DIR)
         # builtin 模式无操作
 
-        return PersonaConfig(active=p.active or "diana"), warning
+        return PersonaConfig(active=p.active or "debata"), warning
 
     # ============================================================
     # 圆角 mask（frameless 窗口 OS 层面真圆角）
@@ -647,8 +791,41 @@ class WizardWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        from ..widgets import apply_rounded_mask
+        from ..widgets import apply_rounded_mask, position_size_grip
         apply_rounded_mask(self, radius=12)
+        position_size_grip(self, getattr(self, "_size_grip", None))
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        from ..widgets import fade_in_window
+
+        fade_in_window(self)
+
+    def nativeEvent(self, eventType, message):  # type: ignore[override]
+        from ..widgets import native_resize_hit_test
+
+        hit = native_resize_hit_test(self, eventType, message)
+        if hit is not None:
+            return hit
+        return super().nativeEvent(eventType, message)
+
+    def _animate_view(self, view: QWidget) -> None:
+        try:
+            from PySide6.QtCore import QEasingCurve, QPropertyAnimation
+            from PySide6.QtWidgets import QGraphicsOpacityEffect
+
+            effect = QGraphicsOpacityEffect(view)
+            view.setGraphicsEffect(effect)
+            anim = QPropertyAnimation(effect, b"opacity", view)
+            anim.setDuration(120)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            view._wizard_fade_animation = anim  # type: ignore[attr-defined]
+            anim.finished.connect(lambda: view.setGraphicsEffect(None))
+            anim.start()
+        except Exception:
+            pass
 
     # ============================================================
     # 关闭
@@ -658,21 +835,37 @@ class WizardWindow(QMainWindow):
         if self._completed_emitted:
             event.accept()
             return
-        box = QMessageBox(self)
-        box.setWindowTitle(COPY["quit.title"])
-        box.setText(COPY["quit.body"])
-        yes = box.addButton("先放着", QMessageBox.ButtonRole.RejectRole)
-        leave = box.addButton("不配了", QMessageBox.ButtonRole.AcceptRole)
-        box.exec()
-        if box.clickedButton() is leave:
+        from ..widgets import show_message
+
+        if show_message(
+            self,
+            COPY["quit.title"],
+            COPY["quit.body"],
+            confirm_text="不配了",
+            cancel_text="先放着",
+            is_danger=True,
+        ):
             self.cancelled.emit()
             event.accept()
         else:
             event.ignore()
 
 
-def _render_minimal_persona(name: str, xml: str) -> str:
+def _admin_entries(admin_qq: str, admin_name: str) -> list[dict[str, object]]:
+    if not admin_qq:
+        return []
+    entry: dict[str, object] = {"qq": int(admin_qq), "role": "owner"}
+    if admin_name:
+        entry["name"] = admin_name
+    return [entry]
+
+
+def _render_minimal_persona(name: str, xml: str, admins: list[dict[str, object]] | None = None) -> str:
+    import json
+
     safe = xml.replace("'''", "\\'\\'\\'")
+    admins_text = json.dumps(admins or [], ensure_ascii=False, indent=4)
+    admins_text = "\n".join("    " + line for line in admins_text.splitlines())
     return (
         '"""自动生成的人格档案。"""\n\n'
         "PERSONA_PROMPT = '''\n"
@@ -680,7 +873,7 @@ def _render_minimal_persona(name: str, xml: str) -> str:
         "'''\n\n"
         "PERSONA_VARS = {\n"
         f"    \"name\": \"{name}\",\n"
-        "    \"admins\": [],\n"
+        f"    \"admins\": {admins_text},\n"
         "}\n"
     )
 

@@ -115,7 +115,7 @@ class NapCatAdapter(IAdapter):
                 reconnect_backoff_max=cfg.reconnect_backoff_max_seconds,
                 ping_interval=cfg.ping_interval_seconds,
                 ping_timeout=cfg.ping_timeout_seconds,
-                initial_connect_timeout=cfg.initial_connect_timeout_seconds,
+                initial_connect_timeout=min(cfg.initial_connect_timeout_seconds, 1.0),
             )
         else:  # mode == "server"
             # 程序作为 WS 服务端，监听 {host}:{port}{path} 等 NapCat 反向连入
@@ -201,8 +201,10 @@ class NapCatAdapter(IAdapter):
         image_b64: str | None = None,
     ) -> str | None:
         if image_path is not None:
-            with open(image_path, "rb") as f:
-                image_b64 = base64.b64encode(f.read()).decode("ascii")
+            def _read():
+                return image_path.read_bytes()
+            raw = await asyncio.to_thread(_read)
+            image_b64 = base64.b64encode(raw).decode("ascii")
 
         if image_b64:
             cq = f"[CQ:image,file=base64://{image_b64}]"
@@ -220,6 +222,37 @@ class NapCatAdapter(IAdapter):
         except (AdapterAPIError, ValueError) as e:
             logger.warning(f"撤回失败: {e}")
             return False
+
+    async def send_voice(
+        self, target: Target, audio_path: Path
+    ) -> str | None:
+        """通过 OneBot V11 record 段发送语音。"""
+        file_uri = "file:///" + str(audio_path.absolute()).replace("\\", "/")
+        message = [{"type": "record", "data": {"file": file_uri}}]
+        params: dict[str, Any] = {
+            "message_type": target.scope,
+            "message": message,
+        }
+        if target.scope == "private":
+            params["user_id"] = int(target.target_id)
+        elif target.scope == "group":
+            params["group_id"] = int(target.target_id)
+        else:
+            raise ValueError(f"未知 target_type: {target.scope}")
+
+        try:
+            result = await self._api.call("send_msg", params)
+        except AdapterAPIError as e:
+            msg = str(e)
+            if "retcode=1200" in msg and "Timeout" in msg:
+                logger.warning(
+                    "NapCat send_voice 回包超时，消息可能已实际发出；按疑似成功处理: %s",
+                    e,
+                )
+                return None
+            raise
+        mid = result.get("message_id")
+        return str(mid) if mid is not None else None
 
     # ============================================================
     # 联系人查询
@@ -312,24 +345,74 @@ class NapCatAdapter(IAdapter):
 
     async def fetch_voice_text(self, message_id: str) -> str:
         """NapCat 的 fetch_ptt_text Action。"""
-        # NapCat 处理需要短暂等待
-        await asyncio.sleep(self._voice_fetch_delay_seconds)
-        try:
-            data = await self._api.call(
-                "fetch_ptt_text", {"message_id": int(message_id)}
-            )
-            return data.get("text", "") or ""
-        except (AdapterAPIError, ValueError) as e:
-            logger.warning(f"语音转文字失败 msg_id={message_id}: {e}")
-            return ""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 8.0
+        await asyncio.sleep(min(max(self._voice_fetch_delay_seconds, 0.0), 8.0))
+        last_error: Exception | None = None
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                data = await self._api.call(
+                    "fetch_ptt_text",
+                    {"message_id": int(message_id)},
+                    timeout=max(0.1, min(3.0, remaining)),
+                )
+                return data.get("text", "") or ""
+            except (AdapterAPIError, ValueError) as e:
+                last_error = e
+                msg = str(e)
+                retryable = (
+                    "获取语音转文字结果失败" in msg
+                    or ("retcode=1200" in msg and "fetch_ptt_text" in msg)
+                )
+                remaining = deadline - loop.time()
+                if not retryable or remaining <= 0:
+                    break
+                await asyncio.sleep(min(1.5, max(0.1, remaining)))
+            except asyncio.TimeoutError as e:
+                last_error = e
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(1.0, max(0.1, remaining)))
+        if last_error is not None:
+            logger.warning(f"语音转文字失败 msg_id={message_id}: {last_error}")
+        return ""
 
     async def get_file_url(self, file_id: str) -> str | None:
-        try:
-            data = await self._api.call("get_file", {"file_id": file_id, "type": "url"})
-            return data.get("url") or None
-        except AdapterAPIError as e:
-            logger.warning(f"获取文件 URL 失败 file_id={file_id}: {e}")
-            return None
+        if file_id and Path(file_id).exists():
+            return file_id
+        last_error: Exception | None = None
+        for params in (
+            {"file_id": file_id, "type": "url"},
+            {"file_id": file_id},
+            {"file": file_id},
+        ):
+            try:
+                data = await self._api.call("get_file", params)
+                value = (
+                    data.get("url")
+                    or data.get("file")
+                    or data.get("file_path")
+                    or data.get("path")
+                    or None
+                )
+                if value:
+                    return value
+            except AdapterAPIError as e:
+                last_error = e
+                msg = str(e).lower()
+                if "no such file" in msg or "not found" in msg or "不存在" in msg:
+                    break
+                continue
+            except asyncio.TimeoutError as e:
+                last_error = e
+                break
+        if last_error is not None:
+            logger.warning(f"获取文件 URL 失败 file_id={file_id}: {last_error}")
+        return None
 
     async def upload_file(
         self,
@@ -342,17 +425,15 @@ class NapCatAdapter(IAdapter):
             params: dict[str, Any] = {
                 "user_id": int(target.target_id),
                 "file": str(file_path),
+                "name": display_name or file_path.name,
             }
-            if display_name:
-                params["name"] = display_name
             await self._api.call("upload_private_file", params)
         elif target.scope == "group":
             params = {
                 "group_id": int(target.target_id),
                 "file": str(file_path),
+                "name": display_name or file_path.name,
             }
-            if display_name:
-                params["name"] = display_name
             await self._api.call("upload_group_file", params)
         else:
             raise ValueError(f"未知 scope: {target.scope}")

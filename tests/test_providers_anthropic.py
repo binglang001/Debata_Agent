@@ -5,16 +5,19 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+from providers.base import CompletionResult
 from providers.protocols.anthropic_proto import AnthropicProvider
 
 
 def test_convert_messages_system_extracted():
     messages = [
-        {"role": "system", "content": "你是 Diana"},
+        {"role": "system", "content": "你是 Debata"},
         {"role": "user", "content": "你好"},
     ]
     system, msgs = AnthropicProvider._convert_messages(messages)
-    assert system == "你是 Diana"
+    assert system == "你是 Debata"
     assert len(msgs) == 1
     assert msgs[0]["role"] == "user"
 
@@ -56,6 +59,75 @@ def test_convert_messages_tool_call_to_tool_use():
     assert tool_use_blocks[0]["name"] == "search"
     assert tool_use_blocks[0]["input"] == {"q": "python"}
     assert tool_use_blocks[0]["id"] == "tc1"
+
+
+def test_convert_messages_replays_reasoning_content_as_thinking_block():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "答案",
+            "reasoning_content": "",
+        },
+    ]
+    _, msgs = AnthropicProvider._convert_messages(messages)
+    blocks = msgs[1]["content"]
+
+    assert blocks[0] == {"type": "thinking", "thinking": ""}
+    assert blocks[1] == {"type": "text", "text": "答案"}
+
+
+def test_convert_messages_replays_signed_reasoning_blocks():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "答案",
+            "reasoning_blocks": [
+                {
+                    "type": "thinking",
+                    "thinking": "chain",
+                    "signature": "sig",
+                },
+                {
+                    "type": "redacted_thinking",
+                    "data": "opaque",
+                },
+            ],
+        },
+    ]
+    _, msgs = AnthropicProvider._convert_messages(messages)
+    blocks = msgs[1]["content"]
+
+    assert blocks[0] == {
+        "type": "thinking",
+        "thinking": "chain",
+        "signature": "sig",
+    }
+    assert blocks[1] == {"type": "redacted_thinking", "data": "opaque"}
+    assert blocks[2] == {"type": "text", "text": "答案"}
+
+
+def test_anthropic_response_preserves_reasoning_blocks():
+    provider = AnthropicProvider("anthropic_test", api_key="sk-ant-test")
+    response = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="thinking", thinking="plan", signature="sig"),
+            SimpleNamespace(type="redacted_thinking", data="opaque"),
+            SimpleNamespace(type="text", text="ok"),
+        ],
+        usage=None,
+        stop_reason="end_turn",
+        model="claude-test",
+    )
+
+    result = provider._build_result_from_response(response, "fallback")
+
+    assert isinstance(result, CompletionResult)
+    assert result.content == "ok"
+    assert result.reasoning_content == "plan"
+    assert result.reasoning_blocks == [
+        {"type": "thinking", "thinking": "plan", "signature": "sig"},
+        {"type": "redacted_thinking", "data": "opaque"},
+    ]
 
 
 def test_convert_messages_tool_result():

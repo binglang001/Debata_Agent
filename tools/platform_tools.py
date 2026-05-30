@@ -7,6 +7,7 @@
     - set_friend_add_request: 处理加好友请求
     - set_group_add_request: 处理加群请求
     - summarize_chat_history: 拉取群历史并交给 LLM 总结
+    - recall_history: 从本地永久归档检索较早上下文
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from .schemas import (
     GetForwardMsgArgs,
     GetUserInfoArgs,
     ListContactsArgs,
+    RecallHistoryArgs,
     SetFriendRequestArgs,
     SetGroupRequestArgs,
     SummarizeChatArgs,
@@ -45,7 +47,10 @@ def _to_dict(obj) -> dict:
 
 @tool(
     name="list_contacts",
-    description="查询好友/群/群成员",
+    description=(
+        "查询 QQ 联系人信息。需要知道可私聊的好友、当前加入的群，或某个群里有哪些成员时使用；"
+        "scope=group_members 时必须提供 group_id。不要用它读取聊天记录。"
+    ),
     args_model=ListContactsArgs,
     category="platform",
 )
@@ -107,7 +112,32 @@ async def get_user_info(args: GetUserInfoArgs, ctx: ToolContext) -> dict:
         info = await ctx.adapter.get_user_info(str(args.user_id))
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    return {"ok": True, "info": _to_dict(info)}
+    return {"ok": True, "info": _public_user_info(_to_dict(info))}
+
+
+def _public_user_info(info: dict) -> dict:
+    """只保留对回复有用的公开字段，丢弃 richBuffer/extBuffer 等噪声。"""
+    extra = info.get("extra") if isinstance(info.get("extra"), dict) else {}
+    public: dict = {}
+    for key in ("user_id", "nickname", "sex", "age"):
+        if info.get(key) not in (None, ""):
+            public[key] = info.get(key)
+    for src, dst in (
+        ("qid", "qid"),
+        ("qqLevel", "qq_level"),
+        ("longNick", "signature"),
+        ("long_nick", "signature"),
+        ("country", "country"),
+        ("province", "province"),
+        ("city", "city"),
+        ("regTime", "reg_time"),
+        ("reg_time", "reg_time"),
+        ("is_vip", "is_vip"),
+        ("vip_level", "vip_level"),
+    ):
+        if extra.get(src) not in (None, "") and dst not in public:
+            public[dst] = extra.get(src)
+    return public
 
 
 # ============================================================
@@ -166,7 +196,10 @@ async def get_forward_msg(args: GetForwardMsgArgs, ctx: ToolContext) -> dict:
 
 @tool(
     name="set_friend_add_request",
-    description="处理好友添加请求。必须先经管理员同意才能调用。",
+    description=(
+        "处理 QQ 好友添加请求。只有系统通知里出现好友请求 flag，且管理员明确同意/拒绝后才能调用；"
+        "普通聊天里不要主动调用。"
+    ),
     args_model=SetFriendRequestArgs,
     category="platform",
     no_feedback=True,
@@ -192,7 +225,10 @@ async def set_friend_add_request(args: SetFriendRequestArgs, ctx: ToolContext) -
 
 @tool(
     name="set_group_add_request",
-    description="处理加群申请或群邀请。必须先经管理员同意才能调用。",
+    description=(
+        "处理加群申请或邀请入群。只有系统通知里出现请求 flag/sub_type，且管理员明确同意/拒绝后才能调用；"
+        "普通聊天里不要主动调用。"
+    ),
     args_model=SetGroupRequestArgs,
     category="platform",
     no_feedback=True,
@@ -233,7 +269,8 @@ _DEFAULT_SUMMARIZE_PROMPT = (
 @tool(
     name="summarize_chat_history",
     description=(
-        "获取群聊聊天记录并总结。了解群基本情况、成员、氛围、对各成员的印象。"
+        "拉取指定群的近期聊天记录并交给总结模型整理。"
+        "当用户要求了解某个群、总结群历史、分析成员印象时使用；必须知道 group_id。"
     ),
     args_model=SummarizeChatArgs,
     category="platform",
@@ -277,3 +314,80 @@ async def summarize_chat_history(args: SummarizeChatArgs, ctx: ToolContext) -> d
         return {"ok": False, "error": f"总结失败: {e}"}
 
     return {"ok": True, "summary": result.content}
+
+
+# ============================================================
+# recall_history
+# ============================================================
+
+
+@tool(
+    name="recall_history",
+    description=(
+        "从本地永久归档和当前活跃历史中检索较早的对话原文。"
+        "当你需要想起已被压缩出工作窗口的旧细节、旧 msg_id、旧约定时使用；"
+        "conversation_id 可限制到当前私聊/群聊，不填则全局检索。"
+    ),
+    args_model=RecallHistoryArgs,
+    category="platform",
+)
+async def recall_history(args: RecallHistoryArgs, ctx: ToolContext) -> dict:
+    if ctx.archive is None:
+        return {"ok": False, "error": "未配置本地历史归档"}
+
+    records = await ctx.archive.search(
+        conversation_id=args.conversation_id,
+        keyword=args.keyword,
+        time_range=args.time_range,
+        limit=args.limit,
+    )
+    if ctx.history is not None:
+        for record in await ctx.history.records():
+            if _history_record_matches(
+                record,
+                conversation_id=args.conversation_id,
+                keyword=args.keyword,
+                time_range=args.time_range,
+            ):
+                records.append(record)
+        records = records[-args.limit:]
+
+    snippets: list[dict] = []
+    for record in records:
+        snippets.append(
+            {
+                "role": record.get("role"),
+                "conversation_id": record.get("conversation_id"),
+                "content": (record.get("content") or "")[:1000],
+                "metadata": record.get("metadata", {}),
+            }
+        )
+    return {
+        "ok": True,
+        "count": len(snippets),
+        "results": snippets,
+    }
+
+
+def _history_record_matches(
+    record: dict,
+    *,
+    conversation_id: str | None,
+    keyword: str | None,
+    time_range: str | None,
+) -> bool:
+    if conversation_id and record.get("conversation_id") != conversation_id:
+        return False
+    text = "\n".join(
+        [
+            str(record.get("content") or ""),
+            str(record.get("metadata") or ""),
+        ]
+    )
+    keyword = (keyword or "").strip()
+    if keyword and keyword not in text:
+        return False
+    time_range = (time_range or "").strip()
+    if time_range and time_range not in text:
+        return False
+    return True

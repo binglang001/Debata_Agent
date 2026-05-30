@@ -1,6 +1,6 @@
 """DuckDuckGo 搜索 service。
 
-duckduckgo_search 包提供同步 API；在异步上下文里用 asyncio.to_thread 包一层。
+ddgs 包提供同步 API；在异步上下文里用 asyncio.to_thread 包一层。
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ import asyncio
 import logging
 from typing import Any
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 logger = logging.getLogger(__name__)
 
@@ -54,5 +54,11 @@ class WebSearchService:
         return "\n\n".join(lines)
 
     def _sync_search(self, query: str) -> list[dict[str, Any]]:
-        with DDGS() as ddgs:
-            return list(ddgs.text(query, max_results=self.max_results))
+        with DDGS(timeout=int(self.timeout_seconds)) as ddgs:
+            return list(
+                ddgs.text(
+                    query,
+                    backend="duckduckgo",
+                    max_results=self.max_results,
+                )
+            )

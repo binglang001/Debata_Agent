@@ -1,4 +1,4 @@
-"""Diana_Agent 适配器层。
+"""Debata_Agent 适配器层。
 
 适配器把不同的聊天平台（QQ / Discord / Telegram / ...）抽象成统一接口。
 

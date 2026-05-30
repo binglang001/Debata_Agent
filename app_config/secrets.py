@@ -33,11 +33,22 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-import keyring
+try:
+    import keyring
+except ImportError:
+    keyring = None  # type: ignore[assignment]
 
 from .paths import AppPaths
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_keyring():
+    """检查 keyring 是否可用，不可用则抛 SecretsError。"""
+    if keyring is None:
+        raise SecretsError(
+            "当前环境无 keyring 后端。请安装 keyring 或设置 KEYRING_BACKEND 环境变量。"
+        )
 
 
 class SecretsError(Exception):
@@ -146,7 +157,7 @@ class SecretsManager:
                 nonce, ciphertext, associated_data=key_id.encode("utf-8")
             ).decode("utf-8")
         except Exception as e:
-            logger.error(f"密钥 {key_id} 解密失败: {type(e).__name__}")
+            logger.error(f"密钥 {key_id} 解密失败: {type(e).__name__}: {e}")
             return None
 
     def get_required(self, key_id: str) -> str:

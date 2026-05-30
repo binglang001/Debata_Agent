@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -29,7 +30,8 @@ DuplicateChecker = Callable[[list[dict], str], Awaitable[bool]]
 
 # 默认的"记住"类关键词。命中即强制保存（绕过 AI 主动判断）
 DEFAULT_FORCE_SAVE_KEYWORDS: list[str] = [
-    "记住", "请记住", "一定要记住", "重要的是",
+    "记住", "请记住", "一定要记住", "记一下", "记下", "帮我记", "帮我记一下",
+    "记一笔", "记：", "记:", "重要的是",
     "约定", "约好", "承诺",
     "我叫", "我是", "我的名字",
     "我的 QQ", "我的qq", "QQ 是", "qq是",
@@ -181,6 +183,37 @@ class ImportantMemoryManager:
                             logger.warning(f"RAG 索引移除失败：{e}")
         return deleted
 
+    async def delete_by_id(self, item_id: str) -> bool:
+        """按 timestamp/id 精确删除一条记忆，返回是否删除。"""
+        if not self._loaded:
+            raise RuntimeError("ImportantMemoryManager 尚未调用 load()")
+        item_id = (item_id or "").strip()
+        if not item_id:
+            return False
+
+        keep: list[dict] = []
+        removed: dict | None = None
+        for item in self._items:
+            current_id = str(item.get("id") or item.get("timestamp") or "")
+            if removed is None and current_id == item_id:
+                removed = item
+                continue
+            keep.append(item)
+
+        if removed is None:
+            return False
+
+        self._items = keep
+        await self._store.write(self._items)
+        self._refresh_text_cache()
+        logger.info(f"重要记忆删除 1 条 (id={item_id})")
+        if self.rag_enabled:
+            try:
+                await self._rag_store.remove_by_id(item_id)  # type: ignore[union-attr]
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"RAG 索引移除失败：{e}")
+        return True
+
     async def force_save_from_keyword(
         self,
         text: str,
@@ -209,17 +242,18 @@ class ImportantMemoryManager:
         if matched is None:
             return {"saved": False, "matched_keyword": None, "content": ""}
 
-        self._items.append(
-            {
-                "timestamp": self._now_fn(),
-                "content": text,
-                "source": f"keyword:{matched}",
-            }
-        )
+        content = _strip_memory_keyword(text, matched)
+        item = {
+            "timestamp": self._now_fn(),
+            "content": content,
+            "source": f"keyword:{matched}",
+        }
+        self._items.append(item)
         await self._store.write(self._items)
         self._refresh_text_cache()
-        logger.info(f"关键词强制保存触发 ({matched}): {text[:50]}")
-        return {"saved": True, "matched_keyword": matched, "content": text}
+        logger.info(f"关键词强制保存触发 ({matched}): {content[:50]}")
+        await self._index_in_rag(item)
+        return {"saved": True, "matched_keyword": matched, "content": content}
 
     async def replace_all(self, items: list[dict]) -> None:
         """整体替换（总结后用）。"""
@@ -240,6 +274,29 @@ class ImportantMemoryManager:
         self._refresh_text_cache()
         self._loaded = True
         logger.info(f"重要记忆整体替换为 {len(cleaned)} 条")
+        await self._rebuild_rag_index()
+
+    async def _rebuild_rag_index(self) -> None:
+        """整体替换重要记忆后重建 RAG 索引。失败仅 warn，不影响 JSON 记忆。"""
+        if not self.rag_enabled:
+            return
+        try:
+            from .rag_store import RagEntry
+
+            entries: list[RagEntry] = []
+            for item in self._items:
+                vec = await self._embedding.embed_one(item["content"])  # type: ignore[union-attr]
+                entries.append(
+                    RagEntry(
+                        id=item["timestamp"],
+                        text=item["content"],
+                        vector=vec,
+                        meta={"timestamp": item["timestamp"]},
+                    )
+                )
+            await self._rag_store.replace_all(entries)  # type: ignore[union-attr]
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"RAG 索引重建失败（不影响重要记忆替换）：{e}")
 
     def _refresh_text_cache(self) -> None:
         if not self._items:
@@ -253,3 +310,12 @@ def _default_now() -> str:
     from datetime import datetime
 
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _strip_memory_keyword(text: str, keyword: str) -> str:
+    """去掉用户显式“记住/记一下”等引导词，保存真正的事实内容。"""
+    content = text.strip()
+    if keyword and content.startswith(keyword):
+        content = content[len(keyword):]
+        content = re.sub(r"^[\s:：,，。.!！-]+", "", content).strip()
+    return content or text.strip()

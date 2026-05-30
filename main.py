@@ -1,4 +1,4 @@
-"""Diana_Agent 程序入口。
+"""Debata_Agent 程序入口。
 
 启动顺序：
     1. 解析命令行参数（--no-gui / --config 路径等）
@@ -47,7 +47,7 @@ def install_uvloop() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="diana", description="Diana_Agent —— 让虚拟角色活过来的通用框架"
+        prog="debata", description="Debata_Agent —— 让虚拟角色活过来的通用框架"
     )
     parser.add_argument(
         "--no-gui",
@@ -83,11 +83,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def run_headless(project_root: Path) -> None:
+async def run_headless(project_root: Path, config_file: Path | None = None) -> None:
     """无 GUI 模式：直接跑 Runtime。"""
     from core import Runtime
 
-    rt = Runtime(project_root=project_root)
+    rt = Runtime(project_root=project_root, config_file=config_file)
     try:
         await rt.start()
         await rt.wait_until_stop()
@@ -121,7 +121,7 @@ def _find_missing_secrets(cfg, secrets) -> list[str]:
     return missing
 
 
-def run_with_gui(project_root: Path, force_wizard: bool = False) -> None:
+def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Path | None = None) -> None:
     """GUI 模式统一入口：qasync 桥接 + 向导 / 仪表盘 + 系统托盘 + graceful shutdown。
 
     - 没有 config 或 force_wizard=True：先弹向导，完成后接力启动 Runtime + Dashboard
@@ -139,7 +139,7 @@ def run_with_gui(project_root: Path, force_wizard: bool = False) -> None:
     from PySide6.QtWidgets import QApplication
 
     from app_config import AppPaths, SecretsManager
-    from ui.theme import LIGHT, build_qss
+    from ui.theme import build_qss, palette_for_theme
     from ui.dashboard.main_window import DashboardWindow
     from ui.tray import Tray
     from ui.wizard.window import WizardWindow
@@ -147,12 +147,12 @@ def run_with_gui(project_root: Path, force_wizard: bool = False) -> None:
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    app.setStyleSheet(build_qss(LIGHT))
+    app.setStyleSheet(build_qss(palette_for_theme("auto")))
 
     loop = qasync.QEventLoop(app)
     _asyncio.set_event_loop(loop)
 
-    paths = AppPaths(project_root=project_root)
+    paths = AppPaths(project_root=project_root, config_file=config_file)
     paths.ensure_data_dirs()
 
     state: dict = {
@@ -167,19 +167,31 @@ def run_with_gui(project_root: Path, force_wizard: bool = False) -> None:
         if state["shutting_down"]:
             return
         state["shutting_down"] = True
-        logger.info("准备退出 Diana...")
+        logger.info("准备退出 Debata...")
+        rt = state["rt"]
+        if rt is not None:
+            try:
+                rt.request_stop()
+            except Exception:
+                pass
         if state["tray"]:
             state["tray"].hide()
         if state["dashboard"]:
             state["dashboard"].close()
         if state["wizard"]:
+            try:
+                state["wizard"]._completed_emitted = True
+            except Exception:
+                pass
             state["wizard"].close()
 
         async def _do_shutdown() -> None:
             rt = state["rt"]
             if rt is not None:
                 try:
-                    await rt.shutdown()
+                    await asyncio.wait_for(rt.shutdown(), timeout=20.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Shutdown 超时，继续退出")
                 except Exception:
                     logger.exception("Shutdown 失败")
             QTimer.singleShot(300, app.quit)
@@ -195,11 +207,11 @@ def run_with_gui(project_root: Path, force_wizard: bool = False) -> None:
         if state["wizard"] is not None:
             try:
                 state["wizard"].close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"关闭向导窗口异常: {e}")
             state["wizard"] = None
 
-        rt = Runtime(project_root=project_root)
+        rt = Runtime(project_root=project_root, config_file=config_file)
         state["rt"] = rt
 
         async def _boot() -> None:
@@ -228,14 +240,24 @@ def run_with_gui(project_root: Path, force_wizard: bool = False) -> None:
 
             def _on_restart() -> None:
                 async def _restart_async() -> None:
+                    ok = False
+                    message = ""
                     try:
+                        rt.request_stop()
                         await rt.shutdown()
                     except Exception:
                         logger.exception("重启时 shutdown 失败")
+                        message = "停止 Runtime 时失败，请查看日志。"
                     try:
                         await rt.start()
+                        ok = True
                     except Exception:
                         logger.exception("重启时 start 失败")
+                        message = "启动 Runtime 时失败，请查看日志。"
+                    try:
+                        dashboard.notify_runtime_restart_finished(ok, message)
+                    except Exception:
+                        logger.exception("通知重启结果失败")
                 loop.create_task(_restart_async())
 
             # 设置页 / 托盘都能触发重启
@@ -250,7 +272,7 @@ def run_with_gui(project_root: Path, force_wizard: bool = False) -> None:
             state["tray"] = tray
             tray.show()
             tray.showMessage(
-                "Diana_Agent",
+                "Debata_Agent",
                 "已在托盘待命。点托盘图标打开仪表盘。",
                 msecs=2500,
             )
@@ -336,6 +358,7 @@ def run_with_gui(project_root: Path, force_wizard: bool = False) -> None:
                 else:
                     begin_shutdown()
             else:
+                app.setStyleSheet(build_qss(palette_for_theme(cfg_check.app.theme)))
                 missing = _find_missing_secrets(cfg_check, secrets_check)
                 if missing:
                     logger.warning(f"启动前检测：密钥缺失 {missing}")
@@ -344,7 +367,7 @@ def run_with_gui(project_root: Path, force_wizard: bool = False) -> None:
                         "密钥不齐",
                         "检测到以下配置项引用的密钥已丢失：\n\n  · "
                         + "\n  · ".join(missing)
-                        + "\n\nDiana 不会以空密钥强行启动（这只会让 API 全报 401）。"
+                        + "\n\nDebata 不会以空密钥强行启动（这只会让 API 全报 401）。"
                         "\n\n请重新配置以覆盖现有 yaml 中的密钥字段。",
                         confirm_text="重新配置", cancel_text="退出",
                     ):
@@ -390,7 +413,8 @@ def main() -> None:
 
     from app_config import AppPaths
 
-    paths = AppPaths(project_root=project_root)
+    config_file = Path(args.config) if args.config else None
+    paths = AppPaths(project_root=project_root, config_file=config_file)
     paths.ensure_data_dirs()
 
     if args.napcat:
@@ -398,7 +422,7 @@ def main() -> None:
         return
 
     if args.test_adapter:
-        asyncio.run(_test_adapter(project_root))
+        asyncio.run(_test_adapter(project_root, config_file=config_file))
         return
 
     if args.list_secrets:
@@ -411,12 +435,12 @@ def main() -> None:
             _run_cli_wizard(paths)
             return
         try:
-            asyncio.run(run_headless(project_root))
+            asyncio.run(run_headless(project_root, config_file=config_file))
         except KeyboardInterrupt:
             print("\n收到 Ctrl+C，已退出。")
     else:
         # GUI 模式：统一入口，内部判断是否要先弹向导
-        run_with_gui(project_root, force_wizard=args.setup)
+        run_with_gui(project_root, force_wizard=args.setup, config_file=config_file)
 
 
 def _run_cli_wizard(paths) -> None:
@@ -452,14 +476,14 @@ def _run_cli_wizard(paths) -> None:
             existing = None
 
     cur_napcat = existing.adapters.get("default") if existing else None
-    cur_persona = existing.persona.active if existing else "diana"
+    cur_persona = existing.persona.active if existing else "debata"
 
     print("=" * 60)
     if existing:
-        print("Diana_Agent 配置向导 · amend 模式")
+        print("Debata_Agent 配置向导 · amend 模式")
         print("（每项 Enter 保留当前值；只问需要的几项）")
     else:
-        print("Diana_Agent 首次配置向导")
+        print("Debata_Agent 首次配置向导")
     print("=" * 60)
 
     secrets = SecretsManager(paths)
@@ -516,7 +540,7 @@ def _run_cli_wizard(paths) -> None:
     if existing:
         print(f"  当前激活：{cur_persona}")
     else:
-        print("  仓库自带：diana（开箱即用）")
+        print("  仓库自带：debata（开箱即用）")
     persona_name = input(f"  人格目录名 [{cur_persona}]: ").strip() or cur_persona
 
     # 4. admin QQ（可选）
@@ -761,7 +785,7 @@ def _run_napcat_setup(paths) -> None:
 # ============================================================
 
 
-async def _test_adapter(project_root: Path) -> None:
+async def _test_adapter(project_root: Path, config_file: Path | None = None) -> None:
     """启动 NapCat adapter 5 秒，报告连接情况。"""
     from core import Runtime
 
@@ -769,7 +793,7 @@ async def _test_adapter(project_root: Path) -> None:
     print("测试 NapCat 适配器连接（5 秒）")
     print("=" * 60)
 
-    rt = Runtime(project_root=project_root)
+    rt = Runtime(project_root=project_root, config_file=config_file)
     try:
         await rt.start()
     except Exception as e:
@@ -777,9 +801,10 @@ async def _test_adapter(project_root: Path) -> None:
         return
 
     # 启动后立刻打印配置摘要，方便用户判断"程序在用什么配置"
-    cfg = rt.config.adapters["default"]
+    adapter_name, cfg = next(iter(rt.config.adapters.items()))
     endpoint = f"ws://{cfg.host}:{cfg.port}{cfg.path}"
     print(f"\n程序配置：")
+    print(f"  adapter  = {adapter_name}")
     print(f"  mode     = {cfg.mode}")
     print(f"  endpoint = {endpoint}")
     print(f"  token_id = {cfg.access_token_id or '(无)'}")
@@ -797,7 +822,7 @@ async def _test_adapter(project_root: Path) -> None:
             break
     else:
         print("\n✗ 5 秒内未建立连接。检查：")
-        cfg = rt.config.adapters["default"]
+        adapter_name, cfg = next(iter(rt.config.adapters.items()))
         endpoint = f"ws://{cfg.host}:{cfg.port}{cfg.path}"
         if cfg.mode == "client":
             print(f"   - NapCat 那边「正向 WS」是否在 {endpoint} 监听？")

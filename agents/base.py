@@ -38,5 +38,8 @@ class AgentRunResult:
     reasoning_logs: list[str] = field(default_factory=list)
     """每轮 reasoning_content 的拼接（用于 UI 展示思考过程）"""
 
+    prompt_tokens: int = 0
+    """本轮所有模型调用累计的 prompt token，用于上下文估算校准。"""
+
     def has_records(self) -> bool:
         return bool(self.records)

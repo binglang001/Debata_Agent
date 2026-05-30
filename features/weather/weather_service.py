@@ -4,9 +4,6 @@
     1. 地理编码：城市名 → location_id（GET /geo/v2/city/lookup）
     2. 实时天气：GET /v7/weather/now
     3. 多日预报：GET /v7/weather/{N}d（按 days 选择 3d/7d）
-
-注：和风天气的 geoapi 走固定域名 geoapi.qweather.com，
-    实时/预报走用户配的 host（免费版 devapi.qweather.com 或商业版专属域名）。
 """
 
 from __future__ import annotations
@@ -21,8 +18,6 @@ logger = logging.getLogger(__name__)
 class WeatherService:
     """和风天气 API 客户端。"""
 
-    GEO_HOST = "geoapi.qweather.com"
-
     def __init__(
         self,
         *,
@@ -31,8 +26,14 @@ class WeatherService:
         timeout_seconds: float = 10.0,
     ) -> None:
         self.api_key = api_key
-        self.host = host
+        self.host = host.strip().rstrip("/")
         self.timeout_seconds = timeout_seconds
+
+    def _url(self, path: str) -> str:
+        base = self.host
+        if not base.startswith(("http://", "https://")):
+            base = f"https://{base}"
+        return base.rstrip("/") + path
 
     async def query(self, city: str, days: int = 1) -> str:
         """查询城市天气。days=1 返回实时，>=2 返回实时 + 多日预报。"""
@@ -44,10 +45,18 @@ class WeatherService:
             # 1. 地理编码
             try:
                 geo_resp = await client.get(
-                    f"https://{self.GEO_HOST}/v2/city/lookup",
+                    self._url("/geo/v2/city/lookup"),
                     params={"location": city, "key": self.api_key},
                 )
-                geo = geo_resp.json()
+                if geo_resp.status_code >= 400:
+                    return f"地理编码 API 错误：HTTP {geo_resp.status_code}"
+                try:
+                    geo = geo_resp.json()
+                except ValueError as e:
+                    logger.warning(
+                        f"geo lookup 返回非 JSON city={city!r} status={geo_resp.status_code}"
+                    )
+                    return f"地理编码响应不是 JSON：{e}"
             except Exception as e:
                 logger.warning(f"geo lookup 失败 city={city!r}: {e}")
                 return f"地理编码失败：{type(e).__name__}: {e}"
@@ -64,10 +73,15 @@ class WeatherService:
             # 2. 实时天气
             try:
                 now_resp = await client.get(
-                    f"https://{self.host}/v7/weather/now",
+                    self._url("/v7/weather/now"),
                     params={"location": location_id, "key": self.api_key},
                 )
-                now = now_resp.json()
+                if now_resp.status_code >= 400:
+                    return f"实时天气 API 错误：HTTP {now_resp.status_code}"
+                try:
+                    now = now_resp.json()
+                except ValueError as e:
+                    return f"实时天气响应不是 JSON：{e}"
             except Exception as e:
                 logger.warning(f"实时天气查询失败 loc={location_name}: {e}")
                 return f"实时天气查询失败：{type(e).__name__}: {e}"
@@ -90,14 +104,24 @@ class WeatherService:
                 forecast_n = 3 if days <= 3 else 7
                 try:
                     forecast_resp = await client.get(
-                        f"https://{self.host}/v7/weather/{forecast_n}d",
+                        self._url(f"/v7/weather/{forecast_n}d"),
                         params={"location": location_id, "key": self.api_key},
                     )
-                    forecast = forecast_resp.json()
+                    if forecast_resp.status_code >= 400:
+                        text_parts.append(f"（预报 API 错误：HTTP {forecast_resp.status_code}）")
+                        forecast = None
+                    else:
+                        try:
+                            forecast = forecast_resp.json()
+                        except ValueError as e:
+                            text_parts.append(f"（预报响应不是 JSON：{e}）")
+                            forecast = None
                 except Exception as e:
                     text_parts.append(f"（预报查询失败：{type(e).__name__}: {e}）")
                 else:
-                    if forecast.get("code") == "200":
+                    if forecast is None:
+                        pass
+                    elif forecast.get("code") == "200":
                         text_parts.append(f"\n未来 {forecast_n} 天：")
                         for day in forecast.get("daily", []):
                             text_parts.append(

@@ -1,6 +1,6 @@
 """OneBot CQ 码解析 —— 从原始 raw_message 字符串恢复人类可读文本。
 
-源自旧 diana_agent/handler.py:_parse_raw_cq。功能与旧版完全一致：
+源自旧 debata_agent/handler.py:_parse_raw_cq。功能与旧版完全一致：
     - 保留原始 @ 顺序和重复
     - 区分 @ 全体、@ 机器人自身、@ 普通用户
     - 把图片/语音/视频/合并转发/文件转成可读占位

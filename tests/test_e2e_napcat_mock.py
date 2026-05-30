@@ -233,14 +233,16 @@ async def test_private_message_napcat_json_to_send(tmp_path):
     registry = build_default_registry(cfg)
     adapter = E2EFakeAdapter("fake")
 
-    scheduler = WakeupScheduler(on_fire=lambda r: asyncio.sleep(0))
+    scheduler = WakeupScheduler(
+        on_fire=lambda r, target=None, mode="wakeup", message_text=None: asyncio.sleep(0)
+    )
     pipeline = MessagePipeline(
         adapter=adapter, chat_agent=chat_agent, persona=persona,
         history=history, important=important, tool_registry=registry,
         wakeup_scheduler=scheduler,
         pending_requests=PendingRequestStore(),
         behavior_cfg=cfg.behavior, features_cfg=cfg.features,
-        emoji_dir=None, upload_allowed_dir=None,
+        emoji_dir=None, workspace_dir=None,
         rate_limiter=None, summary_agent=None,
     )
     scheduler._on_fire = pipeline.run_wakeup_turn
@@ -308,10 +310,12 @@ async def test_group_message_napcat_json_to_send(tmp_path):
     pipeline = MessagePipeline(
         adapter=adapter, chat_agent=chat_agent, persona=persona,
         history=history, important=important, tool_registry=registry,
-        wakeup_scheduler=WakeupScheduler(on_fire=lambda r: asyncio.sleep(0)),
+        wakeup_scheduler=WakeupScheduler(
+            on_fire=lambda r, target=None, mode="wakeup", message_text=None: asyncio.sleep(0)
+        ),
         pending_requests=PendingRequestStore(),
         behavior_cfg=cfg.behavior, features_cfg=cfg.features,
-        emoji_dir=None, upload_allowed_dir=None,
+        emoji_dir=None, workspace_dir=None,
         rate_limiter=None, summary_agent=None,
     )
 

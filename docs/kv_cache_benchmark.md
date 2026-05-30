@@ -55,7 +55,7 @@ venv/Scripts/python -m pytest tests/test_kv_cache_real.py -m live -s
 
 ### 用例 3：大 system 是否被缓存
 
-system prompt 总字符数 ≈ 12,144（含 diana persona + tool_use_protocol + human_chat_patterns 等）
+system prompt 总字符数 ≈ 12,144（含 debata persona + tool_use_protocol + human_chat_patterns 等）
 
 | 轮次 | prompt | cached | hit_rate |
 |---|---|---|---|

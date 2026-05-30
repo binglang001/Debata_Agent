@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import json
 
 from providers.base import IProvider, ProviderError
 
@@ -34,12 +35,21 @@ class VisionService:
         self.max_tokens = max_tokens
         self.timeout_seconds = timeout_seconds
 
-    async def describe(self, image_url: str, prompt: str = "") -> str:
-        """返回图片的文字描述。"""
+    async def describe(self, image_url: str, prompt: str = "") -> dict[str, str]:
+        """返回图片摘要和完整描述。"""
         if not image_url:
-            return "（图片地址为空）"
+            return {"summary": "图片地址为空", "description": "（图片地址为空）"}
 
-        effective_prompt = prompt.strip() or self.DEFAULT_PROMPT
+        question = prompt.strip()
+        effective_prompt = (
+            f"{self.DEFAULT_PROMPT}\n\n用户特别想知道：{question}"
+            if question
+            else self.DEFAULT_PROMPT
+        )
+        effective_prompt += (
+            "\n\n请只返回 JSON 对象，不要包 markdown："
+            '{"summary":"60字以内一句话概括","description":"完整描述或针对问题的完整回答"}'
+        )
         messages = [
             {
                 "role": "user",
@@ -59,9 +69,32 @@ class VisionService:
                 stream=False,
                 timeout=self.timeout_seconds,
                 first_token_timeout=self.timeout_seconds,
-            )
+        )
         except ProviderError as e:
             logger.warning(f"vision describe 失败: {e}")
-            return f"（图片识别失败：{e}）"
+            text = f"（图片识别失败：{e}）"
+            return {"summary": "图片识别失败", "description": text}
 
-        return (result.content or "").strip() or "（模型未返回内容）"
+        content = (result.content or "").strip() or "（模型未返回内容）"
+        parsed = _parse_json_object(content)
+        if parsed:
+            summary = str(parsed.get("summary") or "").strip()
+            description = str(parsed.get("description") or "").strip()
+            if description:
+                return {
+                    "summary": summary or description[:60],
+                    "description": description,
+                }
+        return {"summary": content[:60], "description": content}
+
+
+def _parse_json_object(text: str) -> dict | None:
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start < 0 or end <= start:
+        return None
+    try:
+        value = json.loads(text[start:end])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None

@@ -54,17 +54,21 @@ class ProactiveLoop:
     async def _loop(self) -> None:
         while not self._stopping:
             try:
-                await asyncio.sleep(self.behavior_cfg.proactive_think_interval_seconds)
+                idle = self.pipeline.idle_seconds()
+                interval = self.behavior_cfg.proactive_think_interval_seconds
+                if idle < interval:
+                    await asyncio.sleep(max(0.5, min(interval - idle, 5.0)))
+                    continue
+
+                await self._maybe_act()
+                await asyncio.sleep(min(interval, 5.0))
             except asyncio.CancelledError:
                 break
+            except Exception as e:
+                logger.error(f"主动思考异常: {e}")
 
             if self._stopping:
                 break
-
-            try:
-                await self._maybe_act()
-            except Exception as e:
-                logger.error(f"主动思考异常: {e}")
 
     async def _maybe_act(self) -> None:
         """单次判定 + 行动。
@@ -72,38 +76,64 @@ class ProactiveLoop:
         先用小模型 ProactiveRouterAgent.should_act 判定，True 才跑主 ChatAgent。
         这是主动思考省 token 的关键路径：大部分时段都应该被路由器拦下。
         """
-        # 有待处理消息时跳过（让被动响应优先）
+        interval = self.behavior_cfg.proactive_think_interval_seconds
+        idle = self.pipeline.idle_seconds()
+        if idle < interval:
+            logger.debug("主动思考：idle %.1fs < %.1fs，跳过", idle, interval)
+            return
+
         if not self.pipeline.batch.is_empty_unsafe():
             logger.info("主动思考：有待处理消息，跳过")
             return
+        if self.pipeline.reply_lock.locked():
+            logger.info("主动思考：回复锁忙，跳过")
+            return
 
-        now = get_time()
-
-        # 小模型路由判定
-        if self.proactive_agent is not None:
-            try:
-                # 给路由器看相同的上下文（不带 tools schema，节省 token）
-                router_messages = build_messages(
-                    persona=self.pipeline.persona,
-                    history=await self.pipeline.history.records(),
-                    important_memory_text=self.pipeline.important.text(),
-                    current_context=f"现在是{now}。后台主动思考触发。",
-                    memory_mode=self.pipeline.features_cfg.long_term_memory.mode,
-                )
-                needs_action = await self.proactive_agent.should_act(router_messages)
-            except Exception as e:
-                logger.exception(f"主动路由判断失败: {e}，本次不主动发言")
+        await self.pipeline.reply_lock.acquire()
+        try:
+            # 拿到锁后复检，避免“判断为空→等待锁期间新消息入队”的漂移。
+            idle = self.pipeline.idle_seconds()
+            if idle < interval:
+                logger.debug("主动思考：锁内 idle %.1fs < %.1fs，跳过", idle, interval)
                 return
-            if not needs_action:
-                logger.info("主动路由：本次跳过")
+            if not self.pipeline.batch.is_empty_unsafe():
+                logger.info("主动思考：锁内发现待处理消息，跳过")
                 return
 
-        # 通过路由 → 跑一轮主 Agent
-        task_context = (
-            f"现在是{now}。这是主动思考时间——你刚才判断要主动说点什么。"
-            f"想发就调 send_*，不想就 no_action 收尾。"
-        )
-        await self.pipeline.run_one_turn(task_context)
+            now = get_time()
+
+            if self.proactive_agent is not None:
+                try:
+                    router_messages = build_messages(
+                        persona=self.pipeline.persona,
+                        history=await self.pipeline._select_proactive_router_history(),
+                        important_memory_text=self.pipeline.important.text(),
+                        rolling_summary_text=self.pipeline._rolling_summary_text(),
+                        current_context=(
+                            f"现在是{now}。后台主动思考触发。"
+                            "如果最近用户明确要求你在“下次主动思考”时发消息、提醒用户或执行明确操作，"
+                            "本轮就是那个时机。"
+                        ),
+                        memory_mode=self.pipeline.features_cfg.long_term_memory.mode,
+                    )
+                    needs_action = await self.proactive_agent.should_act(router_messages)
+                except Exception as e:
+                    logger.exception(f"主动路由判断失败: {e}，本次不主动发言")
+                    self.pipeline.mark_activity()
+                    return
+                if not needs_action:
+                    logger.info("主动路由：本次跳过")
+                    self.pipeline.mark_activity()
+                    return
+
+            task_context = (
+                f"现在是{now}。这是主动思考时间——你刚才判断要主动说点什么。"
+                "如果最近用户明确要求你在下次主动思考时发消息、提醒用户或执行明确操作，优先完成那个请求。"
+                f"想发就调 send_*，不想就 no_action 收尾。"
+            )
+            await self.pipeline.run_one_turn(task_context, lock_already_held=True)
+        finally:
+            self.pipeline.reply_lock.release()
 
     async def shutdown(self) -> None:
         self._stopping = True
@@ -111,6 +141,8 @@ class ProactiveLoop:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                logger.warning(f"ProactiveLoop 停止异常: {e}")
         logger.info("ProactiveLoop 已停止")

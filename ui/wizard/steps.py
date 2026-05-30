@@ -32,7 +32,7 @@ class StepId(str, Enum):
     """可选高级功能（多模态 / 天气 / 联网 / 长期记忆模式）"""
 
     EMBEDDING = "embedding"
-    """RAG 模式下的 embedding 配置（features 选了 rag 时才出现）"""
+    """记忆方式配置；RAG 模式在这里配置 embedding"""
 
     ADAPTER = "adapter"
     """渠道配置（NapCat）"""
@@ -75,7 +75,7 @@ STEPS: dict[StepId, Step] = {
         id=StepId.WELCOME,
         title="开始之前",
         subtitle=(
-            "Diana_Agent 是一个让虚拟角色活过来的通用框架。\n"
+            "Debata_Agent 是一个让虚拟角色活过来的通用框架。\n"
             "下面用几分钟配置好——你可以选择「推荐」最快上手，也可以自定义每个细节。"
         ),
     ),
@@ -98,7 +98,7 @@ STEPS: dict[StepId, Step] = {
         id=StepId.OTHER_AGENTS,
         title="其它模型",
         subtitle=(
-            "Diana_Agent 内部用了三类模型：\n"
+            "Debata_Agent 内部用了三类模型：\n"
             "  · 主聊天（你刚才配的）\n"
             "  · 主动思考（小模型，决定是否主动开口）\n"
             "  · 历史总结（中型模型，定期整理对话）\n"
@@ -111,7 +111,7 @@ STEPS: dict[StepId, Step] = {
         id=StepId.FEATURES,
         title="选些可选的本领",
         subtitle=(
-            "这些功能默认关闭。打开哪个，Diana 就拥有哪个能力。\n"
+            "这些功能默认关闭。打开哪个，Debata 就拥有哪个能力。\n"
             "现在不开也没关系，之后随时能在设置里打开。"
         ),
         fields=[
@@ -120,24 +120,22 @@ STEPS: dict[StepId, Step] = {
             "tts",
             "weather",
             "web_search",
-            "long_term_memory_mode",
         ],
     ),
     StepId.EMBEDDING: Step(
         id=StepId.EMBEDDING,
-        title="向量记忆",
+        title="记忆方式",
         subtitle=(
-            "你选择了 RAG 模式的长期记忆。这需要一个 embedding 服务来给对话建索引。\n"
-            "可以用 API（火山引擎 / GLM），也可以本地跑开源模型。"
+            "选择长期记忆的工作方式。普通文件模式更轻，RAG 模式会用 embedding 模型做语义检索。"
         ),
-        fields=["embedding_type", "embedding_provider", "embedding_model"],
+        fields=["long_term_memory_mode", "embedding_type", "embedding_provider", "embedding_model"],
     ),
     StepId.ADAPTER: Step(
         id=StepId.ADAPTER,
         title="把 NapCat 接上",
         subtitle=(
             "NapCat 是连接 QQ 的中间件。你需要先把它跑起来（参考教程），\n"
-            "然后告诉 Diana 怎么找到它。"
+            "然后告诉 Debata 怎么找到它。"
         ),
         fields=[
             "adapter_mode",
@@ -152,7 +150,7 @@ STEPS: dict[StepId, Step] = {
         id=StepId.PERSONA,
         title="赋予一个角色",
         subtitle=(
-            "Diana 不是单一角色——你给它什么人格，它就活成谁。\n"
+            "Debata 不是单一角色——你给它什么人格，它就活成谁。\n"
             "可以用内置的示范角色快速开始，或者花十分钟创造一个属于你的。"
         ),
         fields=["persona_source", "active_persona"],
@@ -161,7 +159,7 @@ STEPS: dict[StepId, Step] = {
         id=StepId.PERSONA_CREATE,
         title="塑造你的角色",
         subtitle=(
-            "回答几个问题，Diana 会和你一起把这个角色具象化。\n"
+            "回答几个问题，Debata 会和你一起把这个角色具象化。\n"
             "可以多轮调整，直到你满意为止。"
         ),
         fields=[

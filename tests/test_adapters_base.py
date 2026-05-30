@@ -416,3 +416,35 @@ async def test_optional_methods_default_raise():
 def test_abstract_cannot_instantiate():
     with pytest.raises(TypeError):
         IAdapter("x")  # type: ignore[abstract]
+
+
+@pytest.mark.asyncio
+async def test_napcat_upload_file_always_sends_required_name(tmp_path):
+    from adapters.napcat.adapter import NapCatAdapter
+
+    class FakeApi:
+        def __init__(self):
+            self.calls = []
+
+        async def call(self, action, params):
+            self.calls.append((action, params))
+            return {}
+
+    adapter = object.__new__(NapCatAdapter)
+    adapter.name = "napcat"
+    adapter._api = FakeApi()
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("x", encoding="utf-8")
+
+    await NapCatAdapter.upload_file(
+        adapter,
+        Target(adapter="napcat", scope="private", target_id="10001"),
+        file_path,
+    )
+
+    assert adapter._api.calls == [
+        (
+            "upload_private_file",
+            {"user_id": 10001, "file": str(file_path), "name": "report.txt"},
+        )
+    ]

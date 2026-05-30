@@ -1,10 +1,10 @@
-"""Diana_Agent 核心运行时。
+"""Debata_Agent 核心运行时。
 
 替代旧 NoneBot2 + handler.py 的整套机制。每个模块职责单一，依赖通过构造器注入。
 
 模块构成（按消息流向）：
     event_bus           —— 接收 IAdapter 上报的事件，按类型分发
-    message_pipeline    —— 消息合并/批处理/中断检测/调用 ChatAgent/真实发送
+    message_pipeline    —— 消息合并/批处理/调用 ChatAgent/即时发送
     recall_handler      —— 撤回事件合并 + 触发 Agent 重新评估
     request_handler     —— 好友/群请求的暂存 + Agent 决策
     proactive_loop      —— 主动思考定时循环

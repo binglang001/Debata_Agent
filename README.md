@@ -1,6 +1,6 @@
 <div align="center">
 
-# Diana_Agent
+# Debata_Agent
 
 **让虚拟角色「活过来」的通用聊天框架**
 
@@ -15,11 +15,11 @@
 
 > 「想让虚拟角色不只是个会回复消息的程序，而是一个**会发牢骚、会跑题、会忘事、会半夜突然问你在不在**的人。」
 
-Diana_Agent 不绑定任何特定角色——你给它一个人格，它就活成那个人。框架名取自项目第一个被实现的角色 Diana。
+Debata_Agent 不绑定任何特定角色——你给它一个人格，它就活成那个人。框架名取自项目第一个被实现的角色 Debata。
 
 ## 与一般 AI 机器人的差异
 
-| 维度 | 一般 AI | Diana_Agent |
+| 维度 | 一般 AI | Debata_Agent |
 |------|--------|-------------|
 | 上下文 | 每对话独立 | **全会话统一时间线** |
 | 回复 | 一条长消息 | 拆 3-7 条短消息，60% ≤12 字 |
@@ -45,8 +45,8 @@ Diana_Agent 不绑定任何特定角色——你给它一个人格，它就活�
 ## 快速开始
 
 ```bash
-git clone https://github.com/binglang001/Diana_Agent.git
-cd Diana_Agent
+git clone https://github.com/binglang001/Debata_Agent.git
+cd Debata_Agent
 
 python -m venv venv
 # Windows
@@ -54,11 +54,14 @@ venv\Scripts\activate
 # macOS / Linux
 source venv/bin/activate
 
-pip install -e .
+pip install -e ".[gui]"
 
 python main.py            # 启动（首次进配置向导）
 python main.py --no-gui   # 纯 CLI 模式
 ```
+
+服务器或无图形环境只跑 `--no-gui` 时，可以用 `pip install -e .` 跳过 PySide6/qasync。
+本地 ASR/TTS/Embedding 的重依赖不随默认安装拉取；打开对应模型的安装指引时，Debata 会检查缺失运行包并在后台用当前 venv 补装。
 
 ### 环境要求
 
@@ -73,7 +76,7 @@ python main.py --no-gui   # 纯 CLI 模式
 1. 选主模型（推荐路径 5 步 / 自定义路径 10 步）
 2. 可选功能（视觉 / 天气 / 联网搜索 / RAG 长期记忆 …）
 3. 接入 NapCat（地址 + token + 白名单）
-4. 选/创建角色（内置 diana 或调 AI 现场生成）
+4. 选/创建角色（内置 debata 或调 AI 现场生成）
 
 完成后进入仪表盘——一切配置都能在设置页改，无需再跑向导。
 
@@ -88,7 +91,7 @@ python main.py --no-gui   # 纯 CLI 模式
 ## 项目结构
 
 ```
-Diana_Agent/
+Debata_Agent/
 ├── adapters/        渠道适配器（NapCat / 未来 Discord / ...）
 ├── providers/       LLM 提供商（含 10 个预设 + 教程）
 ├── agents/          主聊天 / 主动思考 / 总结 / 人格生成
@@ -98,7 +101,7 @@ Diana_Agent/
 ├── core/            事件总线 / 消息管道 / Runtime 生命周期
 ├── app_config/      配置 + AES/RSA 加密密钥
 ├── ui/              PySide6 GUI（向导 + 7 页仪表盘 + 托盘）
-├── personas/        人格目录（diana 入 git，其他 gitignore）
+├── personas/        人格目录（debata 入 git，其他 gitignore）
 ├── utils/           CQ 解析 / KV 缓存测量 / 时间
 ├── docs/            开发者文档
 ├── tests/           279 个单元测试
@@ -127,11 +130,11 @@ Diana_Agent/
 
 ## 一份默认人格的快速演示
 
-`personas/diana/` 自带一个完整人格档案：豆蔻年华女孩、慢热又毒舌、对长辈尊敬、对死党随便、对陌生人冷淡。这是项目最初的样品，也是「关系矩阵 + 真人聊天」方法论的验证。你可以：
+`personas/debata/` 自带一个完整人格档案：豆蔻年华女孩、慢热又毒舌、对长辈尊敬、对死党随便、对陌生人冷淡。这是项目最初的样品，也是「关系矩阵 + 真人聊天」方法论的验证。你可以：
 
-- **直接用 diana**：首次配置时选默认人格
+- **直接用 debata**：首次配置时选默认人格
 - **AI 现场捏一个**：向导里描述「我想要一个 25 岁的程序员、嘴硬心软、爱猫」，等几秒看 AI 写出来
-- **手写**：照 `personas/diana/persona_prompt.py` 葫芦画瓢，放到 `personas/{你的名字}/`
+- **手写**：照 `personas/debata/persona_prompt.py` 葫芦画瓢，放到 `personas/{你的名字}/`
 
 每个 persona 都有自己独立的 `data/memory/{name}/` 目录存历史与重要记忆，互不干扰。
 

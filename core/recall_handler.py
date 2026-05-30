@@ -101,5 +101,7 @@ class RecallHandler:
             self._flush_task.cancel()
             try:
                 await self._flush_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                logger.warning(f"RecallHandler._flush_task 取消异常: {e}")

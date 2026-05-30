@@ -107,7 +107,7 @@ class PersonaChoice:
     """人格选择。"""
 
     source: Literal["builtin", "create", "import"] = "builtin"
-    active: str = "diana"
+    active: str = "debata"
     """source=builtin 时是内置名；source=create 时是 brief.name；source=import 时是导入后的目录名"""
 
     brief: PersonaBrief | None = None
@@ -140,13 +140,19 @@ class WizardContext:
         default_factory=lambda: FeatureChoice(enabled=True)
     )
     long_term_memory_mode: Literal["file", "rag"] = "file"
+    long_term_memory_keyword_trigger_save: bool = True
 
     # RAG embedding（mode=rag 时才用）
     embedding_type: Literal["api", "local"] = "api"
     embedding_provider: str = "volcengine"
+    embedding_provider_preset: str = ""
+    embedding_provider_display_name: str = ""
+    embedding_provider_base_url: str = ""
+    embedding_provider_protocol: Literal["openai_compat", "anthropic"] = "openai_compat"
     embedding_api_key: str = ""
     embedding_model: str = ""
     embedding_local_quality: Literal["performance", "quality"] = "performance"
+    embedding_local_model_dir: str = ""
 
     adapter: AdapterChoice = field(default_factory=AdapterChoice)
 
@@ -155,9 +161,15 @@ class WizardContext:
     admin_qq: str = ""
     """管理员 QQ。可选。若填了，会保存到 persona 的 PERSONA_VARS['admins']。"""
 
+    admin_name: str = ""
+    """管理员显示名。可选；生成自定义人格时会加入提示词。"""
+
     def to_persona_brief(self) -> PersonaBrief:
         """如果用户选择 create 模式，返回 brief；否则返回空 brief。"""
-        return self.persona.brief or PersonaBrief(name=self.persona.active or "")
+        brief = self.persona.brief or PersonaBrief(name=self.persona.active or "")
+        brief.admin_name = brief.admin_name or self.admin_name
+        brief.admin_qq = brief.admin_qq or self.admin_qq
+        return brief
 
 
 # ============================================================

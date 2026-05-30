@@ -26,18 +26,33 @@ from ..copy import COPY
 from ...theme import Spacing
 
 
-_PRESET_DEFAULTS: dict[str, dict] = {
-    "deepseek": {"display": "DeepSeek", "model": "deepseek-v4-flash", "url": "https://api.deepseek.com/v1"},
-    "anthropic": {"display": "Anthropic Claude", "model": "claude-sonnet-4-5", "url": "https://api.anthropic.com/v1"},
-    "openai": {"display": "OpenAI", "model": "gpt-4o", "url": "https://api.openai.com/v1"},
-    "gemini": {"display": "Google Gemini", "model": "gemini-2.0-flash", "url": "https://generativelanguage.googleapis.com/v1beta"},
-    "glm": {"display": "智谱 GLM", "model": "glm-4-flash", "url": "https://open.bigmodel.cn/api/paas/v4"},
-    "qwen": {"display": "阿里通义", "model": "qwen-plus", "url": "https://dashscope.aliyuncs.com/compatible-mode/v1"},
-    "moonshot": {"display": "Moonshot Kimi", "model": "moonshot-v1-8k", "url": "https://api.moonshot.cn/v1"},
-    "openrouter": {"display": "OpenRouter", "model": "anthropic/claude-3.5-sonnet", "url": "https://openrouter.ai/api/v1"},
-    "siliconflow": {"display": "硅基流动", "model": "deepseek-ai/DeepSeek-V3", "url": "https://api.siliconflow.cn/v1"},
-    "volcengine": {"display": "火山引擎豆包", "model": "doubao-seed-1-6-vision", "url": "https://ark.cn-beijing.volces.com/api/v3"},
-}
+def _load_presets() -> dict[str, dict]:
+    """从 providers/presets/ 加载所有预设元数据（display / model / url）。"""
+    from pathlib import Path
+    try:
+        from providers.presets_loader import load_all_presets
+        presets_dir = Path(__file__).resolve().parent.parent.parent.parent / "providers" / "presets"
+        presets = load_all_presets(presets_dir)
+        result: dict[str, dict] = {}
+        for pid, p in presets.items():
+            first_model = p.models[0].id if p.models else ""
+            result[pid] = {
+                "display": p.display_name,
+                "model": first_model,
+                "url": p.base_url,
+                "protocol": p.protocol,
+            }
+        return result
+    except Exception:
+        # fallback: 少量预设
+        return {
+            "deepseek": {"display": "DeepSeek", "model": "", "url": "https://api.deepseek.com/v1", "protocol": "openai_compat"},
+            "anthropic": {"display": "Anthropic Claude", "model": "", "url": "https://api.anthropic.com/v1", "protocol": "anthropic"},
+            "openai": {"display": "OpenAI", "model": "", "url": "https://api.openai.com/v1", "protocol": "openai_compat"},
+        }
+
+
+_PRESET_DEFAULTS: dict[str, dict] = _load_presets()
 
 
 class MainModelCustomStepView(BaseStepView):
@@ -71,13 +86,25 @@ class MainModelCustomStepView(BaseStepView):
         # 自定义 base_url（仅 custom 时显示）
         self._base_url_edit = QLineEdit()
         self._base_url_edit.setPlaceholderText("https://api.example.com/v1")
+        self._base_url_edit.textChanged.connect(lambda *_: self._key_input.set_test_state("idle") if hasattr(self, "_key_input") else None)
         self._base_url_label = QLabel("Base URL")
         form.addRow(self._base_url_label, self._base_url_edit)
 
-        # 模型
-        self._model_edit = QLineEdit()
-        self._model_edit.setPlaceholderText("deepseek-v4-flash")
-        form.addRow(QLabel(COPY["main_model_custom.model_label"]), self._model_edit)
+        # 模型（可编辑下拉 + 获取按钮）
+        model_row = QHBoxLayout()
+        self._model_combo = QComboBox()
+        self._model_combo.setEditable(True)
+        self._model_combo.setMinimumWidth(280)
+        self._model_combo.setPlaceholderText("点击「获取模型」或手动输入模型 ID")
+        self._model_combo.currentTextChanged.connect(lambda *_: self._key_input.set_test_state("idle") if hasattr(self, "_key_input") else None)
+        model_row.addWidget(self._model_combo, 1)
+        self._fetch_btn = QPushButton("获取模型")
+        self._fetch_btn.setProperty("role", "secondary")
+        self._fetch_btn.clicked.connect(self._on_fetch_models)
+        model_row.addWidget(self._fetch_btn)
+        model_wrap = QWidget()
+        model_wrap.setLayout(model_row)
+        form.addRow(QLabel(COPY["main_model_custom.model_label"]), model_wrap)
 
         # 密钥（自带测试连接 - 但测试需要 base_url + model，所以这里用同一个组件）
         self._key_input = ApiKeyInput(placeholder="sk-... 或对应平台的密钥")
@@ -157,26 +184,67 @@ class MainModelCustomStepView(BaseStepView):
         if preset == "custom":
             self._base_url_label.setVisible(True)
             self._base_url_edit.setVisible(True)
-            if not self._model_edit.text():
-                self._model_edit.setText("")
         else:
-            info = _PRESET_DEFAULTS.get(preset, {})
             self._base_url_label.setVisible(False)
             self._base_url_edit.setVisible(False)
-            # 切到预设时自动填默认 model（如果用户没改过）
-            if not self._model_edit.text() or self._is_known_default(self._model_edit.text()):
-                self._model_edit.setText(info.get("model", ""))
+        # 切预设时清空模型下拉（用户需点「获取模型」）
+        self._model_combo.clear()
+        self._model_combo.setCurrentText("")
 
-    def _is_known_default(self, model: str) -> bool:
-        return any(info["model"] == model for info in _PRESET_DEFAULTS.values())
+    def _on_fetch_models(self) -> None:
+        """调用 provider API 获取可用模型列表。"""
+        preset = self._provider_combo.currentData()
+        if preset == "custom":
+            url = self._base_url_edit.text().strip()
+            if not url:
+                self._key_input.set_test_state("error", "自定义模式需要先填 Base URL")
+                return
+        else:
+            info = _PRESET_DEFAULTS.get(preset, {})
+            url = info.get("url", "")
+        key = self._key_input.text().strip()
+        if not key:
+            self._key_input.set_test_state("error", "请先填 API 密钥")
+            return
+
+        protocol = "anthropic" if preset == "anthropic" else "openai_compat"
+        self._fetch_btn.setEnabled(False)
+        self._fetch_btn.setText("获取中...")
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self._fetch_btn.setEnabled(True)
+            self._fetch_btn.setText("获取模型")
+            return
+
+        async def _do_fetch():
+            try:
+                from providers.model_fetcher import fetch_model_list
+                from providers.registry import normalize_base_url
+                normalized = normalize_base_url(url, protocol)
+                models = await fetch_model_list(normalized, key, protocol, timeout=8.0)
+                self._model_combo.clear()
+                for m in models:
+                    self._model_combo.addItem(m)
+                if models:
+                    self._model_combo.setCurrentIndex(0)
+                self._key_input.set_test_state("success", f"已获取 {len(models)} 个模型")
+            except Exception as e:
+                self._key_input.set_test_state("error", f"获取失败：{e}")
+            finally:
+                self._fetch_btn.setEnabled(True)
+                self._fetch_btn.setText("获取模型")
+
+        loop.create_task(_do_fetch())
 
     def refresh(self) -> None:
         m = self.context.main
-        # 选 provider
         idx = self._provider_combo.findData(m.preset or "custom")
         if idx >= 0:
             self._provider_combo.setCurrentIndex(idx)
-        self._model_edit.setText(m.model)
+        if m.model:
+            self._model_combo.setCurrentText(m.model)
         self._base_url_edit.setText(m.base_url)
         if m.api_key:
             self._key_input.set_text(m.api_key)
@@ -184,22 +252,20 @@ class MainModelCustomStepView(BaseStepView):
         self._top_p_spin.setValue(m.top_p)
         self._max_tokens_spin.setValue(m.max_tokens)
         self._reasoning_check.setChecked(m.reasoning_enabled)
-        # budget
         idx2 = self._budget_combo.findData(m.reasoning_budget)
         if idx2 >= 0:
             self._budget_combo.setCurrentIndex(idx2)
-        # max tokens（0 = 不指定）
         self._reasoning_tokens_spin.setValue(m.reasoning_max_tokens or 0)
         self._on_reasoning_toggled(m.reasoning_enabled)
 
     def save(self) -> bool:
         preset = self._provider_combo.currentData()
-        model = self._model_edit.text().strip()
+        model = self._model_combo.currentText().strip()
         key = self._key_input.text().strip()
         base_url = self._base_url_edit.text().strip()
 
         if not model:
-            self.invalid_input.emit("请填一下模型 ID（如 deepseek-chat）")
+            self.invalid_input.emit("请选一个模型或手动输入模型 ID")
             return False
         if not key:
             self.invalid_input.emit("请填一下 API 密钥")
@@ -207,6 +273,11 @@ class MainModelCustomStepView(BaseStepView):
         if preset == "custom" and not base_url:
             self.invalid_input.emit("自定义模式需要 Base URL")
             return False
+
+        # URL 规范化
+        if preset != "custom" and preset != "anthropic":
+            from providers.registry import normalize_base_url
+            _ = normalize_base_url  # imported for use in window.py persist
 
         info = _PRESET_DEFAULTS.get(preset, {})
         m = self.context.main
@@ -229,54 +300,57 @@ class MainModelCustomStepView(BaseStepView):
             m.reasoning_max_tokens = None
         return True
 
-    def _on_test(self, key: str) -> None:
+    async def validate_before_next(self) -> bool:
+        if self._key_input.is_test_success():
+            return True
+        self._key_input.set_test_state("testing", "正在自动测试主模型连接……")
+        ok, message = await self._test_current()
+        self._key_input.set_test_state("success" if ok else "error", message)
+        if not ok:
+            self.invalid_input.emit(message)
+        return ok
+
+    async def _test_current(self) -> tuple[bool, str]:
         preset = self._provider_combo.currentData()
-        model = self._model_edit.text().strip() or "test"
+        model = self._model_combo.currentText().strip() or "test"
+        key = self._key_input.text().strip()
         info = _PRESET_DEFAULTS.get(preset, {})
         url = self._base_url_edit.text().strip() if preset == "custom" else info.get("url", "")
+        if not key:
+            return False, "请填一下 API 密钥"
         if not url:
-            self._key_input.set_test_state("error", "缺少 Base URL")
-            return
+            return False, "缺少 Base URL"
+        try:
+            from providers import probe_provider_endpoint
+            from providers.registry import normalize_base_url
 
+            protocol = info.get("protocol", "anthropic" if preset == "anthropic" else "openai_compat")
+            normalized = normalize_base_url(url, protocol)
+            result = await probe_provider_endpoint(
+                protocol=protocol,
+                base_url=normalized,
+                api_key=key,
+                model=model,
+                timeout_seconds=8.0,
+            )
+            if result.status == "ok":
+                return True, f"已就位（{result.latency_ms}ms）"
+            return False, result.message
+        except Exception as e:  # noqa: BLE001
+            return False, f"未能完成：{e}"
+
+    def _on_test(self, key: str) -> None:
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
             self._key_input.set_test_state("error", "事件循环未就绪")
             return
 
-        is_anthropic = preset == "anthropic"
-
         async def _do_test() -> None:
-            try:
-                if is_anthropic:
-                    from providers import AnthropicProvider
-                    provider = AnthropicProvider(
-                        "wizard_test",
-                        base_url=url, api_key=key, timeout=20.0,
-                    )
-                else:
-                    from providers import OpenAICompatProvider
-                    provider = OpenAICompatProvider(
-                        "wizard_test",
-                        base_url=url, api_key=key, timeout=20.0,
-                    )
-                try:
-                    result = await provider.chat_completion(
-                        messages=[{"role": "user", "content": "hi"}],
-                        model=model,
-                        tools=None,
-                        temperature=0.1,
-                        max_tokens=5,
-                        stream=False,
-                        timeout=20.0,
-                    )
-                finally:
-                    await provider.aclose()
-                self._key_input.set_test_state("success", "已就位")
-            except Exception as e:  # noqa: BLE001
-                self._key_input.set_test_state("error", f"未能完成：{e}")
+            ok, message = await self._test_current()
+            self._key_input.set_test_state("success" if ok else "error", message)
 
         loop.create_task(_do_test())
 
 
-__all__ = ["MainModelCustomStepView", "_PRESET_DEFAULTS"]
+__all__ = ["MainModelCustomStepView"]
