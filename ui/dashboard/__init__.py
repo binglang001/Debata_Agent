@@ -2,14 +2,13 @@
 
 模块构成：
     copy            —— 所有用户可见文案（中文，集中放）
-    layout          —— 整体布局与导航结构（Claude 已定义）
-    main_window     —— 主窗口（GPT-TODO PySide6 实现）
-    status_panel    —— 状态总览面板（GPT-TODO）
-    chat_visualizer —— 实时对话可视化（GPT-TODO）
-    log_viewer      —— 结构化日志查看器（GPT-TODO）
+    layout          —— 整体布局与导航结构
+    main_window     —— 主窗口
+    overview_page   —— 状态总览页
+    chats_page      —— 实时对话页
+    logs_page       —— 结构化日志页
 
-Claude 完成：copy.py / layout.py
-GPT 接手：各个 PySide6 组件，按 docs/ui_style_guide.md 实现。
+copy.py / layout.py 提供文案与布局规格，各页面模块实现具体 PySide6 组件。
 """
 
 from .copy import DASHBOARD_COPY

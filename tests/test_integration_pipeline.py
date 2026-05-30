@@ -495,7 +495,7 @@ async def test_working_history_without_conversation_uses_normal_budget(build_pip
 @pytest.mark.asyncio
 async def test_proactive_router_history_uses_small_window(build_pipeline):
     pipeline, _, _, history, _ = await build_pipeline([])
-    for idx in range(20):
+    for idx in range(40):
         await history.add_user_message(
             f"主动路由小窗口消息 {idx} " + ("占位内容 " * 200),
             conversation_id=f"private:{idx}",
@@ -504,8 +504,24 @@ async def test_proactive_router_history_uses_small_window(build_pipeline):
     selected = await pipeline._select_proactive_router_history()
     joined = "\n".join(str(m.get("content", "")) for m in selected)
 
-    assert "主动路由小窗口消息 19" in joined
+    assert "主动路由小窗口消息 39" in joined
     assert "主动路由小窗口消息 0" not in joined
+
+
+@pytest.mark.asyncio
+async def test_proactive_router_history_window_allows_16k_context(build_pipeline):
+    pipeline, _, _, history, _ = await build_pipeline([])
+    for idx in range(12):
+        await history.add_user_message(
+            f"主动路由16K窗口消息 {idx} " + ("占位内容 " * 120),
+            conversation_id=f"private:{idx}",
+        )
+
+    selected = await pipeline._select_proactive_router_history()
+    joined = "\n".join(str(m.get("content", "")) for m in selected)
+
+    assert "主动路由16K窗口消息 11" in joined
+    assert "主动路由16K窗口消息 0" in joined
 
 
 class FakeProactiveRouter:
@@ -536,12 +552,13 @@ async def test_proactive_skips_until_idle_threshold(build_pipeline):
 
 @pytest.mark.asyncio
 async def test_proactive_router_uses_small_context_after_idle(build_pipeline):
-    pipeline, _, _, history, _ = await build_pipeline([])
-    for idx in range(20):
+    pipeline, _, _, history, important = await build_pipeline([])
+    for idx in range(40):
         await history.add_user_message(
             f"主动路由不应看到的旧消息 {idx} " + ("占位内容 " * 200),
             conversation_id=f"private:{idx}",
         )
+    await important.save("用户不喜欢主动路由丢掉重要记忆")
     await pipeline.rolling_summary.update(
         "滚动摘要里保留跨会话背景",
         archived_until=None,
@@ -560,9 +577,73 @@ async def test_proactive_router_uses_small_context_after_idle(build_pipeline):
     await loop._maybe_act()
 
     assert len(router.calls) == 1
+    assert {m.get("role") for m in router.calls[0]} == {"system"}
     joined = "\n".join(str(m.get("content", "")) for m in router.calls[0])
+    assert "用户不喜欢主动路由丢掉重要记忆" in joined
     assert "滚动摘要里保留跨会话背景" in joined
+    assert "主动路由不应看到的旧消息 39" in joined
     assert "主动路由不应看到的旧消息 0" not in joined
+    assert "所有文字输出必须通过工具调用发送" not in joined
+
+
+@pytest.mark.asyncio
+async def test_proactive_router_flattens_history_to_system_context(build_pipeline):
+    pipeline, _, _, history, _ = await build_pipeline([])
+    await history.add_user_message(
+        "【2026-05-30 私聊 冰狼 msg_id=abc123】下次主动思考时提醒我喝水",
+        conversation_id="private:123",
+    )
+    await history.add_assistant_message(
+        "我记着了",
+        tool_calls=[
+            {
+                "id": "tc-router",
+                "type": "function",
+                "function": {"name": "no_action", "arguments": "{}"},
+            }
+        ],
+        conversation_id="private:123",
+    )
+    await history.add_tool_result(
+        "tc-router",
+        '{"ok": true, "msg_id": "100", "send_id": "send-1", "pollution": "<｜｜DSML｜｜TOOL_CALLS>"}',
+        conversation_id="private:123",
+    )
+    await history.add_system_note(
+        '<send_receipt>{"send_id": "send-1", "msg_id": "200"}</send_receipt>',
+        conversation_id="private:123",
+    )
+    await pipeline.rolling_summary.update(
+        "长期背景需要保留\n[assistant] send_private_messages msg_id=300\n<send_receipt>send_id=x</send_receipt>",
+        archived_until=None,
+        updated_at="test",
+    )
+    router = FakeProactiveRouter(False)
+    loop = ProactiveLoop(
+        pipeline=pipeline,
+        proactive_agent=router,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+    pipeline.last_activity_at = time.monotonic() - (
+        pipeline.behavior_cfg.proactive_think_interval_seconds + 1
+    )
+
+    await loop._maybe_act()
+
+    assert len(router.calls) == 1
+    assert {m.get("role") for m in router.calls[0]} == {"system"}
+    joined = "\n".join(str(m.get("content", "")) for m in router.calls[0])
+    assert "下次主动思考时提醒我喝水" in joined
+    assert "我记着了" in joined
+    assert "长期背景需要保留" in joined
+    assert "内部结果摘要" in joined
+    assert "[assistant" not in joined
+    assert "[tool" not in joined
+    assert "msg_id" not in joined
+    assert "send_id" not in joined
+    assert "tool_calls" not in joined
+    assert "<｜｜DSML｜｜TOOL_CALLS>" not in joined
+    assert "<send_receipt>" not in joined
 
 
 @pytest.mark.asyncio
@@ -634,6 +715,11 @@ async def test_proactive_action_runs_under_acquired_lock(build_pipeline):
     assert adapter.sent[-1][1] == "主动提醒"
     assert not pipeline.reply_lock.locked()
     assert provider.calls
+    joined = "\n".join(
+        str(m.get("content", "")) for m in provider.calls[0]["messages"]
+    )
+    assert "本轮由系统后台主动思考触发" in joined
+    assert "不是用户刚发来的新消息" in joined
 
 
 @pytest.mark.asyncio
@@ -1206,8 +1292,6 @@ async def test_execute_collected_sends_voice_action(build_pipeline, tmp_path):
                 "audio_path": str(audio),
             }
         ],
-        [],
-        check_interrupt=False,
     )
 
     assert adapter.voice_sent

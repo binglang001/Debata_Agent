@@ -1907,84 +1907,6 @@ class SettingsPage(QWidget):
         chk.toggled.connect(_on_toggle)
         return wrap
 
-    def _build_simple_feature_card(self, attr: str, title: str, hint: str) -> QWidget:
-        wrap = QFrame()
-        wrap.setObjectName("Card")
-        outer = QVBoxLayout(wrap)
-        outer.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
-        outer.setSpacing(Spacing.SM)
-
-        feat = getattr(self._cfg().features, attr)
-        head = QHBoxLayout()
-        chk = QCheckBox(title)
-        chk.setChecked(feat.enabled)
-        head.addWidget(chk)
-        head.addStretch(1)
-        outer.addLayout(head)
-
-        h = QLabel(hint)
-        h.setProperty("role", "secondary")
-        h.setWordWrap(True)
-        h.setContentsMargins(24, 0, 0, 0)
-        outer.addWidget(h)
-
-        def _on_toggle(on: bool) -> None:
-            if self._suppress_signals:
-                return
-            feat.enabled = on
-            self._save_now(needs_restart=True, change_desc=f"features.{attr}.enabled")
-
-        chk.toggled.connect(_on_toggle)
-        return wrap
-
-    def _build_asr_card(self) -> QWidget:
-        wrap = QFrame()
-        wrap.setObjectName("Card")
-        outer = QVBoxLayout(wrap)
-        outer.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
-        outer.setSpacing(Spacing.SM)
-
-        feat = self._cfg().features.asr
-        head = QHBoxLayout()
-        chk = QCheckBox("听懂语音（ASR · Whisper）")
-        chk.setChecked(feat.enabled)
-        self._asr_chk = chk
-        head.addWidget(chk)
-        head.addStretch(1)
-        edit_btn = QPushButton("编辑配置")
-        edit_btn.setProperty("role", "secondary")
-        head.addWidget(edit_btn)
-        outer.addLayout(head)
-
-        summary = QLabel(self._asr_summary())
-        summary.setProperty("role", "secondary")
-        summary.setWordWrap(True)
-        summary.setContentsMargins(24, 0, 0, 0)
-        self._asr_summary_lbl = summary
-        outer.addWidget(summary)
-
-        edit_btn.clicked.connect(lambda: self._open_asr_dialog(chk, summary))
-
-        def _on_toggle(on: bool) -> None:
-            if self._suppress_signals:
-                return
-            if on:
-                a = self._cfg().features.asr
-                if a.type == "api" and not a.provider:
-                    if not self._open_asr_dialog(chk, summary):
-                        self._suppress_signals = True
-                        chk.setChecked(False)
-                        self._suppress_signals = False
-                        return
-                a.enabled = True
-            else:
-                feat.enabled = False
-            summary.setText(self._asr_summary())
-            self._save_now(needs_restart=True, change_desc="features.asr.enabled")
-
-        chk.toggled.connect(_on_toggle)
-        return wrap
-
     def _open_asr_dialog(self, chk: QCheckBox, summary: QLabel) -> bool:
         a = self._cfg().features.asr
         dlg = _ASREditDialog(a, self)
@@ -2242,10 +2164,6 @@ class SettingsPage(QWidget):
     # ============================================================
     # 渠道节：adapter 全部可改 + 测试连接
     # ============================================================
-
-    def _get_adapter_cfg(self) -> NapCatAdapterConfig:
-        """动态取当前选中 adapter 的配置引用（避免闭包陷阱）。"""
-        return self._cfg().adapters[self._adapter_name]
 
     def _rebuild_adapter_form(self) -> None:
         """清空并重建 adapter 节表单（切换 adapter 时调用）。"""

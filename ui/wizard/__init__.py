@@ -5,11 +5,10 @@
     copy        —— 所有用户可见的中文文案（按 key 引用）
     flow        —— 步骤流转逻辑：决定下一步去哪、可不可跳过
     persona_creator —— 人格生成器对话流程（独立子模块）
-    components  —— 组件（GPT-TODO 实现：ProviderSelector / ApiKeyInput / 等）
-    wizard_window —— 主窗口（GPT-TODO 实现）
+    components  —— 组件（ProviderSelector / ApiKeyInput / 等）
+    window      —— 主窗口
 
-Claude 已完成：steps.py / copy.py / flow.py 的文案和流程定义。
-GPT 接手：components.py / wizard_window.py 的 PySide6 实现，按 docs/ui_style_guide.md 实现样式。
+各模块按 docs/ui_style_guide.md 的风格约束实现。
 """
 
 from .copy import COPY

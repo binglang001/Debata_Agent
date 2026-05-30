@@ -24,7 +24,7 @@ from core.runtime import Runtime
 # ============================================================
 
 
-def test_provider_model_map_includes_feature_providers():
+def test_provider_health_model_maps_include_feature_providers():
     from app_config.schema import (
         AgentConfig,
         AgentsConfig,
@@ -56,12 +56,6 @@ def test_provider_model_map_includes_feature_providers():
     )
     rt = object.__new__(Runtime)
     rt.config = cfg
-
-    assert Runtime._provider_model_map(rt) == {
-        "chat_p": "chat-model",
-        "vision_p": "vision-model",
-        "embedding_p": "embedding-model",
-    }
 
     assert Runtime._provider_chat_model_map(rt) == {
         "chat_p": "chat-model",

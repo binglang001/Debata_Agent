@@ -52,14 +52,6 @@ class TokenEstimator:
         self.calib_ratio = self.calib_ratio * 0.8 + ratio * 0.2
 
 
-def estimate_text_tokens(text: str, model: str = "") -> int:
-    return TokenEstimator(model=model).estimate_text(text)
-
-
-def estimate_messages_tokens(messages: list[dict[str, Any]], model: str = "") -> int:
-    return TokenEstimator(model=model).estimate_messages(messages)
-
-
 def _estimate_text_raw(text: str, model: str = "") -> int:
     if not text:
         return 1

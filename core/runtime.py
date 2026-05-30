@@ -750,12 +750,6 @@ class Runtime:
             return_exceptions=True,
         )
 
-    def _provider_model_map(self) -> dict[str, str]:
-        result = self._provider_chat_model_map()
-        for name, model in self._provider_embedding_model_map().items():
-            result.setdefault(name, model)
-        return result
-
     def _provider_chat_model_map(self) -> dict[str, str]:
         result: dict[str, str] = {}
         for _name, agent in self.config._iter_agents():

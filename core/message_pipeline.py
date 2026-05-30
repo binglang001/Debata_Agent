@@ -520,7 +520,7 @@ class _AsyncSendManager:
 _RATE_LIMIT_REPLY_TEMPLATE = "已超出速率限制（{window_seconds} 秒内最多 {max_messages} 条），请添加机器人为好友后继续使用"
 _PREFIX_ESTIMATE_TOKENS = 12_000
 _CURRENT_CONVERSATION_MIN_RECORDS = 8
-_PROACTIVE_ROUTER_HISTORY_BUDGET = 4_096
+_PROACTIVE_ROUTER_HISTORY_BUDGET = 16_384
 
 
 def _recommended_context_budget(model: str, context_length: int | None = None) -> int:
@@ -941,7 +941,7 @@ class MessagePipeline:
                 )
 
             # Phase 0 后发送类工具已在工具调用内即时发送；这里仅保留兼容兜底。
-            await self._execute_collected(ctx.collected, items)
+            await self._execute_collected(ctx.collected)
             self._calibrate_tokens(estimated_prompt_tokens, result.prompt_tokens)
             self.mark_activity()
 
@@ -956,9 +956,6 @@ class MessagePipeline:
     async def _execute_collected(
         self,
         collected: list[dict],
-        original_items: list[PendingMessageItem],
-        *,
-        check_interrupt: bool = True,
     ) -> bool:
         """逐条发送遗留 collected 动作。
 
@@ -1103,7 +1100,7 @@ class MessagePipeline:
                 self._send_manager.end_model_turn(conversation_id)
             if result.records:
                 await self.history.add_records(result.records, conversation_id=conversation_id)
-            await self._execute_collected(ctx.collected, [])
+            await self._execute_collected(ctx.collected)
             self.mark_activity()
 
     def _format_send_receipt(self, receipt: dict[str, Any]) -> str:
@@ -1387,7 +1384,7 @@ class MessagePipeline:
             "label": content,
             "delay": 0.0,
         }
-        await self._execute_collected([action], [], check_interrupt=False)
+        await self._execute_collected([action])
 
     # ============================================================
     # 唤醒入口（WakeupScheduler 触发时调用）
@@ -1479,7 +1476,7 @@ class MessagePipeline:
             if result.records:
                 await self.history.add_records(result.records)
             if ctx.collected:
-                await self._execute_collected(ctx.collected, [])
+                await self._execute_collected(ctx.collected)
         self.mark_activity()
 
     # ============================================================
@@ -1541,7 +1538,7 @@ class MessagePipeline:
             if result.records:
                 await self.history.add_records(result.records)
             if ctx.collected:
-                await self._execute_collected(ctx.collected, [])
+                await self._execute_collected(ctx.collected)
             self.mark_activity()
 
         if lock_already_held:

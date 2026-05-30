@@ -151,7 +151,7 @@ def extract_cache_metrics(
 ) -> CacheMetricsSample:
     """从 CompletionResult.raw 中按 provider 类型提取缓存指标。
 
-    GPT-TODO（按需扩展）：每家 provider 的 usage 字段不同，
+    TODO（按需扩展）：每家 provider 的 usage 字段不同，
     必要时按 result.raw 的类型分别取。
 
     当前从统一 Usage 字段读到的是 reasoning_tokens / prompt / completion，

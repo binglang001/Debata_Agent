@@ -29,9 +29,11 @@ def shrink_tool_result(tool_name: str, result: dict[str, Any], ctx: Any) -> dict
 
     shrunk = copy.deepcopy(result)
     if tool_name == "web_search":
-        shrunk = _shrink_web_search(shrunk)
+        shrunk = _shrink_web_search(shrunk, soft_limit, estimator)
     elif tool_name in {"list_contacts", "list_files"}:
-        shrunk = _shrink_contacts(shrunk)
+        shrunk = _shrink_contacts(tool_name, shrunk)
+    elif tool_name == "read_file":
+        shrunk = _shrink_read_file(shrunk, soft_limit, estimator)
     elif tool_name in _LINE_TOOLS:
         shrunk = _shrink_line_result(tool_name, shrunk, soft_limit, estimator)
     elif tool_name in _SUMMARY_TOOLS:
@@ -70,19 +72,27 @@ def _estimate_dict(result: dict[str, Any], estimator: TokenEstimator) -> int:
     return estimator.estimate_text(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
 
-def _shrink_web_search(result: dict[str, Any]) -> dict[str, Any]:
+def _shrink_web_search(
+    result: dict[str, Any],
+    soft_limit: int,
+    estimator: TokenEstimator,
+) -> dict[str, Any]:
     value = result.get("result")
     if not isinstance(value, str):
         return result
 
-    entries = _split_numbered_results(value)
-    if len(entries) <= 5 and len(value) <= 5000:
+    if _estimate_dict(result, estimator) <= soft_limit:
         return result
-    kept = entries[:5] if entries else value.splitlines()[:20]
-    result["result"] = "\n\n".join(_trim_chars(item, 360) for item in kept)
+
+    entries = _split_numbered_results(value)
+    kept = entries[:5] if entries else value.splitlines()[:10]
+    result["result"] = "\n\n".join(_shrink_search_entry(item) for item in kept)
+    if _estimate_dict(result, estimator) > soft_limit and len(kept) > 3:
+        kept = kept[:3]
+        result["result"] = "\n\n".join(_shrink_search_entry(item) for item in kept)
     return add_condensed_marker(
         result,
-        reason="搜索结果过长已保留前 5 条",
+        reason="搜索结果过长已保留高位结果摘要",
         full="可用更具体 query 重新搜索，或打开结果 URL 获取完整内容。",
     )
 
@@ -103,17 +113,58 @@ def _split_numbered_results(text: str) -> list[str]:
     return [item for item in entries if item]
 
 
-def _shrink_contacts(result: dict[str, Any]) -> dict[str, Any]:
+def _shrink_search_entry(entry: str) -> str:
+    """保留搜索条目的标题和 URL，只截断摘要。"""
+    lines = [line.strip() for line in entry.splitlines() if line.strip()]
+    if not lines:
+        return entry
+    url = next((line for line in reversed(lines) if line.startswith(("http://", "https://"))), "")
+    body_lines = lines[1:]
+    if url:
+        body_lines = [line for line in body_lines if line != url]
+    body = _trim_chars(" ".join(body_lines), 120) if body_lines else ""
+    parts = [lines[0]]
+    if body:
+        parts.append(body)
+    if url:
+        parts.append(url)
+    return "\n".join(parts)
+
+
+def _shrink_contacts(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
     for key in ("friends", "groups", "members", "entries"):
         value = result.get(key)
         if isinstance(value, list) and len(value) > 50:
             result[key] = value[:50]
+            retry_tool = "list_files" if tool_name == "list_files" else "list_contacts"
             return add_condensed_marker(
                 result,
                 reason=f"{key} 条目过多，仅保留前 50 条",
-                full="如需完整列表，请缩小查询范围或重新调用 list_contacts。",
+                full=f"如需完整列表，请缩小查询范围或重新调用 {retry_tool}。",
             )
     return result
+
+
+def _shrink_read_file(
+    result: dict[str, Any],
+    soft_limit: int,
+    estimator: TokenEstimator,
+) -> dict[str, Any]:
+    """read_file 已经分页；这里只压缩单页内容，并保留续读元数据。"""
+    if _estimate_dict(result, estimator) <= soft_limit:
+        return result
+    full_hint = "可调小 max_lines 或使用 offset 重新分页读取。"
+    next_offset = result.get("next_offset")
+    if next_offset is not None:
+        full_hint = f"继续调用 read_file，传 offset={next_offset} 读取后续；也可调小 max_lines 重读当前页。"
+    return _shrink_text_field(
+        result,
+        field="content",
+        limit_tokens=soft_limit,
+        reason="文件内容页过长已按 token 预算截断",
+        full=full_hint,
+        estimator=estimator,
+    )
 
 
 def _shrink_line_result(
@@ -134,11 +185,17 @@ def _shrink_line_result(
         lines = value.splitlines()
         if len(lines) <= 80 and estimator.estimate_text(value) <= soft_limit:
             continue
+        if len(lines) <= 2:
+            result[field] = _trim_head_tail(value, soft_limit, estimator)
+            changed = True
+            continue
         head = lines[:50]
         tail = lines[-20:] if len(lines) > 70 else []
         omitted = max(0, len(lines) - len(head) - len(tail))
         middle = [f"...（省略 {omitted} 行）..."] if omitted else []
         result[field] = "\n".join(head + middle + tail)
+        if estimator.estimate_text(result[field]) > soft_limit:
+            result[field] = _trim_head_tail(result[field], soft_limit, estimator)
         changed = True
 
     if changed:

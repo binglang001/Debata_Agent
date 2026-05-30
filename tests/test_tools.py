@@ -463,6 +463,33 @@ async def test_web_search_without_service():
 
 
 @pytest.mark.asyncio
+async def test_web_search_condenses_long_results():
+    class FakeSearch:
+        async def search(self, query: str) -> str:
+            return "\n\n".join(
+                f"{i}. 标题 {i}\n" + ("摘要内容 " * 80) + f"\nhttps://example.com/{i}"
+                for i in range(1, 8)
+            )
+
+    cfg = _make_config(web_search_enabled=True)
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        web_search=FakeSearch(),
+        tool_result_soft_limit_tokens=80,
+        tool_result_hard_cap_tokens=500,
+    )
+    executor = reg.get_executor(ctx)
+    result = await executor("web_search", {"query": "测试"})
+
+    assert result["ok"] is True
+    assert "preview" not in result
+    assert result["_condensed"]["reason"] == "搜索结果过长已保留高位结果摘要"
+    assert "1. 标题 1" in result["result"]
+    assert "https://example.com/1" in result["result"]
+    assert "7. 标题 7" not in result["result"]
+
+
+@pytest.mark.asyncio
 async def test_weather_without_service():
     cfg = _make_config(weather_enabled=True)
     reg = build_default_registry(cfg)
@@ -755,6 +782,34 @@ async def test_read_file_large_text_is_paginated(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_read_file_condenses_content_but_keeps_paging_metadata(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "long.txt").write_text(
+        "\n".join(f"line {i} " + ("内容 " * 30) for i in range(300)),
+        encoding="utf-8",
+    )
+
+    ctx = ToolContext(
+        workspace_dir=workspace,
+        tool_result_soft_limit_tokens=80,
+        tool_result_hard_cap_tokens=500,
+    )
+    executor = reg.get_executor(ctx)
+    result = await executor("read_file", {"path": "long.txt"})
+
+    assert result["ok"] is True
+    assert result["offset"] == 0
+    assert result["next_offset"] > 0
+    assert result["total_lines"] == 300
+    assert "preview" not in result
+    assert result["_condensed"]["reason"] == "文件内容页过长已按 token 预算截断"
+    assert f"offset={result['next_offset']}" in result["_condensed"]["full"]
+
+
+@pytest.mark.asyncio
 async def test_get_user_info_strips_binary_buffers():
     class FakeAdapter:
         async def get_user_info(self, user_id: str):
@@ -785,6 +840,54 @@ async def test_get_user_info_strips_binary_buffers():
 
 
 @pytest.mark.asyncio
+async def test_list_files_condenses_entries_but_keeps_count(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for i in range(60):
+        (workspace / f"{i:02d}.txt").write_text("x", encoding="utf-8")
+
+    executor = reg.get_executor(ToolContext(workspace_dir=workspace))
+    result = await executor("list_files", {"path": ".", "pattern": "*.txt"})
+
+    assert result["ok"] is True
+    assert result["count"] == 60
+    assert len(result["entries"]) == 50
+    assert "preview" not in result
+    assert "list_files" in result["_condensed"]["full"]
+
+
+@pytest.mark.asyncio
+async def test_get_forward_msg_long_content_keeps_content_field():
+    class FakeAdapter:
+        async def get_forward_msg(self, forward_id: str):
+            return [
+                {
+                    "sender": {"nickname": f"用户{i}"},
+                    "raw_message": "转发内容 " * 80,
+                }
+                for i in range(100)
+            ]
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        adapter=FakeAdapter(),
+        tool_result_soft_limit_tokens=80,
+        tool_result_hard_cap_tokens=500,
+    )
+    executor = reg.get_executor(ctx)
+    result = await executor("get_forward_msg", {"forward_id": "forward-1"})
+
+    assert result["ok"] is True
+    assert "content" in result
+    assert "preview" not in result
+    assert "forward-1" not in result["content"]
+    assert result["_condensed"]["reason"] == "工具输出过长已保留头尾"
+
+
+@pytest.mark.asyncio
 async def test_executor_hard_cap_is_creation_time_stable():
     class _Args(BaseModel):
         pass
@@ -807,6 +910,28 @@ async def test_executor_hard_cap_is_creation_time_stable():
     assert first == second
     assert first["_condensed"]["reason"].startswith("工具结果超过中央 hard cap")
     assert "payload" not in first
+
+
+@pytest.mark.asyncio
+async def test_run_python_single_long_line_keeps_stdout_field(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = ToolContext(
+        workspace_dir=workspace,
+        tool_result_soft_limit_tokens=80,
+        tool_result_hard_cap_tokens=800,
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor("run_python", {"code": "print('x' * 5000)"})
+
+    assert result["ok"] is True
+    assert "stdout" in result
+    assert "preview" not in result
+    assert len(result["stdout"]) < 5000
+    assert result["_condensed"]["reason"] == "工具输出过长已保留头尾"
 
 
 class _FakeAdapter:
