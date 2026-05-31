@@ -20,7 +20,7 @@
 
 - 阿里百炼：[Embedding 文档](https://help.aliyun.com/zh/model-studio/)：`text-embedding-v4`
 - 智谱：[Embedding 文档](https://docs.bigmodel.cn/)：`embedding-3`
-- 火山方舟：[模型列表](https://www.volcengine.com/docs/82379)：`doubao-embedding-text-240715`
+- 火山方舟：[Embedding API](https://www.volcengine.com/docs/82379/1302003/)：`doubao-embedding-vision-251215`
 - OpenAI：[Embedding 文档](https://platform.openai.com/docs/guides/embeddings)：`text-embedding-3-small` 或 `text-embedding-3-large`
 
 DeepSeek 主要是聊天模型平台，不建议拿它复用做 Embedding；如果返回 400 或参数调用错误，通常是模型 ID、接口类型或 provider 不匹配，请换独立 Embedding provider。

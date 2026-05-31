@@ -212,7 +212,7 @@ def test_wizard_embedding_endpoint_recovers_independent_provider_preset(qapp):
     ctx.long_term_memory_mode = "rag"
     ctx.embedding_type = "api"
     ctx.embedding_provider = "embedding_volcengine"
-    ctx.embedding_model = "doubao-embedding-text-240715"
+    ctx.embedding_model = "doubao-embedding-vision-251215"
     ctx.embedding_api_key = "embed-key"
 
     view = EmbeddingStepView(ctx)
@@ -223,6 +223,24 @@ def test_wizard_embedding_endpoint_recovers_independent_provider_preset(qapp):
 
     assert base_url == "https://ark.cn-beijing.volces.com/api/v3"
     assert api_key == "embed-key"
+
+
+def test_wizard_embedding_volcengine_uses_current_model(qapp):
+    from ui.wizard.context import WizardContext
+
+    ctx = WizardContext()
+    view = EmbeddingStepView(ctx)
+    try:
+        view._rb_rag.setChecked(True)
+        view._type_combo.setCurrentIndex(view._type_combo.findData("api"))
+        view._api_model.clear()
+        idx = view._api_provider.findData("new:volcengine")
+        assert idx >= 0
+        view._api_provider.setCurrentIndex(idx)
+
+        assert view._api_model.text() == "doubao-embedding-vision-251215"
+    finally:
+        view.deleteLater()
 
 
 def _minimal_root_config() -> RootConfig:

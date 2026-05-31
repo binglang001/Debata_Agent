@@ -10,6 +10,7 @@ from typing import Any
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
@@ -21,15 +22,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from agents.persona_gen_agent import PersonaGenResult, render_persona_file
 from agents.persona_import import (
     PersonaImportError,
     copy_persona_dir,
     import_persona_zip,
 )
 from agents.persona_loader import validate_persona_name
+from ui.wizard.context import WizardContext
+from ui.wizard.persona_creator import PersonaCreatorStepView
 
 from ..theme import Spacing
-from ..widgets import show_message
+from ..widgets import FramelessDialog, show_message
 from .copy import DASHBOARD_COPY
 
 logger = logging.getLogger(__name__)
@@ -69,8 +73,13 @@ class PersonasPage(QWidget):
         actions = QVBoxLayout()
         actions.setSpacing(Spacing.SM)
 
+        self._create_btn = QPushButton(DASHBOARD_COPY["personas.add_button"])
+        self._create_btn.setProperty("role", "primary")
+        self._create_btn.clicked.connect(self._on_create_persona)
+        actions.addWidget(self._create_btn)
+
         self._activate_btn = QPushButton(DASHBOARD_COPY["personas.activate_button"])
-        self._activate_btn.setProperty("role", "primary")
+        self._activate_btn.setProperty("role", "secondary")
         self._activate_btn.clicked.connect(self._on_activate)
         actions.addWidget(self._activate_btn)
 
@@ -163,6 +172,7 @@ class PersonasPage(QWidget):
     def _update_button_states(self) -> None:
         name = self._selected()
         has = name is not None
+        self._create_btn.setEnabled(self._runtime is not None)
         self._activate_btn.setEnabled(has and name != self._active_name)
         self._duplicate_btn.setEnabled(has)
         self._export_btn.setEnabled(has)
@@ -172,6 +182,92 @@ class PersonasPage(QWidget):
         )
 
     # ---- 动作 ----
+
+    def _on_create_persona(self) -> None:
+        context = self._build_creator_context()
+        if context is None:
+            return
+        dlg = _PersonaCreatorDialog(context, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            created = self._save_generated_persona(context)
+        except PersonaImportError as e:
+            show_message(self, "无法保存", str(e), is_danger=True)
+            return
+        except Exception as e:
+            logger.exception("保存生成人格失败")
+            show_message(self, "未能完成", str(e), is_danger=True)
+            return
+        self.refresh()
+        self._select_name(created)
+        show_message(self, "已创建", f"已创建角色「{created}」。需要使用它时，点「切换为当前」。")
+
+    def _build_creator_context(self) -> WizardContext | None:
+        if self._runtime is None or self._runtime.config is None:
+            show_message(self, "运行时未就绪", "暂时无法读取模型配置。", is_danger=True)
+            return None
+        cfg = self._runtime.config
+        agent_cfg = cfg.agents.persona_gen or cfg.agents.chat
+        provider_cfg = cfg.providers.get(agent_cfg.provider)
+        if provider_cfg is None:
+            show_message(
+                self,
+                "模型配置有误",
+                f"人格生成使用的 provider「{agent_cfg.provider}」不存在。",
+                is_danger=True,
+            )
+            return None
+        api_key = ""
+        if provider_cfg.api_key_id and self._runtime.secrets is not None:
+            api_key = self._runtime.secrets.get(provider_cfg.api_key_id) or ""
+        if not api_key:
+            show_message(
+                self,
+                "缺少密钥",
+                "人格生成需要可用的模型 API 密钥。请先在设置页补齐 provider 密钥。",
+                is_danger=True,
+            )
+            return None
+
+        from ui.wizard.step_views.main_model_custom import _PRESET_DEFAULTS
+
+        preset = provider_cfg.preset or "custom"
+        preset_info = _PRESET_DEFAULTS.get(preset, {})
+        protocol_raw = provider_cfg.protocol or preset_info.get("protocol") or "openai_compat"
+        protocol = "anthropic" if protocol_raw == "anthropic" else "openai_compat"
+
+        context = WizardContext()
+        context.main.preset = preset
+        context.main.display_name = provider_cfg.display_name or preset_info.get("display") or agent_cfg.provider
+        context.main.api_key = api_key
+        context.main.model = agent_cfg.model
+        context.main.base_url = provider_cfg.base_url or preset_info.get("url", "")
+        context.main.protocol = protocol
+        context.main.temperature = agent_cfg.temperature
+        context.main.top_p = agent_cfg.top_p
+        context.main.max_tokens = agent_cfg.max_tokens
+        return context
+
+    def _save_generated_persona(self, context: WizardContext) -> str:
+        p = context.persona
+        if p.source != "create" or not p.generated_xml:
+            raise PersonaImportError("还没有可保存的人格内容")
+        validate_persona_name(p.active)
+        target = self._personas_dir / p.active
+        if target.exists():
+            raise PersonaImportError(f"角色「{p.active}」已存在，请换一个名字")
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "__init__.py").touch(exist_ok=True)
+        result = PersonaGenResult(persona_prompt=p.generated_xml, display_name=p.active)
+        admins = _admin_entries(context.admin_qq, context.admin_name)
+        file_text = (
+            render_persona_file(result, p.brief, admins=admins)
+            if p.brief
+            else _render_minimal_persona(p.active, p.generated_xml, admins=admins)
+        )
+        (target / "persona_prompt.py").write_text(file_text, encoding="utf-8")
+        return p.active
 
     def _on_activate(self) -> None:
         name = self._selected()
@@ -301,3 +397,60 @@ class PersonasPage(QWidget):
             self.refresh()
         except Exception as e:
             show_message(self, "未能完成", str(e), is_danger=True)
+
+
+class _PersonaCreatorDialog(FramelessDialog):
+    """仪表盘里复用向导的人格生成界面。"""
+
+    def __init__(self, context: WizardContext, parent=None) -> None:
+        super().__init__("AI 生成角色", parent)
+        self.setMinimumSize(1100, 760)
+        self._creator = PersonaCreatorStepView(context, self)
+        self._creator.invalid_input.connect(
+            lambda msg: show_message(self, "还没完成", msg, is_danger=True)
+        )
+        self.body_layout().addWidget(self._creator, 1)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setProperty("role", "secondary")
+        cancel_btn.clicked.connect(self.reject)
+        actions.addWidget(cancel_btn)
+        save_btn = QPushButton("保存角色")
+        save_btn.setProperty("role", "primary")
+        save_btn.clicked.connect(self._on_accept)
+        actions.addWidget(save_btn)
+        self.body_layout().addLayout(actions)
+        self._creator.refresh()
+
+    def _on_accept(self) -> None:
+        if self._creator.save():
+            self.accept()
+
+
+def _admin_entries(admin_qq: str, admin_name: str) -> list[dict[str, object]]:
+    if not admin_qq:
+        return []
+    entry: dict[str, object] = {"qq": int(admin_qq), "role": "owner"}
+    if admin_name:
+        entry["name"] = admin_name
+    return [entry]
+
+
+def _render_minimal_persona(name: str, xml: str, admins: list[dict[str, object]] | None = None) -> str:
+    import json
+
+    safe = xml.replace("'''", "\\'\\'\\'")
+    admins_text = json.dumps(admins or [], ensure_ascii=False, indent=4)
+    admins_text = "\n".join("    " + line for line in admins_text.splitlines())
+    return (
+        '"""自动生成的人格档案。"""\n\n'
+        "PERSONA_PROMPT = '''\n"
+        f"{safe}\n"
+        "'''\n\n"
+        "PERSONA_VARS = {\n"
+        f"    \"name\": \"{name}\",\n"
+        f"    \"admins\": {admins_text},\n"
+        "}\n"
+    )

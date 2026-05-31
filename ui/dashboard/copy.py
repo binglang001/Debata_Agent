@@ -130,7 +130,7 @@ DASHBOARD_COPY: dict[str, str] = {
     # 角色管理
     # ============================================================
     "personas.list_title": "角色列表",
-    "personas.add_button": "新建角色",
+    "personas.add_button": "AI 生成角色",
     "personas.activate_button": "切换为当前",
     "personas.duplicate_button": "复制一份",
     "personas.delete_button": "删除",

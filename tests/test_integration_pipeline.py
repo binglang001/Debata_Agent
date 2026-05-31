@@ -660,11 +660,13 @@ async def test_proactive_skips_when_reply_lock_busy(build_pipeline):
 
     await pipeline.reply_lock.acquire()
     try:
+        before = pipeline.last_activity_at
         await loop._maybe_act()
     finally:
         pipeline.reply_lock.release()
 
     assert router.calls == []
+    assert pipeline.last_activity_at > before
 
 
 @pytest.mark.asyncio

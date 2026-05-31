@@ -741,7 +741,7 @@ class _EmbeddingEditDialog(FramelessDialog):
         form.addRow(QLabel("Provider"), self._prov)
 
         self._model = QLineEdit(emb.api_model or "")
-        self._model.setPlaceholderText("如 text-embedding-v4 / embedding-3 / doubao-embedding-text-240715")
+        self._model.setPlaceholderText("如 text-embedding-v4 / embedding-3 / doubao-embedding-vision-251215")
         form.addRow(QLabel("模型 ID"), self._model)
 
         self._key = QLineEdit()

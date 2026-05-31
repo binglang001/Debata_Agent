@@ -32,6 +32,7 @@ from memory.rag_store import RagEntry
 from ui.dashboard.chats_page import _group_records_by_conversation
 from ui.dashboard.logs_page import _format_record
 from ui.dashboard.memory_page import MemoryPage
+from ui.dashboard.personas_page import PersonasPage
 from ui.dashboard.settings_page import SettingsPage
 from ui.widgets.window_chrome import _resize_edges_for_local_pos
 from ui.wizard.components import ApiKeyInput
@@ -248,6 +249,54 @@ def test_memory_page_rag_mode_shows_index_view(qapp):
         assert page._list.count() == 1
         assert page._add_row_widget.isHidden()
         assert page._action_row_widget.isHidden()
+    finally:
+        page.deleteLater()
+
+
+def test_personas_page_can_build_and_save_generated_persona(qapp, tmp_path):
+    from agents.persona_gen_agent import PersonaBrief
+
+    cfg = _minimal_root_config()
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir()
+    debata_dir = personas_dir / "debata"
+    debata_dir.mkdir()
+    (debata_dir / "persona_prompt.py").write_text("PERSONA_PROMPT = 'x'\n", encoding="utf-8")
+
+    class FakeSecrets:
+        def get(self, key_id: str) -> str | None:
+            return "sk-test" if key_id == "ds_key" else None
+
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "secrets": FakeSecrets(),
+            "paths": type("Paths", (), {"PERSONAS_DIR": personas_dir})(),
+        },
+    )()
+    page = PersonasPage(runtime)
+    try:
+        assert page._create_btn.text() == "AI 生成角色"
+        context = page._build_creator_context()
+        assert context is not None
+        assert context.main.api_key == "sk-test"
+        assert context.main.model == "deepseek-chat"
+
+        context.persona.source = "create"
+        context.persona.active = "Mika"
+        context.persona.generated_xml = "<identity>你是 Mika</identity>"
+        context.persona.brief = PersonaBrief(name="Mika", admin_name="Lily", admin_qq="123456")
+        context.admin_name = "Lily"
+        context.admin_qq = "123456"
+
+        assert page._save_generated_persona(context) == "Mika"
+        saved = personas_dir / "Mika" / "persona_prompt.py"
+        assert saved.exists()
+        text = saved.read_text(encoding="utf-8")
+        assert "<identity>你是 Mika</identity>" in text
+        assert '"qq": 123456' in text
     finally:
         page.deleteLater()
 

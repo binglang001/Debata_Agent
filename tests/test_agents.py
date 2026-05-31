@@ -13,7 +13,13 @@ from agents.context_builder import (
     build_messages,
     build_task_context,
 )
-from agents.persona_gen_agent import PersonaBrief, PersonaGenResult, render_persona_file
+from agents.persona_gen_agent import (
+    PERSONA_GEN_SYSTEM_PROMPT,
+    PERSONA_REFINE_SYSTEM_PROMPT,
+    PersonaBrief,
+    PersonaGenResult,
+    render_persona_file,
+)
 from agents.persona_loader import (
     Persona,
     find_persona_dir,
@@ -259,6 +265,15 @@ def test_render_persona_file_writes_admins():
     assert '"admins":' in text
     assert '"qq": 123456' in text
     assert '"name": "Lily"' in text
+
+
+def test_persona_generation_prompt_requires_second_person():
+    assert "第二人称硬要求" in PERSONA_GEN_SYSTEM_PROMPT
+    assert "写\"你是……\"、\"你习惯……\"、\"你不会……\"" in PERSONA_GEN_SYSTEM_PROMPT
+    assert "不要写\"她/他/ta 是……\"" in PERSONA_GEN_SYSTEM_PROMPT
+    assert "<identity>\n你是[角色名]" in PERSONA_GEN_SYSTEM_PROMPT
+    assert "你不会做的事：" in PERSONA_GEN_SYSTEM_PROMPT
+    assert "仍必须使用第二人称描述角色本人" in PERSONA_REFINE_SYSTEM_PROMPT
 
 
 def test_build_task_context_empty():

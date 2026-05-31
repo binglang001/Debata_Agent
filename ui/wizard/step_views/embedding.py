@@ -36,7 +36,7 @@ from .main_model_custom import _PRESET_DEFAULTS
 _EMBEDDING_PRESETS: dict[str, dict[str, str]] = {
     "volcengine": {
         "display": "火山方舟 · 独立 Embedding",
-        "model": "doubao-embedding-text-240715",
+        "model": "doubao-embedding-vision-251215",
     },
     "qwen": {
         "display": "通义千问 · 独立 Embedding",
@@ -147,7 +147,7 @@ class EmbeddingStepView(BaseStepView):
         form.addRow(QLabel("Base URL"), self._api_base_url)
 
         self._api_model = QLineEdit()
-        self._api_model.setPlaceholderText("如 text-embedding-v4 / embedding-3 / doubao-embedding-text-240715")
+        self._api_model.setPlaceholderText("如 text-embedding-v4 / embedding-3 / doubao-embedding-vision-251215")
         form.addRow(QLabel("模型 ID"), self._api_model)
 
         self._api_key = ApiKeyInput(

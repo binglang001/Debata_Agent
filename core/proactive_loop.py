@@ -320,6 +320,7 @@ class ProactiveLoop:
             return
         if self.pipeline.reply_lock.locked():
             logger.info("主动思考：回复锁忙，跳过")
+            self.pipeline.mark_activity()
             return
 
         await self.pipeline.reply_lock.acquire()

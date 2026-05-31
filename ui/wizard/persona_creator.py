@@ -262,10 +262,13 @@ class PersonaCreatorStepView(BaseStepView):
         if not m.api_key:
             return None
 
-        if m.preset == "custom":
+        if m.base_url:
+            base_url = m.base_url
+        elif m.preset == "custom":
             base_url = m.base_url
         else:
             from .step_views.main_model_custom import _PRESET_DEFAULTS
+
             base_url = _PRESET_DEFAULTS.get(m.preset, {}).get("url", "")
 
         if not base_url:
@@ -279,7 +282,7 @@ class PersonaCreatorStepView(BaseStepView):
         cfg = AgentConfig(
             provider=m.preset or "deepseek",
             model=m.model,
-            temperature=0.7,
+            temperature=m.temperature,
             top_p=m.top_p,
             max_tokens=max(8192, m.max_tokens),
             first_token_timeout_seconds=60.0,
