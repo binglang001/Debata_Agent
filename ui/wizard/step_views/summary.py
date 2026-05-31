@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout
 
+from ...theme import Spacing
 from ..components import SectionCard
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
-from ...theme import Spacing
 
 
 class SummaryStepView(BaseStepView):

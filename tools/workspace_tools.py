@@ -159,7 +159,7 @@ def _extract_pdf_text(path: Path, max_bytes: int) -> tuple[str, str | None]:
                     text[:max_bytes],
                     "未安装 pypdf，已使用粗略 PDF 文本提取；复杂 PDF 可能不完整",
                 )
-            raise RuntimeError("读取 PDF 需要安装 pypdf，或提供可复制文本版本")
+            raise RuntimeError("读取 PDF 需要安装 pypdf，或提供可复制文本版本") from None
 
     reader = PdfReader(str(path))
     pages: list[str] = []

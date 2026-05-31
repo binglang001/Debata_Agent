@@ -5,11 +5,10 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
-from ..components import SectionCard
+from ...theme import Spacing
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
 from ..flow import WIZARD_PATH_CUSTOM, WIZARD_PATH_RECOMMENDED
-from ...theme import Spacing
 
 
 class WelcomeStepView(BaseStepView):

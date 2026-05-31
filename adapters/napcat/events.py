@@ -16,7 +16,6 @@ from typing import Any
 
 from adapters.types import (
     AnyEvent,
-    EventType,
     IncomingMessage,
     IncomingNotice,
     IncomingRequest,

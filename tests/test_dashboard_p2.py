@@ -1,5 +1,7 @@
 """P2/体验修复的轻量回归测试。"""
 
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import logging
@@ -10,8 +12,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-QtWidgets = pytest.importorskip("PySide6.QtWidgets")
-QtCore = pytest.importorskip("PySide6.QtCore")
+QtWidgets = pytest.importorskip("PySide6.QtWidgets", exc_type=ImportError)
+QtCore = pytest.importorskip("PySide6.QtCore", exc_type=ImportError)
 QApplication = QtWidgets.QApplication
 QWidget = QtWidgets.QWidget
 Qt = QtCore.Qt
@@ -31,11 +33,11 @@ from ui.dashboard.chats_page import _group_records_by_conversation
 from ui.dashboard.logs_page import _format_record
 from ui.dashboard.memory_page import MemoryPage
 from ui.dashboard.settings_page import SettingsPage
+from ui.widgets.window_chrome import _resize_edges_for_local_pos
 from ui.wizard.components import ApiKeyInput
 from ui.wizard.context import WizardContext
 from ui.wizard.step_views.features import _TTSFeatureCard
 from ui.wizard.step_views.welcome import WelcomeStepView
-from ui.widgets.window_chrome import _resize_edges_for_local_pos
 
 
 @pytest.fixture(scope="module")

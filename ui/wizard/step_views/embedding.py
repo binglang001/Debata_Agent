@@ -20,9 +20,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...theme import Spacing
 from ..components import ApiKeyInput, SectionCard, open_feature_guide
 from ..context import BaseStepView, WizardContext
-from ...theme import Spacing
 from .features import (
     _directory_has_files,
     _open_directory,
@@ -32,7 +32,6 @@ from .features import (
     _start_plugin_download,
 )
 from .main_model_custom import _PRESET_DEFAULTS
-
 
 _EMBEDDING_PRESETS: dict[str, dict[str, str]] = {
     "volcengine": {

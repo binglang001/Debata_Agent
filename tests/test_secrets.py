@@ -87,6 +87,7 @@ def test_persistence_across_instances(tmp_paths, fake_keyring):
 def test_tamper_detection(tmp_paths, fake_keyring):
     """篡改密文应导致解密失败。"""
     import base64
+
     import orjson
 
     sm = SecretsManager(tmp_paths)

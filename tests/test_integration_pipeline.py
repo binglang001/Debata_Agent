@@ -64,7 +64,6 @@ from memory.rag_store import RagStore
 from providers.base import CompletionResult, IProvider, ToolCall, Usage
 from tools import ToolContext, build_default_registry
 
-
 # ============================================================
 # 配置/Persona 工厂
 # ============================================================

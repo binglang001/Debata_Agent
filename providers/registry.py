@@ -16,8 +16,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from app_config.schema import ProviderConfig
 from app_config.secrets import SecretsManager

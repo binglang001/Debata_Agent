@@ -22,7 +22,6 @@ from .base import (
     ToolCall,
     Usage,
 )
-from .presets_loader import ModelInfo, ProviderPreset, load_all_presets
 from .health import (
     ProviderHealth,
     probe_embedding_endpoint,
@@ -30,6 +29,7 @@ from .health import (
     probe_provider_endpoint,
     probe_provider_instance,
 )
+from .presets_loader import ModelInfo, ProviderPreset, load_all_presets
 from .protocols import AnthropicProvider, OpenAICompatProvider
 from .registry import (
     PROTOCOL_REGISTRY,

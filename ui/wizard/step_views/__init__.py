@@ -15,7 +15,6 @@ from .persona import PersonaStepView
 from .summary import SummaryStepView
 from .welcome import WelcomeStepView
 
-
 __all__ = [
     "WelcomeStepView",
     "MainModelQuickStepView",

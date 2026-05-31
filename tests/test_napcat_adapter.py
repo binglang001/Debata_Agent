@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 
 import pytest
@@ -16,12 +15,9 @@ from adapters.napcat.process import NapCatProcessManager
 from adapters.types import (
     FriendInfo,
     GroupInfo,
-    GroupMemberInfo,
     IncomingMessage,
-    NoticeType,
     Target,
 )
-
 
 # ============================================================
 # FakeConnection：内存版连接，不开真实 WebSocket

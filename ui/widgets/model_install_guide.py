@@ -6,8 +6,8 @@ import importlib.util
 import logging
 import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QUrl
 from PySide6.QtGui import QDesktopServices
@@ -38,7 +38,7 @@ _PIP_SOURCES = {
     "official": ("官方源", ""),
 }
 _RUNNING_DEPENDENCY_INSTALLS: dict[str, QProcess] = {}
-_OPEN_GUIDE_DIALOGS: list["ModelInstallGuideDialog"] = []
+_OPEN_GUIDE_DIALOGS: list[ModelInstallGuideDialog] = []
 
 
 def required_model_paths(record: PluginRecord) -> list[Path]:

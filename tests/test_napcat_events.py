@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from adapters.napcat.events import parse_napcat_event
-from utils.cq_parser import parse_raw_cq as _parse_raw_message
 from adapters.types import (
     EventType,
     IncomingMessage,
@@ -14,7 +13,7 @@ from adapters.types import (
     NoticeType,
     RequestType,
 )
-
+from utils.cq_parser import parse_raw_cq as _parse_raw_message
 
 # ============================================================
 # Message 解析

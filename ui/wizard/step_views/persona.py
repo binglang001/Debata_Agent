@@ -18,10 +18,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...theme import Spacing
 from ..components import SectionCard
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
-from ...theme import Spacing
 
 
 def _list_builtin_personas() -> list[str]:

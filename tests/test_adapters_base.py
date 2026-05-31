@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +28,6 @@ from adapters import (
     known_adapter_types,
     register_adapter_type,
 )
-
 
 # ============================================================
 # Mock 适配器：用于验证抽象层的契约
@@ -112,7 +111,7 @@ def test_target_str_repr():
 
 def test_target_immutable():
     t = Target(adapter="a", scope="group", target_id="1")
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         t.adapter = "b"  # frozen dataclass
 
 

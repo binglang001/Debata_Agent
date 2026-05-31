@@ -30,9 +30,9 @@
 
 from __future__ import annotations
 
-import logging
 import json
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass
 from typing import Any
 
 from app_config.schema import AgentConfig

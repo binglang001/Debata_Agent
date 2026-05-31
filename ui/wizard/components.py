@@ -32,15 +32,14 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QSizePolicy,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
-    QSizePolicy,
 )
 
-from ..theme import FontSize, Spacing
+from ..theme import Spacing
 from ..widgets.window_chrome import FramelessDialog
-
 
 # ============================================================
 # SectionCard

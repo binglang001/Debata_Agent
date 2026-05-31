@@ -9,8 +9,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QSize, QTimer
-from PySide6.QtWidgets import QSizePolicy
-from PySide6.QtWidgets import QStackedWidget
+from PySide6.QtWidgets import QSizePolicy, QStackedWidget
 
 
 class AutoSizeStack(QStackedWidget):

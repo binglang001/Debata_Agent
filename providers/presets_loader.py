@@ -33,7 +33,7 @@ from pathlib import Path
 import yaml
 
 logger = logging.getLogger(__name__)
-_PRESETS_CACHE: dict[Path, dict[str, "ProviderPreset"]] = {}
+_PRESETS_CACHE: dict[Path, dict[str, ProviderPreset]] = {}
 
 
 @dataclass(slots=True)
@@ -74,7 +74,7 @@ class ProviderPreset:
 
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> ProviderPreset:
-        with open(yaml_path, "r", encoding="utf-8") as f:
+        with open(yaml_path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
 
         if not data.get("id"):

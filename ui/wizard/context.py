@@ -20,7 +20,6 @@ from agents.persona_gen_agent import PersonaBrief
 from .components import WhitelistState
 from .flow import WIZARD_PATH_RECOMMENDED
 
-
 # ============================================================
 # 子配置块
 # ============================================================

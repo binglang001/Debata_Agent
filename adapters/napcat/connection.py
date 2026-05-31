@@ -24,7 +24,7 @@ import asyncio
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 import websockets
 from websockets.asyncio.client import ClientConnection as _WSClient

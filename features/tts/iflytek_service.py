@@ -128,8 +128,8 @@ class iFlytekTTSService(ITTSService):
         try:
             err = resp.json()
             raise TTSError(f"讯飞合成失败: {err}")
-        except (ValueError, KeyError):
-            raise TTSError(f"讯飞合成失败: HTTP {resp.status_code}")
+        except (ValueError, KeyError) as e:
+            raise TTSError(f"讯飞合成失败: HTTP {resp.status_code}") from e
 
     async def aclose(self) -> None:
         pass

@@ -16,15 +16,11 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 import os
 
 import pytest
 
 from agents import (
-    AgentRunner,
-    ChatAgent,
     Persona,
     build_messages,
 )
@@ -59,8 +55,8 @@ def _make_persona() -> Persona:
     """加载仓库自带 debata persona 作为真实大 system prompt。"""
     from pathlib import Path
 
-    from app_config.paths import AppPaths
     from agents.persona_loader import load_persona
+    from app_config.paths import AppPaths
 
     project_root = Path(__file__).resolve().parent.parent
     paths = AppPaths(project_root=project_root)
@@ -296,12 +292,17 @@ async def test_tool_definitions_do_not_break_cache():
     """
     _skip_if_no_key()
 
-    from tools import build_default_registry
     from app_config.schema import (
-        AgentsConfig, BehaviorConfig, FeaturesConfig,
-        LongTermMemoryConfig, NapCatAdapterConfig,
-        PersonaConfig, ProviderConfig, RootConfig,
+        AgentsConfig,
+        BehaviorConfig,
+        FeaturesConfig,
+        LongTermMemoryConfig,
+        NapCatAdapterConfig,
+        PersonaConfig,
+        ProviderConfig,
+        RootConfig,
     )
+    from tools import build_default_registry
 
     cfg_root = RootConfig(
         adapters={"a": NapCatAdapterConfig()},
@@ -377,8 +378,8 @@ def write_benchmark_report(
     lines = [
         "# KV 缓存命中率实测报告",
         "",
-        f"测试时间：见 git log。",
-        f"Provider：DeepSeek（deepseek-chat）。",
+        "测试时间：见 git log。",
+        "Provider：DeepSeek（deepseek-chat）。",
         "",
         "## 验证目标",
         "- 第二轮起每轮 hit_rate > 90%",

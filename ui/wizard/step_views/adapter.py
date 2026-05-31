@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -15,9 +14,9 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QSpinBox,
     QVBoxLayout,
-    QWidget,
 )
 
+from ...theme import Spacing
 from ..components import (
     ApiKeyInput,
     SectionCard,
@@ -25,7 +24,6 @@ from ..components import (
 )
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
-from ...theme import Spacing
 
 
 class AdapterStepView(BaseStepView):

@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import yaml
 
 from providers.presets_loader import (
     ModelInfo,
@@ -196,6 +195,6 @@ def test_builtin_presets_registration_urls():
 def test_builtin_presets_tutorial_dirs():
     """所有预设都应有 tutorial/ 目录占位（即使为空）。"""
     presets = load_all_presets(PRESETS_DIR)
-    for pid, preset in presets.items():
+    for pid, _preset in presets.items():
         tutorial = PRESETS_DIR / pid / "tutorial"
         assert tutorial.is_dir(), f"{pid} 缺 tutorial/ 子目录"

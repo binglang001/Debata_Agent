@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from memory import (
@@ -13,7 +11,6 @@ from memory import (
     JsonStore,
     StoreError,
 )
-
 
 # ============================================================
 # JsonStore

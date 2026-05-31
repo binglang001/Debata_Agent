@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from agents.behavior_prompt import (
-    CORE_RULES,
     build_tool_use_protocol,
 )
 from agents.context_builder import (
@@ -14,6 +13,7 @@ from agents.context_builder import (
     build_messages,
     build_task_context,
 )
+from agents.persona_gen_agent import PersonaBrief, PersonaGenResult, render_persona_file
 from agents.persona_loader import (
     Persona,
     find_persona_dir,
@@ -21,11 +21,9 @@ from agents.persona_loader import (
     load_persona,
     validate_persona_name,
 )
-from agents.persona_gen_agent import PersonaBrief, PersonaGenResult, render_persona_file
 from agents.proactive_agent import ProactiveRouterAgent, _is_action_decision
 from app_config.schema import AgentConfig
 from providers.base import CompletionResult
-
 
 # ============================================================
 # persona_loader

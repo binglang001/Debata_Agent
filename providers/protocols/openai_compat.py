@@ -21,7 +21,7 @@ import logging
 from typing import Any
 
 import httpx
-from openai import AsyncOpenAI, APIError, AuthenticationError, RateLimitError
+from openai import APIError, AsyncOpenAI, AuthenticationError, RateLimitError
 
 from providers.base import (
     CompletionResult,

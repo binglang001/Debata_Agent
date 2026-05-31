@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import asyncio
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
+from ...theme import Spacing
 from ..components import ApiKeyInput, SectionCard
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
-from ...theme import Spacing
-
 
 _DEEPSEEK_TUTORIAL_MD = """
 ## 怎么拿到 DeepSeek API 密钥
@@ -166,8 +164,8 @@ class MainModelQuickStepView(BaseStepView):
         loop.create_task(_do_test())
 
     def _open_get_key_page(self) -> None:
-        from PySide6.QtGui import QDesktopServices
         from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
 
         QDesktopServices.openUrl(QUrl("https://platform.deepseek.com/api_keys"))
 

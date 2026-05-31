@@ -10,8 +10,8 @@
 
 from __future__ import annotations
 
-import logging
 import asyncio
+import logging
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -30,10 +30,9 @@ from PySide6.QtWidgets import (
 from app_config import AppPaths, SecretsManager
 from app_config.loader import save_config
 from app_config.schema import (
-    ASRFeatureConfig,
-    AdapterConfig,
     AgentConfig,
     AgentsConfig,
+    ASRFeatureConfig,
     BehaviorConfig,
     EmbeddingFeatureConfig,
     FeaturesConfig,
@@ -50,6 +49,7 @@ from app_config.schema import (
     WhitelistConfig,
 )
 
+from ..theme import Spacing
 from .components import WhitelistState
 from .context import WizardContext
 from .copy import COPY
@@ -74,7 +74,6 @@ from .step_views import (
     WelcomeStepView,
 )
 from .steps import STEPS, StepId
-from ..theme import Spacing
 
 logger = logging.getLogger(__name__)
 
@@ -405,15 +404,6 @@ class WizardWindow(QMainWindow):
     def _persist(self) -> None:
         """把 WizardContext 转成 config + secrets 写入。"""
         c = self._context
-
-        # 1. 写 secrets ——
-        secret_ids: dict[str, str] = {}
-
-        def _store(prefix: str, value: str) -> str:
-            sid = prefix
-            if value:
-                self._secrets.set(sid, value)
-            return sid
 
         # 主模型 key
         main_key_id = f"{c.main.preset}_main"
@@ -753,9 +743,9 @@ class WizardWindow(QMainWindow):
         p = self._context.persona
         warning = ""
         if p.source == "create" and p.generated_xml:
+            from agents.persona_gen_agent import PersonaGenResult, render_persona_file
             from agents.persona_import import PersonaImportError
             from agents.persona_loader import validate_persona_name
-            from agents.persona_gen_agent import PersonaGenResult, render_persona_file
 
             validate_persona_name(p.active)
             target = self._paths.PERSONAS_DIR / p.active

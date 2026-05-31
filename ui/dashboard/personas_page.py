@@ -21,15 +21,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..theme import Spacing
-from ..widgets import show_message
-from .copy import DASHBOARD_COPY
 from agents.persona_import import (
     PersonaImportError,
     copy_persona_dir,
     import_persona_zip,
 )
 from agents.persona_loader import validate_persona_name
+
+from ..theme import Spacing
+from ..widgets import show_message
+from .copy import DASHBOARD_COPY
 
 logger = logging.getLogger(__name__)
 

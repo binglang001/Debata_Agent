@@ -11,9 +11,8 @@ from __future__ import annotations
 import logging
 import shutil
 from pathlib import Path
-from typing import Any
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QDialog,
@@ -455,7 +454,7 @@ class EmojiAddDialog(QDialog):
         final_names = self._final_dest_names()
         saved = 0
         failed: list[str] = []
-        for staged, final_name in zip(self._staged, final_names):
+        for staged, final_name in zip(self._staged, final_names, strict=True):
             dest = self._emoji_dir / final_name
             try:
                 shutil.copy2(staged.src, dest)

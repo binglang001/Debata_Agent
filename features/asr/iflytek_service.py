@@ -12,8 +12,6 @@ import time
 from pathlib import Path
 from urllib.parse import urlencode
 
-import httpx
-
 from features.asr import ASRError, IASRService
 
 logger = logging.getLogger(__name__)
@@ -100,8 +98,8 @@ class iFlytekASRService(IASRService):
 
         try:
             import websockets
-        except ImportError:
-            raise ASRError("需安装 websockets: pip install websockets")
+        except ImportError as e:
+            raise ASRError("需安装 websockets: pip install websockets") from e
 
         result_parts: list[str] = []
         result_event = asyncio.Event()
@@ -150,9 +148,9 @@ class iFlytekASRService(IASRService):
         task = asyncio.ensure_future(_run())
         try:
             await asyncio.wait_for(result_event.wait(), timeout=self._timeout)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             task.cancel()
-            raise ASRError("讯飞识别超时")
+            raise ASRError("讯飞识别超时") from e
         await task
         return "".join(result_parts)
 

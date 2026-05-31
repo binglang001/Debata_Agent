@@ -363,11 +363,11 @@ class ProactiveLoop:
                     if router_history_text:
                         router_context_parts.append(router_history_text)
                     router_context_parts.append(
-                        (
+
                             f"现在是{now}。后台主动思考触发。"
                             "如果最近用户明确要求你在“下次主动思考”时发消息、提醒用户或执行明确操作，"
                             "本轮就是那个时机。"
-                        )
+
                     )
                     router_messages = build_messages(
                         persona=self.pipeline.persona,

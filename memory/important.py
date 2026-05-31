@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from utils.token_budget import TokenEstimator
 
@@ -194,7 +195,7 @@ class ImportantMemoryManager:
         """从磁盘加载到内存缓存。必须先调用。"""
         data = await self._store.read(default=[])
         if not isinstance(data, list):
-            logger.warning(f"重要记忆文件格式不是 list，重置为空")
+            logger.warning("重要记忆文件格式不是 list，重置为空")
             data = []
         self._items = [self._normalize_item(item) for item in data if isinstance(item, dict)]
         self._refresh_text_cache()

@@ -18,7 +18,6 @@ import yaml
 
 from core.runtime import Runtime
 
-
 # ============================================================
 # 准备一个最小可用的项目根（personas + config + secrets）
 # ============================================================
@@ -274,7 +273,7 @@ async def test_runtime_ignores_configured_asr_and_uses_napcat(
     sm.initialize()
     sm.set("asr_xfyun", "asr-api-key")
 
-    with open(paths.CONFIG_FILE, "r", encoding="utf-8") as f:
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
         data = yaml.safe_load(f)
     data.setdefault("features", {})["asr"] = {
         "enabled": True,
@@ -311,7 +310,7 @@ async def test_runtime_asr_ignore_does_not_record_failure(
     sm.initialize()
     sm.set("asr_xfyun", "asr-api-key")
 
-    with open(paths.CONFIG_FILE, "r", encoding="utf-8") as f:
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
         data = yaml.safe_load(f)
     data.setdefault("features", {})["asr"] = {
         "enabled": True,
@@ -342,7 +341,7 @@ async def test_runtime_starts_local_tts_warmup_in_background(
 ):
     project_root, paths = assembled_project
 
-    with open(paths.CONFIG_FILE, "r", encoding="utf-8") as f:
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
         data = yaml.safe_load(f)
     data.setdefault("features", {})["tts"] = {
         "enabled": True,
@@ -434,7 +433,7 @@ async def test_runtime_handles_missing_provider_reference(assembled_project):
     project_root, paths = assembled_project
 
     # 改 config.yaml 让 chat.provider 指向不存在的 ID
-    with open(paths.CONFIG_FILE, "r", encoding="utf-8") as f:
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
         data = yaml.safe_load(f)
     data["agents"]["chat"]["provider"] = "ghost_provider"
     with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:

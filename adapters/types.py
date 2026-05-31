@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
 
-
 # ============================================================
 # 目标（发送方向）
 # ============================================================

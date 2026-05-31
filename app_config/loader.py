@@ -64,7 +64,7 @@ def load_config(paths: AppPaths, set_global: bool = True) -> RootConfig:
         )
 
     try:
-        with open(paths.CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(paths.CONFIG_FILE, encoding="utf-8") as f:
             raw: Any = yaml.safe_load(f)
     except yaml.YAMLError as e:
         raise ConfigError(f"YAML 解析失败: {paths.CONFIG_FILE}\n{e}") from e

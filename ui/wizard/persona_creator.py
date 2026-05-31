@@ -29,10 +29,10 @@ from PySide6.QtWidgets import (
 from agents.persona_gen_agent import PersonaBrief, PersonaGenAgent
 from app_config.schema import AgentConfig
 
+from ..theme import Spacing
 from .components import SectionCard
 from .context import BaseStepView, WizardContext
 from .copy import COPY
-from ..theme import Spacing
 
 logger = logging.getLogger(__name__)
 

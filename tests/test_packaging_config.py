@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import tomllib
 from pathlib import Path
 
+import tomllib
 from setuptools import find_packages
-
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 

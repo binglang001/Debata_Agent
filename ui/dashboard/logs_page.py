@@ -33,7 +33,6 @@ from ..theme import Spacing
 from ..widgets import FramelessDialog, show_message
 from .copy import DASHBOARD_COPY
 
-
 _LEVEL_NAMES = {
     logging.DEBUG: "DEBUG",
     logging.INFO: "INFO",

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable
+from collections.abc import Callable
 
 from .base import EventCallback, IAdapter
 from .types import AnyEvent

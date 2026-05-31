@@ -7,15 +7,15 @@
 
 from __future__ import annotations
 
-import logging
 import asyncio
+import logging
 from copy import deepcopy
-from typing import Any, Callable
+from typing import Any
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QButtonGroup,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -35,24 +35,17 @@ from PySide6.QtWidgets import (
 
 from app_config.loader import save_config
 from app_config.schema import (
-    ASRFeatureConfig,
     AgentConfig,
-    EmbeddingFeatureConfig,
-    LongTermMemoryConfig,
     NapCatAdapterConfig,
     ProviderConfig,
     ReasoningConfig,
-    TTSFeatureConfig,
-    VisionFeatureConfig,
-    WeatherFeatureConfig,
-    WebSearchFeatureConfig,
     WhitelistConfig,
 )
 
 from ..theme import Spacing
-from ..wizard.components import SectionCard, WhitelistEditor, WhitelistState
 from ..widgets import FramelessDialog, show_message
 from ..widgets.wheel_freeze import install_wheel_freeze
+from ..wizard.components import SectionCard, WhitelistEditor, WhitelistState
 from .copy import DASHBOARD_COPY
 
 logger = logging.getLogger(__name__)
@@ -1421,7 +1414,7 @@ class SettingsPage(QWidget):
             return "启动检测中或尚无检测结果"
         if getattr(item, "status", "") == "ok":
             latency = getattr(item, "latency_ms", 0)
-            return f"可用" + (f" · {latency}ms" if latency else "")
+            return "可用" + (f" · {latency}ms" if latency else "")
         return getattr(item, "message", "无响应")
 
     def _agent_model_for_provider(self, provider_name: str) -> str:
@@ -1762,7 +1755,8 @@ class SettingsPage(QWidget):
                 self._validate_features_then_save("vision toggle")
             except Exception as e:  # noqa: BLE001
                 self._suppress_signals = True
-                chk.setChecked(not on); v_now.enabled = not on
+                chk.setChecked(not on)
+                v_now.enabled = not on
                 self._suppress_signals = False
                 show_message(self, "未能保存", str(e))
 
@@ -1850,7 +1844,8 @@ class SettingsPage(QWidget):
                 self._validate_features_then_save("weather toggle")
             except Exception as e:  # noqa: BLE001
                 self._suppress_signals = True
-                chk.setChecked(not on); w_now.enabled = not on
+                chk.setChecked(not on)
+                w_now.enabled = not on
                 self._suppress_signals = False
                 show_message(self, "未能保存", str(e))
 
@@ -2038,7 +2033,6 @@ class SettingsPage(QWidget):
         outer.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
         outer.setSpacing(Spacing.SM)
 
-        emb = self._cfg().features.embedding
         title = QLabel("Embedding（RAG 向量检索）")
         title.setProperty("role", "title-3")
         outer.addWidget(title)
@@ -2307,7 +2301,8 @@ class SettingsPage(QWidget):
         card.add_layout(form)
 
         # 白名单（hot，立即生效）
-        sep = QFrame(); sep.setProperty("role", "separator")
+        sep = QFrame()
+        sep.setProperty("role", "separator")
         card.add_content(sep)
         wl_title = QLabel("白名单（立即生效）")
         wl_title.setProperty("role", "title-3")
@@ -2385,7 +2380,8 @@ class SettingsPage(QWidget):
 
         async def _do_test() -> None:
             from adapters.napcat.connection import (
-                ForwardWSConnection, ReverseWSConnection,
+                ForwardWSConnection,
+                ReverseWSConnection,
             )
             token = self._runtime.secrets.get(cfg.access_token_id) if cfg.access_token_id else None
             conn = None
@@ -2425,7 +2421,7 @@ class SettingsPage(QWidget):
                         self._adapter_test_status.setText(f"✓ NapCat 已连入 ws://{cfg.host}:{cfg.port}{cfg.path}")
                     else:
                         self._adapter_test_status.setText(
-                            f"⚠ 端口可用已监听，但 NapCat 暂未连入"
+                            "⚠ 端口可用已监听，但 NapCat 暂未连入"
                         )
             except Exception as e:  # noqa: BLE001
                 self._adapter_test_status.setText(f"✗ 未能完成：{e}")
@@ -2547,7 +2543,9 @@ class SettingsPage(QWidget):
 
         # 合并窗口
         merge_spin = QDoubleSpinBox()
-        merge_spin.setRange(0.0, 60.0); merge_spin.setSingleStep(0.5); merge_spin.setValue(b.merge_window_seconds)
+        merge_spin.setRange(0.0, 60.0)
+        merge_spin.setSingleStep(0.5)
+        merge_spin.setValue(b.merge_window_seconds)
         merge_spin.setSuffix(" 秒")
         merge_spin.editingFinished.connect(
             lambda: self._on_behavior_field("merge_window_seconds", merge_spin.value())
@@ -2556,7 +2554,9 @@ class SettingsPage(QWidget):
 
         # 撤回合并
         recall_spin = QDoubleSpinBox()
-        recall_spin.setRange(0.0, 60.0); recall_spin.setSingleStep(0.5); recall_spin.setValue(b.recall_merge_window_seconds)
+        recall_spin.setRange(0.0, 60.0)
+        recall_spin.setSingleStep(0.5)
+        recall_spin.setValue(b.recall_merge_window_seconds)
         recall_spin.setSuffix(" 秒")
         recall_spin.editingFinished.connect(
             lambda: self._on_behavior_field("recall_merge_window_seconds", recall_spin.value())
@@ -2565,7 +2565,9 @@ class SettingsPage(QWidget):
 
         # 主动思考间隔
         proactive_spin = QDoubleSpinBox()
-        proactive_spin.setRange(10.0, 86400.0); proactive_spin.setSingleStep(60.0); proactive_spin.setValue(b.proactive_think_interval_seconds)
+        proactive_spin.setRange(10.0, 86400.0)
+        proactive_spin.setSingleStep(60.0)
+        proactive_spin.setValue(b.proactive_think_interval_seconds)
         proactive_spin.setSuffix(" 秒")
         proactive_spin.editingFinished.connect(
             lambda: self._on_behavior_field("proactive_think_interval_seconds", proactive_spin.value())
@@ -2574,7 +2576,8 @@ class SettingsPage(QWidget):
 
         # 默认拉历史条数
         hist_spin = QSpinBox()
-        hist_spin.setRange(1, 1000); hist_spin.setValue(b.default_history_fetch_count)
+        hist_spin.setRange(1, 1000)
+        hist_spin.setValue(b.default_history_fetch_count)
         hist_spin.editingFinished.connect(
             lambda: self._on_behavior_field("default_history_fetch_count", hist_spin.value())
         )
@@ -2582,7 +2585,9 @@ class SettingsPage(QWidget):
 
         # Typing 速度
         chars_spin = QDoubleSpinBox()
-        chars_spin.setRange(0.1, 50.0); chars_spin.setSingleStep(0.5); chars_spin.setValue(b.typing.chars_per_second)
+        chars_spin.setRange(0.1, 50.0)
+        chars_spin.setSingleStep(0.5)
+        chars_spin.setValue(b.typing.chars_per_second)
         chars_spin.editingFinished.connect(
             lambda: self._on_behavior_nested("typing", "chars_per_second", chars_spin.value())
         )
@@ -2594,22 +2599,37 @@ class SettingsPage(QWidget):
         rl_chk.toggled.connect(lambda on: self._on_behavior_nested("rate_limit", "enabled", on))
         form.addRow(QLabel("速率限制"), rl_chk)
 
-        rl_window = QSpinBox(); rl_window.setRange(1, 3600); rl_window.setValue(b.rate_limit.window_seconds); rl_window.setSuffix(" 秒")
+        rl_window = QSpinBox()
+        rl_window.setRange(1, 3600)
+        rl_window.setValue(b.rate_limit.window_seconds)
+        rl_window.setSuffix(" 秒")
         rl_window.editingFinished.connect(lambda: self._on_behavior_nested("rate_limit", "window_seconds", rl_window.value()))
         form.addRow(QLabel("  窗口"), rl_window)
-        rl_max = QSpinBox(); rl_max.setRange(1, 1000); rl_max.setValue(b.rate_limit.max_messages); rl_max.setSuffix(" 条")
+        rl_max = QSpinBox()
+        rl_max.setRange(1, 1000)
+        rl_max.setValue(b.rate_limit.max_messages)
+        rl_max.setSuffix(" 条")
         rl_max.editingFinished.connect(lambda: self._on_behavior_nested("rate_limit", "max_messages", rl_max.value()))
         form.addRow(QLabel("  最多条数"), rl_max)
 
         # Summarize
-        sum_trigger = QSpinBox(); sum_trigger.setRange(10, 10000); sum_trigger.setValue(b.summarize.trigger_at_messages); sum_trigger.setSuffix(" 条")
+        sum_trigger = QSpinBox()
+        sum_trigger.setRange(10, 10000)
+        sum_trigger.setValue(b.summarize.trigger_at_messages)
+        sum_trigger.setSuffix(" 条")
         sum_trigger.editingFinished.connect(lambda: self._on_behavior_nested("summarize", "trigger_at_messages", sum_trigger.value()))
         form.addRow(QLabel("总结触发条数"), sum_trigger)
 
-        sum_start = QSpinBox(); sum_start.setRange(1, 10000); sum_start.setValue(b.summarize.range_start_messages); sum_start.setSuffix(" 条")
+        sum_start = QSpinBox()
+        sum_start.setRange(1, 10000)
+        sum_start.setValue(b.summarize.range_start_messages)
+        sum_start.setSuffix(" 条")
         sum_start.editingFinished.connect(lambda: self._on_behavior_nested("summarize", "range_start_messages", sum_start.value()))
         form.addRow(QLabel("  保留下限"), sum_start)
-        sum_end = QSpinBox(); sum_end.setRange(1, 10000); sum_end.setValue(b.summarize.range_end_messages); sum_end.setSuffix(" 条")
+        sum_end = QSpinBox()
+        sum_end.setRange(1, 10000)
+        sum_end.setValue(b.summarize.range_end_messages)
+        sum_end.setSuffix(" 条")
         sum_end.editingFinished.connect(lambda: self._on_behavior_nested("summarize", "range_end_messages", sum_end.value()))
         form.addRow(QLabel("  保留上限"), sum_end)
 
@@ -2739,7 +2759,7 @@ class SettingsPage(QWidget):
         if getattr(obj, field) == value:
             return
         setattr(obj, field, value)
-        needs = not (field in self._HOT_FIELDS)
+        needs = field not in self._HOT_FIELDS
         self._save_now(needs_restart=needs, change_desc=f"behavior.{field}")
 
     def _on_behavior_nested(self, section: str, field: str, value) -> None:
@@ -2749,7 +2769,7 @@ class SettingsPage(QWidget):
         if getattr(obj, field) == value:
             return
         setattr(obj, field, value)
-        needs = not (field in self._HOT_FIELDS)
+        needs = field not in self._HOT_FIELDS
         self._save_now(needs_restart=needs, change_desc=f"behavior.{section}.{field}")
 
     def _on_tool_result_overrides(self, text: str) -> None:

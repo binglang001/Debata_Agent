@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -25,14 +24,14 @@ from PySide6.QtWidgets import (
 from app_config.loader import save_config
 
 from ..theme import Spacing, build_qss, palette_for_theme, resolve_theme_name
+from .chats_page import ChatsPage
 from .copy import DASHBOARD_COPY
 from .layout import DEFAULT_LAYOUT, NAV_ITEMS, STATUS_BADGE_MAP
-from .chats_page import ChatsPage
 from .logs_page import LogsPage
 from .memory_page import MemoryPage
+from .models_page import ModelsPage
 from .overview_page import OverviewPage
 from .personas_page import PersonasPage
-from .models_page import ModelsPage
 from .settings_page import SettingsPage
 
 logger = logging.getLogger(__name__)
@@ -92,6 +91,7 @@ class DashboardWindow(QMainWindow):
 
         # stack 包 ScrollArea，仅在当前页溢出时滚动（AutoSizeStack 让 sizeHint 跟当前页走）
         from PySide6.QtWidgets import QScrollArea
+
         from ..widgets import AutoSizeStack
         self._stack = AutoSizeStack()
         self._scroll = QScrollArea()

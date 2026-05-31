@@ -12,7 +12,6 @@ from typing import Literal
 
 import httpx
 
-
 HealthStatus = Literal["checking", "ok", "error"]
 
 

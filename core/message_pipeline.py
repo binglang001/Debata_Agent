@@ -48,7 +48,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from adapters.base import IAdapter
 from adapters.types import IncomingMessage, MediaType, Target
@@ -118,7 +118,7 @@ class _AsyncSendManager:
     回执会投递给模型，且所有回执都只追加、不回改旧历史。
     """
 
-    def __init__(self, pipeline: "MessagePipeline") -> None:
+    def __init__(self, pipeline: MessagePipeline) -> None:
         self.pipeline = pipeline
         self._states: dict[str, _SendConversationState] = {}
         self._recent_inbound: dict[str, list[_InboundRef]] = {}
@@ -302,7 +302,7 @@ class _AsyncSendManager:
         sent: list[dict[str, Any]] = []
         errors: list[str] = []
         for conversation_id, actions in groups.items():
-            for index, action in enumerate(actions):
+            for _index, action in enumerate(actions):
                 try:
                     msg_id = await self._send_one(
                         action,

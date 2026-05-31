@@ -20,15 +20,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...theme import Spacing
 from ..components import ApiKeyInput, SectionCard
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
-from ...theme import Spacing
 
 
 def _load_presets() -> dict[str, dict]:
     """从 providers/presets/ 加载所有预设元数据（display / model / url）。"""
-    from pathlib import Path
     try:
         from providers.presets_loader import load_all_presets
         presets_dir = Path(__file__).resolve().parent.parent.parent.parent / "providers" / "presets"

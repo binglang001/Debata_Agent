@@ -285,6 +285,7 @@ def test_install_guide_shows_dependency_progress_panel(qapp, monkeypatch):
 
 def test_install_guide_dialog_is_independent_non_modal(qapp):
     from PySide6.QtCore import Qt
+
     from ui.widgets.model_install_guide import ModelInstallGuideDialog
 
     parent = QtWidgets.QWidget()

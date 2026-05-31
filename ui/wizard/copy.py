@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-
 COPY: dict[str, str] = {
     # ============================================================
     # 通用按钮 / 控件

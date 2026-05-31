@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -16,10 +15,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...theme import Spacing
 from ..components import ApiKeyInput, SectionCard
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
-from ...theme import Spacing
 from .main_model_custom import _load_presets
 
 
@@ -74,7 +73,6 @@ class _SubAgentBlock(QWidget):
         outer.addWidget(self._detail)
 
         # 思考（reasoning）配置 —— 不论 use_main 都可以独立调
-        from PySide6.QtWidgets import QHBoxLayout
         rea_row = QHBoxLayout()
         rea_row.setSpacing(Spacing.SM)
         self._reasoning_check = QCheckBox("启用思考")
@@ -129,6 +127,7 @@ class _SubAgentBlock(QWidget):
         try:
             from providers import probe_provider_endpoint
             from providers.registry import normalize_base_url
+
             from .main_model_custom import _PRESET_DEFAULTS
 
             info = _PRESET_DEFAULTS.get(preset, {})

@@ -72,8 +72,8 @@ class VolcengineASRService(IASRService):
 
         try:
             import websockets
-        except ImportError:
-            raise ASRError("需安装 websockets: pip install websockets")
+        except ImportError as e:
+            raise ASRError("需安装 websockets: pip install websockets") from e
 
         connect_id = uuid.uuid4().hex
         result_parts: list[str] = []
@@ -162,9 +162,9 @@ class VolcengineASRService(IASRService):
         task = asyncio.ensure_future(_run())
         try:
             await asyncio.wait_for(result_event.wait(), timeout=self._timeout)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             task.cancel()
-            raise ASRError("火山引擎识别超时")
+            raise ASRError("火山引擎识别超时") from e
         await task
         return "".join(result_parts)
 

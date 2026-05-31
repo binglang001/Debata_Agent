@@ -629,7 +629,7 @@ class RootConfig(StrictModel):
                 )
 
         # 检查 features 中的 provider 引用（如有）
-        for feat_name, feat in [
+        for _feat_name, feat in [
             ("vision", self.features.vision),
             ("asr", self.features.asr),
             ("tts", self.features.tts),

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Literal
 
 # 工具执行器签名
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]

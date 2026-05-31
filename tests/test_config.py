@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from app_config.loader import ConfigError, load_config, save_config
 from app_config.schema import (
@@ -55,7 +56,7 @@ def test_agent_provider_must_exist():
 
 def test_extra_fields_rejected():
     """unknown 字段应被拒绝（防止拼写错误）。"""
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         RootConfig.model_validate(
             {
                 "agents": {
@@ -102,7 +103,7 @@ def test_old_version_rejected():
 
 
 def test_temperature_range():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         AgentConfig(provider="x", model="y", temperature=3.0)
 
 

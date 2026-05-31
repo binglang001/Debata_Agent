@@ -19,8 +19,8 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QPropertyAnimation,
-    QRectF,
     QRect,
+    QRectF,
     Qt,
 )
 from PySide6.QtGui import QMouseEvent, QPainterPath, QRegion
@@ -44,7 +44,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
 
 _RESIZE_MARGIN = 7
 

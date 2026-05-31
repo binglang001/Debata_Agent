@@ -13,7 +13,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-
 # ============================================================
 # 色板
 # ============================================================
@@ -167,7 +166,6 @@ def build_qss(palette: Palette) -> str:
     pressed_primary = _darken(p.accent_primary, 0.16)
     hover_error = _darken(p.error, 0.08)
     pressed_error = _darken(p.error, 0.16)
-    focus_ring = _rgba(p.accent_primary, 0.18)
     selected_fill = _rgba(p.accent_primary, 0.10)
 
     return f"""

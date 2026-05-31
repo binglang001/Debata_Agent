@@ -40,7 +40,6 @@ from memory import HistoryManager, ImportantMemoryManager
 from providers.base import CompletionResult, IProvider, ToolCall, Usage
 from tools import build_default_registry
 
-
 # ============================================================
 # Fakes
 # ============================================================
@@ -301,7 +300,8 @@ async def test_group_message_napcat_json_to_send(tmp_path):
     persona = _make_persona()
     history = HistoryManager(tmp_path / "history.jsonl")
     important = ImportantMemoryManager(tmp_path / "important.json")
-    await history.load(); await important.load()
+    await history.load()
+    await important.load()
 
     chat_agent = ChatAgent(provider, cfg.agents.chat)
     registry = build_default_registry(cfg)

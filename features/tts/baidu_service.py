@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from pathlib import Path
@@ -115,8 +114,8 @@ class BaiduTTSService(ITTSService):
             try:
                 err = resp.json()
                 raise TTSError(f"百度合成失败: {err}")
-            except (ValueError, KeyError):
-                raise TTSError(f"百度合成失败: HTTP {resp.status_code}")
+            except (ValueError, KeyError) as e:
+                raise TTSError(f"百度合成失败: HTTP {resp.status_code}") from e
         except httpx.RequestError as e:
             raise TTSError(f"百度网络错误: {e}") from e
 

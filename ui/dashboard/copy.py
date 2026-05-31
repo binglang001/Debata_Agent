@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-
 DASHBOARD_COPY: dict[str, str] = {
     # ============================================================
     # 窗口标题

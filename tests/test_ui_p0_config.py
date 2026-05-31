@@ -1,5 +1,7 @@
 """P0 UI 配置保存路径回归测试。"""
 
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import os
@@ -8,16 +10,16 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+QtWidgets = pytest.importorskip("PySide6.QtWidgets", exc_type=ImportError)
 QApplication = QtWidgets.QApplication
 QDialog = QtWidgets.QDialog
 
 from app_config import SecretsManager
 from app_config.loader import load_config
 from app_config.schema import (
-    ASRFeatureConfig,
     AgentConfig,
     AgentsConfig,
+    ASRFeatureConfig,
     EmbeddingFeatureConfig,
     NapCatAdapterConfig,
     ProviderConfig,
@@ -25,17 +27,17 @@ from app_config.schema import (
     TTSFeatureConfig,
 )
 from ui.dashboard.settings_page import (
+    SettingsPage,
     _AddProviderDialog,
     _ASREditDialog,
     _EmbeddingEditDialog,
-    _TTSEditDialog,
     _load_provider_presets_for_dialog,
-    SettingsPage,
+    _TTSEditDialog,
 )
-from ui.wizard.window import WizardWindow
 from ui.wizard.flow import next_step
-from ui.wizard.steps import StepId
 from ui.wizard.step_views.embedding import EmbeddingStepView
+from ui.wizard.steps import StepId
+from ui.wizard.window import WizardWindow
 
 
 @pytest.fixture(scope="module")

@@ -5,8 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel, Field
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from tools import (
     DEFAULT_NO_FEEDBACK_TOOLS,
@@ -24,12 +23,6 @@ from tools import (
 from tools.base import _inline_refs, _strip_pydantic_metadata, tool
 from tools.feature_tools import send_voice_message
 from tools.schemas import (
-    DescribeImageArgs,
-    GetWeatherArgs,
-    ListContactsArgs,
-    SaveMemoryArgs,
-    SendGroupArgs,
-    SendPrivateArgs,
     SendVoiceMessageArgs,
 )
 
@@ -348,8 +341,6 @@ async def test_executor_exception_returns_error():
 
     class _Args(BaseModel):
         pass
-
-    spec_list = list(get_default_specs())
 
     @tool(name="_boom", description="boom", args_model=_Args)
     async def _boom(args, ctx):

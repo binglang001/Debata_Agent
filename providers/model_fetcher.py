@@ -85,9 +85,9 @@ async def fetch_model_list(
         try:
             resp = await client.get(url, headers=headers)
         except httpx.TransportError as e:
-            raise ProviderError(f"网络不通：{e}")
-        except httpx.TimeoutException:
-            raise ProviderError("请求超时，请检查网络或换一个更短的超时")
+            raise ProviderError(f"网络不通：{e}") from e
+        except httpx.TimeoutException as e:
+            raise ProviderError("请求超时，请检查网络或换一个更短的超时") from e
 
         if resp.status_code == 401 or resp.status_code == 403:
             raise ProviderError("鉴权失败，请检查 API 密钥是否正确")
@@ -98,8 +98,8 @@ async def fetch_model_list(
 
         try:
             data: dict[str, Any] = resp.json()
-        except Exception:
-            raise ProviderError("响应不是合法 JSON")
+        except Exception as e:
+            raise ProviderError("响应不是合法 JSON") from e
 
         # 尝试多种响应格式
         models_raw: list[dict[str, Any]] = []

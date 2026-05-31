@@ -11,8 +11,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -20,8 +20,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QFrame,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -31,11 +31,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...theme import Spacing
 from ..components import ApiKeyInput, SectionCard
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
-from ...theme import Spacing
-
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -130,7 +129,9 @@ def _start_plugin_download(
 ) -> None:
     """在向导中打开模型安装指引，不再执行自动下载。"""
     from pathlib import Path
+
     from plugins import PluginManager
+
     from ...widgets import show_model_install_guide
     from ...widgets.window_chrome import show_message
 

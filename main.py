@@ -139,11 +139,11 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
     from PySide6.QtWidgets import QApplication
 
     from app_config import AppPaths, SecretsManager
-    from ui.theme import build_qss, palette_for_theme
+    from core import Runtime
     from ui.dashboard.main_window import DashboardWindow
+    from ui.theme import build_qss, palette_for_theme
     from ui.tray import Tray
     from ui.wizard.window import WizardWindow
-    from core import Runtime
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -630,7 +630,7 @@ def _run_cli_wizard(paths) -> None:
     print("\n" + "-" * 60)
     print("即将写入以下配置：")
     print(f"  人格        : {persona_name}")
-    print(f"  Provider    : DeepSeek（model=deepseek-v4-flash）")
+    print("  Provider    : DeepSeek（model=deepseek-v4-flash）")
     print(f"  Adapter mode: {mode}")
     print(f"  WS endpoint : ws://{host}:{port}{path}")
     print(f"  Token       : {'(已绑定)' if napcat_token_id else '(无)'}")
@@ -803,7 +803,7 @@ async def _test_adapter(project_root: Path, config_file: Path | None = None) -> 
     # 启动后立刻打印配置摘要，方便用户判断"程序在用什么配置"
     adapter_name, cfg = next(iter(rt.config.adapters.items()))
     endpoint = f"ws://{cfg.host}:{cfg.port}{cfg.path}"
-    print(f"\n程序配置：")
+    print("\n程序配置：")
     print(f"  adapter  = {adapter_name}")
     print(f"  mode     = {cfg.mode}")
     print(f"  endpoint = {endpoint}")
@@ -811,7 +811,7 @@ async def _test_adapter(project_root: Path, config_file: Path | None = None) -> 
     print(f"  NapCat 这边应该: "
           f"{'「正向 WS」监听 ' + endpoint if cfg.mode == 'client' else '「反向 WS」目标 = ' + endpoint}")
 
-    print(f"\nAdapter 已启动。等 5 秒看连接情况...")
+    print("\nAdapter 已启动。等 5 秒看连接情况...")
     for i in range(5):
         await asyncio.sleep(1)
         connected = rt.adapter.is_connected

@@ -826,8 +826,8 @@ class Runtime:
                 self.embedding_service = None
                 self.rag_store = None
                 if self.important is not None:
-                    setattr(self.important, "_embedding", None)
-                    setattr(self.important, "_rag_store", None)
+                    self.important._embedding = None
+                    self.important._rag_store = None
             else:
                 getattr(self.config.features, label).enabled = False
                 setattr(self, label, None)
