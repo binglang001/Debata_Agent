@@ -41,7 +41,7 @@ Debata 不是 ChatGPT 套壳，也不是「能多就多」的 AI 全家桶。她
    - 改了行为：补回归测试
    - 加了新功能：先写用例测试，再实现到通过
    - 不要直接 commit 到 `main`
-4. **跑全部测试**：`venv/Scripts/python -m pytest tests/ -q --ignore=tests/test_kv_cache_real.py`，确保全过。
+4. **安装测试依赖并跑全部测试**：`pip install -e ".[dev,gui]"` 后执行 `venv/Scripts/python -m pytest tests/ -q --ignore=tests/test_kv_cache_real.py`，确保全过。
 5. **提 PR 到 `develop` 分支**。
    - PR 标题：动词开头，一句话讲明白做了什么（如「fix: 修白名单 verify 模式漏判群消息」）
    - PR 描述写：动机 + 变更点 + 自测清单

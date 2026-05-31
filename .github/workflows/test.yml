@@ -9,6 +9,8 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
     strategy:
       fail-fast: false
       matrix:
@@ -26,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install .[dev]
+          pip install ".[dev,gui]"
 
       - name: Run pytest
         run: python -m pytest tests/ -q --ignore=tests/test_kv_cache_real.py
