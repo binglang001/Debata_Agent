@@ -730,6 +730,42 @@ async def test_keyword_save_no_manager():
 # ============================================================
 
 
+def _simple_pdf_bytes(text: str) -> bytes:
+    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("ascii")
+    objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        (
+            b"3 0 obj\n"
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\n"
+            b"endobj\n"
+        ),
+        b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        (
+            f"5 0 obj\n<< /Length {len(stream)} >>\nstream\n".encode("ascii")
+            + stream
+            + b"\nendstream\nendobj\n"
+        ),
+    ]
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("ascii"))
+    for offset in offsets:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+    )
+    return bytes(pdf)
+
+
 @pytest.mark.asyncio
 async def test_read_file_extracts_simple_pdf_text(tmp_path):
     cfg = _make_config()
@@ -737,12 +773,7 @@ async def test_read_file_extracts_simple_pdf_text(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     pdf = workspace / "simple.pdf"
-    pdf.write_bytes(
-        b"%PDF-1.4\n"
-        b"1 0 obj <<>> endobj\n"
-        b"stream\nBT (Hello PDF from workspace) Tj ET\nendstream\n"
-        b"%%EOF\n"
-    )
+    pdf.write_bytes(_simple_pdf_bytes("Hello PDF from workspace"))
 
     ctx = ToolContext(workspace_dir=workspace)
     executor = reg.get_executor(ctx)
