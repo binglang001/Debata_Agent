@@ -607,6 +607,60 @@ def _safe_agent_task_filename(name: str, *, default: str, suffix: str) -> str:
     return safe[:120]
 
 
+def _clamp_agent_task_max_loops(value: Any, default: int) -> int:
+    try:
+        raw = int(value if value is not None else default)
+    except (TypeError, ValueError):
+        raw = default
+    return min(60, max(5, raw))
+
+
+def _agent_task_partial_text(
+    *,
+    task_id: str,
+    prompt: str,
+    result: Any,
+    output_rel: str,
+    max_loops: int,
+) -> str:
+    lines = [
+        f"# 后台子 Agent 部分结果：{task_id}",
+        "",
+        f"- 状态：达到工具循环上限 {max_loops} 轮",
+        f"- 目标输出文件：{output_rel}",
+        f"- 已执行轮数：{getattr(result, 'loop_count', 0)}",
+        "",
+        "## 任务说明",
+        "",
+        prompt.strip() or "（无）",
+        "",
+    ]
+    final_content = str(getattr(result, "final_content", "") or "").strip()
+    if final_content:
+        lines.extend(["## 最后一轮模型输出", "", final_content, ""])
+
+    records = list(getattr(result, "records", []) or [])
+    if records:
+        lines.extend(["## 最近执行记录", ""])
+        for record in records[-8:]:
+            role = str(record.get("role") or "?")
+            content = str(record.get("content") or "").strip()
+            tool_calls = record.get("tool_calls") or []
+            if content:
+                lines.append(f"- {role}: {content[:500]}")
+            elif tool_calls:
+                names = []
+                for tool_call in tool_calls:
+                    func = tool_call.get("function") if isinstance(tool_call, dict) else None
+                    if isinstance(func, dict):
+                        names.append(str(func.get("name") or "?"))
+                lines.append(f"- {role}: 调用工具 {', '.join(names) if names else '?'}")
+        lines.append("")
+
+    lines.append("任务没有失败，但还没有在轮数上限内完整收尾。可以提高 max_loops 或基于当前文件继续处理。")
+    return "\n".join(lines)
+
+
 def _resolve_agent_workspace_path(value: str, workspace_dir: Path | None) -> Path:
     from tools.workspace import resolve_in_workspace
 
@@ -1833,6 +1887,10 @@ class MessagePipeline:
                 suffix=suffix,
             )
             output_path = task_dir / output_name
+            max_loops = _clamp_agent_task_max_loops(
+                payload.get("max_loops"),
+                int(getattr(getattr(self.chat_agent, "cfg", None), "max_loops", 25) or 25),
+            )
             source_manifest = await self._materialize_agent_task_sources(
                 payload.get("sources") or [],
                 task_dir,
@@ -1901,20 +1959,30 @@ class MessagePipeline:
                 tools=sub_registry.get_schemas(),
                 tool_executor=sub_registry.get_executor(sub_ctx),
                 task_contract=f"后台资料处理任务 {task_id}",
+                max_loops=max_loops,
             )
+            status = "partial" if result.finish_reason == "max_loops" else "completed"
             if not output_path.exists():
                 fallback = (result.final_content or "").strip()
-                if not fallback:
+                if status == "partial":
+                    fallback = _agent_task_partial_text(
+                        task_id=task_id,
+                        prompt=prompt,
+                        result=result,
+                        output_rel=output_rel,
+                        max_loops=max_loops,
+                    )
+                elif not fallback:
                     fallback = "后台子 Agent 已结束，但没有写出结果内容。"
                 output_path.write_text(fallback, encoding="utf-8")
 
             await self._deliver_agent_task_result(
                 task_id,
-                status="completed",
+                status=status,
                 result_path=output_path,
                 conversation_id=conversation_id,
                 default_target=default_target,
-                error="",
+                error="达到工具循环上限，已产出部分结果。" if status == "partial" else "",
             )
         except asyncio.CancelledError:
             raise

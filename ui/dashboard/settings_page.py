@@ -1626,6 +1626,20 @@ class SettingsPage(QWidget):
         )
         form.addRow(QLabel("模型 ID"), model_edit)
 
+        if agent_name == "chat":
+            loops_spin = QSpinBox()
+            loops_spin.setRange(5, 60)
+            loops_spin.setValue(min(60, max(5, int(agent_cfg.max_loops or 25))))
+            loops_spin.setSuffix(" 轮")
+            install_wheel_freeze(loops_spin)
+            loops_spin.editingFinished.connect(
+                lambda *_, an=agent_name, s=loops_spin: self._on_agent_max_loops_changed(
+                    an,
+                    s.value(),
+                )
+            )
+            form.addRow(QLabel("工具轮数上限"), loops_spin)
+
         # 思考
         chk = QCheckBox("启用")
         is_on = bool(agent_cfg.reasoning and agent_cfg.reasoning.enabled)
@@ -1680,6 +1694,18 @@ class SettingsPage(QWidget):
             return
         a.model = model
         self._save_now(needs_restart=True, change_desc=f"agents.{agent_name}.model={model}")
+
+    def _on_agent_max_loops_changed(self, agent_name: str, value: int) -> None:
+        if self._suppress_signals:
+            return
+        a = getattr(self._cfg().agents, agent_name, None)
+        if a is None:
+            return
+        value = min(60, max(5, int(value)))
+        if a.max_loops == value:
+            return
+        a.max_loops = value
+        self._save_now(needs_restart=False, change_desc=f"agents.{agent_name}.max_loops={value} (hot)")
 
     def _on_agent_reasoning_changed(self, agent_name: str, enabled: bool, budget) -> None:
         if self._suppress_signals:

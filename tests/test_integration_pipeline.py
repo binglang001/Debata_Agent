@@ -36,6 +36,7 @@ from adapters.types import (
     UserInfo,
 )
 from agents import ChatAgent, Persona
+from agents.base import AgentRunResult
 from app_config.schema import (
     AgentConfig,
     AgentsConfig,
@@ -753,6 +754,60 @@ async def test_agent_task_materializes_sources_without_url(build_pipeline, tmp_p
     assert inline_path.read_text(encoding="utf-8") == "内联材料"
     assert manifest["sources"][2]["record_count"] == 1
     assert "暂不支持直接传 URL" in manifest["sources"][3]["error"]
+
+
+@pytest.mark.asyncio
+async def test_agent_task_max_loops_writes_partial_result(build_pipeline, tmp_path):
+    pipeline, _, _, _, _ = await build_pipeline([])
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pipeline.workspace_dir = workspace
+    delivered: list[dict[str, Any]] = []
+
+    async def fake_run(_messages, *, max_loops=None, **_kwargs):
+        assert max_loops == 17
+        return AgentRunResult(
+            final_content="还没完全整理完",
+            records=[{"role": "assistant", "content": "正在整理资料"}],
+            loop_count=17,
+            finish_reason="max_loops",
+        )
+
+    async def fake_deliver(task_id, *, status, result_path, conversation_id, default_target, error):
+        delivered.append(
+            {
+                "task_id": task_id,
+                "status": status,
+                "result_path": result_path,
+                "conversation_id": conversation_id,
+                "default_target": default_target,
+                "error": error,
+            }
+        )
+
+    pipeline.chat_agent.run = fake_run  # type: ignore[method-assign]
+    pipeline._deliver_agent_task_result = fake_deliver  # type: ignore[method-assign]
+
+    await pipeline._run_agent_task(
+        "task-partial",
+        {
+            "prompt": "整理资料并输出 Markdown",
+            "max_loops": 17,
+            "output_format": "markdown",
+            "output_name": "result.md",
+        },
+        conversation_id="private:123",
+        default_target=None,
+    )
+
+    result_path = workspace / "agent_tasks" / "task-partial" / "result.md"
+    assert result_path.exists()
+    text = result_path.read_text(encoding="utf-8")
+    assert "部分结果" in text
+    assert "整理资料并输出 Markdown" in text
+    assert delivered[0]["status"] == "partial"
+    assert delivered[0]["result_path"] == result_path
+    assert "工具循环上限" in delivered[0]["error"]
 
 
 @pytest.mark.asyncio

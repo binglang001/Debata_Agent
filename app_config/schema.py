@@ -240,7 +240,7 @@ class AgentConfig(StrictModel):
     first_token_timeout_seconds: float = 30.0
     """首 token 超时（秒）。流式模式下，首字未到即超时重试。"""
 
-    max_loops: int = 15
+    max_loops: int = 25
     """工具循环最大轮次（仅 chat agent 用）。"""
 
     refocus_interval: int = Field(default=5, ge=0)

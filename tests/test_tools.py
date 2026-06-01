@@ -1311,6 +1311,7 @@ async def test_start_agent_task_requires_prompt_and_calls_runtime():
             "prompt": "提取对话，保留发送者",
             "sources": [{"type": "inline_text", "value": "A: hi"}],
             "output_format": "markdown",
+            "max_loops": 30,
         },
     )
 
@@ -1318,6 +1319,7 @@ async def test_start_agent_task_requires_prompt_and_calls_runtime():
     assert result["task_id"] == "agent-1"
     assert calls[0]["prompt"] == "提取对话，保留发送者"
     assert calls[0]["sources"][0]["type"] == "inline_text"
+    assert calls[0]["max_loops"] == 30
 
 
 # ============================================================

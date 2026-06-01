@@ -352,6 +352,15 @@ class StartAgentTaskArgs(_ToolArgs):
         default=None,
         description="期望结果文件名，可不填；系统会保存到 workspace/agent_tasks/ 下。",
     )
+    max_loops: int | None = Field(
+        default=None,
+        ge=5,
+        le=60,
+        description=(
+            "后台子 Agent 最多可调用工具多少轮。复杂资料整理可调高；"
+            "必须在 5 到 60 之间。不填则使用主 Agent 当前默认值。"
+        ),
+    )
 
 
 # ============================================================
