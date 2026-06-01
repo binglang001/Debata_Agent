@@ -119,22 +119,24 @@ class RateLimiter:
         window_seconds: int = 60,
         max_messages: int = 5,
         whitelist_provider=None,
+        whitelist_cache_ttl_seconds: float = 300.0,
     ) -> None:
         self.window = window_seconds
         self.max_messages = max_messages
         self.whitelist_provider = whitelist_provider
+        self.whitelist_cache_ttl_seconds = whitelist_cache_ttl_seconds
         self._records: dict[str, list[float]] = {}
         self._lock = asyncio.Lock()
+        self._whitelist_cache: set[str] | None = None
+        self._whitelist_cache_expires_at: float = 0.0
+        self._whitelist_refresh_task: asyncio.Task | None = None
 
     async def check_and_log(self, user_id: str) -> bool:
         """记录本次消息，返回 True 表示已超限。"""
         if self.whitelist_provider is not None:
-            try:
-                whitelist = await self.whitelist_provider()
-                if user_id in whitelist:
-                    return False
-            except Exception as e:
-                logger.warning(f"速率限制白名单查询失败，按非白名单处理: {e}")
+            whitelist = self._get_cached_whitelist()
+            if whitelist is not None and user_id in whitelist:
+                return False
 
         now = time.time()
         async with self._lock:
@@ -150,6 +152,43 @@ class RateLimiter:
             else:
                 self._records.pop(user_id, None)
             return False
+
+    def _get_cached_whitelist(self) -> set[str] | None:
+        """返回好友白名单缓存；过期时后台刷新，不阻塞消息热路径。"""
+        now = time.time()
+        if self._whitelist_cache is not None and now < self._whitelist_cache_expires_at:
+            return self._whitelist_cache
+
+        self._schedule_whitelist_refresh()
+        # 有旧缓存时先用旧缓存，避免 NapCat 一次慢响应让好友被短时误判。
+        return self._whitelist_cache
+
+    def _schedule_whitelist_refresh(self) -> None:
+        if self.whitelist_provider is None:
+            return
+        task = self._whitelist_refresh_task
+        if task is not None and not task.done():
+            return
+        self._whitelist_refresh_task = asyncio.create_task(
+            self._refresh_whitelist_cache(),
+            name="rate-limit-whitelist-refresh",
+        )
+
+    async def _refresh_whitelist_cache(self) -> None:
+        if self.whitelist_provider is None:
+            return
+        try:
+            whitelist = await self.whitelist_provider()
+            self._whitelist_cache = set(whitelist or set())
+            self._whitelist_cache_expires_at = (
+                time.time() + self.whitelist_cache_ttl_seconds
+            )
+            logger.debug("速率限制好友白名单已刷新：%s 人", len(self._whitelist_cache))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # 不让好友列表查询失败阻塞正常聊天；已有旧缓存会继续使用。
+            logger.debug("速率限制白名单后台刷新失败：%s", e)
 
 
 # ============================================================

@@ -760,6 +760,7 @@ class MessagePipeline:
 
     async def enqueue(self, event: IncomingMessage) -> None:
         """接收一条入站消息，做前置检查后加入批处理队列。"""
+        enqueue_t0 = time.monotonic()
         if not event.text and not event.media:
             # 空消息（无文本无媒体）忽略
             return
@@ -834,6 +835,14 @@ class MessagePipeline:
 
         await self.batch.append(item)
         self._send_manager.notify_inbound(item)
+        logger.debug(
+            "入站消息预处理完成 conversation_id=%s msg_id=%s text_len=%s keyword_saved=%s elapsed=%.3fs",
+            conversation_id,
+            event.message_id,
+            len(text),
+            keyword_saved,
+            time.monotonic() - enqueue_t0,
+        )
         if self._send_manager.should_defer_batch(conversation_id):
             return
         # 启动批处理任务（如未运行）
@@ -947,6 +956,7 @@ class MessagePipeline:
             4. 执行遗留 collected 兜底动作（常规发送已在工具内即时完成）
             5. 触发可选总结
         """
+        batch_t0 = time.monotonic()
         now = get_time()
         user_record = self._build_user_record(items, now)
         conversation_id = user_record.get("conversation_id") or "legacy:unknown"
@@ -959,6 +969,12 @@ class MessagePipeline:
         important_text = await self._important_memory_text(
             conversation_id,
             query=items[-1].text if items else None,
+        )
+        logger.debug(
+            "批处理记忆准备完成 conversation_id=%s memory_len=%s elapsed=%.3fs",
+            conversation_id,
+            len(important_text),
+            time.monotonic() - batch_t0,
         )
 
         history_window = await self._select_working_history(conversation_id)
@@ -993,6 +1009,7 @@ class MessagePipeline:
         # 只串行模型轮；Phase 0 后台发送不占 reply_lock。
         async with self.reply_lock:
             self._send_manager.begin_model_turn(conversation_id)
+            model_t0 = time.monotonic()
             try:
                 result = await self.chat_agent.run(
                     messages,
@@ -1005,6 +1022,13 @@ class MessagePipeline:
                 )
             finally:
                 self._send_manager.end_model_turn(conversation_id)
+            logger.debug(
+                "模型轮完成 conversation_id=%s finish=%s loops=%s elapsed=%.3fs",
+                conversation_id,
+                result.finish_reason,
+                result.loop_count,
+                time.monotonic() - model_t0,
+            )
 
             # 写 records
             if result.records:
@@ -1019,6 +1043,12 @@ class MessagePipeline:
             self.mark_activity()
 
         self._schedule_summarize()
+        logger.debug(
+            "批处理完成 conversation_id=%s items=%s elapsed=%.3fs",
+            conversation_id,
+            len(items),
+            time.monotonic() - batch_t0,
+        )
 
         return False
 
@@ -2271,7 +2301,7 @@ class MessagePipeline:
                 async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
                     resp = await client.get(url)
                     resp.raise_for_status()
-                    dest.write_bytes(resp.content)
+                    await asyncio.to_thread(dest.write_bytes, resp.content)
             return f"incoming/{dest.name}"
         except Exception as e:  # noqa: BLE001
             logger.warning(f"下载媒体到 workspace 失败 url={url[:60]}: {e}")

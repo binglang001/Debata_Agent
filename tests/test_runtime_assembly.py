@@ -235,6 +235,8 @@ async def test_runtime_start_assembles_all_components(assembled_project):
         assert rt.history is not None
         assert rt.important is not None
         assert "fake_main" in rt.providers, "provider 未实例化"
+        if rt._provider_health_task is not None:
+            await rt._provider_health_task
         assert rt.provider_health["fake_main"].status == "error"
         assert "缺 API 密钥" in rt.provider_health["fake_main"].message
         assert rt.chat_agent is not None
@@ -256,6 +258,31 @@ async def test_runtime_start_assembles_all_components(assembled_project):
         # 验证 pipeline 拿到了 summary_agent
         assert rt.pipeline.summary_agent is rt.summary_agent
 
+    finally:
+        await rt.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_provider_health_check_does_not_block_start(
+    assembled_project,
+    monkeypatch,
+):
+    project_root, _paths = assembled_project
+    started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def slow_health_check(self):
+        started.set()
+        await never_finish.wait()
+
+    monkeypatch.setattr(Runtime, "_check_provider_health", slow_health_check)
+    rt = Runtime(project_root=project_root)
+
+    try:
+        await asyncio.wait_for(rt.start(), timeout=1.0)
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        assert rt._provider_health_task is not None
+        assert not rt._provider_health_task.done()
     finally:
         await rt.shutdown()
 
