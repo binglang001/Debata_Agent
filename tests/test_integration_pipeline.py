@@ -338,12 +338,15 @@ async def _drain_pipeline(pipeline: MessagePipeline, max_wait: float = 1.0) -> N
         )
         receipt_tasks = getattr(pipeline, "_send_receipt_tasks", {})
         receipt_tasks_done = all(task.done() for task in receipt_tasks.values())
+        agent_task_tasks = getattr(pipeline, "_agent_task_tasks", {})
+        agent_task_tasks_done = all(task.done() for task in agent_task_tasks.values())
         if (
             (batch_task is None or batch_task.done())
             and (requeue is None or requeue.done())
             and all(t.done() for t in rag_tasks)
             and send_workers_done
             and receipt_tasks_done
+            and agent_task_tasks_done
         ):
             return
     raise AssertionError(f"pipeline 在 {max_wait}s 内未完成")
@@ -721,6 +724,35 @@ async def test_proactive_action_runs_under_acquired_lock(build_pipeline):
     )
     assert "本轮由系统后台主动思考触发" in joined
     assert "不是用户刚发来的新消息" in joined
+
+
+@pytest.mark.asyncio
+async def test_agent_task_materializes_sources_without_url(build_pipeline, tmp_path):
+    pipeline, _, _, history, _ = await build_pipeline([])
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pipeline.workspace_dir = workspace
+    (workspace / "input.md").write_text("已有文件", encoding="utf-8")
+    await history.add_user_message("这里有 msg_id=abc123 的记录", conversation_id="private:123")
+    task_dir = workspace / "agent_tasks" / "manual"
+    task_dir.mkdir(parents=True)
+
+    manifest = await pipeline._materialize_agent_task_sources(
+        [
+            {"type": "workspace_path", "value": "input.md"},
+            {"type": "inline_text", "value": "内联材料"},
+            {"type": "message_id", "value": "abc123"},
+            {"type": "image_ref", "value": "https://example.com/a.png"},
+        ],
+        task_dir,
+    )
+
+    assert manifest["count"] == 4
+    assert manifest["sources"][0]["path"] == "input.md"
+    inline_path = workspace / manifest["sources"][1]["path"]
+    assert inline_path.read_text(encoding="utf-8") == "内联材料"
+    assert manifest["sources"][2]["record_count"] == 1
+    assert "暂不支持直接传 URL" in manifest["sources"][3]["error"]
 
 
 @pytest.mark.asyncio

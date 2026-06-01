@@ -46,6 +46,9 @@ DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "set_friend_add_request",
     "set_group_add_request",
     "schedule_wakeup",
+    "start_agent_task",
+    "summarize_chat_history",
+    "summarize_conversation",
 }
 
 # 发送类工具：send_only=True 时同样算作终止信号

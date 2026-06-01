@@ -170,8 +170,10 @@ _TOOL_USE_PROTOCOL_FOOTER = """<no_action>
 - recall_message：撤回（仅 2 分钟内的消息）
 - get_forward_msg：提取合并转发内容
 - get_user_info：查 QQ 用户公开信息
-- summarize_conversation：总结本地归档和活跃历史，私聊/群聊都可用
-- summarize_chat_history：拉取并总结 NapCat 服务器侧近期群历史，仅群聊可用
+- start_agent_task：启动后台子 Agent 处理大资料、长文件、合并转发、本地历史提取/整理任务；必须传 prompt，不支持直接传 URL；调用后先返回 task_id，完成后系统会把结果作为新请求回传
+- 用户让你整理/提取/转换合并转发、长历史或长文件时，优先用 start_agent_task，把资料来源交给后台处理；不要先把大材料完整取回当前轮导致工具结果截断
+- summarize_conversation：启动后台子 Agent 总结本地归档和活跃历史，私聊/群聊都可用；不会立刻返回摘要
+- summarize_chat_history：拉取 NapCat 服务器侧近期群历史并启动后台子 Agent 总结，仅群聊可用；不会立刻返回摘要
 - upload_file：发送本地文件
 - send_voice_message：发送语音。调用时必须填写 prompt，用一句话写清语气/音色/节奏；不要省略语气提示词
 - set_friend_add_request / set_group_add_request：处理验证请求（必须管理员同意后才调）

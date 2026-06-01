@@ -9,6 +9,7 @@
     platform_tools      —— list_contacts / get_user_info / get_forward_msg /
                            set_*_add_request / summarize_chat_history /
                            summarize_conversation / recall_history
+    agent_task_tools    —— start_agent_task 后台子 Agent 资料处理
     control_tools       —— no_action / schedule_wakeup
     feature_tools       —— describe_image / web_search / get_weather
     keyword_save        —— 关键词强制保存联动
@@ -28,6 +29,7 @@ import logging
 
 # 导入各模块的副作用：注册装饰器把工具加入全局列表
 from . import (  # noqa: F401
+    agent_task_tools,
     control_tools,
     feature_tools,
     memory_tools,
@@ -37,6 +39,7 @@ from . import (  # noqa: F401
 )
 from .base import (
     DEFAULT_NO_FEEDBACK_TOOLS,
+    AgentTaskCallback,
     IVisionService,
     IWeatherService,
     IWebSearchService,
@@ -72,6 +75,7 @@ __all__ = [
     "IWebSearchService",
     "IWeatherService",
     "DEFAULT_NO_FEEDBACK_TOOLS",
+    "AgentTaskCallback",
     "tool",
     "get_default_specs",
     "clear_default_registry",

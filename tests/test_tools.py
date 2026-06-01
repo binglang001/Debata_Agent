@@ -132,7 +132,7 @@ def test_all_expected_tools_registered():
         "save_important_memory", "delete_important_memory",
         "list_contacts", "get_user_info", "get_forward_msg",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
-        "summarize_conversation", "recall_history",
+        "summarize_conversation", "recall_history", "start_agent_task",
         "no_action", "schedule_wakeup",
         "describe_image", "web_search", "get_weather",
         "send_voice_message",
@@ -1247,26 +1247,8 @@ async def test_delete_memory_with_manager(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_summarize_conversation_uses_local_archive_and_history(tmp_path):
+async def test_summarize_conversation_starts_agent_task(tmp_path):
     from memory import ArchiveStore, HistoryManager
-    from providers.base import CompletionResult
-
-    class FakeSummaryProvider:
-        timeout = 12.0
-
-        def __init__(self) -> None:
-            self.calls = []
-
-        async def chat_completion(self, messages, *, model, tools=None, **kwargs):
-            self.calls.append(
-                {
-                    "messages": messages,
-                    "model": model,
-                    "tools": tools,
-                    "kwargs": kwargs,
-                }
-            )
-            return CompletionResult(content="本地摘要")
 
     archive = ArchiveStore(tmp_path / "archive.jsonl")
     history = HistoryManager(tmp_path / "history.jsonl")
@@ -1280,15 +1262,18 @@ async def test_summarize_conversation_uses_local_archive_and_history(tmp_path):
         ]
     )
     await history.add_user_message("活跃区继续讨论茶会", conversation_id="group:42")
-    provider = FakeSummaryProvider()
+    calls = []
+
+    async def fake_agent_task(payload):
+        calls.append(payload)
+        return {"ok": True, "status": "queued", "task_id": "agent-test"}
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
     ctx = ToolContext(
         archive=archive,
         history=history,
-        summary_provider=provider,  # type: ignore[arg-type]
-        summary_model="summary-model",
+        agent_task_cb=fake_agent_task,
         conversation_id="group:42",
     )
     executor = reg.get_executor(ctx)
@@ -1299,13 +1284,40 @@ async def test_summarize_conversation_uses_local_archive_and_history(tmp_path):
     )
 
     assert result["ok"] is True
-    assert result["summary"] == "本地摘要"
-    assert result["count"] == 2
-    assert result["source"] == "local_archive"
-    assert provider.calls[0]["model"] == "summary-model"
-    prompt = "\n".join(m["content"] for m in provider.calls[0]["messages"])
-    assert "归档里提到茶会安排" in prompt
-    assert "活跃区继续讨论茶会" in prompt
+    assert result["status"] == "queued"
+    assert result["task_id"] == "agent-test"
+    assert calls
+    assert "茶会" in calls[0]["prompt"]
+    assert calls[0]["sources"][0]["type"] == "conversation_history"
+    assert calls[0]["sources"][0]["conversation_id"] == "group:42"
+    assert calls[0]["sources"][0]["time_range"] == "茶会"
+
+
+@pytest.mark.asyncio
+async def test_start_agent_task_requires_prompt_and_calls_runtime():
+    calls = []
+
+    async def fake_agent_task(payload):
+        calls.append(payload)
+        return {"ok": True, "status": "queued", "task_id": "agent-1"}
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext(agent_task_cb=fake_agent_task))
+
+    result = await executor(
+        "start_agent_task",
+        {
+            "prompt": "提取对话，保留发送者",
+            "sources": [{"type": "inline_text", "value": "A: hi"}],
+            "output_format": "markdown",
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["task_id"] == "agent-1"
+    assert calls[0]["prompt"] == "提取对话，保留发送者"
+    assert calls[0]["sources"][0]["type"] == "inline_text"
 
 
 # ============================================================

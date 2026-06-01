@@ -14,7 +14,6 @@ from typing import Any
 from utils.token_budget import TokenEstimator
 
 _LINE_TOOLS = {"run_python", "get_forward_msg"}
-_SUMMARY_TOOLS = {"summarize_chat_history", "summarize_conversation"}
 
 
 def shrink_tool_result(tool_name: str, result: dict[str, Any], ctx: Any) -> dict[str, Any]:
@@ -35,15 +34,6 @@ def shrink_tool_result(tool_name: str, result: dict[str, Any], ctx: Any) -> dict
         shrunk = _shrink_read_file(shrunk, soft_limit, estimator)
     elif tool_name in _LINE_TOOLS:
         shrunk = _shrink_line_result(tool_name, shrunk, soft_limit, estimator)
-    elif tool_name in _SUMMARY_TOOLS:
-        shrunk = _shrink_text_field(
-            shrunk,
-            field="summary",
-            limit_tokens=soft_limit,
-            reason="摘要过长已精简",
-            full="如需更细节，请缩小总结范围或重新调用工具。",
-            estimator=estimator,
-        )
 
     return _hard_cap(tool_name, shrunk, hard_cap, estimator)
 

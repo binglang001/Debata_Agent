@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -251,7 +251,7 @@ class SummarizeConversationArgs(_ToolArgs):
         default=4096,
         ge=512,
         le=16384,
-        description="总结模型最大输出 token，默认 4096。",
+        description="兼容旧参数；现在总结由后台子 Agent 写文件，通常不需要填写。",
     )
 
 
@@ -274,6 +274,84 @@ class RecallHistoryArgs(_ToolArgs):
         description="时间范围关键词，如 2026-05-30 / 凌晨 / 昨晚。Phase A 按原文和 metadata 做简单文本匹配。",
     )
     limit: int = Field(default=20, ge=1, le=100, description="最多返回多少条记录")
+
+
+class AgentTaskSource(_ToolArgs):
+    """start_agent_task 的资料来源。"""
+
+    type: Literal[
+        "workspace_path",
+        "tool_call_id",
+        "tool_result_file",
+        "forward_id",
+        "conversation_history",
+        "message_id",
+        "image_ref",
+        "inline_text",
+        "inline_json",
+        "workspace_glob",
+        "directory",
+    ] = Field(
+        ...,
+        description=(
+            "资料类型。不支持 URL；网页类资料需先由其它工具保存到 workspace 后再传 workspace_path。"
+        ),
+    )
+    value: str | None = Field(
+        default=None,
+        description="通用值：路径、tool_call_id、forward_id、message_id、图片引用或短文本。",
+    )
+    conversation_id: str | None = Field(
+        default=None,
+        description="conversation_history/message_id 可用：private:QQ 或 group:群号。",
+    )
+    keyword: str | None = Field(
+        default=None,
+        description="conversation_history 可用：按关键词检索历史。",
+    )
+    time_range: str | None = Field(
+        default=None,
+        description="conversation_history 可用：时间范围线索，如 2026-05-30。",
+    )
+    limit: int = Field(
+        default=50,
+        ge=1,
+        le=500,
+        description="conversation_history 可用：最多收集多少条记录。",
+    )
+    data: Any = Field(
+        default=None,
+        description="inline_json 可用：直接传入的小型 JSON 资料。",
+    )
+
+
+class StartAgentTaskArgs(_ToolArgs):
+    """start_agent_task 工具参数。"""
+
+    prompt: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "必须填写：交给后台子 Agent 的完整任务说明。写清要处理哪些资料、输出什么、"
+            "是否保留发送者/时间/证据。"
+        ),
+    )
+    sources: list[AgentTaskSource] = Field(
+        default_factory=list,
+        description=(
+            "资料来源列表。支持 workspace_path/tool_call_id/tool_result_file/forward_id/"
+            "conversation_history/message_id/image_ref/inline_text/inline_json/"
+            "workspace_glob/directory；不支持 URL。"
+        ),
+    )
+    output_format: Literal["markdown", "json", "text"] = Field(
+        default="markdown",
+        description="期望输出格式。",
+    )
+    output_name: str | None = Field(
+        default=None,
+        description="期望结果文件名，可不填；系统会保存到 workspace/agent_tasks/ 下。",
+    )
 
 
 # ============================================================
