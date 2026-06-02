@@ -1,6 +1,6 @@
 """重要记忆类工具：save / delete。
 
-file 与 RAG 模式都会注册。RAG 模式下 save/delete 会同步维护向量索引。
+仅 file 长期记忆模式注册。RAG 模式使用自动会话向量检索，不写 important.json。
 """
 
 from __future__ import annotations

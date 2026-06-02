@@ -38,7 +38,7 @@ CORE_RULES = """<core_rules priority="critical">
 #
 #    拆成 _HEADER + _MEMORY_BLOCK_* + _FOOTER 三段，便于按
 #    long_term_memory.mode 动态注入对应的记忆工具说明
-#    RAG 模式同样暴露 save/delete，但说明会强调向量索引同步。
+#    RAG 模式不暴露 save/delete，长期记忆由会话向量检索自动完成。
 # ============================================================
 
 _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
@@ -136,22 +136,12 @@ _MEMORY_BLOCK_FILE_MODE = """<memory>
 """
 
 _MEMORY_BLOCK_RAG_MODE = """<memory>
-## save_important_memory / delete_important_memory（RAG 语义检索）
+## RAG 会话向量检索
 
-长期记忆会保存到文件并建立向量索引。与你当前话题相关的记忆会在 <long_term_memory> 中召回。
+系统会自动把历史对话建立向量索引。与你当前话题相关的旧消息会在 <long_term_memory> 中召回。
 
-必须主动保存的情况：
-- 用户明确说“记住 / 记一下 / 帮我记 / 约定”
-- 认识了新的人——对方是谁、QQ 号、与你的关系
-- 与人做了约定或承诺——时间、内容、对方
-- 对方表达了稳定偏好、长期目标或需要以后参考的事实
-- 你做了自我反思，发现要改进的地方
-- 管理员给了反馈或指示
-
-保存时用一句话概括核心信息，不存日常寒暄、临时测试、工具执行结果或已经过期的信息。scope 通常留空由系统按当前私聊/群聊推断；只有跨会话稳定事实才用 global，需要任何场景都常驻时才 pinned=true。
-如果用户只是笼统说“随便记”，但没有给出可保存的事实、偏好或约定，应追问要记什么。
-
-记忆过时、错误、重复或不再需要 → delete_important_memory（关键词模糊匹配）。删除会同步移除 RAG 索引。
+RAG 模式下不要主动保存或删除重要记忆；没有 save_important_memory / delete_important_memory 工具。
+用户说“记住 / 记一下 / 帮我记 / 约定”时，把它当作当前对话内容正常回应即可，后续会由历史向量检索召回。
 </memory>
 """
 
@@ -187,7 +177,7 @@ def build_tool_use_protocol(memory_mode: str = "file") -> str:
 
     Args:
         memory_mode: "file" = 文件模式（AI 主动调用 save_important_memory）
-                     "rag"  = RAG 模式（AI 主动保存 + 向量检索）
+                     "rag"  = RAG 模式（自动会话向量检索，不暴露重要记忆工具）
 
     Returns:
         完整的 <tool_use_protocol>...</tool_use_protocol> 字符串
@@ -406,7 +396,7 @@ SELF_REFLECTION = """<self_reflection priority="medium">
 - 是否误解了对方
 - 是否漏了该保存的重要信息
 
-发现问题 → 用 save_important_memory 记录："反思：[问题]，下次注意[改进]"。
+发现问题 → 后续对话中修正；若当前工具集中提供长期记忆工具，才把稳定、长期需要参考的信息保存。
 </self_reflection>"""
 
 

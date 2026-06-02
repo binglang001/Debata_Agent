@@ -229,11 +229,11 @@ def test_registry_file_mode_includes_memory_tools():
     assert "delete_important_memory" in reg
 
 
-def test_registry_rag_mode_includes_memory_tools():
+def test_registry_rag_mode_excludes_memory_tools():
     cfg = _make_config(memory_mode="rag")
     reg = build_default_registry(cfg)
     for name in MEMORY_FILE_TOOLS:
-        assert name in reg, f"RAG 模式下也应注册 {name}"
+        assert name not in reg, f"RAG 模式下不应注册 {name}"
 
 
 def test_registry_feature_disabled_excludes_tool():
@@ -278,6 +278,15 @@ def test_registry_no_feedback_names_includes_known():
     assert "no_action" in names
     assert "save_important_memory" in names
     assert "schedule_wakeup" in names
+
+
+def test_registry_rag_no_feedback_names_excludes_memory_tools():
+    cfg = _make_config(memory_mode="rag")
+    reg = build_default_registry(cfg)
+    names = reg.get_no_feedback_names()
+    assert "no_action" in names
+    assert "save_important_memory" not in names
+    assert "delete_important_memory" not in names
 
 
 def test_registry_duplicate_spec_raises():

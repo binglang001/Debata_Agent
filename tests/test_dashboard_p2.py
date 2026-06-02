@@ -244,11 +244,12 @@ def test_memory_page_rag_mode_shows_index_view(qapp):
     try:
         page.refresh()
 
-        assert page._title.text() == "RAG 记忆索引"
+        assert page._title.text() == "RAG 历史向量索引"
         assert "索引 1 条" in page._rag_status.text()
         assert page._list.count() == 1
         assert page._add_row_widget.isHidden()
         assert page._action_row_widget.isHidden()
+        assert page._metadata_row_widget.isHidden()
     finally:
         page.deleteLater()
 

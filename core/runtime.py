@@ -79,6 +79,7 @@ class Runtime:
         self.weather: Any = None
         self.embedding_service: Any = None
         self.rag_store: Any = None
+        self.rag_memory: Any = None
         self.plugin_manager: Any = None
         self.asr: Any = None
         self.tts: Any = None
@@ -355,6 +356,7 @@ class Runtime:
             weather=self.weather,
             asr=self.asr,
             tts=self.tts,
+            rag_memory=self.rag_memory,
         )
         # 回填 wakeup 双向依赖
         self.wakeup_scheduler._on_fire = self.pipeline.run_wakeup_turn
@@ -484,6 +486,8 @@ class Runtime:
             await _close("wakeup_scheduler", self.wakeup_scheduler.cancel_all)
         if self.pipeline is not None:
             await _close("pipeline", self.pipeline.shutdown)
+        if self.rag_memory is not None:
+            await _close("rag_memory", self.rag_memory.shutdown)
         if self.embedding_service is not None:
             await _close("embedding_service", self.embedding_service.aclose)
         if self.asr is not None:
@@ -514,9 +518,9 @@ class Runtime:
             return set()
 
     async def _setup_rag(self, mem_dir) -> None:
-        """RAG 模式装配 EmbeddingService + RagStore，并 attach 到 important。
+        """RAG 模式装配 EmbeddingService + 会话向量检索服务。
 
-        失败仅 warn，不阻塞主流程（pipeline 会自动 fallback 到 text() 全部注入）。
+        失败仅 warn，不阻塞主流程。RAG 模式不再复用 important.json。
         """
         ecfg = self.config.features.embedding
         if not ecfg.enabled:
@@ -534,11 +538,20 @@ class Runtime:
                         model_dir = "data/models/embedding/all-MiniLM-L6-v2"
                 model_dir = self._resolve_project_path(model_dir)
                 self.embedding_service = get_local_service(model_dir)
-                from memory.rag_store import RagStore
+                from memory import RagMemoryService, SqliteVectorStore
 
-                self.rag_store = RagStore(mem_dir / "rag.jsonl")
+                self.rag_store = SqliteVectorStore(mem_dir / "rag_memory.sqlite3")
                 await self.rag_store.load()
-                self.important.attach_rag(self.embedding_service, self.rag_store)
+                self.rag_memory = RagMemoryService(
+                    embedding=self.embedding_service,
+                    store=self.rag_store,
+                    top_k=self.config.features.long_term_memory.rag_top_k,
+                )
+                await self.rag_memory.load()
+                self.history.on_append(self.rag_memory.enqueue_records)
+                archive_records = await self.archive.records()
+                history_records = await self.history.records()
+                self.rag_memory.schedule_bootstrap([*archive_records, *history_records])
                 self._fire_warmup("embedding", self.embedding_service)
                 logger.info(
                     f"RAG 已就位（本地 embedding）：quality={ecfg.local_quality}, "
@@ -549,6 +562,7 @@ class Runtime:
                 self._disable_feature_after_failure("embedding", e)
                 self.embedding_service = None
                 self.rag_store = None
+                self.rag_memory = None
         elif ecfg.type == "api":
             if not ecfg.provider or ecfg.provider not in self.providers:
                 logger.warning(
@@ -578,10 +592,20 @@ class Runtime:
                     api_key=api_key or "",
                     model=ecfg.api_model or "text-embedding-v1",
                 )
-                from memory.rag_store import RagStore
-                self.rag_store = RagStore(mem_dir / "rag.jsonl")
+                from memory import RagMemoryService, SqliteVectorStore
+
+                self.rag_store = SqliteVectorStore(mem_dir / "rag_memory.sqlite3")
                 await self.rag_store.load()
-                self.important.attach_rag(self.embedding_service, self.rag_store)
+                self.rag_memory = RagMemoryService(
+                    embedding=self.embedding_service,
+                    store=self.rag_store,
+                    top_k=self.config.features.long_term_memory.rag_top_k,
+                )
+                await self.rag_memory.load()
+                self.history.on_append(self.rag_memory.enqueue_records)
+                archive_records = await self.archive.records()
+                history_records = await self.history.records()
+                self.rag_memory.schedule_bootstrap([*archive_records, *history_records])
                 logger.info(
                     f"RAG 已就位：provider={ecfg.provider}, model={ecfg.api_model}, "
                     f"索引条目={len(self.rag_store)}"
@@ -591,6 +615,7 @@ class Runtime:
                 self._disable_feature_after_failure("embedding", e)
                 self.embedding_service = None
                 self.rag_store = None
+                self.rag_memory = None
 
     async def _setup_plugins(self) -> None:
         """扫描 plugins/ 并按 features.asr/tts 决定要不要 build。
@@ -883,6 +908,7 @@ class Runtime:
                 self.config.features.long_term_memory.mode = "file"
                 self.embedding_service = None
                 self.rag_store = None
+                self.rag_memory = None
                 if self.important is not None:
                     self.important._embedding = None
                     self.important._rag_store = None

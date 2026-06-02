@@ -1,9 +1,7 @@
-"""向量记忆存储 + cosine top-k 检索。
+"""旧版 JSONL 向量存储 + cosine top-k 检索。
 
-简单纯内存 + jsonl 持久化的设计：
-    - 条目数 < 1 万时性能完全够用（cosine 计算就是 list of dot product，10k 量级 < 10ms）
-    - 不引入向量数据库（chroma/qdrant 等），保持零依赖
-    - 与 ImportantMemoryManager 配合：每条 important 都索引一份向量，query 时按相似度排序
+新的 RAG 模式使用 rag_memory.SqliteVectorStore 索引会话历史。此模块保留给旧测试、
+旧数据迁移和 cosine_similarity 复用。
 """
 
 from __future__ import annotations
@@ -50,14 +48,9 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 class RagStore:
-    """RAG 向量存储。
+    """旧版 RAG 向量存储。
 
     jsonl 文件每行一个 entry。加载到内存做检索，新增/删除即时落盘。
-
-    与 ImportantMemoryManager 一一对应：
-        - important.save() 后调用 rag_store.add(entry)
-        - important.delete_by_keyword() 后调用 rag_store.remove_by_id()
-        - context 注入时 await rag_store.top_k(query_vec, k)
     """
 
     def __init__(self, path: Path) -> None:

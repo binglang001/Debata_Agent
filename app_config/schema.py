@@ -430,20 +430,20 @@ class WebSearchFeatureConfig(StrictModel):
 
 
 class LongTermMemoryConfig(StrictModel):
-    """长期记忆配置 —— 决定 important.json 之外是否启用 RAG。"""
+    """长期记忆配置。"""
 
     mode: Literal["file", "rag"] = "file"
     """file = 纯文件模式（默认，零开销，AI 主动调 save_important_memory 工具触发）;
-    rag = 文件 + 向量检索（需 features.embedding 启用，P2 才生效）"""
+    rag = 会话历史向量检索（需 features.embedding 启用，不使用 important.json）"""
 
     keyword_trigger_save: bool = True
     """命中关键词（"记住"/"约定"/"我叫"等）时强制保存为重要记忆，不依赖 AI 主动调用工具。"""
 
     rag_top_k: int = 5
-    """RAG 模式下每次召回的相关条目数（仅 mode=rag 生效，当前未实装）"""
+    """RAG 模式下每次召回的相关历史条目数（仅 mode=rag 生效）"""
 
     rag_extractor_interval: int = 15
-    """被动抽取触发间隔（每 N 轮对话扫描一次，仅 mode=rag 生效，当前未实装）"""
+    """预留：被动结构化抽取触发间隔。当前 RAG 索引历史原文，不使用重要记忆抽取。"""
 
 
 class EmbeddingFeatureConfig(StrictModel):

@@ -90,14 +90,15 @@ class ImportantMemoryManager:
         self._cached_text: str = ""
         self._loaded: bool = False
         self._now_fn = now_fn or _default_now
-        # RAG 模式可选：runtime 装配时调 attach_rag(embedding, rag_store)
+        # 兼容旧版本的 important-memory RAG；Runtime 的 RAG 模式已改用
+        # RagMemoryService，不再 attach 这里。
         self._embedding = None  # type: ignore[var-annotated]
         self._rag_store = None  # type: ignore[var-annotated]
 
     def attach_rag(self, embedding_service, rag_store) -> None:
-        """注入 RAG 组件。runtime 在 long_term_memory.mode='rag' 时调用。
+        """注入旧版 important-memory RAG 组件。
 
-        attach 后，每次 save() 会异步索引一份向量；retrieve_for_query 走 cosine top-k。
+        Runtime 不再调用此方法；保留给旧数据迁移/外部兼容。
         """
         self._embedding = embedding_service
         self._rag_store = rag_store
@@ -115,7 +116,7 @@ class ImportantMemoryManager:
         token_budget: int | None = None,
         estimator: TokenEstimator | None = None,
     ) -> str:
-        """RAG 模式下按 query 召回 top-k 重要记忆，拼接成可直接注入 prompt 的文本。
+        """旧版 RAG：按 query 召回 top-k 重要记忆，拼接成可直接注入 prompt 的文本。
 
         未启用 RAG / query 为空 / 索引为空 时退回到按 scope 筛选的文本注入。
         """

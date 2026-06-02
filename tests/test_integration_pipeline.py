@@ -61,7 +61,6 @@ from memory import (
     ImportantMemoryManager,
     RollingSummaryStore,
 )
-from memory.rag_store import RagStore
 from providers.base import CompletionResult, IProvider, ToolCall, Usage
 from tools import ToolContext, build_default_registry
 
@@ -1283,45 +1282,15 @@ async def test_pipeline_injects_scope_filtered_important_memory(build_pipeline):
     assert "群 99 约定" not in joined
 
 
-class _FakeEmbedding:
-    async def warmup(self):
-        pass
-
-    async def embed_one(self, text: str) -> list[float]:
-        return [float(len(text)), 1.0]
-
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        return [[float(len(t)), 1.0] for t in texts]
-
-    async def aclose(self):
-        pass
-
-    @property
-    def dimension(self) -> int:
-        return 2
-
-
 @pytest.mark.asyncio
-async def test_rag_mode_save_tool_indexes_long_term_memory(build_pipeline, tmp_path):
-    save_tc = ToolCall(
-        id="tc-save",
-        name="save_important_memory",
-        arguments=json.dumps({"memory_text": "用户报名了某项长期活动，7月7日有选拔环节"}),
-    )
-    pipeline, provider, _, _, important = await build_pipeline(
-        [CompletionResult(tool_calls=[save_tc], finish_reason="tool_calls")]
-    )
-    rag_store = RagStore(tmp_path / "rag.jsonl")
-    await rag_store.load()
-    important.attach_rag(_FakeEmbedding(), rag_store)
+async def test_rag_mode_does_not_write_important_memory(build_pipeline):
+    pipeline, _, _, _, important = await build_pipeline([_ai_no_action()])
     pipeline.features_cfg.long_term_memory.mode = "rag"
 
     await pipeline.enqueue(_msg(text="记一下：我报名了某项长期活动，7月7日有选拔环节"))
     await _drain_pipeline(pipeline)
 
-    items = important.items()
-    assert any("长期活动" in (i.get("content") or "") for i in items)
-    assert len(rag_store) == 1
+    assert important.items() == []
 
 
 @pytest.mark.asyncio

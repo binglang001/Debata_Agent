@@ -339,11 +339,12 @@ class ProactiveLoop:
             if self.proactive_agent is not None:
                 try:
                     router_history = await self.pipeline._select_proactive_router_history()
+                    router_history_text = _format_proactive_router_history(router_history)
                     router_context_parts: list[str] = []
-                    important_memory = self.pipeline.important.text_for_context(
+                    important_memory = await self.pipeline._important_memory_text(
                         None,
+                        query=router_history_text,
                         token_budget=2048,
-                        estimator=self.pipeline._token_estimator(),
                     )
                     if important_memory:
                         router_context_parts.append(
@@ -360,7 +361,6 @@ class ProactiveLoop:
                             f"{rolling_summary.strip()}\n"
                             "</rolling_conversation_summary>"
                         )
-                    router_history_text = _format_proactive_router_history(router_history)
                     if router_history_text:
                         router_context_parts.append(router_history_text)
                     router_context_parts.append(

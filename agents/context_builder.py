@@ -61,7 +61,7 @@ def build_combined_system_prompt(
     Args:
         persona: 已加载的人格
         important_memory_text: 已按当前会话 scope / RAG 规则选出的重要记忆文本
-        memory_mode: "file" = 文件模式（默认）；"rag" = RAG 模式（不告诉 AI 主动保存）
+        memory_mode: "file" = 文件模式（默认）；"rag" = 自动会话向量检索
 
     稳定性递减顺序：
         critical: core_rules（永不变）

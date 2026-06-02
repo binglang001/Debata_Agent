@@ -107,9 +107,9 @@ MEMORY_TOOLS: set[str] = {
     "save_important_memory",
     "delete_important_memory",
 }
-"""长期记忆工具。file 与 RAG 模式都会启用；RAG 保存时会同步索引向量。"""
+"""文件长期记忆工具。RAG 模式改用会话向量检索，不暴露这些工具。"""
 
-# 兼容旧测试/旧导入名。不要再用于过滤。
+# 兼容旧测试/旧导入名。
 MEMORY_FILE_TOOLS = MEMORY_TOOLS
 
 
@@ -140,7 +140,7 @@ def build_default_registry(
     规则：
         - messaging 工具（send_*/recall）：始终启用
         - upload_file：默认启用（受 ctx.workspace_dir 进一步限制）
-        - memory 工具：file 与 RAG 模式都启用
+        - memory 工具：仅 file 模式启用；RAG 模式不再使用 important.json
         - platform 工具：始终启用（按需）
         - control 工具：始终启用
         - feature 工具：按 features.{vision,web_search,weather}.enabled
@@ -167,6 +167,10 @@ def build_default_registry(
 
         # 2. upload_file 按调用方意愿
         if spec.name == "upload_file" and not include_upload_file:
+            continue
+
+        # 3. RAG 模式使用自动会话向量检索，不暴露重要记忆写入/删除工具
+        if memory_mode == "rag" and spec.name in MEMORY_TOOLS:
             continue
 
         enabled.append(spec)

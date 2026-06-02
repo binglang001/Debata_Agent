@@ -142,32 +142,30 @@ class MemoryPage(QWidget):
         self._on_selection_changed()
 
     def _refresh_rag_mode(self, rt: Any) -> None:
-        self._title.setText("RAG 记忆索引")
+        self._title.setText("RAG 历史向量索引")
         self._action_row_widget.hide()
         self._add_row_widget.hide()
-        self._metadata_row_widget.show()
+        self._metadata_row_widget.hide()
         self._rag_status.show()
 
         rag_store = getattr(rt, "rag_store", None)
         embedding = getattr(rt, "embedding_service", None)
         entries = rag_store.all_entries() if rag_store is not None else []
-        items = rt.important.items() if rt.important is not None else []
-        fallback_count = len(items)
         if rag_store is None or embedding is None:
             self._rag_status.setText(
-                f"RAG 当前未就绪，运行时会暂时退回全文记忆。已有文件记忆 {fallback_count} 条。"
+                "RAG 当前未就绪。RAG 模式使用历史向量检索，不会读写重要记忆文件。"
             )
         else:
             self._rag_status.setText(
-                f"按语义向量检索长期记忆。索引 {len(entries)} 条，原始记忆 {fallback_count} 条。"
+                f"按语义向量检索历史消息。索引 {len(entries)} 条。"
             )
 
-        if not items:
+        if not entries:
             self._show_empty(True)
             return
         self._show_empty(False)
-        for item in items:
-            self._add_memory_item(item, rag_mode=True)
+        for entry in entries:
+            self._add_rag_entry(entry)
         self._on_selection_changed()
 
     def _is_rag_mode(self) -> bool:
@@ -181,7 +179,7 @@ class MemoryPage(QWidget):
         if self._is_rag_mode():
             self._action_row_widget.hide()
             self._add_row_widget.hide()
-            self._metadata_row_widget.setVisible(not on)
+            self._metadata_row_widget.hide()
         else:
             self._delete_btn.setVisible(not on)
             self._metadata_row_widget.setVisible(not on)
@@ -205,6 +203,28 @@ class MemoryPage(QWidget):
                 "content": content,
                 "scope": scope,
                 "pinned": pinned,
+            },
+        )
+        self._list.addItem(li)
+
+    def _add_rag_entry(self, entry: Any) -> None:
+        meta = getattr(entry, "meta", {}) or {}
+        timestamp = getattr(entry, "timestamp", "") or meta.get("timestamp", "")
+        conversation_id = getattr(entry, "conversation_id", "") or meta.get("conversation_id", "")
+        role = getattr(entry, "role", "") or meta.get("role", "")
+        text = getattr(entry, "text", "")
+        parts = [str(part) for part in (timestamp, conversation_id, role) if part]
+        prefix = "  ·  ".join(parts)
+        line = f"{prefix}  ·  {text}" if prefix else str(text)
+        li = QListWidgetItem(line)
+        li.setToolTip("RAG 模式索引的是历史消息；编辑重要记忆不会影响这里。")
+        li.setData(
+            Qt.ItemDataRole.UserRole,
+            {
+                "id": str(getattr(entry, "id", "")),
+                "content": str(text),
+                "scope": "global",
+                "pinned": False,
             },
         )
         self._list.addItem(li)

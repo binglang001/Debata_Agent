@@ -131,9 +131,10 @@ def test_tool_use_protocol_file_mode():
 
 def test_tool_use_protocol_rag_mode():
     s = build_tool_use_protocol("rag")
-    assert "RAG 语义检索" in s
+    assert "RAG 会话向量检索" in s
     assert "save_important_memory" in s
-    assert "必须主动保存" in s
+    assert "没有 save_important_memory" in s
+    assert "必须主动保存" not in s
 
 
 def test_tool_use_protocol_default_is_file():
@@ -212,9 +213,10 @@ def test_build_combined_system_prompt_memory_mode_default():
 def test_build_combined_system_prompt_rag_mode_no_active_save():
     p = _persona()
     sys = build_combined_system_prompt(p, memory_mode="rag")
-    assert "RAG 语义检索" in sys
+    assert "RAG 会话向量检索" in sys
     assert "save_important_memory" in sys
-    assert "必须主动保存" in sys
+    assert "没有 save_important_memory" in sys
+    assert "必须主动保存" not in sys
 
 
 def test_build_combined_system_prompt_with_important_memory():
@@ -343,8 +345,8 @@ def test_build_messages_memory_mode_propagates():
     p = _persona()
     msgs_rag = build_messages(p, [], memory_mode="rag")
     msgs_file = build_messages(p, [], memory_mode="file")
-    assert "RAG 语义检索" in msgs_rag[0]["content"]
-    assert "必须主动保存" in msgs_rag[0]["content"]
+    assert "RAG 会话向量检索" in msgs_rag[0]["content"]
+    assert "必须主动保存" not in msgs_rag[0]["content"]
     assert "必须主动保存" in msgs_file[0]["content"]
 
 
