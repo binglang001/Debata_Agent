@@ -48,6 +48,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _default_tool_result_budgets() -> dict[str, Any]:
+    try:
+        from app_config.schema import default_tool_result_budgets
+
+        return default_tool_result_budgets()
+    except Exception:
+        logger.debug("加载默认工具预算失败，使用空预算表", exc_info=True)
+        return {}
+
+
 # ============================================================
 # Feature service protocols（极简骨架，P2 完整实现）
 # ============================================================
@@ -163,6 +173,9 @@ class ToolContext:
     tool_result_soft_limit_tokens: int = 600
     tool_result_hard_cap_tokens: int = 1500
     tool_result_soft_overrides: dict[str, int] = field(default_factory=dict)
+    tool_result_default_budget_tokens: int = 800
+    tool_result_default_hard_cap_tokens: int = 3000
+    tool_result_budgets: dict[str, Any] = field(default_factory=_default_tool_result_budgets)
     """工具结果创建即定型压缩阈值。"""
 
     activity_cb: Callable[[], None] | None = None

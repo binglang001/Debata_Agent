@@ -22,9 +22,45 @@ from tools import (
 )
 from tools.base import _inline_refs, _strip_pydantic_metadata, tool
 from tools.feature_tools import send_voice_message
+from tools.result_shrink import tool_budget
 from tools.schemas import (
     SendVoiceMessageArgs,
 )
+
+
+def test_tool_budget_uses_default_per_tool_values():
+    ctx = ToolContext()
+
+    budget = tool_budget("read_file", ctx)
+
+    assert budget.inline == 2500
+    assert budget.artifact_threshold == 2500
+    assert budget.hard_cap >= 2500
+
+
+def test_tool_budget_falls_back_to_global_default_for_unknown_tool():
+    ctx = ToolContext()
+
+    budget = tool_budget("unknown_tool", ctx)
+
+    assert budget.inline == 800
+    assert budget.artifact_threshold == 800
+    assert budget.hard_cap == 3000
+
+
+def test_tool_budget_keeps_legacy_override_when_no_new_budget_exists():
+    ctx = ToolContext(
+        tool_result_budgets={},
+        tool_result_soft_limit_tokens=700,
+        tool_result_hard_cap_tokens=1600,
+        tool_result_soft_overrides={"read_file": 900},
+    )
+
+    budget = tool_budget("read_file", ctx)
+
+    assert budget.inline == 900
+    assert budget.artifact_threshold == 900
+    assert budget.hard_cap == 1600
 
 
 class FakeSendAdapter:
@@ -436,7 +472,13 @@ async def test_describe_image_long_description_saved_once(tmp_path):
     ctx = ToolContext(
         vision=FakeVision(),
         workspace_dir=workspace,
-        tool_result_soft_overrides={"describe_image": 20},
+        tool_result_budgets={
+            "describe_image": {
+                "inline_budget_tokens": 256,
+                "artifact_threshold_tokens": 256,
+                "hard_cap_tokens": 512,
+            }
+        },
     )
     executor = reg.get_executor(ctx)
     result = await executor("describe_image", {"image_url": "incoming/a.png"})
@@ -475,6 +517,7 @@ async def test_web_search_condenses_long_results():
     reg = build_default_registry(cfg)
     ctx = ToolContext(
         web_search=FakeSearch(),
+        tool_result_budgets={},
         tool_result_soft_limit_tokens=80,
         tool_result_hard_cap_tokens=500,
     )
@@ -825,6 +868,7 @@ async def test_read_file_condenses_content_but_keeps_paging_metadata(tmp_path):
 
     ctx = ToolContext(
         workspace_dir=workspace,
+        tool_result_budgets={},
         tool_result_soft_limit_tokens=80,
         tool_result_hard_cap_tokens=500,
     )
@@ -905,6 +949,7 @@ async def test_get_forward_msg_long_content_keeps_content_field():
     reg = build_default_registry(cfg)
     ctx = ToolContext(
         adapter=FakeAdapter(),
+        tool_result_budgets={},
         tool_result_soft_limit_tokens=80,
         tool_result_hard_cap_tokens=500,
     )
@@ -930,7 +975,11 @@ async def test_executor_hard_cap_is_creation_time_stable():
     new_spec = next(s for s in get_default_specs() if s.name == "_huge_result")
     try:
         reg = ToolRegistry([new_spec])
-        ctx = ToolContext(tool_result_soft_limit_tokens=100, tool_result_hard_cap_tokens=120)
+        ctx = ToolContext(
+            tool_result_budgets={},
+            tool_result_soft_limit_tokens=100,
+            tool_result_hard_cap_tokens=120,
+        )
         executor = reg.get_executor(ctx)
         first = await executor("_huge_result", {})
         second = await executor("_huge_result", {})
@@ -951,6 +1000,7 @@ async def test_run_python_single_long_line_keeps_stdout_field(tmp_path):
     workspace.mkdir()
     ctx = ToolContext(
         workspace_dir=workspace,
+        tool_result_budgets={},
         tool_result_soft_limit_tokens=80,
         tool_result_hard_cap_tokens=800,
     )

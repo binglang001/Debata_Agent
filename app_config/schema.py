@@ -535,6 +535,72 @@ class SummarizeConfig(StrictModel):
     """compaction 后活跃 history 目标 token。None 表示按模型工作预算自动推导。"""
 
 
+class ToolResultBudgetConfig(StrictModel):
+    """单个工具结果的 token 预算。
+
+    inline_budget_tokens 控制工具可直接回传给模型的预算。
+    artifact_threshold_tokens 供资料型工具判断何时改写 workspace 文件。
+    hard_cap_tokens 是事故兜底，不应作为正常截断机制。
+    """
+
+    inline_budget_tokens: int = Field(default=800, ge=256)
+    artifact_threshold_tokens: int | None = Field(default=None, ge=256)
+    hard_cap_tokens: int | None = Field(default=None, ge=512)
+
+
+def default_tool_result_budgets() -> dict[str, ToolResultBudgetConfig]:
+    """项目推荐的各工具结果预算。默认偏保守，大资料应走 artifact/分页。"""
+    return {
+        # 动作类
+        "send_private_messages": ToolResultBudgetConfig(inline_budget_tokens=600),
+        "send_group_message": ToolResultBudgetConfig(inline_budget_tokens=600),
+        "send_voice_message": ToolResultBudgetConfig(inline_budget_tokens=800),
+        "upload_file": ToolResultBudgetConfig(inline_budget_tokens=500),
+        "recall_message": ToolResultBudgetConfig(inline_budget_tokens=400),
+        "set_friend_add_request": ToolResultBudgetConfig(inline_budget_tokens=400),
+        "set_group_add_request": ToolResultBudgetConfig(inline_budget_tokens=400),
+        "no_action": ToolResultBudgetConfig(inline_budget_tokens=256),
+        "schedule_wakeup": ToolResultBudgetConfig(inline_budget_tokens=700),
+        # 查询类
+        "list_contacts": ToolResultBudgetConfig(
+            inline_budget_tokens=1200,
+            artifact_threshold_tokens=1200,
+        ),
+        "get_user_info": ToolResultBudgetConfig(inline_budget_tokens=800),
+        "get_weather": ToolResultBudgetConfig(inline_budget_tokens=1000),
+        "web_search": ToolResultBudgetConfig(inline_budget_tokens=1800),
+        # 资料类
+        "describe_image": ToolResultBudgetConfig(
+            inline_budget_tokens=1800,
+            artifact_threshold_tokens=2500,
+        ),
+        "read_file": ToolResultBudgetConfig(
+            inline_budget_tokens=2500,
+            artifact_threshold_tokens=2500,
+        ),
+        "run_python": ToolResultBudgetConfig(
+            inline_budget_tokens=2500,
+            artifact_threshold_tokens=2500,
+        ),
+        "get_forward_msg": ToolResultBudgetConfig(
+            inline_budget_tokens=1000,
+            artifact_threshold_tokens=1000,
+        ),
+        "recall_history": ToolResultBudgetConfig(
+            inline_budget_tokens=3000,
+            artifact_threshold_tokens=3000,
+        ),
+        "get_recent_chat_messages": ToolResultBudgetConfig(
+            inline_budget_tokens=3000,
+            artifact_threshold_tokens=3000,
+        ),
+        # 子 Agent
+        "start_agent_task": ToolResultBudgetConfig(inline_budget_tokens=600),
+        "summarize_chat_history": ToolResultBudgetConfig(inline_budget_tokens=600),
+        "summarize_conversation": ToolResultBudgetConfig(inline_budget_tokens=600),
+    }
+
+
 class ContextConfig(StrictModel):
     """上下文预算配置。max_context_tokens 是工作预算，不是模型硬上限。"""
 
@@ -550,14 +616,25 @@ class ContextConfig(StrictModel):
     summary_token_budget: int = Field(default=4096, ge=256)
     """滚动摘要注入预算。"""
 
+    tool_result_default_budget_tokens: int = Field(default=800, ge=256)
+    """未单独配置的工具结果 inline 默认预算。"""
+
+    tool_result_default_hard_cap_tokens: int = Field(default=3000, ge=512)
+    """未单独配置的工具结果事故兜底上限。"""
+
+    tool_result_budgets: dict[str, ToolResultBudgetConfig] = Field(
+        default_factory=default_tool_result_budgets
+    )
+    """按工具名配置结果预算。普通用户不建议手动修改。"""
+
     tool_result_soft_limit_tokens: int = Field(default=600, ge=64)
-    """单条工具结果的软阈值；超过后按工具特定规则精简。"""
+    """旧配置兼容：单条工具结果软阈值。新逻辑优先使用 tool_result_budgets。"""
 
     tool_result_hard_cap_tokens: int = Field(default=1500, ge=128)
-    """单条工具结果的中央硬上限；未被特判的结果超过后通用截断。"""
+    """旧配置兼容：单条工具结果硬上限。新逻辑优先使用 tool_result_budgets。"""
 
     tool_result_soft_overrides: dict[str, int] = Field(default_factory=dict)
-    """按工具名覆盖软阈值，如 {"describe_image": 900}。"""
+    """旧配置兼容：按工具名覆盖软阈值，如 {"describe_image": 900}。"""
 
 
 class BehaviorConfig(StrictModel):

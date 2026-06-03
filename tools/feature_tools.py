@@ -24,7 +24,7 @@ from adapters.types import Target
 from utils.token_budget import TokenEstimator
 
 from .base import ToolContext, tool
-from .result_shrink import add_condensed_marker
+from .result_shrink import add_condensed_marker, tool_budget
 from .schemas import (
     DescribeImageArgs,
     GetWeatherArgs,
@@ -63,12 +63,9 @@ async def describe_image(args: DescribeImageArgs, ctx: ToolContext) -> dict:
     description = parsed["description"]
     summary = parsed["summary"]
     result: dict[str, Any] = {"ok": True, "summary": summary}
-    threshold = ctx.tool_result_soft_overrides.get(
-        "describe_image",
-        ctx.tool_result_soft_limit_tokens,
-    )
+    threshold = tool_budget("describe_image", ctx).artifact_threshold
     if question:
-        threshold *= 3
+        threshold = max(threshold, tool_budget("describe_image", ctx).inline * 2)
 
     if TokenEstimator().estimate_text(description) > threshold:
         saved = _save_image_description(args.image_url, description, ctx)
