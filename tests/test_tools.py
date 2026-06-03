@@ -504,9 +504,11 @@ async def test_describe_image_long_description_saved_once(tmp_path):
     result = await executor("describe_image", {"image_url": "incoming/a.png"})
 
     assert result["ok"] is True
+    assert result["status"] == "artifact"
     assert result["summary"] == "胡桃和魈表情包"
     assert "description" not in result
     assert result["full_saved"] == "incoming/a.desc.md"
+    assert result["artifact"]["path"] == "incoming/a.desc.md"
     assert (workspace / "incoming" / "a.desc.md").read_text(encoding="utf-8").startswith("完整描述")
     first = dict(result)
     second = await executor("describe_image", {"image_url": "incoming/a.png"})
@@ -1749,8 +1751,41 @@ async def test_list_contacts_with_adapter():
     executor = reg.get_executor(ctx)
     result = await executor("list_contacts", {"scope": "friends"})
     assert result["ok"] is True
+    assert result["status"] == "inline"
     assert result["count"] == 1
     assert result["friends"][0]["nickname"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_list_contacts_returns_explicit_pages():
+    """联系人列表按 offset/limit 显式分页，不依赖压缩器截断。"""
+    from adapters.types import FriendInfo
+
+    class FakeAd:
+        name = "fake"
+        is_connected = True
+
+        async def list_friends(self):
+            return [FriendInfo(user_id=str(i), nickname=f"F{i}") for i in range(60)]
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(adapter=FakeAd())  # type: ignore
+    executor = reg.get_executor(ctx)
+    result = await executor("list_contacts", {"scope": "friends", "limit": 50})
+
+    assert result["ok"] is True
+    assert result["count"] == 60
+    assert len(result["friends"]) == 50
+    assert result["next_offset"] == 50
+    assert "_condensed" not in result
+
+    second = await executor(
+        "list_contacts",
+        {"scope": "friends", "limit": 50, "offset": result["next_offset"]},
+    )
+    assert len(second["friends"]) == 10
+    assert "next_offset" not in second
 
 
 @pytest.mark.asyncio

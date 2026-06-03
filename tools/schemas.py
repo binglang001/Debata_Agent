@@ -172,6 +172,17 @@ class ListContactsArgs(_ToolArgs):
     group_id: int | None = Field(
         default=None, description="scope=group_members 时必填，填目标群号"
     )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="从第几条联系人开始返回，默认 0。返回 next_offset 时可用它续读。",
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=200,
+        description="本页最多返回多少条，默认 100，最多 200。",
+    )
 
     @model_validator(mode="after")
     def validate_group_id(self) -> ListContactsArgs:

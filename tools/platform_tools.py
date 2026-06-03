@@ -71,7 +71,12 @@ def _to_dict(obj) -> dict:
 )
 async def list_contacts(args: ListContactsArgs, ctx: ToolContext) -> dict:
     if ctx.adapter is None:
-        return {"ok": False, "error": "未连接适配器"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "未连接适配器，无法查询联系人。",
+            "error": "未连接适配器",
+        }
 
     try:
         if args.scope == "friends":
@@ -79,18 +84,35 @@ async def list_contacts(args: ListContactsArgs, ctx: ToolContext) -> dict:
             items = [
                 {"nickname": f.nickname, "user_id": f.user_id} for f in friends
             ]
-            return {"ok": True, "friends": items, "count": len(items)}
+            return _paged_contacts_result(
+                scope=args.scope,
+                key="friends",
+                items=items,
+                offset=args.offset,
+                limit=args.limit,
+            )
 
         if args.scope == "groups":
             groups = await ctx.adapter.list_groups()
             items = [
                 {"group_name": g.group_name, "group_id": g.group_id} for g in groups
             ]
-            return {"ok": True, "groups": items, "count": len(items)}
+            return _paged_contacts_result(
+                scope=args.scope,
+                key="groups",
+                items=items,
+                offset=args.offset,
+                limit=args.limit,
+            )
 
         if args.scope == "group_members":
             if args.group_id is None:
-                return {"ok": False, "error": "group_members 需要 group_id"}
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "brief": "查询群成员需要提供 group_id。",
+                    "error": "group_members 需要 group_id",
+                }
             members = await ctx.adapter.list_group_members(str(args.group_id))
             items = [
                 {
@@ -100,13 +122,67 @@ async def list_contacts(args: ListContactsArgs, ctx: ToolContext) -> dict:
                 }
                 for m in members
             ]
-            return {"ok": True, "members": items, "count": len(items)}
+            return _paged_contacts_result(
+                scope=args.scope,
+                key="members",
+                items=items,
+                offset=args.offset,
+                limit=args.limit,
+                group_id=str(args.group_id),
+            )
 
     except Exception as e:
         logger.warning(f"list_contacts 失败: {e}")
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"联系人查询失败：{e}",
+            "error": str(e),
+        }
 
-    return {"ok": False, "error": f"未知 scope: {args.scope}"}
+    return {
+        "ok": False,
+        "status": "failed",
+        "brief": f"未知联系人查询范围：{args.scope}",
+        "error": f"未知 scope: {args.scope}",
+    }
+
+
+def _paged_contacts_result(
+    *,
+    scope: str,
+    key: str,
+    items: list[dict[str, Any]],
+    offset: int,
+    limit: int,
+    group_id: str | None = None,
+) -> dict[str, Any]:
+    total = len(items)
+    start = min(offset, total)
+    page = items[start : start + limit]
+    result: dict[str, Any] = {
+        "ok": True,
+        "status": "inline",
+        "brief": f"已查询 {scope}，返回 {len(page)}/{total} 条。",
+        key: page,
+        "count": total,
+        "offset": start,
+        "limit": limit,
+        "data": {
+            "scope": scope,
+            "count": total,
+            "returned": len(page),
+            "offset": start,
+        },
+    }
+    if group_id is not None:
+        result["data"]["group_id"] = group_id
+    next_offset = start + len(page)
+    if next_offset < total:
+        result["next_offset"] = next_offset
+        result["next"] = f"继续调用 list_contacts，传 scope={scope!r}, offset={next_offset} 读取下一页。"
+        result["data"]["next_offset"] = next_offset
+    return result
 
 
 # ============================================================
@@ -122,12 +198,33 @@ async def list_contacts(args: ListContactsArgs, ctx: ToolContext) -> dict:
 )
 async def get_user_info(args: GetUserInfoArgs, ctx: ToolContext) -> dict:
     if ctx.adapter is None:
-        return {"ok": False, "error": "未连接适配器"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "未连接适配器，无法查询用户信息。",
+            "error": "未连接适配器",
+        }
     try:
         info = await ctx.adapter.get_user_info(str(args.user_id))
     except Exception as e:
-        return {"ok": False, "error": str(e)}
-    return {"ok": True, "info": _public_user_info(_to_dict(info))}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"查询用户 {args.user_id} 失败：{e}",
+            "error": str(e),
+        }
+    public = _public_user_info(_to_dict(info))
+    name = public.get("nickname") or args.user_id
+    return {
+        "ok": True,
+        "status": "inline",
+        "brief": f"已获取用户 {name}({args.user_id}) 的公开信息。",
+        "info": public,
+        "data": {
+            "user_id": str(args.user_id),
+            "field_count": len(public),
+        },
+    }
 
 
 def _public_user_info(info: dict) -> dict:
