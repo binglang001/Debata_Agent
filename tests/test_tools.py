@@ -1140,6 +1140,58 @@ async def test_get_recent_chat_messages_writes_complete_artifact(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_recall_history_writes_complete_artifact(tmp_path):
+    from memory import ArchiveStore
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    archive = ArchiveStore(tmp_path / "archive.jsonl")
+    await archive.append_many(
+        [
+            {
+                "role": "user",
+                "content": f"历史消息 {idx} " + ("很长" * 80),
+                "conversation_id": "group:42",
+                "metadata": {"timestamp": f"2026-05-30 00:{idx:02d}"},
+            }
+            for idx in range(12)
+        ]
+    )
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        archive=archive,
+        workspace_dir=workspace,
+        tool_result_budgets={
+            "recall_history": {
+                "inline_budget_tokens": 256,
+                "artifact_threshold_tokens": 256,
+                "hard_cap_tokens": 1200,
+            }
+        },
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "recall_history",
+        {"conversation_id": "group:42", "limit": 12},
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "artifact"
+    assert "content" not in result
+    assert result["artifact"]["count"] == 12
+    assert result["count"] == 12
+    assert "metadata" not in result["results"][0]
+    text = (workspace / result["artifact"]["path"]).read_text(encoding="utf-8")
+    assert "历史消息 0" in text
+    assert "历史消息 11" in text
+    assert "2026-05-30 00:00" in text
+    assert "2026-05-30 00:11" in text
+    assert "已按 token 预算截断" not in text
+
+
+@pytest.mark.asyncio
 async def test_executor_hard_cap_is_creation_time_stable():
     class _Args(BaseModel):
         pass

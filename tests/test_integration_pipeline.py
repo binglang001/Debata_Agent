@@ -1337,10 +1337,11 @@ async def test_recall_history_reads_archive(build_pipeline):
     )
 
     assert result["ok"] is True
+    assert result["status"] == "inline"
     assert result["count"] == 2
-    joined = "\n".join(item["content"] for item in result["results"])
-    assert "周日做游戏 Demo" in joined
-    assert "周一补玩法文档" in joined
+    assert "周日做游戏 Demo" in result["content"]
+    assert "周一补玩法文档" in result["content"]
+    assert "metadata" not in result["results"][0]
 
 
 @pytest.mark.asyncio

@@ -1013,20 +1013,59 @@ async def recall_history(args: RecallHistoryArgs, ctx: ToolContext) -> dict:
                 records.append(record)
         records = records[-args.limit:]
 
-    snippets: list[dict] = []
-    for record in records:
-        snippets.append(
-            {
-                "role": record.get("role"),
-                "conversation_id": record.get("conversation_id"),
-                "content": (record.get("content") or "")[:1000],
-                "metadata": record.get("metadata", {}),
-            }
-        )
+    markdown = _format_history_recall_markdown(records)
+    snippets = [_history_recall_snippet(record) for record in records]
+    meta = {
+        "count": len(records),
+        "conversation_id": args.conversation_id,
+        "keyword": args.keyword,
+        "time_range": args.time_range,
+        "range": "continuous_result_order",
+    }
+    inline_result = {
+        "ok": True,
+        "status": "inline",
+        "brief": f"找到 {len(records)} 条本地历史记录。",
+        "count": len(snippets),
+        "content": markdown,
+        "results": snippets,
+        "data": meta,
+    }
+    budget = tool_budget("recall_history", ctx)
+    estimator = TokenEstimator()
+    if _estimate_result(inline_result, estimator) <= budget.inline:
+        return inline_result
+
+    if ctx.workspace_dir is None:
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "历史记录超过 inline 预算，但 workspace 未配置，无法写出完整文件。",
+            "error": "历史记录超过 inline 预算，但 workspace 未配置",
+            "count": len(snippets),
+            "results": snippets,
+            "data": meta,
+        }
+
+    path = _write_history_recall_artifact(
+        ctx,
+        markdown=markdown,
+        meta=meta,
+    )
     return {
         "ok": True,
+        "status": "artifact",
+        "brief": f"找到 {len(records)} 条本地历史记录，完整 Markdown 已写入 {path}。",
+        "path": path,
+        "artifact": {
+            "path": path,
+            "type": "markdown",
+            "count": len(records),
+        },
         "count": len(snippets),
-        "results": snippets,
+        "results": snippets[:5],
+        "data": meta,
+        "next": "需要分析完整历史时，把 artifact.path 交给 start_agent_task 或用 read_file 分页读取。",
     }
 
 
@@ -1052,6 +1091,87 @@ def _history_record_matches(
     if time_range and time_range not in text:
         return False
     return True
+
+
+def _format_history_recall_markdown(records: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for record in records:
+        lines.extend(_format_history_recall_record(record))
+    return "\n".join(lines)
+
+
+def _format_history_recall_record(record: dict[str, Any]) -> list[str]:
+    timestamp = _summary_timestamp(record) or "-"
+    conversation_id = str(record.get("conversation_id") or "-")
+    role = str(record.get("role") or "-")
+    sender = _history_recall_sender(record, role)
+    content = str(record.get("content") or "").strip()
+    if not content:
+        content = "(空内容)"
+    lines = [
+        f"{timestamp} [{conversation_id}] {sender}({role})：{line}"
+        for line in content.splitlines()
+    ]
+    return lines or [f"{timestamp} [{conversation_id}] {sender}({role})：(空内容)"]
+
+
+def _history_recall_sender(record: dict[str, Any], role: str) -> str:
+    meta = record.get("metadata")
+    if isinstance(meta, dict):
+        messages = meta.get("messages")
+        if isinstance(messages, list) and messages:
+            first = messages[0]
+            if isinstance(first, dict):
+                nickname = first.get("nickname")
+                user_id = first.get("user_id")
+                if nickname and user_id:
+                    return f"{nickname}({user_id})"
+                if nickname:
+                    return str(nickname)
+        if meta.get("nickname"):
+            return str(meta.get("nickname"))
+    if role == "assistant":
+        return "assistant"
+    if role == "system":
+        return "system"
+    if role == "tool":
+        return "tool"
+    return "user"
+
+
+def _history_recall_snippet(record: dict[str, Any]) -> dict[str, Any]:
+    content = str(record.get("content") or "")
+    return {
+        "role": record.get("role"),
+        "conversation_id": record.get("conversation_id"),
+        "timestamp": _summary_timestamp(record) or None,
+        "content": content[:160],
+    }
+
+
+def _write_history_recall_artifact(
+    ctx: ToolContext,
+    *,
+    markdown: str,
+    meta: dict[str, Any],
+) -> str:
+    if ctx.workspace_dir is None:
+        raise RuntimeError("workspace 未配置")
+    out_dir = ctx.workspace_dir / "runtime" / "history_recall"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scope = str(meta.get("conversation_id") or "global")
+    safe_scope = _SAFE_PATH_RE.sub("_", scope).strip("._") or "history"
+    path = out_dir / f"{safe_scope}_{int(time.time() * 1000)}.md"
+    header = (
+        "# 本地历史检索结果\n\n"
+        f"- 记录数：{meta.get('count')}\n"
+        f"- 会话：{meta.get('conversation_id') or '-'}\n"
+        f"- 关键词：{meta.get('keyword') or '-'}\n"
+        f"- 时间范围：{meta.get('time_range') or '-'}\n\n"
+        "---\n\n"
+    )
+    path.write_text(header + markdown + ("\n" if markdown else ""), encoding="utf-8")
+    return relative_to_workspace(path, ctx.workspace_dir)
 
 
 async def _local_summary_records(
