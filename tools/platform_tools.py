@@ -777,7 +777,12 @@ def _write_chat_timeline_artifact(
 )
 async def set_friend_add_request(args: SetFriendRequestArgs, ctx: ToolContext) -> dict:
     if ctx.adapter is None:
-        return {"ok": False, "error": "未连接适配器"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "处理好友请求失败：未连接适配器。",
+            "error": "未连接适配器",
+        }
     try:
         await ctx.adapter.handle_friend_request(
             flag=args.flag,
@@ -785,8 +790,23 @@ async def set_friend_add_request(args: SetFriendRequestArgs, ctx: ToolContext) -
             remark=args.remark or "",
         )
     except Exception as e:
-        return {"ok": False, "error": str(e)}
-    return {"ok": True}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"处理好友请求失败：{e}",
+            "error": str(e),
+        }
+    action = "同意" if args.approve else "拒绝"
+    return {
+        "ok": True,
+        "status": "done",
+        "brief": f"已{action}好友请求。",
+        "data": {
+            "flag": args.flag,
+            "approve": args.approve,
+            "remark": args.remark or "",
+        },
+    }
 
 
 # ============================================================
@@ -806,7 +826,12 @@ async def set_friend_add_request(args: SetFriendRequestArgs, ctx: ToolContext) -
 )
 async def set_group_add_request(args: SetGroupRequestArgs, ctx: ToolContext) -> dict:
     if ctx.adapter is None:
-        return {"ok": False, "error": "未连接适配器"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "处理群请求失败：未连接适配器。",
+            "error": "未连接适配器",
+        }
     logger.info(
         f"[FLAG追踪] AI调用 set_group_add_request: flag={args.flag!r}, "
         f"sub_type={args.sub_type!r}, approve={args.approve}"
@@ -819,8 +844,24 @@ async def set_group_add_request(args: SetGroupRequestArgs, ctx: ToolContext) -> 
             reason=args.reason or "",
         )
     except Exception as e:
-        return {"ok": False, "error": str(e)}
-    return {"ok": True}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"处理群请求失败：{e}",
+            "error": str(e),
+        }
+    action = "同意" if args.approve else "拒绝"
+    return {
+        "ok": True,
+        "status": "done",
+        "brief": f"已{action}群请求。",
+        "data": {
+            "flag": args.flag,
+            "sub_type": args.sub_type,
+            "approve": args.approve,
+            "reason": args.reason or "",
+        },
+    }
 
 
 # ============================================================

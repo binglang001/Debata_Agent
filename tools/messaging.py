@@ -313,13 +313,29 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
 async def recall_message(args: RecallMessageArgs, ctx: ToolContext) -> dict:
     """直接调用 adapter.recall。"""
     if ctx.adapter is None:
-        return {"ok": False, "error": "未连接适配器"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "撤回失败：未连接适配器。",
+            "error": "未连接适配器",
+        }
 
     ok = await ctx.adapter.recall(str(args.message_id))
     if not ok:
-        return {"ok": False, "error": "撤回失败（可能已超时或消息不存在）"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "撤回失败：可能已超时或消息不存在。",
+            "error": "撤回失败（可能已超时或消息不存在）",
+            "data": {"message_id": str(args.message_id)},
+        }
     _mark_activity(ctx)
-    return {"ok": True}
+    return {
+        "ok": True,
+        "status": "done",
+        "brief": f"已撤回消息 {args.message_id}。",
+        "data": {"message_id": str(args.message_id)},
+    }
 
 
 # ============================================================
@@ -340,17 +356,33 @@ async def recall_message(args: RecallMessageArgs, ctx: ToolContext) -> dict:
 async def upload_file(args: UploadFileArgs, ctx: ToolContext) -> dict:
     """通过 adapter.upload_file 上传。安全检查：file_path 必须在 workspace 下。"""
     if ctx.adapter is None:
-        return {"ok": False, "error": "未连接适配器"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "上传文件失败：未连接适配器。",
+            "error": "未连接适配器",
+        }
 
     from .workspace import WorkspaceError, resolve_in_workspace
 
     try:
         file_path = resolve_in_workspace(args.file_path, ctx.workspace_dir)
     except WorkspaceError as e:
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"上传文件失败：{e}",
+            "error": str(e),
+        }
 
     if not file_path.exists() or not file_path.is_file():
-        return {"ok": False, "error": "文件不存在"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "上传文件失败：文件不存在。",
+            "error": "文件不存在",
+            "data": {"path": str(args.file_path)},
+        }
 
     from adapters.types import Target  # 延迟导入避免循环
 
@@ -369,9 +401,30 @@ async def upload_file(args: UploadFileArgs, ctx: ToolContext) -> dict:
         )
         _mark_activity(ctx)
     except NotImplementedError:
-        return {"ok": False, "error": "当前适配器不支持上传文件"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "上传文件失败：当前适配器不支持上传文件。",
+            "error": "当前适配器不支持上传文件",
+        }
     except Exception as e:
         logger.exception(f"upload_file 失败: {e}")
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"上传文件失败：{e}",
+            "error": str(e),
+        }
 
-    return {"ok": True}
+    display_name = args.file_name or file_path.name
+    return {
+        "ok": True,
+        "status": "done",
+        "brief": f"已上传文件 {display_name}。",
+        "data": {
+            "target_type": scope,
+            "target_id": str(args.target_id),
+            "path": str(file_path),
+            "file_name": display_name,
+        },
+    }

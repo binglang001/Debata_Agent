@@ -394,6 +394,8 @@ async def test_executor_no_action_works():
     executor = reg.get_executor(ctx)
     result = await executor("no_action", {})
     assert result["ok"] is True
+    assert result["status"] == "done"
+    assert "不需要执行" in result["brief"]
     assert result.get("no_action") is True
 
 
@@ -1195,9 +1197,22 @@ class _FakeAdapter:
 
     def __init__(self):
         self.uploaded: list = []
+        self.recalled: list[str] = []
+        self.friend_requests: list[tuple[str, bool, str]] = []
+        self.group_requests: list[tuple[str, str, bool, str]] = []
 
     async def upload_file(self, target, file_path, *, display_name=None):
         self.uploaded.append((target, file_path, display_name))
+
+    async def recall(self, message_id: str) -> bool:
+        self.recalled.append(message_id)
+        return message_id != "999"
+
+    async def handle_friend_request(self, flag, approve, remark=""):
+        self.friend_requests.append((flag, approve, remark))
+
+    async def handle_group_request(self, flag, sub_type, approve, reason=""):
+        self.group_requests.append((flag, sub_type, approve, reason))
 
 
 @pytest.mark.asyncio
@@ -1216,6 +1231,8 @@ async def test_upload_file_outside_whitelist_rejected(tmp_path):
         {"target_type": "private", "target_id": 1, "file_path": str(outside)},
     )
     assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "上传文件失败" in result["brief"]
     assert "workspace" in result["error"]
 
 
@@ -1236,6 +1253,9 @@ async def test_upload_file_inside_whitelist_ok(tmp_path):
         {"target_type": "group", "target_id": 1, "file_path": str(inside)},
     )
     assert result["ok"] is True
+    assert result["status"] == "done"
+    assert result["data"]["file_name"] == "x.txt"
+    assert result["data"]["target_type"] == "group"
     assert len(fake.uploaded) == 1
     assert fake.uploaded[0][2] == "x.txt"
 
@@ -1251,6 +1271,36 @@ async def test_upload_file_no_adapter():
         {"target_type": "private", "target_id": 1, "file_path": "/tmp/x"},
     )
     assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "未连接适配器" in result["brief"]
+
+
+@pytest.mark.asyncio
+async def test_recall_message_result_envelope():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    fake = _FakeAdapter()
+    executor = reg.get_executor(ToolContext(adapter=fake))
+
+    result = await executor("recall_message", {"message_id": 123})
+
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert result["data"]["message_id"] == "123"
+    assert fake.recalled == ["123"]
+
+
+@pytest.mark.asyncio
+async def test_recall_message_failure_result_envelope():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext(adapter=_FakeAdapter()))
+
+    result = await executor("recall_message", {"message_id": 999})
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "撤回失败" in result["brief"]
 
 
 # ============================================================
@@ -1268,6 +1318,8 @@ async def test_schedule_wakeup_no_callback():
         "schedule_wakeup", {"delay_seconds": 10, "reminder": "test"}
     )
     assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "未注册唤醒回调" in result["brief"]
 
 
 @pytest.mark.asyncio
@@ -1285,6 +1337,9 @@ async def test_schedule_wakeup_with_callback():
         "schedule_wakeup", {"delay_seconds": 10, "reminder": "test"}
     )
     assert result["ok"] is True
+    assert result["status"] == "done"
+    assert result["data"]["delay_seconds"] == 10
+    assert result["data"]["mode"] == "wakeup"
     assert received == [(10, "test", None, "wakeup", None)]
 
 
@@ -1307,6 +1362,7 @@ async def test_schedule_wakeup_uses_default_reply_target():
     )
 
     assert result["ok"] is True
+    assert result["data"]["target"] == {"target_type": "private", "target_id": 123}
     delay, reminder, target, mode, message_text = received[0]
     assert delay == 10
     assert target == {"target_type": "private", "target_id": 123}
@@ -1369,6 +1425,7 @@ async def test_schedule_wakeup_send_message_mode_uses_default_target():
     )
 
     assert result["ok"] is True
+    assert result["data"]["message_text"] == "到点了"
     delay, reminder, target, mode, message_text = received[0]
     assert delay == 30
     assert target == {"target_type": "private", "target_id": 123}
@@ -1397,7 +1454,35 @@ async def test_schedule_wakeup_send_message_requires_target():
     )
 
     assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "缺少发送目标" in result["brief"]
     assert "mode=send_message 需要" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_request_action_tools_result_envelope():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    fake = _FakeAdapter()
+    executor = reg.get_executor(ToolContext(adapter=fake))
+
+    friend = await executor(
+        "set_friend_add_request",
+        {"flag": "f1", "approve": True, "remark": "熟人"},
+    )
+    group = await executor(
+        "set_group_add_request",
+        {"flag": "g1", "sub_type": "invite", "approve": False, "reason": "暂不加入"},
+    )
+
+    assert friend["ok"] is True
+    assert friend["status"] == "done"
+    assert friend["data"]["flag"] == "f1"
+    assert group["ok"] is True
+    assert group["status"] == "done"
+    assert group["data"]["approve"] is False
+    assert fake.friend_requests == [("f1", True, "熟人")]
+    assert fake.group_requests == [("g1", "invite", False, "暂不加入")]
 
 
 # ============================================================
