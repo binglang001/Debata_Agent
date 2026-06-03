@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ValidationError
 
+from core.chat_timeline import ChatTimelineMessage, ChatTimelineStore
 from tools import (
     DEFAULT_NO_FEEDBACK_TOOLS,
     FEATURE_TOOL_FEATURES,
@@ -61,6 +62,22 @@ def test_tool_budget_keeps_legacy_override_when_no_new_budget_exists():
     assert budget.inline == 900
     assert budget.artifact_threshold == 900
     assert budget.hard_cap == 1600
+
+
+def _timeline_message(message_id: str, text: str) -> ChatTimelineMessage:
+    return ChatTimelineMessage(
+        conversation_id="private:123",
+        direction="inbound",
+        timestamp=1_780_000_000.0,
+        time_text="2026-05-30 00:00:00",
+        sender_name="用户",
+        sender_id="123",
+        target_id="123",
+        group_id=None,
+        msg_id=message_id,
+        text=text,
+        raw_message=text,
+    )
 
 
 class FakeSendAdapter:
@@ -166,7 +183,7 @@ def test_all_expected_tools_registered():
     expected = {
         "send_private_messages", "send_group_message", "recall_message", "upload_file",
         "save_important_memory", "delete_important_memory",
-        "list_contacts", "get_user_info", "get_forward_msg",
+        "list_contacts", "get_user_info", "get_forward_msg", "get_recent_chat_messages",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
         "summarize_conversation", "recall_history", "start_agent_task",
         "no_action", "schedule_wakeup",
@@ -961,6 +978,82 @@ async def test_get_forward_msg_long_content_keeps_content_field():
     assert "preview" not in result
     assert "forward-1" not in result["content"]
     assert result["_condensed"]["reason"] == "工具输出过长已保留头尾"
+
+
+@pytest.mark.asyncio
+async def test_get_recent_chat_messages_requires_timeline():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext(conversation_id="private:123"))
+
+    result = await executor("get_recent_chat_messages", {"limit": 5})
+
+    assert result["ok"] is False
+    assert "聊天时间线" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_recent_chat_messages_returns_inline_markdown():
+    timeline = ChatTimelineStore()
+    timeline.append(_timeline_message("m1", "你好"))
+    timeline.append(_timeline_message("m2", "我改口"))
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        conversation_id="private:123",
+        extras={"chat_timeline": timeline},
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor("get_recent_chat_messages", {"limit": 2})
+
+    assert result["ok"] is True
+    assert result["status"] == "inline"
+    assert result["data"]["count"] == 2
+    assert result["data"]["first_msg_id"] == "m1"
+    assert result["data"]["last_msg_id"] == "m2"
+    assert "2026-05-30 00:00:00 用户(123)：你好 [msg_id=m1]" in result["content"]
+    assert "我改口" in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_get_recent_chat_messages_writes_complete_artifact(tmp_path):
+    timeline = ChatTimelineStore()
+    for idx in range(20):
+        timeline.append(_timeline_message(f"m{idx}", f"消息{idx} " + "很长" * 40))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        conversation_id="private:123",
+        workspace_dir=workspace,
+        extras={"chat_timeline": timeline},
+        tool_result_budgets={
+            "get_recent_chat_messages": {
+                "inline_budget_tokens": 256,
+                "artifact_threshold_tokens": 256,
+                "hard_cap_tokens": 1200,
+            }
+        },
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor("get_recent_chat_messages", {"limit": 20})
+
+    assert result["ok"] is True
+    assert result["status"] == "artifact"
+    assert "content" not in result
+    assert result["data"]["count"] == 20
+    assert result["data"]["first_msg_id"] == "m0"
+    assert result["data"]["last_msg_id"] == "m19"
+    path = workspace / result["path"]
+    text = path.read_text(encoding="utf-8")
+    assert "消息0" in text
+    assert "消息19" in text
+    assert "msg_id=m0" in text
+    assert "msg_id=m19" in text
+    assert "已按 token 预算截断" not in text
 
 
 @pytest.mark.asyncio

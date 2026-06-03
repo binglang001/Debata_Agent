@@ -4,6 +4,7 @@
     - list_contacts: 列好友/群/群成员
     - get_user_info: 获取陌生人信息
     - get_forward_msg: 提取合并转发
+    - get_recent_chat_messages: 读取当前运行期真实 QQ 可见聊天时间线
     - set_friend_add_request: 处理加好友请求
     - set_group_add_request: 处理加群请求
     - summarize_chat_history: 拉取 NapCat/QQ 服务器侧近期群历史并启动后台子 Agent
@@ -13,15 +14,20 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
+import time
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from utils.token_budget import TokenEstimator
 
 from .base import ToolContext, tool
+from .result_shrink import tool_budget
 from .schemas import (
     GetForwardMsgArgs,
+    GetRecentChatMessagesArgs,
     GetUserInfoArgs,
     ListContactsArgs,
     RecallHistoryArgs,
@@ -30,8 +36,11 @@ from .schemas import (
     SummarizeChatArgs,
     SummarizeConversationArgs,
 )
+from .workspace import relative_to_workspace
 
 logger = logging.getLogger(__name__)
+
+_SAFE_PATH_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 # ============================================================
@@ -190,6 +199,130 @@ async def get_forward_msg(args: GetForwardMsgArgs, ctx: ToolContext) -> dict:
         formatted.append(f"{sender}: {content}")
 
     return {"ok": True, "content": "\n".join(formatted)}
+
+
+# ============================================================
+# get_recent_chat_messages
+# ============================================================
+
+
+@tool(
+    name="get_recent_chat_messages",
+    description=(
+        "读取当前运行期真实 QQ 可见聊天记录。用于 stale 发送后确认当前会话真实消息状态，"
+        "或在群聊/私聊消息散落时按连续时间线查看最近消息。只记录真实入站和已成功发出的出站消息；"
+        "不会包含工具参数、未发出的草稿、模型思考或系统记录。"
+    ),
+    args_model=GetRecentChatMessagesArgs,
+    category="platform",
+)
+async def get_recent_chat_messages(
+    args: GetRecentChatMessagesArgs,
+    ctx: ToolContext,
+) -> dict:
+    conversation_id = (args.conversation_id or ctx.conversation_id or "").strip()
+    if not conversation_id:
+        return {
+            "ok": False,
+            "error": "缺少 conversation_id，且当前工具上下文无法推断会话",
+        }
+
+    timeline = (ctx.extras or {}).get("chat_timeline")
+    if timeline is None or not hasattr(timeline, "recent"):
+        return {"ok": False, "error": "当前运行时未启用真实 QQ 聊天时间线"}
+
+    messages = timeline.recent(
+        conversation_id,
+        args.limit,
+        since_msg_id=args.since_msg_id,
+        before_msg_id=args.before_msg_id,
+    )
+    markdown = timeline.to_markdown(messages, include_raw=args.include_raw)
+    meta = _chat_timeline_meta(messages, conversation_id)
+    budget = tool_budget("get_recent_chat_messages", ctx)
+    estimator = TokenEstimator()
+    inline_result = {
+        "ok": True,
+        "status": "inline",
+        "brief": (
+            f"已读取 {conversation_id} 最近 {len(messages)} 条真实 QQ 消息"
+            "（连续窗口）。"
+        ),
+        "content": markdown,
+        "data": meta,
+    }
+    if _estimate_result(inline_result, estimator) <= budget.inline:
+        return inline_result
+
+    if ctx.workspace_dir is None:
+        return {
+            "ok": False,
+            "error": "聊天记录超过 inline 预算，但 workspace 未配置，无法写出完整文件",
+            "data": meta,
+        }
+
+    path = _write_chat_timeline_artifact(
+        ctx,
+        conversation_id=conversation_id,
+        markdown=markdown,
+        meta=meta,
+    )
+    return {
+        "ok": True,
+        "status": "artifact",
+        "brief": (
+            f"聊天记录较长，已写入完整连续文件：{path}；"
+            f"共 {len(messages)} 条。"
+        ),
+        "path": path,
+        "data": meta,
+    }
+
+
+def _chat_timeline_meta(messages: list[Any], conversation_id: str) -> dict[str, Any]:
+    first = messages[0] if messages else None
+    last = messages[-1] if messages else None
+    return {
+        "conversation_id": conversation_id,
+        "count": len(messages),
+        "range": "continuous",
+        "from": getattr(first, "time_text", None) if first else None,
+        "to": getattr(last, "time_text", None) if last else None,
+        "first_msg_id": getattr(first, "msg_id", None) if first else None,
+        "last_msg_id": getattr(last, "msg_id", None) if last else None,
+    }
+
+
+def _estimate_result(result: dict[str, Any], estimator: TokenEstimator) -> int:
+    return estimator.estimate_text(
+        json.dumps(result, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def _write_chat_timeline_artifact(
+    ctx: ToolContext,
+    *,
+    conversation_id: str,
+    markdown: str,
+    meta: dict[str, Any],
+) -> str:
+    if ctx.workspace_dir is None:
+        raise RuntimeError("workspace 未配置")
+    out_dir = ctx.workspace_dir / "runtime" / "chat_timeline"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_cid = _SAFE_PATH_RE.sub("_", conversation_id).strip("._") or "conversation"
+    path = out_dir / f"{safe_cid}_{int(time.time() * 1000)}.md"
+    header = (
+        "# 真实 QQ 聊天记录\n\n"
+        f"- 会话：{conversation_id}\n"
+        f"- 消息数：{meta.get('count')}\n"
+        f"- 范围：{meta.get('from') or '-'} ~ {meta.get('to') or '-'}\n"
+        f"- first_msg_id：{meta.get('first_msg_id') or '-'}\n"
+        f"- last_msg_id：{meta.get('last_msg_id') or '-'}\n\n"
+        "---\n\n"
+    )
+    path.write_text(header + markdown + ("\n" if markdown else ""), encoding="utf-8")
+    return relative_to_workspace(path, ctx.workspace_dir)
 
 
 # ============================================================

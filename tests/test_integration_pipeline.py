@@ -890,6 +890,31 @@ async def test_send_private_immediate_path_reaches_adapter(build_pipeline):
 
 
 @pytest.mark.asyncio
+async def test_chat_timeline_records_real_inbound_and_successful_outbound(build_pipeline):
+    """真实 QQ 时间线只记录已进入处理的入站和 adapter 成功返回后的出站。"""
+    pipeline, _, adapter, _, _ = await build_pipeline(
+        [_ai_send_private(target_qq="456", content="真实回复", send_only=True)]
+    )
+
+    await pipeline.enqueue(_msg(user_id="456", text="真实入站", message_id="in-1"))
+    await _drain_pipeline(pipeline)
+
+    assert [content for _, content in adapter.sent] == ["真实回复"]
+    messages = pipeline.chat_timeline.recent("private:456", 10)
+    markdown = pipeline.chat_timeline.to_markdown(messages)
+    assert "用户(456)：真实入站 [msg_id=in-1]" in markdown
+    assert "我(999)：真实回复 [msg_id=1000]" in markdown
+
+    ctx = pipeline._build_tool_context(conversation_id="private:456")
+    executor = pipeline.tool_registry.get_executor(ctx)
+    result = await executor("get_recent_chat_messages", {"limit": 10})
+    assert result["ok"] is True
+    assert result["status"] == "inline"
+    assert "真实入站" in result["content"]
+    assert "真实回复" in result["content"]
+
+
+@pytest.mark.asyncio
 async def test_send_private_with_delay_uses_async_queue(build_pipeline):
     """多条且存在正 delay 时，工具先返回 queued，后台仍按原拆条发完。"""
     args = {
@@ -1079,6 +1104,12 @@ async def test_same_conversation_message_while_model_thinking_returns_stale(buil
     assert '"status": "stale"' in joined
     assert "m-new" in joined
     assert "<send_receipt>" in joined
+    timeline_markdown = pipeline.chat_timeline.to_markdown(
+        pipeline.chat_timeline.recent("private:123", 10)
+    )
+    assert "m-old" in timeline_markdown
+    assert "m-new" in timeline_markdown
+    assert "旧回复" not in timeline_markdown
 
 
 @pytest.mark.asyncio

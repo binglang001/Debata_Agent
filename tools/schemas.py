@@ -196,6 +196,36 @@ class GetForwardMsgArgs(_ToolArgs):
     )
 
 
+class GetRecentChatMessagesArgs(_ToolArgs):
+    """get_recent_chat_messages 工具参数。"""
+
+    conversation_id: str | None = Field(
+        default=None,
+        description=(
+            "要读取的当前运行期真实 QQ 会话，如 private:430666862 或 group:1039163467。"
+            "不填则使用当前会话。"
+        ),
+    )
+    limit: int = Field(
+        default=50,
+        ge=1,
+        le=1000,
+        description="最多读取多少条最近消息，1 到 1000。返回的是连续最近窗口，不做头尾拼接。",
+    )
+    since_msg_id: str | None = Field(
+        default=None,
+        description="只读取此 msg_id 之后的消息；用于 stale/回执后确认当前真实聊天状态。",
+    )
+    before_msg_id: str | None = Field(
+        default=None,
+        description="只读取此 msg_id 之前的消息；用于向前翻连续历史窗口。",
+    )
+    include_raw: bool = Field(
+        default=False,
+        description="是否附带原始 CQ 消息。通常不要开启，只有排查图片/合并转发/引用等原始结构时使用。",
+    )
+
+
 class SetFriendRequestArgs(_ToolArgs):
     """set_friend_add_request 工具参数。"""
 

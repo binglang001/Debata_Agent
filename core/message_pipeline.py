@@ -71,6 +71,7 @@ from tools import (
 from utils import get_time, parse_raw_cq
 from utils.token_budget import TokenBudget, TokenEstimator
 
+from .chat_timeline import ChatTimelineStore
 from .state import MessageBatch, PendingMessageItem, PendingRequestStore, RateLimiter
 from .wakeup import WakeupScheduler
 
@@ -423,6 +424,12 @@ class _AsyncSendManager:
             msg_id = await self.pipeline.adapter.send_text(target, content)
 
         self.pipeline.mark_activity()
+        if msg_id is not None:
+            self.pipeline._record_successful_outbound(
+                action,
+                conversation_id=conversation_id,
+                msg_id=str(msg_id),
+            )
         logger.debug(
             "出站气泡 sent_at_ms=%s msg_id=%s source=%s conversation_id=%s "
             "trigger_msg_id=%s order=%s kind=%s",
@@ -802,6 +809,8 @@ class MessagePipeline:
         self._send_manager = _AsyncSendManager(self)
         self._send_receipt_tasks: dict[str, asyncio.Task] = {}
         self._agent_task_tasks: dict[str, asyncio.Task] = {}
+        self.chat_timeline = ChatTimelineStore(max_per_conversation=1000)
+        self._self_id_by_conversation: dict[str, str] = {}
 
     def mark_activity(self) -> None:
         """刷新活动时间。主动思考只在足够空闲后触发。"""
@@ -875,6 +884,7 @@ class MessagePipeline:
             event.message_id,
             event.user_id,
         )
+        self._self_id_by_conversation[conversation_id] = str(getattr(event, "self_id", "") or "")
 
         item = PendingMessageItem(
             message_id=event.message_id,
@@ -889,6 +899,12 @@ class MessagePipeline:
             keyword_saved=keyword_saved,
         )
 
+        self.chat_timeline.append_inbound_event(
+            event,
+            conversation_id=conversation_id,
+            text=text,
+            timestamp=getattr(event, "timestamp", None),
+        )
         await self.batch.append(item)
         self._send_manager.notify_inbound(item)
         logger.debug(
@@ -1541,9 +1557,21 @@ class MessagePipeline:
                     return None
                 msg_id = await send_voice(target, Path(audio_path))
                 self.mark_activity()
+                if msg_id is not None:
+                    self._record_successful_outbound(
+                        action,
+                        conversation_id=f"{scope}:{target_id}",
+                        msg_id=str(msg_id),
+                    )
                 return msg_id
             msg_id = await self.adapter.send_text(target, content)
             self.mark_activity()
+            if msg_id is not None:
+                self._record_successful_outbound(
+                    action,
+                    conversation_id=f"{scope}:{target_id}",
+                    msg_id=str(msg_id),
+                )
             return msg_id
         except Exception as e:
             logger.error(f"发送失败 {target}: {e}")
@@ -1767,6 +1795,7 @@ class MessagePipeline:
             }
         if latest_user_text:
             extras["latest_user_message"] = latest_user_text
+        extras["chat_timeline"] = self.chat_timeline
 
         async def _send_actions(
             actions: list[dict[str, Any]],
@@ -1814,6 +1843,29 @@ class MessagePipeline:
             default_history_fetch_count=self.behavior_cfg.default_history_fetch_count,
             collected=[],
             extras=extras,
+        )
+
+    def _record_successful_outbound(
+        self,
+        action: dict[str, Any],
+        *,
+        conversation_id: str,
+        msg_id: str,
+    ) -> None:
+        """记录 QQ 上真实发送成功的出站消息。"""
+        self_id = self._self_id_by_conversation.get(conversation_id) or None
+        normalized = {
+            "target_scope": action.get("target_scope") or action.get("action"),
+            "target_id": action.get("target_id") or action.get("target"),
+            "content": action.get("content") or "",
+            "label": action.get("label") or action.get("content") or "",
+            "kind": action.get("kind", "text"),
+        }
+        self.chat_timeline.append_outbound_action(
+            normalized,
+            conversation_id=conversation_id,
+            msg_id=msg_id,
+            self_id=self_id,
         )
 
     # ============================================================
@@ -1924,6 +1976,7 @@ class MessagePipeline:
                 "write_file",
                 "run_python",
                 "get_forward_msg",
+                "get_recent_chat_messages",
                 "recall_history",
             }
             if self.vision is not None:
@@ -1946,6 +1999,7 @@ class MessagePipeline:
                 tool_result_hard_cap_tokens=self.behavior_cfg.context.tool_result_hard_cap_tokens,
                 tool_result_soft_overrides=dict(self.behavior_cfg.context.tool_result_soft_overrides),
                 activity_cb=self.mark_activity,
+                extras={"chat_timeline": self.chat_timeline},
             )
             output_rel = _workspace_rel(output_path, self.workspace_dir)
             manifest_rel = _workspace_rel(manifest_path, self.workspace_dir)
@@ -2399,7 +2453,23 @@ class MessagePipeline:
             window_seconds=rl.window_seconds, max_messages=rl.max_messages
         )
         try:
-            await self.adapter.send_text(event.source_target, text)
+            msg_id = await self.adapter.send_text(event.source_target, text)
+            if msg_id is not None:
+                conversation_id = self._conversation_id_from_event(event)
+                self._self_id_by_conversation[conversation_id] = str(
+                    getattr(event, "self_id", "") or ""
+                )
+                self._record_successful_outbound(
+                    {
+                        "target_scope": event.source_target.scope,
+                        "target_id": event.source_target.target_id,
+                        "content": text,
+                        "label": text,
+                        "kind": "text",
+                    },
+                    conversation_id=conversation_id,
+                    msg_id=str(msg_id),
+                )
         except Exception:
             logger.debug("发送速率超限提示失败（adapter 可能未连接）")
 
