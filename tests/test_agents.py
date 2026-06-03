@@ -249,24 +249,31 @@ def test_build_admin_info_with_admins():
 
 
 def test_persona_brief_includes_admin_info():
-    brief = PersonaBrief(name="Mika", admin_name="Lily", admin_qq="123456")
+    brief = PersonaBrief(
+        name="Mika",
+        gender="female",
+        admins=[{"name": "Lily", "qq": "123456", "relation": "创作者"}],
+    )
     block = brief.to_brief_block()
-    assert "管理员/用户信息" in block
+    assert "熟悉的人（管理员）" in block
+    assert "性别" in block
     assert "Lily" in block
     assert "123456" in block
+    assert "创作者" in block
 
 
 def test_render_persona_file_writes_admins():
-    brief = PersonaBrief(name="Mika")
+    brief = PersonaBrief(name="Mika", gender="female")
     result = PersonaGenResult(persona_prompt="<identity>Mika</identity>", display_name="Mika")
     text = render_persona_file(
         result,
         brief,
-        admins=[{"qq": 123456, "name": "Lily", "role": "owner"}],
+            admins=[{"qq": 123456, "name": "Lily", "role": "owner"}],
     )
-    assert '"admins":' in text
-    assert '"qq": 123456' in text
-    assert '"name": "Lily"' in text
+    assert "'admins':" in text
+    assert "'qq': 123456" in text
+    assert "'name': 'Lily'" in text
+    assert "'gender': 'female'" in text
 
 
 def test_persona_generation_prompt_requires_second_person():

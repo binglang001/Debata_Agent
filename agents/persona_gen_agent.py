@@ -30,9 +30,8 @@
 
 from __future__ import annotations
 
-import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from app_config.schema import AgentConfig
@@ -88,6 +87,12 @@ class PersonaBrief:
     admin_qq: str = ""
     """管理员/用户的 QQ 号。生成时作为身份锚点。"""
 
+    admins: list[dict[str, str]] = field(default_factory=list)
+    """熟悉的人/管理员列表。每项包含 name、qq、relation。"""
+
+    gender: str = ""
+    """性别：female/male/other/空。不用于硬编码称谓，只作为用户明确给出的设定信息。"""
+
     extra_notes: str = ""
     """其它任何用户想补充的"""
 
@@ -95,6 +100,7 @@ class PersonaBrief:
         """把简述拼成喂给 LLM 的一段文字。空字段会被跳过。"""
         sections: list[tuple[str, str]] = [
             ("角色名", self.name),
+            ("性别", _gender_text(self.gender)),
             ("用户描述的性格", self.personality),
             ("背景故事", self.background),
             ("用户给的说话样本", self.voice_samples),
@@ -103,7 +109,7 @@ class PersonaBrief:
             ("关系矩阵（对不同关系的人怎么说话）", self.relation_matrix),
             ("敏感话题 / 破防点 / 跑题诱因", self.sensitive_topics),
             ("用户和角色的关系", _resolve_relation(self.relation, self.relation_detail)),
-            ("管理员/用户信息", _admin_info(self.admin_name, self.admin_qq)),
+            ("熟悉的人（管理员）", _admin_info(self.admin_name, self.admin_qq, self.admins)),
             ("其它补充", self.extra_notes),
         ]
         lines: list[str] = []
@@ -127,15 +133,42 @@ def _resolve_relation(rel: str, detail: str) -> str:
     return base + (f"（补充：{detail}）" if detail else "")
 
 
-def _admin_info(name: str, qq: str) -> str:
+def _gender_text(gender: str) -> str:
+    mapping = {
+        "female": "女。用户明确给出了这个字段；生成时可以据此选择称谓，但不要在保存文件之外硬编码对话页面称谓。",
+        "male": "男。用户明确给出了这个字段；生成时可以据此选择称谓，但不要在保存文件之外硬编码对话页面称谓。",
+        "other": "非二元或其他。请尊重用户描述，避免强行套用二元性别称谓。",
+    }
+    return mapping.get(gender, "")
+
+
+def _admin_info(
+    name: str,
+    qq: str,
+    admins: list[dict[str, str]] | None = None,
+) -> str:
     parts: list[str] = []
+    clean_admins = [
+        item for item in (admins or [])
+        if item.get("name") or item.get("qq") or item.get("relation")
+    ]
+    if clean_admins:
+        for idx, item in enumerate(clean_admins, start=1):
+            line_parts = []
+            if item.get("name"):
+                line_parts.append(f"称呼：{item['name']}")
+            if item.get("qq"):
+                line_parts.append(f"QQ：{item['qq']}")
+            if item.get("relation"):
+                line_parts.append(f"关系：{item['relation']}")
+            parts.append(f"{idx}. " + "；".join(line_parts))
     if name:
         parts.append(f"名称：{name}")
     if qq:
         parts.append(f"QQ：{qq}")
     if not parts:
         return ""
-    return "这是配置 Debata 的管理员/用户身份。生成 <relation_with_user> 时要使用这些信息，不要把用户写成泛泛的陌生人。\n" + "\n".join(parts)
+    return "这些人是配置 Debata 的熟悉对象/管理员。生成 <relation_with_user> 和关系矩阵时要使用这些信息，不要把他们写成泛泛的陌生人。\n" + "\n".join(parts)
 
 
 # ============================================================
@@ -255,13 +288,13 @@ PERSONA_GEN_SYSTEM_PROMPT = """你是一位人格设定的专业撰写者。你�
 
 下游 LLM 会在微信 / QQ 这种即时通讯场景里扮演这个角色。这意味着：
 
-- **真人在 IM 里大多数消息极短**（60% 以上在 12 字以内），1-3 字回复占很大比例。你的 `<voice>` 段要明确这个角色的"基线句长"——除非用户明确要求长篇大论型角色，否则**默认的基线就是"碎句为主"**
-- **拆条而非长段**：真人想说一段话会拆 3-7 条短消息瀑布式连发，不是一次发一整段。`<voice>` 中要写明这个角色拆条的偏好（多拆 / 少拆 / 拆条节奏）
-- **不打句号、不告别、不寒暄**是真人的常态。如果角色要"打全标点 / 习惯说再见"，那必须是**有理由的人设特征**（如 60 岁老教授、机器人 NPC、严谨学者），而不是默认状态
+- **消息长短是方法论，不是硬限制**：很多人在 IM 里会短句和拆条，但也有人天生喜欢长篇、小作文、完整段落或认真解释。你要根据用户描述和角色性格判断基线句长，不能机械地把所有角色压成短句。
+- **拆条偏好要按人设判断**：有的人会拆 3-7 条短消息瀑布连发，有的人会想清楚一次说完。`<voice>` 中要写明这个角色拆条的偏好（多拆 / 少拆 / 拆条节奏），不要把拆条当成强制规则。
+- **标点、寒暄、告别要按语境判断**：很多对话会自然结束，不必每轮都说"再见"；但当语境需要礼貌收尾、对方明确离开、或角色性格会告别时，可以自然告别。不要因为"像真人"就无故不回复、突然中断或显得没礼貌。
 - **风格随关系/场景剧烈切换**：同一个人对长辈、对死党、对老师、对陌生人是四个不同的表现。`<voice>` 中**必须写"关系矩阵"**——这个角色对不同关系的人怎么调整句长 / 用词 / 礼貌度
 - **允许真人的"不完美"**：跑题、忘事、改口、错字、不回 —— 这些是"活"的表现，不是缺陷
 
-**对生成的影响**：`<voice>` 不能只写"她说话温柔"或"他言简意赅"这种笼统话。要回答"她**默认**多长一条消息？""她**什么时候**会突然变长？""她**对长辈和死党**分别怎么说话？""她**会不会**不回消息？"
+**对生成的影响**：`<voice>` 不能只写"她说话温柔"或"他言简意赅"这种笼统话。要回答"她**默认**多长一条消息？""她**什么时候**会突然变长或变短？""她**对长辈和死党**分别怎么说话？""她**什么情况下**会沉默、礼貌收尾或暂时不回？"
 
 # 输出格式（严格遵守）
 
@@ -509,18 +542,30 @@ def render_persona_file(
     """
     # 三引号字符串中如有连续三个单引号需要转义；这里用替换处理
     safe_prompt = result.persona_prompt.replace("'''", "\\'\\'\\'")
-    admins_text = json.dumps(admins or [], ensure_ascii=False, indent=4)
-    admins_text = "\n".join("    " + line for line in admins_text.splitlines())
+    persona_vars: dict[str, Any] = {
+        "name": result.display_name,
+        "admins": admins or [],
+    }
+    if brief.gender:
+        persona_vars["gender"] = brief.gender
+    vars_text = _format_python_literal(persona_vars, indent=4)
     return (
         '"""自动生成的人格档案。可手动调整。"""\n\n'
         "PERSONA_PROMPT = '''\n"
         f"{safe_prompt}\n"
         "'''\n\n"
-        "PERSONA_VARS = {\n"
-        f"    \"name\": \"{result.display_name}\",\n"
-        f"    \"admins\": {admins_text},\n"
-        "}\n"
+        f"PERSONA_VARS = {vars_text}\n"
     )
+
+
+def _format_python_literal(value: Any, *, indent: int = 0) -> str:
+    import pprint
+
+    text = pprint.pformat(value, width=96, sort_dicts=False)
+    if indent <= 0:
+        return text
+    prefix = " " * indent
+    return "\n".join(prefix + line if idx else line for idx, line in enumerate(text.splitlines()))
 
 
 def _extract_name_from_xml(xml: str) -> str | None:

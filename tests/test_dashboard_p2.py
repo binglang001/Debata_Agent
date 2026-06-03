@@ -347,7 +347,14 @@ def test_personas_page_can_build_and_save_generated_persona(qapp, tmp_path):
         context.persona.source = "create"
         context.persona.active = "Mika"
         context.persona.generated_xml = "<identity>你是 Mika</identity>"
-        context.persona.brief = PersonaBrief(name="Mika", admin_name="Lily", admin_qq="123456")
+        context.persona.brief = PersonaBrief(
+            name="Mika",
+            gender="female",
+            admins=[
+                {"name": "Lily", "qq": "123456", "relation": "创作者"},
+                {"name": "Robin", "qq": "654321", "relation": "朋友"},
+            ],
+        )
         context.admin_name = "Lily"
         context.admin_qq = "123456"
 
@@ -356,7 +363,36 @@ def test_personas_page_can_build_and_save_generated_persona(qapp, tmp_path):
         assert saved.exists()
         text = saved.read_text(encoding="utf-8")
         assert "<identity>你是 Mika</identity>" in text
-        assert '"qq": 123456' in text
+        assert "'qq': 123456" in text
+        assert "'qq': 654321" in text
+        assert "'gender': 'female'" in text
+    finally:
+        page.deleteLater()
+
+
+def test_personas_page_selects_active_persona_on_refresh(qapp, tmp_path):
+    cfg = _minimal_root_config()
+    cfg.persona.active = "Mika"
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir()
+    for name in ("debata", "Mika"):
+        d = personas_dir / name
+        d.mkdir()
+        (d / "persona_prompt.py").write_text("PERSONA_PROMPT = 'x'\n", encoding="utf-8")
+
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "secrets": None,
+            "paths": type("Paths", (), {"PERSONAS_DIR": personas_dir})(),
+        },
+    )()
+    page = PersonasPage(runtime)
+    try:
+        page.refresh()
+        assert page._selected() == "Mika"
     finally:
         page.deleteLater()
 
