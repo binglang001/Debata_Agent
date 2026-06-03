@@ -29,7 +29,11 @@ from app_config.schema import (
 )
 from memory.important import ImportantMemoryManager
 from memory.rag_store import RagEntry
-from ui.dashboard.chats_page import _group_records_by_conversation, _scrollbar_near_bottom
+from ui.dashboard.chats_page import (
+    _format_tool_call_for_display,
+    _group_records_by_conversation,
+    _scrollbar_near_bottom,
+)
 from ui.dashboard.logs_page import _format_record
 from ui.dashboard.memory_page import MemoryPage
 from ui.dashboard.personas_page import PersonasPage
@@ -83,6 +87,45 @@ def test_chats_group_records_by_metadata_and_legacy_header():
     assert grouped[0]["label"] == "群聊 20002"
     assert grouped[1]["key"] == "private:10001"
     assert len(grouped[1]["records"]) == 2
+
+
+def test_chats_group_records_prefers_explicit_conversation_id():
+    records = [
+        {"role": "user", "content": "u", "conversation_id": "private:10001"},
+        {"role": "assistant", "content": "a", "conversation_id": "private:10001"},
+        {"role": "system", "content": "主动思考：本次跳过"},
+        {
+            "role": "tool",
+            "content": "{}",
+            "tool_call_id": "tc",
+            "conversation_id": "group:20002",
+        },
+    ]
+
+    grouped = _group_records_by_conversation(records)
+    by_key = {item["key"]: item for item in grouped}
+
+    assert by_key["private:10001"]["label"] == "私聊 10001"
+    assert len(by_key["private:10001"]["records"]) == 2
+    assert by_key["system:global"]["records"][0]["content"] == "主动思考：本次跳过"
+    assert by_key["group:20002"]["records"][0]["tool_call_id"] == "tc"
+
+
+def test_chats_formats_send_tool_call_readably():
+    text = _format_tool_call_for_display(
+        {
+            "function": {
+                "name": "send_group_message",
+                "arguments": (
+                    '{"group_id":1039163467,"targets":['
+                    '{"content":"好好好 不说了","delay":0.5},'
+                    '{"content":"那我先待机","delay":0.6}]}'
+                ),
+            }
+        }
+    )
+
+    assert text == "在群 1039163467 发送消息：好好好 不说了（0.5s）；那我先待机（0.6s）"
 
 
 def test_chats_scrollbar_bottom_threshold():
