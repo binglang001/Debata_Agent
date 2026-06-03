@@ -35,9 +35,11 @@ class NapCatApiCaller:
         connection: NapCatConnection,
         *,
         default_timeout: float = 30.0,
+        wait_connected_timeout: float = 3.0,
     ) -> None:
         self._conn = connection
         self.default_timeout = default_timeout
+        self.wait_connected_timeout = wait_connected_timeout
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
     def handle_response(self, data: dict[str, Any]) -> bool:
@@ -81,7 +83,14 @@ class NapCatApiCaller:
             asyncio.TimeoutError: 超时
         """
         if not self._conn.is_connected:
-            raise AdapterNotConnectedError(f"NapCat 未连接，无法调用 {action}")
+            if self.wait_connected_timeout > 0:
+                ok = await self._conn.wait_connected(self.wait_connected_timeout)
+                if not ok:
+                    raise AdapterNotConnectedError(
+                        f"NapCat 未连接，等待 {self.wait_connected_timeout:.1f}s 后仍无法调用 {action}"
+                    )
+            else:
+                raise AdapterNotConnectedError(f"NapCat 未连接，无法调用 {action}")
 
         echo = uuid.uuid4().hex
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()

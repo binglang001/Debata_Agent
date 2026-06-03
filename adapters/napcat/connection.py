@@ -23,8 +23,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Literal
 
 import websockets
 from websockets.asyncio.client import ClientConnection as _WSClient
@@ -35,6 +39,27 @@ logger = logging.getLogger(__name__)
 
 # NapCat 投递过来的原始 JSON 字典
 MessageCallback = Callable[[dict], Awaitable[None]]
+ConnectionLostCallback = Callable[[], None]
+ConnectionState = Literal[
+    "idle",
+    "connecting",
+    "connected",
+    "disconnected",
+    "stopping",
+    "error",
+]
+_KEEP = object()
+
+
+@dataclass(slots=True)
+class ConnectionStatus:
+    state: ConnectionState
+    connected: bool
+    attempt: int
+    last_connected_at: float | None
+    last_disconnected_at: float | None
+    last_error: str | None
+    endpoint: str
 
 
 class NapCatConnection(ABC):
@@ -42,10 +67,22 @@ class NapCatConnection(ABC):
 
     def __init__(self) -> None:
         self._callback: MessageCallback | None = None
+        self._lost_callbacks: list[ConnectionLostCallback] = []
 
     def on_message(self, callback: MessageCallback) -> None:
         """注册接收到 NapCat 消息时的回调。"""
         self._callback = callback
+
+    def on_connection_lost(self, callback: ConnectionLostCallback) -> None:
+        """注册连接断开回调。用于取消等待中的 API 调用。"""
+        self._lost_callbacks.append(callback)
+
+    def _notify_connection_lost(self) -> None:
+        for callback in list(self._lost_callbacks):
+            try:
+                callback()
+            except Exception as e:
+                logger.exception(f"NapCat 断线回调失败: {type(e).__name__}: {e}")
 
     async def _dispatch(self, data: dict) -> None:
         if self._callback is None:
@@ -68,6 +105,13 @@ class NapCatConnection(ABC):
     @abstractmethod
     def is_connected(self) -> bool: ...
 
+    @property
+    @abstractmethod
+    def status(self) -> ConnectionStatus: ...
+
+    @abstractmethod
+    async def wait_connected(self, timeout: float | None = None) -> bool: ...
+
 
 class ReverseWSConnection(NapCatConnection):
     """程序作为客户端连接 NapCat（推荐模式）。"""
@@ -83,6 +127,9 @@ class ReverseWSConnection(NapCatConnection):
         ping_interval: float = 20.0,
         ping_timeout: float = 20.0,
         initial_connect_timeout: float = 10.0,
+        fast_reconnect_attempts: int = 5,
+        fast_reconnect_interval: float = 0.3,
+        reconnect_jitter: float = 0.2,
     ) -> None:
         super().__init__()
         self.ws_url = ws_url
@@ -93,15 +140,45 @@ class ReverseWSConnection(NapCatConnection):
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.initial_connect_timeout = initial_connect_timeout
+        self.fast_reconnect_attempts = max(0, fast_reconnect_attempts)
+        self.fast_reconnect_interval = max(0.0, fast_reconnect_interval)
+        self.reconnect_jitter = max(0.0, reconnect_jitter)
 
         self._ws: _WSClient | None = None
         self._loop_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._connected_event = asyncio.Event()
+        self._state: ConnectionStatus = ConnectionStatus(
+            state="idle",
+            connected=False,
+            attempt=0,
+            last_connected_at=None,
+            last_disconnected_at=None,
+            last_error=None,
+            endpoint=ws_url,
+        )
 
     @property
     def is_connected(self) -> bool:
         return self._ws is not None
+
+    @property
+    def status(self) -> ConnectionStatus:
+        return self._state
+
+    async def wait_connected(self, timeout: float | None = None) -> bool:
+        if self.is_connected:
+            return True
+        if timeout is not None and timeout <= 0:
+            return self.is_connected
+        try:
+            if timeout is None:
+                await self._connected_event.wait()
+            else:
+                await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return self.is_connected
+        return self.is_connected
 
     async def start(self) -> None:
         self._stop_event.clear()
@@ -123,6 +200,7 @@ class ReverseWSConnection(NapCatConnection):
             )
 
     async def stop(self) -> None:
+        self._set_state("stopping")
         self._stop_event.set()
         if self._ws is not None:
             try:
@@ -136,6 +214,7 @@ class ReverseWSConnection(NapCatConnection):
             except asyncio.CancelledError:
                 pass
             self._loop_task = None
+        self._set_state("idle")
 
     async def send(self, data: dict) -> None:
         if self._ws is None:
@@ -144,10 +223,11 @@ class ReverseWSConnection(NapCatConnection):
 
     async def _run_forever(self) -> None:
         attempts = 0
-        backoff = self.reconnect_interval
+        failure_count = 0
 
         while not self._stop_event.is_set():
             attempts += 1
+            self._set_state("connecting", attempt=attempts, last_error=None)
             try:
                 logger.info(f"连接 NapCat（第 {attempts} 次尝试）: {self.ws_url}")
                 headers: dict[str, str] = {}
@@ -163,8 +243,15 @@ class ReverseWSConnection(NapCatConnection):
                 ) as ws:
                     self._ws = ws
                     self._connected_event.set()
+                    failure_count = 0
+                    self._set_state(
+                        "connected",
+                        connected=True,
+                        attempt=attempts,
+                        last_connected_at=time.time(),
+                        last_error=None,
+                    )
                     attempts = 0
-                    backoff = self.reconnect_interval
                     logger.info(f"NapCat WS 已连接: {self.ws_url}")
 
                     async for raw in ws:
@@ -187,12 +274,35 @@ class ReverseWSConnection(NapCatConnection):
                 ConnectionRefusedError,
                 OSError,
             ) as e:
+                failure_count += 1
+                self._set_state(
+                    "error",
+                    connected=False,
+                    attempt=attempts,
+                    last_error=f"{type(e).__name__}: {e}",
+                )
                 logger.warning(f"NapCat 连接失败: {type(e).__name__}: {e}")
             except Exception as e:
+                failure_count += 1
+                self._set_state(
+                    "error",
+                    connected=False,
+                    attempt=attempts,
+                    last_error=f"{type(e).__name__}: {e}",
+                )
                 logger.exception(f"NapCat 连接异常: {e}")
             finally:
+                was_connected = self._ws is not None
                 self._ws = None
                 self._connected_event.clear()
+                if was_connected:
+                    self._set_state(
+                        "disconnected",
+                        connected=False,
+                        attempt=attempts,
+                        last_disconnected_at=time.time(),
+                    )
+                    self._notify_connection_lost()
 
             if self._stop_event.is_set():
                 break
@@ -201,13 +311,53 @@ class ReverseWSConnection(NapCatConnection):
                 logger.error(f"已达最大重连次数 {self.max_reconnect_attempts}，放弃")
                 break
 
+            backoff = self._next_delay(failure_count)
             logger.info(f"{backoff:.1f}s 后重试 NapCat 连接")
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=backoff)
                 break  # stop 信号到达
             except asyncio.TimeoutError:
                 pass
-            backoff = min(backoff * 2, self.reconnect_backoff_max)
+
+    def _next_delay(self, failure_count: int) -> float:
+        if failure_count <= self.fast_reconnect_attempts:
+            return self.fast_reconnect_interval
+        slow_index = max(1, failure_count - self.fast_reconnect_attempts)
+        delay = self.reconnect_interval * (2 ** (slow_index - 1))
+        delay = min(delay, self.reconnect_backoff_max)
+        if self.reconnect_jitter:
+            delay += random.uniform(0, self.reconnect_jitter)
+        return delay
+
+    def _set_state(
+        self,
+        state: ConnectionState,
+        *,
+        connected: bool | None = None,
+        attempt: int | None = None,
+        last_connected_at: float | None = None,
+        last_disconnected_at: float | None = None,
+        last_error: str | None | object = _KEEP,
+    ) -> None:
+        self._state = ConnectionStatus(
+            state=state,
+            connected=self.is_connected if connected is None else connected,
+            attempt=self._state.attempt if attempt is None else attempt,
+            last_connected_at=(
+                self._state.last_connected_at
+                if last_connected_at is None
+                else last_connected_at
+            ),
+            last_disconnected_at=(
+                self._state.last_disconnected_at
+                if last_disconnected_at is None
+                else last_disconnected_at
+            ),
+            last_error=(
+                self._state.last_error if last_error is _KEEP else last_error
+            ),
+            endpoint=self.ws_url,
+        )
 
 
 class ForwardWSConnection(NapCatConnection):
@@ -236,12 +386,41 @@ class ForwardWSConnection(NapCatConnection):
 
         self._server = None
         self._client: _WSServer | None = None
+        self._connected_event = asyncio.Event()
+        self._state: ConnectionStatus = ConnectionStatus(
+            state="idle",
+            connected=False,
+            attempt=0,
+            last_connected_at=None,
+            last_disconnected_at=None,
+            last_error=None,
+            endpoint=f"ws://{host}:{port}{path}",
+        )
 
     @property
     def is_connected(self) -> bool:
         return self._client is not None
 
+    @property
+    def status(self) -> ConnectionStatus:
+        return self._state
+
+    async def wait_connected(self, timeout: float | None = None) -> bool:
+        if self.is_connected:
+            return True
+        if timeout is not None and timeout <= 0:
+            return self.is_connected
+        try:
+            if timeout is None:
+                await self._connected_event.wait()
+            else:
+                await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return self.is_connected
+        return self.is_connected
+
     async def start(self) -> None:
+        self._set_state("connecting", last_error=None)
         self._server = await websockets.serve(
             self._handle_client,
             self.host,
@@ -253,8 +432,10 @@ class ForwardWSConnection(NapCatConnection):
         logger.info(
             f"NapCat 正向 WS 服务监听: ws://{self.host}:{self.port}{self.path}"
         )
+        self._set_state("disconnected")
 
     async def stop(self) -> None:
+        self._set_state("stopping")
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -265,6 +446,8 @@ class ForwardWSConnection(NapCatConnection):
             except Exception:
                 pass
             self._client = None
+        self._connected_event.clear()
+        self._set_state("idle")
 
     async def send(self, data: dict) -> None:
         if self._client is None:
@@ -304,6 +487,13 @@ class ForwardWSConnection(NapCatConnection):
             return
 
         self._client = ws
+        self._connected_event.set()
+        self._set_state(
+            "connected",
+            connected=True,
+            last_connected_at=time.time(),
+            last_error=None,
+        )
         logger.info(f"NapCat 已连入: {ws.remote_address}")
 
         try:
@@ -316,4 +506,40 @@ class ForwardWSConnection(NapCatConnection):
                 asyncio.create_task(self._dispatch(data))
         finally:
             self._client = None
+            self._connected_event.clear()
+            self._set_state(
+                "disconnected",
+                connected=False,
+                last_disconnected_at=time.time(),
+            )
+            self._notify_connection_lost()
             logger.info("NapCat 连接已断开")
+
+    def _set_state(
+        self,
+        state: ConnectionState,
+        *,
+        connected: bool | None = None,
+        last_connected_at: float | None = None,
+        last_disconnected_at: float | None = None,
+        last_error: str | None | object = _KEEP,
+    ) -> None:
+        self._state = ConnectionStatus(
+            state=state,
+            connected=self.is_connected if connected is None else connected,
+            attempt=self._state.attempt,
+            last_connected_at=(
+                self._state.last_connected_at
+                if last_connected_at is None
+                else last_connected_at
+            ),
+            last_disconnected_at=(
+                self._state.last_disconnected_at
+                if last_disconnected_at is None
+                else last_disconnected_at
+            ),
+            last_error=(
+                self._state.last_error if last_error is _KEEP else last_error
+            ),
+            endpoint=f"ws://{self.host}:{self.port}{self.path}",
+        )

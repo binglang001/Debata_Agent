@@ -137,10 +137,25 @@ class NapCatAdapterConfig(StrictModel):
     """WS ping 未收到 pong 多久判定为断连。"""
 
     initial_connect_timeout_seconds: float = 10.0
-    """初次连接等待超时（之后仍会后台重连）。"""
+    """旧配置兼容：初次连接等待超时。新逻辑优先使用 startup_connect_timeout_seconds。"""
+
+    startup_connect_timeout_seconds: float = 1.5
+    """Runtime 启动时最多等待首次连接的时间；超过后后台继续重连。"""
 
     api_timeout_seconds: float = 30.0
     """调用 OneBot API（send_msg / get_friend_list 等）的超时。"""
+
+    api_wait_connected_timeout_seconds: float = 3.0
+    """调用 OneBot API 前等待连接建立的最长时间。0 表示不等待。"""
+
+    fast_reconnect_attempts: int = 5
+    """启动早期或断线后的快速重试次数。"""
+
+    fast_reconnect_interval_seconds: float = 0.3
+    """快速重试间隔。"""
+
+    reconnect_jitter_seconds: float = 0.2
+    """慢速重连等待的随机抖动上限。"""
 
     process_warmup_seconds: float = 2.0
     """manage_process=True 时拉起 NapCat 后等待启动的时间。"""
