@@ -6,10 +6,15 @@ registration_url: https://platform.moonshot.cn
 reasoning_style: thinking_extra_body
 
 models:
-  - id: kimi-k2-instruct
-    display_name: Kimi K2 Instruct
-    capabilities: [chat, tool_call]
-    context_length: 256000
+  - id: kimi-k2.6
+    display_name: Kimi K2.6（推荐 · 最新旗舰）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 262144
+
+  - id: kimi-k2.5
+    display_name: Kimi K2.5
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 262144
 
   - id: moonshot-v1-128k
     display_name: Moonshot V1 128K
@@ -20,3 +25,9 @@ models:
     display_name: Moonshot V1 32K
     capabilities: [chat, tool_call]
     context_length: 32000
+
+  # Kimi K2 Instruct 将于 2026-05-25 停用，请迁移到 K2.5/K2.6
+  - id: kimi-k2-instruct
+    display_name: Kimi K2 Instruct（legacy，即将停用）
+    capabilities: [chat, tool_call]
+    context_length: 256000

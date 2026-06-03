@@ -6,12 +6,32 @@ registration_url: https://siliconflow.cn
 reasoning_style: thinking_extra_body
 
 models:
+  - id: deepseek-ai/DeepSeek-V4-Flash
+    display_name: DeepSeek V4 Flash（推荐 · 硅基托管）
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 1000000
+
+  - id: Qwen/Qwen3.6-35B-A3B
+    display_name: Qwen3.6 35B-A3B（推荐 · MoE 多模态）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 262144
+
   - id: deepseek-ai/DeepSeek-V3.2-Exp
-    display_name: DeepSeek V3.2 (SiliconFlow)
+    display_name: DeepSeek V3.2 Exp（实验版）
     capabilities: [chat, tool_call]
     context_length: 128000
 
-  - id: Qwen/Qwen3-Max-Preview
-    display_name: Qwen3 Max Preview (SiliconFlow)
-    capabilities: [chat, tool_call]
-    context_length: 256000
+  - id: Qwen/Qwen3.5-397B-A17B
+    display_name: Qwen3.5 397B-A17B（大 MoE 旗舰）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 262144
+
+  - id: Pro/zai-org/GLM-5.1
+    display_name: GLM-5.1（硅基托管）
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 128000
+
+  - id: Pro/moonshotai/Kimi-K2.6
+    display_name: Kimi K2.6（硅基托管）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 262144

@@ -6,8 +6,18 @@ registration_url: https://console.groq.com
 reasoning_style: none
 
 models:
+  - id: llama-4-scout-17b-16e-instruct
+    display_name: Llama 4 Scout 17B（推荐 · 视觉 · 极致速度）
+    capabilities: [chat, tool_call, vision]
+    context_length: 131072
+
   - id: llama-3.3-70b-versatile
     display_name: Llama 3.3 70B
+    capabilities: [chat, tool_call]
+    context_length: 131072
+
+  - id: qwen-3-32b
+    display_name: Qwen3 32B
     capabilities: [chat, tool_call]
     context_length: 131072
 

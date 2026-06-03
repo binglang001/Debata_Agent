@@ -7,37 +7,22 @@ reasoning_style: openai_native
 
 models:
   - id: gpt-5.5
-    display_name: GPT-5.5
+    display_name: GPT-5.5（推荐 · 最新旗舰 · 1M 上下文）
     capabilities: [chat, tool_call, reasoning, vision]
-    context_length: 400000
+    context_length: 1050000
+
+  - id: gpt-5.4
+    display_name: GPT-5.4（推荐 · 性价比 · 1M 上下文）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 1050000
 
   - id: gpt-5.4-mini
-    display_name: GPT-5.4 mini
+    display_name: GPT-5.4 Mini（日常生产首选）
     capabilities: [chat, tool_call, reasoning, vision]
     context_length: 400000
 
   - id: gpt-5.4-nano
-    display_name: GPT-5.4 nano
-    capabilities: [chat, tool_call, reasoning, vision]
-    context_length: 400000
-
-  - id: gpt-5.2
-    display_name: GPT-5.2
-    capabilities: [chat, tool_call, reasoning, vision]
-    context_length: 400000
-
-  - id: gpt-5.2-pro
-    display_name: GPT-5.2 Pro
-    capabilities: [chat, tool_call, reasoning, vision]
-    context_length: 400000
-
-  - id: gpt-5
-    display_name: GPT-5
-    capabilities: [chat, tool_call, reasoning, vision]
-    context_length: 400000
-
-  - id: gpt-5-mini
-    display_name: GPT-5 mini
+    display_name: GPT-5.4 Nano（最便宜）
     capabilities: [chat, tool_call, reasoning, vision]
     context_length: 400000
 
@@ -47,16 +32,37 @@ models:
     context_length: 128000
 
   - id: gpt-4o-mini
-    display_name: GPT-4o mini
+    display_name: GPT-4o Mini
     capabilities: [chat, tool_call, vision]
     context_length: 128000
 
   - id: o3
-    display_name: o3
+    display_name: o3（深度推理）
     capabilities: [chat, reasoning]
     context_length: 200000
 
   - id: o3-mini
-    display_name: o3-mini
+    display_name: o3-mini（经济推理）
     capabilities: [chat, tool_call, reasoning]
     context_length: 200000
+
+  # 以下为已退役/历史模型，仅用于兼容旧配置
+  - id: gpt-5
+    display_name: GPT-5（已退役）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 400000
+
+  - id: gpt-5-mini
+    display_name: GPT-5 Mini（已退役）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 400000
+
+  - id: gpt-5.2
+    display_name: GPT-5.2（已退役）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 400000
+
+  - id: gpt-5.2-pro
+    display_name: GPT-5.2 Pro（已退役）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 400000

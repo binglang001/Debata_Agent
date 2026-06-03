@@ -6,12 +6,33 @@ registration_url: https://x.ai/api
 reasoning_style: none
 
 models:
+  - id: grok-4.3
+    display_name: Grok 4.3（推荐 · 1M 上下文）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 1000000
+
+  - id: grok-4.20-0309-reasoning
+    display_name: Grok 4.20 Reasoning（2M 上下文）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 2000000
+
+  - id: grok-4.20-0309-non-reasoning
+    display_name: Grok 4.20（非推理 · 2M 上下文）
+    capabilities: [chat, tool_call, vision]
+    context_length: 2000000
+
+  - id: grok-4.20-multi-agent-0309
+    display_name: Grok 4.20 Multi-Agent
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 2000000
+
+  # 以下 Grok 2 系列已于 2026-05-15 退役，请求自动重定向至 grok-4.3
   - id: grok-2-1212
-    display_name: Grok 2
+    display_name: Grok 2（legacy，已退役）
     capabilities: [chat, tool_call]
     context_length: 131072
 
   - id: grok-2-vision-1212
-    display_name: Grok 2 Vision
+    display_name: Grok 2 Vision（legacy，已退役）
     capabilities: [chat, tool_call, vision]
     context_length: 131072

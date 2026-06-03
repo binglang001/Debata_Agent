@@ -6,17 +6,38 @@ registration_url: https://api.together.xyz
 reasoning_style: none
 
 models:
+  - id: deepseek-ai/DeepSeek-V4-Pro
+    display_name: DeepSeek V4 Pro（推荐 · 512K 上下文）
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 524288
+
+  - id: Qwen/Qwen3.6-Plus
+    display_name: Qwen3.6 Plus（推荐 · 1M 上下文）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 1000000
+
   - id: meta-llama/Llama-3.3-70B-Instruct-Turbo
-    display_name: Llama 3.3 70B
+    display_name: Llama 3.3 70B Turbo
     capabilities: [chat, tool_call]
     context_length: 131072
 
+  - id: moonshotai/Kimi-K2.6
+    display_name: Kimi K2.6
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 262144
+
+  - id: Qwen/Qwen3.5-397B-A17B
+    display_name: Qwen3.5 397B-A17B
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 262144
+
+  # Qwen2.5 / DeepSeek-V3 已被新模型取代，保留兼容
   - id: Qwen/Qwen2.5-72B-Instruct-Turbo
-    display_name: Qwen 2.5 72B
+    display_name: Qwen 2.5 72B（已停用）
     capabilities: [chat, tool_call]
     context_length: 131072
 
   - id: deepseek-ai/DeepSeek-V3
-    display_name: DeepSeek V3
+    display_name: DeepSeek V3（已停用）
     capabilities: [chat, tool_call]
     context_length: 131072

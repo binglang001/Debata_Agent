@@ -209,6 +209,12 @@ _VISION_PRESETS: dict[str, dict] = {
         "url": "https://api.anthropic.com/v1",
         "hint": "走 Anthropic 协议；密钥从 console.anthropic.com 获取。",
     },
+    "xai": {
+        "display": "xAI Grok",
+        "model": "grok-4.3",
+        "url": "https://api.x.ai/v1",
+        "hint": "Grok 4.3 支持多模态 vision；控制台 https://x.ai/api 获取 API Key。",
+    },
     "openrouter": {
         "display": "OpenRouter",
         "model": "anthropic/claude-sonnet-4-6",
