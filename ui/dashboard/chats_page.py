@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -43,6 +44,7 @@ class ChatsPage(QWidget):
         self._records: list[dict] = []
         self._conversations: list[dict] = []
         self._current_key: str | None = None
+        self._current_detail_html = ""
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -120,7 +122,9 @@ class ChatsPage(QWidget):
     def _render_list(self) -> None:
         selected_key = self._current_key
         list_scroll = self._list.verticalScrollBar().value()
-        detail_scroll = self._detail.verticalScrollBar().value()
+        detail_bar = self._detail.verticalScrollBar()
+        detail_scroll = detail_bar.value()
+        detail_was_at_bottom = _scrollbar_near_bottom(detail_bar)
 
         self._conversations = _group_records_by_conversation(self._records)
         self._list.clear()
@@ -142,7 +146,13 @@ class ChatsPage(QWidget):
         self._list.setCurrentRow(restore_row)
         self._list.verticalScrollBar().setValue(list_scroll)
         if self._current_key == selected_key:
-            QTimer.singleShot(0, lambda: self._detail.verticalScrollBar().setValue(detail_scroll))
+            QTimer.singleShot(
+                0,
+                lambda: self._restore_detail_scroll(
+                    detail_scroll,
+                    stick_to_bottom=detail_was_at_bottom,
+                ),
+            )
 
     def _on_item_changed(self, item: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if item is None:
@@ -151,8 +161,33 @@ class ChatsPage(QWidget):
         conv = next((c for c in self._conversations if c["key"] == key), None)
         if conv is None:
             return
+        previous_key = self._current_key
         self._current_key = key
-        self._detail.setHtml(self._render_conversation(conv))
+        html = self._render_conversation(conv)
+        if html == self._current_detail_html:
+            return
+        bar = self._detail.verticalScrollBar()
+        old_scroll = bar.value()
+        was_at_bottom = _scrollbar_near_bottom(bar)
+        self._detail.setHtml(html)
+        self._current_detail_html = html
+        if previous_key == key:
+            QTimer.singleShot(
+                0,
+                lambda: self._restore_detail_scroll(
+                    old_scroll,
+                    stick_to_bottom=was_at_bottom,
+                ),
+            )
+        else:
+            self._detail.moveCursor(QTextCursor.MoveOperation.Start)
+
+    def _restore_detail_scroll(self, value: int, *, stick_to_bottom: bool) -> None:
+        bar = self._detail.verticalScrollBar()
+        if stick_to_bottom:
+            bar.setValue(bar.maximum())
+        else:
+            bar.setValue(min(value, bar.maximum()))
 
     def _render_conversation(self, conv: dict) -> str:
         parts = [f"<h3 style='margin:0 0 12px 0'>{_escape(conv['label'])}</h3>"]
@@ -270,3 +305,7 @@ def _escape(s: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def _scrollbar_near_bottom(bar: Any, threshold: int = 24) -> bool:
+    return bar.maximum() - bar.value() <= threshold

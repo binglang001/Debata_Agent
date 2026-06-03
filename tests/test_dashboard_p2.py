@@ -29,7 +29,7 @@ from app_config.schema import (
 )
 from memory.important import ImportantMemoryManager
 from memory.rag_store import RagEntry
-from ui.dashboard.chats_page import _group_records_by_conversation
+from ui.dashboard.chats_page import _group_records_by_conversation, _scrollbar_near_bottom
 from ui.dashboard.logs_page import _format_record
 from ui.dashboard.memory_page import MemoryPage
 from ui.dashboard.personas_page import PersonasPage
@@ -83,6 +83,22 @@ def test_chats_group_records_by_metadata_and_legacy_header():
     assert grouped[0]["label"] == "群聊 20002"
     assert grouped[1]["key"] == "private:10001"
     assert len(grouped[1]["records"]) == 2
+
+
+def test_chats_scrollbar_bottom_threshold():
+    class FakeBar:
+        def __init__(self, value: int, maximum: int) -> None:
+            self._value = value
+            self._maximum = maximum
+
+        def value(self) -> int:
+            return self._value
+
+        def maximum(self) -> int:
+            return self._maximum
+
+    assert _scrollbar_near_bottom(FakeBar(980, 1000), threshold=24) is True
+    assert _scrollbar_near_bottom(FakeBar(900, 1000), threshold=24) is False
 
 
 @pytest.mark.asyncio
