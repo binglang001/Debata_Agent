@@ -2198,20 +2198,31 @@ class MessagePipeline:
                 elif source_type == "forward_id":
                     if self.adapter is None:
                         raise ValueError("adapter 未就绪，无法读取合并转发")
-                    forward_id = str(raw.get("value") or "").strip()
-                    messages = await self.adapter.get_forward_msg(forward_id)
-                    forward_path = task_dir / f"forward_{idx}.json"
-                    forward_path.write_text(
-                        json.dumps(
-                            {"forward_id": forward_id, "messages": messages},
-                            ensure_ascii=False,
-                            indent=2,
-                            default=str,
-                        ),
-                        encoding="utf-8",
+                    from tools.platform_tools import (
+                        build_forward_tree,
+                        summarize_forward_tree,
+                        write_forward_artifact,
                     )
+
+                    forward_id = str(raw.get("value") or "").strip()
+                    tree = await build_forward_tree(
+                        self.adapter,
+                        forward_id,
+                        recursive=True,
+                        max_depth=3,
+                    )
+                    forward_path = write_forward_artifact(
+                        self.workspace_dir,
+                        tree,
+                        output="json",
+                        prefix=f"agent_source_{idx}",
+                    )
+                    summary = summarize_forward_tree(tree)
                     item["path"] = _workspace_rel(forward_path, self.workspace_dir)
-                    item["message_count"] = len(messages) if isinstance(messages, list) else 0
+                    item["message_count"] = summary["message_count"]
+                    item["nested_forward_count"] = summary["nested_forward_count"]
+                    item["expired_forward_count"] = summary["expired_forward_count"]
+                    item["image_count"] = summary["image_count"]
                 elif source_type == "conversation_history":
                     records = await self._agent_task_history_records(raw)
                     history_path = task_dir / f"history_{idx}.json"

@@ -194,6 +194,20 @@ class GetForwardMsgArgs(_ToolArgs):
         min_length=1,
         description="合并转发消息的 ID，从 [合并转发 id=xxx] 标记中获取",
     )
+    recursive: bool = Field(
+        default=True,
+        description="是否递归尝试展开内层合并转发。默认开启。",
+    )
+    max_depth: int = Field(
+        default=3,
+        ge=0,
+        le=5,
+        description="递归展开内层合并转发的最大深度，0 表示只读取外层。",
+    )
+    output: Literal["auto", "json", "markdown"] = Field(
+        default="auto",
+        description="完整结果写入文件的格式。auto/json 写嵌套 JSON；markdown 写可读 Markdown。",
+    )
 
 
 class GetRecentChatMessagesArgs(_ToolArgs):

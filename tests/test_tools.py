@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -963,33 +964,101 @@ async def test_list_files_condenses_entries_but_keeps_count(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_get_forward_msg_long_content_keeps_content_field():
+async def test_get_forward_msg_writes_nested_artifact_and_preserves_image_url(tmp_path):
     class FakeAdapter:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
         async def get_forward_msg(self, forward_id: str):
+            self.calls.append(forward_id)
+            if forward_id == "outer":
+                return [
+                    {
+                        "sender": {"nickname": "Lilith", "user_id": 1},
+                        "raw_message": (
+                            "看图 "
+                            "[CQ:image,summary=&#91;动画表情&#93;,file=a.png,url=https://img.example/a.png]"
+                            "[CQ:forward,id=inner]"
+                        ),
+                        "message_id": "m1",
+                    }
+                ]
             return [
                 {
-                    "sender": {"nickname": f"用户{i}"},
-                    "raw_message": "转发内容 " * 80,
+                    "sender": {"nickname": "Diana", "user_id": 2},
+                    "content": [
+                        {"type": "text", "data": {"text": "内层消息"}},
+                        {
+                            "type": "image",
+                            "data": {
+                                "summary": "截图",
+                                "file": "b.jpg",
+                                "url": "https://img.example/b.jpg",
+                            },
+                        },
+                    ],
                 }
-                for i in range(100)
             ]
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeAdapter()
     ctx = ToolContext(
-        adapter=FakeAdapter(),
-        tool_result_budgets={},
-        tool_result_soft_limit_tokens=80,
-        tool_result_hard_cap_tokens=500,
+        adapter=adapter,
+        workspace_dir=workspace,
     )
     executor = reg.get_executor(ctx)
-    result = await executor("get_forward_msg", {"forward_id": "forward-1"})
+    result = await executor("get_forward_msg", {"forward_id": "outer"})
 
     assert result["ok"] is True
-    assert "content" in result
-    assert "preview" not in result
-    assert "forward-1" not in result["content"]
-    assert result["_condensed"]["reason"] == "工具输出过长已保留头尾"
+    assert result["status"] == "artifact"
+    assert "content" not in result
+    assert result["artifact"]["type"] == "json"
+    assert result["data"]["message_count"] == 2
+    assert result["data"]["nested_forward_count"] == 1
+    assert result["data"]["image_count"] == 2
+    assert adapter.calls == ["outer", "inner"]
+    path = workspace / result["artifact"]["path"]
+    tree = json.loads(path.read_text(encoding="utf-8"))
+    outer_segments = tree["messages"][0]["segments"]
+    assert outer_segments[1]["url"] == "https://img.example/a.png"
+    nested = outer_segments[2]["node"]
+    assert nested["forward_id"] == "inner"
+    assert nested["messages"][0]["segments"][1]["url"] == "https://img.example/b.jpg"
+    assert "preview" in result
+    assert "artifact.path" in result["next"]
+
+
+@pytest.mark.asyncio
+async def test_get_forward_msg_keeps_parent_when_nested_forward_expired(tmp_path):
+    class FakeAdapter:
+        async def get_forward_msg(self, forward_id: str):
+            if forward_id == "outer":
+                return [
+                    {
+                        "sender": {"nickname": "Lilith"},
+                        "raw_message": "[CQ:forward,id=expired-inner]",
+                    }
+                ]
+            raise RuntimeError("API get_forward_msg 失败 (retcode=1200): 消息已过期或者为内层消息")
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    executor = reg.get_executor(ToolContext(adapter=FakeAdapter(), workspace_dir=workspace))
+
+    result = await executor("get_forward_msg", {"forward_id": "outer"})
+
+    assert result["ok"] is True
+    assert result["data"]["expired_forward_count"] == 1
+    path = workspace / result["artifact"]["path"]
+    tree = json.loads(path.read_text(encoding="utf-8"))
+    nested = tree["messages"][0]["segments"][0]["node"]
+    assert nested["status"] == "expired"
+    assert nested["forward_id"] == "expired-inner"
 
 
 @pytest.mark.asyncio

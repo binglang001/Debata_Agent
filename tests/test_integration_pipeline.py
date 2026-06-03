@@ -728,7 +728,7 @@ async def test_proactive_action_runs_under_acquired_lock(build_pipeline):
 
 @pytest.mark.asyncio
 async def test_agent_task_materializes_sources_without_url(build_pipeline, tmp_path):
-    pipeline, _, _, history, _ = await build_pipeline([])
+    pipeline, _, adapter, history, _ = await build_pipeline([])
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     pipeline.workspace_dir = workspace
@@ -737,22 +737,47 @@ async def test_agent_task_materializes_sources_without_url(build_pipeline, tmp_p
     task_dir = workspace / "agent_tasks" / "manual"
     task_dir.mkdir(parents=True)
 
+    async def fake_get_forward_msg(forward_id: str):
+        if forward_id == "outer":
+            return [
+                {
+                    "sender": {"nickname": "Lilith"},
+                    "raw_message": "[CQ:forward,id=inner]",
+                }
+            ]
+        return [
+            {
+                "sender": {"nickname": "Diana"},
+                "raw_message": "内层消息",
+            }
+        ]
+
+    adapter.get_forward_msg = fake_get_forward_msg  # type: ignore[method-assign]
+
     manifest = await pipeline._materialize_agent_task_sources(
         [
             {"type": "workspace_path", "value": "input.md"},
             {"type": "inline_text", "value": "内联材料"},
             {"type": "message_id", "value": "abc123"},
             {"type": "image_ref", "value": "https://example.com/a.png"},
+            {"type": "forward_id", "value": "outer"},
         ],
         task_dir,
     )
 
-    assert manifest["count"] == 4
+    assert manifest["count"] == 5
     assert manifest["sources"][0]["path"] == "input.md"
     inline_path = workspace / manifest["sources"][1]["path"]
     assert inline_path.read_text(encoding="utf-8") == "内联材料"
     assert manifest["sources"][2]["record_count"] == 1
     assert "暂不支持直接传 URL" in manifest["sources"][3]["error"]
+    assert manifest["sources"][4]["message_count"] == 2
+    assert manifest["sources"][4]["nested_forward_count"] == 1
+    forward_tree = json.loads(
+        (workspace / manifest["sources"][4]["path"]).read_text(encoding="utf-8")
+    )
+    assert forward_tree["type"] == "forward"
+    assert forward_tree["messages"][0]["segments"][0]["node"]["forward_id"] == "inner"
 
 
 @pytest.mark.asyncio
