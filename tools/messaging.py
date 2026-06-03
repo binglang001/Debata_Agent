@@ -10,6 +10,7 @@ import asyncio
 import logging
 
 from adapters.types import Target
+from utils import get_time
 
 from .base import ToolContext, tool
 from .message_builder import build_message, contains_forbidden, typing_delay
@@ -26,6 +27,58 @@ logger = logging.getLogger(__name__)
 def _mark_activity(ctx: ToolContext) -> None:
     if ctx.activity_cb is not None:
         ctx.activity_cb()
+
+
+def _send_result(
+    *,
+    sent: list[dict],
+    sent_messages: list[dict],
+    errors: list[str],
+    action_count: int,
+) -> dict:
+    result: dict = {
+        "ok": bool(sent) or not action_count,
+        "status": "sent",
+        "brief": (
+            f"已发送 {len(sent)} 条消息，QQ 可见。"
+            if sent
+            else "发送尝试完成，但没有消息发出。"
+        ),
+        "qq_visible": bool(sent),
+        "count": len(sent),
+        "sent": sent,
+        "sent_messages": sent_messages,
+    }
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def _sent_message_item(
+    *,
+    target_type: str,
+    target_id: str,
+    order: int,
+    content: str,
+    delay: float,
+    msg_id: object,
+) -> dict:
+    item = {
+        "conversation_id": f"{target_type}:{target_id}",
+        "target_type": target_type,
+        "target_id": target_id,
+        "order": int(order),
+        "content": content,
+        "delay": float(delay),
+        "msg_id": str(msg_id) if msg_id is not None else None,
+        "time": get_time(),
+        "qq_visible": True,
+    }
+    if target_type == "private":
+        item["target_qq"] = target_id
+    if target_type == "group":
+        item["group_id"] = target_id
+    return item
 
 
 # ============================================================
@@ -95,6 +148,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
         return result
 
     sent: list[dict[str, str | int | None]] = []
+    sent_messages: list[dict] = []
     for i, action in enumerate(actions):
         target = Target(
             adapter=ctx.adapter.name,
@@ -116,15 +170,27 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
                 "msg_id": str(msg_id) if msg_id is not None else None,
             }
         )
+        sent_messages.append(
+            _sent_message_item(
+                target_type="private",
+                target_id=target.target_id,
+                order=int(action["order"]),
+                content=str(action.get("label") or action.get("content") or ""),
+                delay=float(action.get("delay") or 0.0),
+                msg_id=msg_id,
+            )
+        )
 
         delay = float(action.get("delay") or 0.0)
         if delay > 0 and i < len(actions) - 1:
             await asyncio.sleep(delay)
 
-    result: dict = {"ok": bool(sent) or not actions, "count": len(sent), "sent": sent}
-    if errors:
-        result["errors"] = errors
-    return result
+    return _send_result(
+        sent=sent,
+        sent_messages=sent_messages,
+        errors=errors,
+        action_count=len(actions),
+    )
 
 
 # ============================================================
@@ -188,6 +254,7 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
         return result
 
     sent: list[dict[str, str | int | None]] = []
+    sent_messages: list[dict] = []
     for i, action in enumerate(actions):
         target = Target(
             adapter=ctx.adapter.name,
@@ -209,15 +276,27 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
                 "msg_id": str(msg_id) if msg_id is not None else None,
             }
         )
+        sent_messages.append(
+            _sent_message_item(
+                target_type="group",
+                target_id=target.target_id,
+                order=int(action["order"]),
+                content=str(action.get("label") or action.get("content") or ""),
+                delay=float(action.get("delay") or 0.0),
+                msg_id=msg_id,
+            )
+        )
 
         delay = float(action.get("delay") or 0.0)
         if delay > 0 and i < len(actions) - 1:
             await asyncio.sleep(delay)
 
-    result: dict = {"ok": bool(sent) or not actions, "count": len(sent), "sent": sent}
-    if errors:
-        result["errors"] = errors
-    return result
+    return _send_result(
+        sent=sent,
+        sent_messages=sent_messages,
+        errors=errors,
+        action_count=len(actions),
+    )
 
 
 # ============================================================

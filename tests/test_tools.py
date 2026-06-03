@@ -627,6 +627,11 @@ async def test_send_private_sends_immediately(tmp_path):
         {"order": 1, "target_qq": "12345", "msg_id": "100"},
         {"order": 2, "target_qq": "12345", "msg_id": "101"},
     ]
+    assert result["status"] == "sent"
+    assert result["qq_visible"] is True
+    assert result["sent_messages"][0]["conversation_id"] == "private:12345"
+    assert result["sent_messages"][0]["content"] == "你好"
+    assert result["sent_messages"][0]["qq_visible"] is True
     assert ctx.collected == []
     assert [content for _, content in adapter.sent] == ["你好", "在吗"]
 
@@ -674,6 +679,13 @@ async def test_send_group_order_sorted(tmp_path):
     contents = [content for _, content in adapter.sent]
     assert contents == ["first", "second", "third"]
     assert [item["msg_id"] for item in result["sent"]] == ["100", "101", "102"]
+    assert result["qq_visible"] is True
+    assert result["sent_messages"][0]["conversation_id"] == "group:100"
+    assert [item["content"] for item in result["sent_messages"]] == [
+        "first",
+        "second",
+        "third",
+    ]
 
 
 # ============================================================

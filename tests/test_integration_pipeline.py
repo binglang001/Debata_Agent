@@ -950,6 +950,9 @@ async def test_send_private_with_delay_uses_async_queue(build_pipeline):
         if r.get("role") == "tool" and r.get("tool_call_id") == "tc-send"
     ]
     assert tool_contents[-1]["status"] == "queued"
+    assert tool_contents[-1]["qq_visible"] == "pending"
+    assert tool_contents[-1]["data"]["conversation_ids"] == ["private:123"]
+    assert tool_contents[-1]["data"]["message_count"] == 2
     assert any(
         "发送完成（全部消息已发出）" in (r.get("content") or "")
         for r in records
@@ -1047,6 +1050,8 @@ async def test_same_conversation_interrupt_flushes_async_send_queue(build_pipeli
     assert '"interrupted": true' in joined
     assert '"content": "二"' in joined
     assert '"content": "三"' in joined
+    assert '"qq_visible": false' in joined
+    assert '"qq_visible": true' in joined
     receipt_turn_context = "\n".join(
         str(m.get("content", ""))
         for m in provider.calls[-1]["messages"]
@@ -1102,6 +1107,26 @@ async def test_same_conversation_message_while_model_thinking_returns_stale(buil
     records = await history.records()
     joined = "\n".join(str(r.get("content", "")) for r in records)
     assert '"status": "stale"' in joined
+    tool_contents = [
+        json.loads(r["content"])
+        for r in records
+        if r.get("role") == "tool" and r.get("tool_call_id") == "tc-send"
+    ]
+    stale_result = tool_contents[-1]
+    assert stale_result["qq_visible"] is False
+    attempted = stale_result["attempted_messages"][0]
+    assert attempted["send_id"] == stale_result["send_id"]
+    assert attempted["conversation_id"] == "private:123"
+    assert attempted["target_type"] == "private"
+    assert attempted["target_id"] == "123"
+    assert attempted["order"] == 1
+    assert attempted["content"] == "旧回复"
+    assert attempted["delay"] >= 0
+    assert attempted["qq_visible"] is False
+    assert stale_result["new_visible_messages"][0]["conversation_id"] == "private:123"
+    assert stale_result["new_visible_messages"][0]["text"] == "我改口"
+    assert stale_result["new_visible_messages"][0]["qq_visible"] is True
+    assert "get_recent_chat_messages" in stale_result["next"]
     assert "m-new" in joined
     assert "<send_receipt>" in joined
     timeline_markdown = pipeline.chat_timeline.to_markdown(

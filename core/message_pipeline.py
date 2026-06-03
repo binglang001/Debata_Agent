@@ -192,7 +192,16 @@ class _AsyncSendManager:
         send_id = self._next_send_id()
         normalized = [self._normalize_action(a) for a in actions]
         if not normalized:
-            return {"ok": True, "status": "sent", "send_id": send_id, "count": 0, "sent": []}
+            return {
+                "ok": True,
+                "status": "sent",
+                "brief": "没有可发送的有效消息。",
+                "qq_visible": False,
+                "send_id": send_id,
+                "count": 0,
+                "sent": [],
+                "sent_messages": [],
+            }
 
         groups: dict[str, list[dict[str, Any]]] = {}
         for action in normalized:
@@ -200,12 +209,20 @@ class _AsyncSendManager:
 
         stale_convs = [cid for cid in groups if self._state(cid).needs_resync]
         if stale_convs:
+            new_visible_messages: list[dict[str, Any]] = []
+            for cid in stale_convs:
+                new_visible_messages.extend(self._state(cid).interrupt_messages)
             return {
                 "ok": False,
                 "status": "stale",
+                "brief": "发送未执行：目标会话刚收到新消息，需要重新判断。",
+                "qq_visible": False,
                 "send_id": send_id,
                 "note": "该会话刚来新消息，请先看新消息再决定发不发",
                 "stale_conversations": stale_convs,
+                "attempted_messages": self._attempted_items(normalized, send_id),
+                "new_visible_messages": new_visible_messages,
+                "next": "不要自动补发 attempted_messages；先阅读 new_visible_messages，必要时调用 get_recent_chat_messages 确认 QQ 当前聊天记录后重新判断。",
             }
 
         can_sync = all(self._can_sync_send(cid, acts) for cid, acts in groups.items())
@@ -238,7 +255,13 @@ class _AsyncSendManager:
         return {
             "ok": True,
             "status": "queued",
+            "brief": "消息已进入发送队列，QQ 可见状态待后台发送确认。",
+            "qq_visible": "pending",
             "send_id": send_id,
+            "data": {
+                "conversation_ids": list(groups.keys()),
+                "message_count": sum(len(items) for items in groups.values()),
+            },
             "note": "已进入发送队列；正常发完只静默记历史，被打断或失败才会追加 send_receipt。",
         }
 
@@ -321,9 +344,16 @@ class _AsyncSendManager:
         result: dict[str, Any] = {
             "ok": bool(sent) or not errors,
             "status": "sent",
+            "brief": (
+                f"已发送 {len(sent)} 条消息，QQ 可见。"
+                if sent
+                else "发送尝试完成，但没有消息发出。"
+            ),
+            "qq_visible": bool(sent),
             "send_id": send_id,
             "count": len(sent),
             "sent": sent,
+            "sent_messages": sent,
         }
         if errors:
             result["errors"] = errors
@@ -445,16 +475,23 @@ class _AsyncSendManager:
 
     @staticmethod
     def _sent_item(action: dict[str, Any], msg_id: str | None) -> dict[str, Any]:
+        target_scope = action.get("target_scope")
+        target_id = action.get("target_id")
         item: dict[str, Any] = {
+            "conversation_id": f"{target_scope}:{target_id}",
             "order": int(action.get("order", 0)),
-            "target_type": action.get("target_scope"),
-            "target_id": action.get("target_id"),
+            "target_type": target_scope,
+            "target_id": target_id,
             "msg_id": str(msg_id) if msg_id is not None else None,
+            "content": action.get("label") or action.get("content") or "",
+            "delay": float(action.get("delay") or 0.0),
+            "time": get_time(),
+            "qq_visible": True,
         }
-        if action.get("target_scope") == "private":
-            item["target_qq"] = action.get("target_id")
-        if action.get("target_scope") == "group":
-            item["group_id"] = action.get("target_id")
+        if target_scope == "private":
+            item["target_qq"] = target_id
+        if target_scope == "group":
+            item["group_id"] = target_id
         return item
 
     @staticmethod
@@ -462,10 +499,29 @@ class _AsyncSendManager:
         return [
             {
                 "send_id": send_id,
+                "conversation_id": f"{action.get('target_scope')}:{action.get('target_id')}",
                 "order": int(action.get("order", 0)),
                 "target_type": action.get("target_scope"),
                 "target_id": action.get("target_id"),
                 "content": action.get("label") or action.get("content") or "",
+                "delay": float(action.get("delay") or 0.0),
+                "qq_visible": False,
+            }
+            for action in actions
+        ]
+
+    @staticmethod
+    def _attempted_items(actions: list[dict[str, Any]], send_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "send_id": send_id,
+                "conversation_id": f"{action.get('target_scope')}:{action.get('target_id')}",
+                "target_type": action.get("target_scope"),
+                "target_id": action.get("target_id"),
+                "order": int(action.get("order", 0)),
+                "content": action.get("label") or action.get("content") or "",
+                "delay": float(action.get("delay") or 0.0),
+                "qq_visible": False,
             }
             for action in actions
         ]
@@ -516,10 +572,13 @@ class _AsyncSendManager:
     @staticmethod
     def _inbound_to_receipt_message(ref: _InboundRef) -> dict[str, Any]:
         return {
+            "conversation_id": ref.conversation_id,
+            "time": get_time(),
             "nickname": ref.nickname,
             "user_id": ref.user_id,
             "text": ref.text,
             "msg_id": ref.message_id,
+            "qq_visible": True,
         }
 
 
@@ -1177,10 +1236,13 @@ class MessagePipeline:
             records.append(self._build_user_record(interrupted_items))
             new_messages = [
                 {
+                    "conversation_id": item.conversation_id,
+                    "time": get_time(),
                     "nickname": item.nickname,
                     "user_id": item.user_id,
                     "text": item.text,
                     "msg_id": item.message_id,
+                    "qq_visible": True,
                 }
                 for item in interrupted_items
             ]
@@ -1285,8 +1347,9 @@ class MessagePipeline:
         return (
             "<send_receipt>\n"
             "发送回执：这是当前会话的发送状态记录，请以 sent / unsent / interrupted / new_messages 字段判断结果。\n"
-            "sent 表示已经发出；unsent 表示未发出；interrupted 表示发送是否被新消息中断；new_messages 是中断期间的新消息。\n"
+            "sent 表示已经发出，qq_visible=true；unsent 表示未发出，qq_visible=false；interrupted 表示发送是否被新消息中断；new_messages 是中断期间 QQ 上真实出现的新消息。\n"
             "未发出的消息不要自动补发，先结合新消息判断是否需要回应。\n"
+            "如果当前 QQ 真实聊天状态不清楚，先调用 get_recent_chat_messages。\n"
             f"{json.dumps(receipt, ensure_ascii=False)}\n"
             "</send_receipt>"
         )
