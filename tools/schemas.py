@@ -608,6 +608,17 @@ class ListFilesArgs(_ToolArgs):
         default="*",
         description="glob 模式，如 '*.txt' 或 '**/*.py'。默认 '*' 列所有",
     )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="从第几条匹配结果开始返回，默认 0。返回 next_offset 时可用它续读。",
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=200,
+        description="本页最多返回多少条，默认 100，最多 200。",
+    )
 
 
 class DeleteFileArgs(_ToolArgs):

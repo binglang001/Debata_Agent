@@ -888,7 +888,7 @@ async def test_read_file_large_text_is_paginated(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_read_file_condenses_content_but_keeps_paging_metadata(tmp_path):
+async def test_read_file_writes_complete_artifact_for_large_page(tmp_path):
     cfg = _make_config()
     reg = build_default_registry(cfg)
     workspace = tmp_path / "workspace"
@@ -908,12 +908,19 @@ async def test_read_file_condenses_content_but_keeps_paging_metadata(tmp_path):
     result = await executor("read_file", {"path": "long.txt"})
 
     assert result["ok"] is True
+    assert result["status"] == "artifact"
     assert result["offset"] == 0
     assert result["next_offset"] > 0
     assert result["total_lines"] == 300
     assert "preview" not in result
-    assert result["_condensed"]["reason"] == "文件内容页过长已按 token 预算截断"
-    assert f"offset={result['next_offset']}" in result["_condensed"]["full"]
+    assert "content" not in result
+    assert result["artifact"]["type"] == "markdown"
+    artifact = workspace / result["artifact"]["path"]
+    assert artifact.exists()
+    text = artifact.read_text(encoding="utf-8")
+    assert "line 0" in text
+    assert f"line {result['next_offset'] - 1}" in text
+    assert "...[已按 token 预算截断]..." not in text
 
 
 @pytest.mark.asyncio
@@ -947,7 +954,7 @@ async def test_get_user_info_strips_binary_buffers():
 
 
 @pytest.mark.asyncio
-async def test_list_files_condenses_entries_but_keeps_count(tmp_path):
+async def test_list_files_returns_explicit_pages(tmp_path):
     cfg = _make_config()
     reg = build_default_registry(cfg)
     workspace = tmp_path / "workspace"
@@ -956,13 +963,25 @@ async def test_list_files_condenses_entries_but_keeps_count(tmp_path):
         (workspace / f"{i:02d}.txt").write_text("x", encoding="utf-8")
 
     executor = reg.get_executor(ToolContext(workspace_dir=workspace))
-    result = await executor("list_files", {"path": ".", "pattern": "*.txt"})
+    result = await executor("list_files", {"path": ".", "pattern": "*.txt", "limit": 50})
 
     assert result["ok"] is True
     assert result["count"] == 60
     assert len(result["entries"]) == 50
+    assert result["next_offset"] == 50
     assert "preview" not in result
-    assert "list_files" in result["_condensed"]["full"]
+
+    second = await executor(
+        "list_files",
+        {
+            "path": ".",
+            "pattern": "*.txt",
+            "limit": 50,
+            "offset": result["next_offset"],
+        },
+    )
+    assert len(second["entries"]) == 10
+    assert "next_offset" not in second
 
 
 @pytest.mark.asyncio
@@ -1237,10 +1256,15 @@ async def test_run_python_single_long_line_keeps_stdout_field(tmp_path):
     result = await executor("run_python", {"code": "print('x' * 5000)"})
 
     assert result["ok"] is True
+    assert result["status"] == "artifact"
     assert "stdout" in result
     assert "preview" not in result
     assert len(result["stdout"]) < 5000
-    assert result["_condensed"]["reason"] == "工具输出过长已保留头尾"
+    assert result["stdout_truncated"] is True
+    artifact = workspace / result["artifact"]["path"]
+    text = artifact.read_text(encoding="utf-8")
+    assert "x" * 5000 in text
+    assert "...[已按 token 预算截断]..." not in text
 
 
 class _FakeAdapter:

@@ -15,14 +15,20 @@ run_python 用 subprocess.run 跑 Python 解释器（venv 的）：
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import sys
+import time
 import zipfile
 from pathlib import Path
+from typing import Any
 from xml.etree import ElementTree
 
+from utils.token_budget import TokenEstimator
+
 from .base import ToolContext, tool
+from .result_shrink import tool_budget
 from .schemas import (
     DeleteFileArgs,
     EditFileArgs,
@@ -36,16 +42,56 @@ from .workspace import WorkspaceError, relative_to_workspace, resolve_in_workspa
 logger = logging.getLogger(__name__)
 
 
-# 单次工具调用返回内容截断（防超长返回炸 token）
-_MAX_RETURN_BYTES = 50_000
+_SAFE_PATH_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+_RUN_OUTPUT_INLINE_CHARS = 800
+_RUN_OUTPUT_PREVIEW_LINES = 80
 
 
-def _truncate(s: str, max_bytes: int = _MAX_RETURN_BYTES) -> tuple[str, bool]:
-    """按字节截断字符串。返回 (截断后字符串, 是否被截断)。"""
-    encoded = s.encode("utf-8", errors="replace")
-    if len(encoded) <= max_bytes:
-        return s, False
-    return encoded[:max_bytes].decode("utf-8", errors="replace") + "\n...（已截断）", True
+def _estimate_result(result: dict[str, Any], estimator: TokenEstimator) -> int:
+    return estimator.estimate_text(
+        json.dumps(result, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def _artifact_dir(ctx: ToolContext, name: str) -> Path:
+    if ctx.workspace_dir is None:
+        raise RuntimeError("workspace 未配置")
+    out_dir = ctx.workspace_dir / "runtime" / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _safe_artifact_stem(value: str, default: str) -> str:
+    stem = Path(value).name or default
+    stem = _SAFE_PATH_RE.sub("_", stem).strip("._")
+    return stem or default
+
+
+def _write_text_artifact(
+    ctx: ToolContext,
+    *,
+    directory: str,
+    stem: str,
+    suffix: str,
+    content: str,
+) -> str:
+    out_dir = _artifact_dir(ctx, directory)
+    path = out_dir / f"{_safe_artifact_stem(stem, directory)}_{int(time.time() * 1000)}{suffix}"
+    path.write_text(content, encoding="utf-8")
+    return relative_to_workspace(path, ctx.workspace_dir)  # type: ignore[arg-type]
+
+
+def _line_preview(
+    text: str,
+    *,
+    max_lines: int = _RUN_OUTPUT_PREVIEW_LINES,
+    max_chars: int = _RUN_OUTPUT_INLINE_CHARS,
+) -> str:
+    lines = text.splitlines()
+    preview = text if len(lines) <= max_lines else "\n".join(lines[-max_lines:])
+    if len(preview) <= max_chars:
+        return preview
+    return preview[-max_chars:]
 
 
 @tool(
@@ -62,32 +108,45 @@ async def read_file(args: ReadFileArgs, ctx: ToolContext) -> dict:
     try:
         path = resolve_in_workspace(args.path, ctx.workspace_dir)
     except WorkspaceError as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "status": "failed", "brief": str(e), "error": str(e)}
     if not path.exists():
-        return {"ok": False, "error": f"文件不存在：{args.path}"}
+        error = f"文件不存在：{args.path}"
+        return {"ok": False, "status": "failed", "brief": error, "error": error}
     if not path.is_file():
-        return {"ok": False, "error": f"不是文件：{args.path}"}
+        error = f"不是文件：{args.path}"
+        return {"ok": False, "status": "failed", "brief": error, "error": error}
 
     suffix = path.suffix.lower()
     if suffix in {".pdf", ".docx", ".xlsx"}:
-        return await _read_document_file(path, args.max_bytes, args.offset, args.max_lines)
+        return await _read_document_file(path, args, ctx)
 
     try:
         raw = await asyncio.to_thread(path.read_bytes)
     except OSError as e:
-        return {"ok": False, "error": f"读取失败：{e}"}
+        error = f"读取失败：{e}"
+        return {"ok": False, "status": "failed", "brief": error, "error": error}
 
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         text = raw.decode("utf-8", errors="replace")
-        result = _page_text_content(text, args.offset, args.max_lines, args.max_bytes)
+        result = _page_text_content(text, args, ctx, source_path=path)
         result["warning"] = "文件不是有效 UTF-8，已替换非法字节"
         return result
-    return _page_text_content(text, args.offset, args.max_lines, args.max_bytes)
+    return _page_text_content(text, args, ctx, source_path=path)
 
 
-def _page_text_content(text: str, offset: int, max_lines: int, max_bytes: int) -> dict:
+def _page_text_content(
+    text: str,
+    args: ReadFileArgs,
+    ctx: ToolContext,
+    *,
+    source_path: Path,
+) -> dict:
+    offset = args.offset
+    max_lines = args.max_lines
+    max_bytes = args.max_bytes
+    rel_path = relative_to_workspace(source_path, ctx.workspace_dir)  # type: ignore[arg-type]
     lines = text.splitlines()
     total_lines = len(lines)
     start = min(offset, total_lines)
@@ -98,54 +157,137 @@ def _page_text_content(text: str, offset: int, max_lines: int, max_bytes: int) -
         if selected and used_bytes + line_bytes > max_bytes:
             break
         if not selected and line_bytes > max_bytes:
-            selected.append(
-                line.encode("utf-8", errors="replace")[:max_bytes].decode(
-                    "utf-8",
-                    errors="replace",
-                )
-            )
-            used_bytes = max_bytes
+            selected.append(line)
+            used_bytes = line_bytes
             break
         selected.append(line)
         used_bytes += line_bytes
     next_offset = start + len(selected)
-    result: dict = {
+    from_line = start + 1 if selected else start
+    to_line = next_offset if selected else start
+    content = "\n".join(selected)
+    meta = {
+        "path": rel_path,
+        "offset": start,
+        "returned_lines": len(selected),
+        "from_line": from_line,
+        "to_line": to_line,
+        "total_lines": total_lines,
+        "bytes": len(content.encode("utf-8", errors="replace")),
+        "range": "continuous_page",
+    }
+    result: dict[str, Any] = {
         "ok": True,
-        "content": "\n".join(selected),
+        "status": "inline",
+        "brief": f"已读取 {rel_path} 第 {from_line}-{to_line} 行，共 {total_lines} 行。",
+        "content": content,
+        "path": rel_path,
         "offset": start,
         "total_lines": total_lines,
+        "data": meta,
     }
     if next_offset < total_lines:
         result["next_offset"] = next_offset
         result["truncated"] = True
-        result["_condensed"] = {
-            "reason": "文件内容已分页返回",
-            "full": f"继续调用 read_file，传 offset={next_offset} 读取后续。",
-        }
-    return result
+        result["next"] = f"继续调用 read_file，传 path={args.path!r}, offset={next_offset} 读取后续连续内容。"
+        meta["next_offset"] = next_offset
+
+    budget = tool_budget("read_file", ctx)
+    estimator = TokenEstimator()
+    if _estimate_result(result, estimator) <= budget.inline:
+        return result
+
+    artifact_path = _write_read_file_artifact(
+        ctx,
+        rel_path=rel_path,
+        content=content,
+        meta=meta,
+    )
+    artifact_result: dict[str, Any] = {
+        "ok": True,
+        "status": "artifact",
+        "brief": (
+            f"{rel_path} 当前连续页较长，已写入完整文件：{artifact_path}；"
+            f"第 {from_line}-{to_line} 行，共 {len(selected)} 行。"
+        ),
+        "path": rel_path,
+        "artifact": {
+            "path": artifact_path,
+            "type": "markdown",
+            "from_line": from_line,
+            "to_line": to_line,
+            "line_count": len(selected),
+            "total_lines": total_lines,
+        },
+        "offset": start,
+        "total_lines": total_lines,
+        "data": meta,
+        "next": (
+            "需要当前页完整正文时读取 artifact.path；"
+            f"{'继续原文件后续内容可调用 read_file offset=' + str(next_offset) if next_offset < total_lines else '原文件已到末尾'}。"
+        ),
+    }
+    if next_offset < total_lines:
+        artifact_result["next_offset"] = next_offset
+        artifact_result["truncated"] = True
+    return artifact_result
 
 
-async def _read_document_file(path: Path, max_bytes: int, offset: int, max_lines: int) -> dict:
+def _write_read_file_artifact(
+    ctx: ToolContext,
+    *,
+    rel_path: str,
+    content: str,
+    meta: dict[str, Any],
+) -> str:
+    header = [
+        "# read_file 结果",
+        "",
+        f"- path: {rel_path}",
+        f"- range: line {meta['from_line']} to {meta['to_line']} of {meta['total_lines']}",
+        f"- bytes: {meta['bytes']}",
+        "",
+        "```text",
+        content,
+        "```",
+        "",
+    ]
+    return _write_text_artifact(
+        ctx,
+        directory="read_file",
+        stem=rel_path,
+        suffix=".md",
+        content="\n".join(header),
+    )
+
+
+async def _read_document_file(path: Path, args: ReadFileArgs, ctx: ToolContext) -> dict:
     try:
         if path.suffix.lower() == ".pdf":
-            content, warning = await asyncio.to_thread(_extract_pdf_text, path, max_bytes)
+            content, warning = await asyncio.to_thread(_extract_pdf_text, path)
         elif path.suffix.lower() == ".docx":
-            content, warning = await asyncio.to_thread(_extract_docx_text, path, max_bytes)
+            content, warning = await asyncio.to_thread(_extract_docx_text, path)
         else:
-            content, warning = await asyncio.to_thread(_extract_xlsx_text, path, max_bytes)
+            content, warning = await asyncio.to_thread(_extract_xlsx_text, path)
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"文档解析失败：{e}"}
+        error = f"文档解析失败：{e}"
+        return {"ok": False, "status": "failed", "brief": error, "error": error}
 
     content = content.strip()
     if not content:
-        return {"ok": False, "error": "文档中未提取到可读文本"}
-    result = _page_text_content(content, offset, max_lines, max_bytes)
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "文档中未提取到可读文本",
+            "error": "文档中未提取到可读文本",
+        }
+    result = _page_text_content(content, args, ctx, source_path=path)
     if warning:
         result["warning"] = warning
     return result
 
 
-def _extract_pdf_text(path: Path, max_bytes: int) -> tuple[str, str | None]:
+def _extract_pdf_text(path: Path) -> tuple[str, str | None]:
     try:
         from pypdf import PdfReader  # type: ignore[import-not-found]
     except ModuleNotFoundError:
@@ -156,7 +298,7 @@ def _extract_pdf_text(path: Path, max_bytes: int) -> tuple[str, str | None]:
             text = _extract_pdf_literal_strings(raw)
             if text.strip():
                 return (
-                    text[:max_bytes],
+                    text,
                     "未安装 pypdf，已使用粗略 PDF 文本提取；复杂 PDF 可能不完整",
                 )
             raise RuntimeError("读取 PDF 需要安装 pypdf，或提供可复制文本版本") from None
@@ -165,8 +307,6 @@ def _extract_pdf_text(path: Path, max_bytes: int) -> tuple[str, str | None]:
     pages: list[str] = []
     for page in reader.pages:
         pages.append(page.extract_text() or "")
-        if len("\n".join(pages).encode("utf-8", errors="replace")) >= max_bytes:
-            break
     return "\n".join(pages), None
 
 
@@ -182,7 +322,7 @@ def _extract_pdf_literal_strings(raw: bytes) -> str:
     return "\n".join(chunks)
 
 
-def _extract_docx_text(path: Path, max_bytes: int) -> tuple[str, str | None]:
+def _extract_docx_text(path: Path) -> tuple[str, str | None]:
     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
     with zipfile.ZipFile(path) as zf:
         xml = zf.read("word/document.xml")
@@ -192,12 +332,10 @@ def _extract_docx_text(path: Path, max_bytes: int) -> tuple[str, str | None]:
         text = "".join(node.text or "" for node in para.findall(".//w:t", ns))
         if text:
             paragraphs.append(text)
-        if len("\n".join(paragraphs).encode("utf-8", errors="replace")) >= max_bytes:
-            break
     return "\n".join(paragraphs), None
 
 
-def _extract_xlsx_text(path: Path, max_bytes: int) -> tuple[str, str | None]:
+def _extract_xlsx_text(path: Path) -> tuple[str, str | None]:
     ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     with zipfile.ZipFile(path) as zf:
         shared = _xlsx_shared_strings(zf, ns)
@@ -212,13 +350,9 @@ def _extract_xlsx_text(path: Path, max_bytes: int) -> tuple[str, str | None]:
                 line = "\t".join(c for c in cells if c)
                 if line:
                     sheet_lines.append(line)
-                if len("\n".join(lines + sheet_lines).encode("utf-8", errors="replace")) >= max_bytes:
-                    break
             if sheet_lines:
                 lines.append(f"[{Path(name).stem}]")
                 lines.extend(sheet_lines)
-            if len("\n".join(lines).encode("utf-8", errors="replace")) >= max_bytes:
-                break
     return "\n".join(lines), None
 
 
@@ -329,33 +463,67 @@ async def list_files(args: ListFilesArgs, ctx: ToolContext) -> dict:
     try:
         base = resolve_in_workspace(args.path, ctx.workspace_dir)
     except WorkspaceError as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "status": "failed", "brief": str(e), "error": str(e)}
     if not base.exists():
-        return {"ok": False, "error": f"目录不存在：{args.path}"}
+        error = f"目录不存在：{args.path}"
+        return {"ok": False, "status": "failed", "brief": error, "error": error}
     if not base.is_dir():
-        return {"ok": False, "error": f"不是目录：{args.path}"}
+        error = f"不是目录：{args.path}"
+        return {"ok": False, "status": "failed", "brief": error, "error": error}
 
-    entries: list[dict] = []
+    matches: list[Path] = []
     try:
         for p in base.glob(args.pattern):
-            try:
-                rel = relative_to_workspace(p, ctx.workspace_dir)  # type: ignore[arg-type]
-                stat = p.stat()
-                entries.append(
-                    {
-                        "path": rel,
-                        "is_dir": p.is_dir(),
-                        "size": stat.st_size if p.is_file() else 0,
-                    }
-                )
-                if len(entries) >= 200:
-                    break
-            except OSError:
-                continue
+            matches.append(p)
     except (OSError, ValueError) as e:
-        return {"ok": False, "error": f"列举失败：{e}"}
+        return {"ok": False, "status": "failed", "brief": f"列举失败：{e}", "error": f"列举失败：{e}"}
 
-    return {"ok": True, "entries": entries, "count": len(entries)}
+    matches.sort(key=lambda item: relative_to_workspace(item, ctx.workspace_dir).lower())  # type: ignore[arg-type]
+    total = len(matches)
+    start = min(args.offset, total)
+    page = matches[start : start + args.limit]
+
+    entries: list[dict[str, Any]] = []
+    for p in page:
+        try:
+            rel = relative_to_workspace(p, ctx.workspace_dir)  # type: ignore[arg-type]
+            stat = p.stat()
+            entries.append(
+                {
+                    "path": rel,
+                    "is_dir": p.is_dir(),
+                    "size": stat.st_size if p.is_file() else 0,
+                }
+            )
+        except OSError:
+            entries.append(
+                {
+                    "path": relative_to_workspace(p, ctx.workspace_dir),  # type: ignore[arg-type]
+                    "error": "stat_failed",
+                }
+            )
+    next_offset = start + len(entries)
+    result: dict[str, Any] = {
+        "ok": True,
+        "status": "inline",
+        "brief": f"列出 {args.path} 中 {len(entries)}/{total} 条匹配项。",
+        "entries": entries,
+        "count": total,
+        "offset": start,
+        "limit": args.limit,
+        "data": {
+            "path": args.path,
+            "pattern": args.pattern,
+            "count": total,
+            "returned": len(entries),
+            "offset": start,
+        },
+    }
+    if next_offset < total:
+        result["next_offset"] = next_offset
+        result["next"] = f"继续调用 list_files，传 offset={next_offset} 读取下一页。"
+        result["data"]["next_offset"] = next_offset
+    return result
 
 
 @tool(
@@ -398,14 +566,14 @@ async def delete_file(args: DeleteFileArgs, ctx: ToolContext) -> dict:
 )
 async def run_python(args: RunPythonArgs, ctx: ToolContext) -> dict:
     if ctx.workspace_dir is None:
-        return {"ok": False, "error": "workspace 未配置，run_python 被禁用"}
+        error = "workspace 未配置，run_python 被禁用"
+        return {"ok": False, "status": "failed", "brief": error, "error": error}
     ws_root = ctx.workspace_dir.resolve(strict=False)
     if not ws_root.exists():
-        return {"ok": False, "error": "workspace 目录不存在"}
+        error = "workspace 目录不存在"
+        return {"ok": False, "status": "failed", "brief": error, "error": error}
 
     # 把代码先写到 workspace/.run/_inline_{ts}.py 然后跑（让 traceback 路径可读）
-    import time
-
     run_dir = ws_root / ".run"
     run_dir.mkdir(exist_ok=True)
     script = run_dir / f"_inline_{int(time.time() * 1000)}.py"
@@ -420,7 +588,8 @@ async def run_python(args: RunPythonArgs, ctx: ToolContext) -> dict:
     try:
         await asyncio.to_thread(script.write_text, guard + args.code, encoding="utf-8")
     except OSError as e:
-        return {"ok": False, "error": f"无法写入临时脚本：{e}"}
+        error = f"无法写入临时脚本：{e}"
+        return {"ok": False, "status": "failed", "brief": error, "error": error}
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -442,12 +611,15 @@ async def run_python(args: RunPythonArgs, ctx: ToolContext) -> dict:
                 pass
             return {
                 "ok": False,
+                "status": "failed",
+                "brief": f"Python 执行超时（{args.timeout_seconds} 秒）。",
                 "error": f"超时（{args.timeout_seconds} 秒）",
                 "timeout": True,
             }
         returncode = proc.returncode if proc.returncode is not None else -1
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"执行失败：{e}"}
+        error = f"执行失败：{e}"
+        return {"ok": False, "status": "failed", "brief": error, "error": error}
     finally:
         try:
             script.unlink()
@@ -456,17 +628,103 @@ async def run_python(args: RunPythonArgs, ctx: ToolContext) -> dict:
 
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
-    stdout, st_trunc = _truncate(stdout)
-    stderr, se_trunc = _truncate(stderr)
 
-    result: dict = {
+    stdout_bytes_len = len(stdout.encode("utf-8", errors="replace"))
+    stderr_bytes_len = len(stderr.encode("utf-8", errors="replace"))
+    result: dict[str, Any] = {
         "ok": returncode == 0,
+        "status": "inline",
+        "brief": f"Python 执行完成，returncode={returncode}。",
         "returncode": returncode,
         "stdout": stdout,
         "stderr": stderr,
+        "data": {
+            "returncode": returncode,
+            "stdout_bytes": stdout_bytes_len,
+            "stderr_bytes": stderr_bytes_len,
+            "timeout_seconds": args.timeout_seconds,
+        },
     }
-    if st_trunc:
-        result["stdout_truncated"] = True
-    if se_trunc:
-        result["stderr_truncated"] = True
-    return result
+    budget = tool_budget("run_python", ctx)
+    estimator = TokenEstimator()
+    if _estimate_result(result, estimator) <= budget.inline:
+        return result
+
+    artifact_path = _write_run_python_artifact(
+        ctx,
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+        timeout_seconds=args.timeout_seconds,
+    )
+    stdout_preview = _line_preview(stdout)
+    stderr_preview = _line_preview(stderr)
+    artifact_result: dict[str, Any] = {
+        "ok": returncode == 0,
+        "status": "artifact",
+        "brief": (
+            f"Python 输出较长，完整 stdout/stderr 已写入 {artifact_path}；"
+            f"returncode={returncode}。"
+        ),
+        "returncode": returncode,
+        "stdout": stdout_preview,
+        "stderr": stderr_preview,
+        "stdout_preview": stdout_preview,
+        "stderr_preview": stderr_preview,
+        "stdout_truncated": stdout != stdout_preview,
+        "stderr_truncated": stderr != stderr_preview,
+        "artifact": {
+            "path": artifact_path,
+            "type": "markdown",
+            "stdout_bytes": stdout_bytes_len,
+            "stderr_bytes": stderr_bytes_len,
+        },
+        "data": {
+            "returncode": returncode,
+            "stdout_bytes": stdout_bytes_len,
+            "stderr_bytes": stderr_bytes_len,
+            "stdout_preview_lines": len(stdout_preview.splitlines()) if stdout_preview else 0,
+            "stderr_preview_lines": len(stderr_preview.splitlines()) if stderr_preview else 0,
+            "timeout_seconds": args.timeout_seconds,
+        },
+        "next": "需要完整 stdout/stderr 时读取 artifact.path；预览字段不是完整输出。",
+    }
+    return artifact_result
+
+
+def _write_run_python_artifact(
+    ctx: ToolContext,
+    *,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    timeout_seconds: int,
+) -> str:
+    body = [
+        "# run_python 输出",
+        "",
+        f"- returncode: {returncode}",
+        f"- timeout_seconds: {timeout_seconds}",
+        f"- stdout_bytes: {len(stdout.encode('utf-8', errors='replace'))}",
+        f"- stderr_bytes: {len(stderr.encode('utf-8', errors='replace'))}",
+        "",
+        "## stdout",
+        "",
+        "```text",
+        stdout,
+        "```",
+        "",
+        "## stderr",
+        "",
+        "```text",
+        stderr,
+        "```",
+        "",
+    ]
+    return _write_text_artifact(
+        ctx,
+        directory="run_python",
+        stem="run_python",
+        suffix=".md",
+        content="\n".join(body),
+    )

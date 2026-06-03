@@ -14,7 +14,7 @@ from typing import Any
 
 from utils.token_budget import TokenEstimator
 
-_LINE_TOOLS = {"run_python", "get_forward_msg"}
+_LINE_TOOLS = {"get_forward_msg"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,10 +37,8 @@ def shrink_tool_result(tool_name: str, result: dict[str, Any], ctx: Any) -> dict
     shrunk = copy.deepcopy(result)
     if tool_name == "web_search":
         shrunk = _shrink_web_search(shrunk, soft_limit, estimator)
-    elif tool_name in {"list_contacts", "list_files"}:
+    elif tool_name == "list_contacts":
         shrunk = _shrink_contacts(tool_name, shrunk)
-    elif tool_name == "read_file":
-        shrunk = _shrink_read_file(shrunk, soft_limit, estimator)
     elif tool_name in _LINE_TOOLS:
         shrunk = _shrink_line_result(tool_name, shrunk, soft_limit, estimator)
 
@@ -225,28 +223,6 @@ def _shrink_contacts(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _shrink_read_file(
-    result: dict[str, Any],
-    soft_limit: int,
-    estimator: TokenEstimator,
-) -> dict[str, Any]:
-    """read_file 已经分页；这里只压缩单页内容，并保留续读元数据。"""
-    if _estimate_dict(result, estimator) <= soft_limit:
-        return result
-    full_hint = "可调小 max_lines 或使用 offset 重新分页读取。"
-    next_offset = result.get("next_offset")
-    if next_offset is not None:
-        full_hint = f"继续调用 read_file，传 offset={next_offset} 读取后续；也可调小 max_lines 重读当前页。"
-    return _shrink_text_field(
-        result,
-        field="content",
-        limit_tokens=soft_limit,
-        reason="文件内容页过长已按 token 预算截断",
-        full=full_hint,
-        estimator=estimator,
-    )
-
-
 def _shrink_line_result(
     tool_name: str,
     result: dict[str, Any],
@@ -287,22 +263,6 @@ def _shrink_line_result(
     return result
 
 
-def _shrink_text_field(
-    result: dict[str, Any],
-    *,
-    field: str,
-    limit_tokens: int,
-    reason: str,
-    full: str,
-    estimator: TokenEstimator,
-) -> dict[str, Any]:
-    value = result.get(field)
-    if not isinstance(value, str) or estimator.estimate_text(value) <= limit_tokens:
-        return result
-    result[field] = _trim_head_tail(value, limit_tokens, estimator)
-    return add_condensed_marker(result, reason=reason, full=full)
-
-
 def _hard_cap(
     tool_name: str,
     result: dict[str, Any],
@@ -314,13 +274,29 @@ def _hard_cap(
 
     compact = {
         "ok": result.get("ok", True),
+        "status": result.get("status", "truncated"),
         "tool": tool_name,
-        "preview": _trim_head_tail(
+        "brief": result.get(
+            "brief",
+            "工具结果超过硬上限，已拒绝把不完整正文作为完整结果交给模型。",
+        ),
+    }
+    if "artifact" in result:
+        compact["artifact"] = result.get("artifact")
+    if "path" in result:
+        compact["path"] = result.get("path")
+    if "count" in result:
+        compact["count"] = result.get("count")
+    if "data" in result:
+        compact["data"] = result.get("data")
+    if "next" in result:
+        compact["next"] = result.get("next")
+    if "artifact" not in compact:
+        compact["preview"] = _trim_head_tail(
             json.dumps(result, ensure_ascii=False, sort_keys=True),
             hard_cap,
             estimator,
-        ),
-    }
+        )
     return add_condensed_marker(
         compact,
         reason="工具结果超过中央 hard cap，已通用截断",
