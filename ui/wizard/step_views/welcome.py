@@ -99,10 +99,9 @@ class WelcomeStepView(BaseStepView):
     def _select_path(self, value: str) -> None:
         self._selected_path = value
         for path_value, card in self._path_cards.items():
-            if path_value == value:
-                card.setStyleSheet("QFrame#SectionCard { border: 2px solid #6FA39A; }")
-            else:
-                card.setStyleSheet("")
+            card.setProperty("selected", path_value == value)
+            card.style().unpolish(card)
+            card.style().polish(card)
 
     def refresh(self) -> None:
         pass  # welcome 不需要回填

@@ -212,6 +212,27 @@ QFrame#SectionCard {{
     border-radius: {Radius.DEFAULT}px;
 }}
 
+QFrame#SectionCard[selected="true"] {{
+    border: 2px solid {p.accent_primary};
+}}
+
+QFrame#EmojiTile {{
+    background-color: {p.bg_card};
+    border: 1px solid {p.border};
+    border-radius: {Radius.SMALL}px;
+}}
+
+QLabel#EmojiDropHint {{
+    border: 2px dashed {p.border_strong};
+    border-radius: {Radius.DEFAULT}px;
+    padding: {Spacing.LG}px;
+}}
+
+QLabel#EmojiPreview {{
+    border: 1px solid {p.border};
+    border-radius: {Radius.SMALL}px;
+}}
+
 QFrame#Sidebar {{
     background-color: {p.bg_card};
     border-right: 1px solid {p.border};

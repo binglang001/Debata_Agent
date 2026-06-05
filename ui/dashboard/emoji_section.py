@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..theme import Radius, Spacing
+from ..theme import Spacing
 from ..widgets.window_chrome import (
     DragBar,
     apply_rounded_mask,
@@ -139,10 +139,6 @@ class EmojiSection(SectionCard):
         tile.setObjectName("EmojiTile")
         tile.setFrameShape(QFrame.Shape.StyledPanel)
         tile.setMinimumWidth(150)
-        tile.setStyleSheet(
-            f"QFrame#EmojiTile {{ border: 1px solid rgba(0,0,0,0.1); "
-            f"border-radius: {Radius.SMALL}px; }}"
-        )
         v = QVBoxLayout(tile)
         v.setContentsMargins(Spacing.SM, Spacing.SM, Spacing.SM, Spacing.SM)
         v.setSpacing(Spacing.XS)
@@ -289,12 +285,9 @@ class EmojiAddDialog(QDialog):
         left.setSpacing(Spacing.SM)
 
         self._drop_hint = QLabel("把图片拖到这里\n或者点击下方按钮选择文件")
+        self._drop_hint.setObjectName("EmojiDropHint")
         self._drop_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._drop_hint.setProperty("role", "secondary")
-        self._drop_hint.setStyleSheet(
-            f"QLabel {{ border: 2px dashed rgba(0,0,0,0.2); "
-            f"border-radius: {Radius.DEFAULT}px; padding: {Spacing.LG}px; }}"
-        )
         self._drop_hint.setMinimumHeight(120)
         left.addWidget(self._drop_hint)
 
@@ -314,12 +307,9 @@ class EmojiAddDialog(QDialog):
         right.setSpacing(Spacing.SM)
 
         self._preview = QLabel("（选中左侧文件预览）")
+        self._preview.setObjectName("EmojiPreview")
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setMinimumSize(280, 280)
-        self._preview.setStyleSheet(
-            f"QLabel {{ border: 1px solid rgba(0,0,0,0.1); "
-            f"border-radius: {Radius.SMALL}px; }}"
-        )
         right.addWidget(self._preview, 1)
 
         name_row = QHBoxLayout()
