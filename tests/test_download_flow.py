@@ -71,10 +71,10 @@ def test_models_detail_opens_install_guide_for_error_status(qapp):
 
     record = PluginRecord(
         meta=PluginMeta(
-            name="whisper",
-            display_name="Whisper",
-            kind="asr",
-            model_dir="whisper",
+            name="voxcpm2",
+            display_name="VoxCPM2",
+            kind="tts",
+            model_dir="VoxCPM2",
             auto_download=True,
             download_sources=[
                 DownloadSource(
@@ -112,10 +112,10 @@ def test_install_guide_matches_nested_model_folder_and_preserves_dest_prefix(
 
     record = PluginRecord(
         meta=PluginMeta(
-            name="whisper",
-            display_name="Whisper",
-            kind="asr",
-            model_dir="faster-whisper",
+            name="voxcpm2",
+            display_name="VoxCPM2",
+            kind="tts",
+            model_dir="VoxCPM2",
             download_sources=[
                 DownloadSource(
                     url="https://example.com/model.bin",
@@ -135,7 +135,7 @@ def test_install_guide_matches_nested_model_folder_and_preserves_dest_prefix(
 
     install_model_folder(source, record)
 
-    target = tmp_path / "models" / "faster-whisper" / "large-v3"
+    target = tmp_path / "models" / "VoxCPM2" / "large-v3"
     assert (target / "model.bin").read_bytes() == b"model"
     assert (target / "config.json").read_text(encoding="utf-8") == "{}"
     assert (target / "extra.json").read_text(encoding="utf-8") == "{}"

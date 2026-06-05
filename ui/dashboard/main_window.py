@@ -94,12 +94,20 @@ class DashboardWindow(QMainWindow):
 
         from ..widgets import AutoSizeStack
         self._stack = AutoSizeStack()
+        self._stack.setMaximumWidth(DEFAULT_LAYOUT.page_max_width)
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._scroll.setWidget(self._stack)
+        scroll_content = QWidget()
+        scroll_lay = QHBoxLayout(scroll_content)
+        scroll_lay.setContentsMargins(0, 0, 0, 0)
+        scroll_lay.setSpacing(0)
+        scroll_lay.addStretch(1)
+        scroll_lay.addWidget(self._stack, 1)
+        scroll_lay.addStretch(1)
+        self._scroll.setWidget(scroll_content)
         content_lay.addWidget(self._scroll, 1)
 
         right_lay.addWidget(content_wrap, 1)

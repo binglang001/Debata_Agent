@@ -73,7 +73,7 @@ def test_plugin_python_deps_are_optional_local_model_dependencies():
     optional = _pyproject()["project"]["optional-dependencies"]
     local_deps = {
         dep.split(">=", 1)[0].split("==", 1)[0]
-        for group in ("asr-local", "tts-local", "embedding-local", "local-models")
+        for group in ("tts-local", "embedding-local", "local-models")
         for dep in optional[group]
     }
     manager = PluginManager(PROJECT_ROOT / "plugins")

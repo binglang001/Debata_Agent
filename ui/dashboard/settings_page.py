@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -30,7 +29,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
-    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QVBoxLayout,
@@ -55,46 +53,9 @@ from ..widgets.wheel_freeze import install_wheel_freeze
 from ..wizard.components import SectionCard, WhitelistEditor, WhitelistState
 from .copy import DASHBOARD_COPY
 from .settings import CollapsibleSection, _SaveStatusBar
-from .settings.helpers import _progress_slot
+from .settings.helpers import _path_picker_row, _progress_slot, _set_form_field_visible
 
 logger = logging.getLogger(__name__)
-
-
-def _path_picker_row(
-    edit: QLineEdit,
-    *,
-    parent: QWidget,
-    title: str,
-    directory: bool,
-    file_filter: str = "所有文件 (*)",
-) -> QWidget:
-    row = QWidget()
-    lay = QHBoxLayout(row)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(Spacing.SM)
-    lay.addWidget(edit, 1)
-    btn = QPushButton("浏览")
-    btn.setProperty("role", "secondary")
-
-    def _pick() -> None:
-        start = edit.text().strip()
-        if directory:
-            path = QFileDialog.getExistingDirectory(parent, title, start)
-        else:
-            path, _ = QFileDialog.getOpenFileName(parent, title, start, file_filter)
-        if path:
-            edit.setText(path)
-
-    btn.clicked.connect(_pick)
-    lay.addWidget(btn)
-    return row
-
-
-def _set_form_field_visible(form: QFormLayout, field: QWidget, visible: bool) -> None:
-    label = form.labelForField(field)
-    if label is not None:
-        label.setVisible(visible)
-    field.setVisible(visible)
 
 
 def _format_tool_result_overrides(value: dict[str, int]) -> str:
@@ -1252,19 +1213,13 @@ class SettingsPage(QWidget):
         item.setData(Qt.ItemDataRole.UserRole, key)
         self._settings_nav.addItem(item)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(Spacing.MD)
         lay.addWidget(content)
         lay.addStretch(1)
-        scroll.setWidget(page)
-        self._settings_stack.addWidget(scroll)
+        self._settings_stack.addWidget(page)
 
     # ============================================================
     # 公共辅助

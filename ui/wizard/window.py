@@ -49,6 +49,7 @@ from app_config.schema import (
     WhitelistConfig,
 )
 
+from ..dashboard.layout import DEFAULT_LAYOUT
 from ..theme import Spacing
 from .components import WhitelistState
 from .context import WizardContext
@@ -134,6 +135,7 @@ class WizardWindow(QMainWindow):
         from PySide6.QtWidgets import QScrollArea
         self._active_view: QWidget | None = None
         self._page_host = QWidget()
+        self._page_host.setMaximumWidth(DEFAULT_LAYOUT.page_max_width)
         self._page_lay = QVBoxLayout(self._page_host)
         self._page_lay.setContentsMargins(0, 0, 0, 0)
         self._page_lay.setSpacing(0)
@@ -143,7 +145,14 @@ class WizardWindow(QMainWindow):
         self._wizard_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._wizard_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._wizard_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._wizard_scroll.setWidget(self._page_host)
+        scroll_content = QWidget()
+        scroll_lay = QHBoxLayout(scroll_content)
+        scroll_lay.setContentsMargins(0, 0, 0, 0)
+        scroll_lay.setSpacing(0)
+        scroll_lay.addStretch(1)
+        scroll_lay.addWidget(self._page_host, 1)
+        scroll_lay.addStretch(1)
+        self._wizard_scroll.setWidget(scroll_content)
 
         wrap = QWidget()
         wrap_lay = QVBoxLayout(wrap)

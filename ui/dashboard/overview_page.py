@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -205,14 +204,8 @@ class OverviewPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self._scroll = QScrollArea()
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        outer.addWidget(self._scroll, 1)
-
         content = QWidget()
-        self._scroll.setWidget(content)
+        outer.addWidget(content, 1)
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(Spacing.MD)

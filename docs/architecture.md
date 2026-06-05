@@ -52,8 +52,8 @@ IAdapter.send_text() → 用户收到消息
 | `agents` | `providers`, `memory`, `app_config` | `ChatAgent`, `Persona`, `build_messages()`, prompts | ✅ |
 | `tools` | `adapters`, `memory`, `providers`, `app_config` | `ToolRegistry`, `ToolContext`, `build_default_registry()` | ✅ |
 | `core` | 上面全部 | `Runtime`, `MessagePipeline`, `EventBus` | ✅ |
-| `features` | `providers` | `IVisionService`, `IWebSearchService`, `IWeatherService`, `IEmbeddingService`, `IASRService`, `ITTSService` | ✅（Vision/WebSearch/Weather/Embedding 已实装；TTS 支持 API 与本地 VoxCPM2；ASR 支持 API，Whisper 本地插件预留） |
-| `plugins` | `features` | `PluginManager`, `PluginMeta`, `PluginStatus` | ✅（VoxCPM2 与本地 embedding 已接入；Whisper 本地 ASR 待插件实装） |
+| `features` | `providers` | `IVisionService`, `IWebSearchService`, `IWeatherService`, `IEmbeddingService`, `ITTSService` | ✅（Vision/WebSearch/Weather/Embedding 已实装；TTS 支持 API 与本地 VoxCPM2；QQ 语音转写走 NapCat 内置能力） |
+| `plugins` | `features` | `PluginManager`, `PluginMeta`, `PluginStatus` | ✅（VoxCPM2 与本地 embedding 已接入） |
 | `ui` | `core`, `app_config` | `WizardWindow`, `DashboardWindow`, `Tray` | ✅ |
 | `utils` | - | `parse_raw_cq`, `MetricsProvider`, `get_time` | ✅ |
 

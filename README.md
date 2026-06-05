@@ -123,7 +123,7 @@ Debata_Agent/
 |------|------|------|
 | 1.0~1.9 基础架构 / 适配器 / 提供商 / 记忆 / Agent / 工具 / 集成测试 | ✅ | |
 | 2 PySide6 GUI（向导 + 仪表盘 + 托盘） | ✅ | 圆角窗口 / 即时保存 / 主题切换 |
-| 3 本地模型可选插件（VoxCPM2 / 本地 embedding / ASR 预留） | 🚧 | VoxCPM2 与本地 embedding 已接入；Whisper 本地 ASR 仍待插件实装 |
+| 3 本地模型可选插件（VoxCPM2 / 本地 embedding） | 🚧 | VoxCPM2 与本地 embedding 已接入；QQ 语音转写走 NapCat 内置能力 |
 | 4 文档完善 + 开源发布（CHANGELOG / CI / 模板） | 🚧 | CHANGELOG / CI / Issue 模板已就位 |
 
 当前全量测试覆盖 RAG / KV 缓存 / 跨模块集成 / 上下文重构链路；具体命令见归档测试流程文档。

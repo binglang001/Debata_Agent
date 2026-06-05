@@ -45,10 +45,6 @@ perf = [
     "uvloop>=0.19.0 ; sys_platform != 'win32'",
 ]
 
-# 本地 ASR 插件依赖。也会在用户打开模型安装指引时按需后台安装。
-asr-local = [
-]
-
 # 本地 TTS 插件依赖。也会在用户打开模型安装指引时按需后台安装。
 tts-local = [
     "voxcpm>=2.0.0",
