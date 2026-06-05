@@ -62,6 +62,15 @@ from .flow import (
     progress,
 )
 from .persona_creator import PersonaCreatorStepView
+from .persona_render import (
+    admin_entries as _admin_entries,
+)
+from .persona_render import (
+    admin_entries_from_brief as _admin_entries_from_brief,
+)
+from .persona_render import (
+    render_minimal_persona as _render_minimal_persona,
+)
 from .step_views import (
     AdapterStepView,
     EmbeddingStepView,
@@ -845,52 +854,5 @@ class WizardWindow(QMainWindow):
             event.accept()
         else:
             event.ignore()
-
-
-def _admin_entries(admin_qq: str, admin_name: str) -> list[dict[str, object]]:
-    if not admin_qq:
-        return []
-    entry: dict[str, object] = {"qq": int(admin_qq), "role": "owner"}
-    if admin_name:
-        entry["name"] = admin_name
-    return [entry]
-
-
-def _admin_entries_from_brief(brief) -> list[dict[str, object]]:
-    entries: list[dict[str, object]] = []
-    for item in getattr(brief, "admins", []) or []:
-        qq = str(item.get("qq", "")).strip()
-        name = str(item.get("name", "")).strip()
-        relation = str(item.get("relation", "")).strip()
-        if not qq:
-            continue
-        entry: dict[str, object] = {"qq": int(qq), "role": "owner"}
-        if name:
-            entry["name"] = name
-        if relation:
-            entry["relation"] = relation
-        entries.append(entry)
-    if entries:
-        return entries
-    return _admin_entries(getattr(brief, "admin_qq", ""), getattr(brief, "admin_name", ""))
-
-
-def _render_minimal_persona(name: str, xml: str, admins: list[dict[str, object]] | None = None) -> str:
-    import json
-
-    safe = xml.replace("'''", "\\'\\'\\'")
-    admins_text = json.dumps(admins or [], ensure_ascii=False, indent=4)
-    admins_text = "\n".join("    " + line for line in admins_text.splitlines())
-    return (
-        '"""自动生成的人格档案。"""\n\n'
-        "PERSONA_PROMPT = '''\n"
-        f"{safe}\n"
-        "'''\n\n"
-        "PERSONA_VARS = {\n"
-        f"    \"name\": \"{name}\",\n"
-        f"    \"admins\": {admins_text},\n"
-        "}\n"
-    )
-
 
 __all__ = ["WizardWindow"]

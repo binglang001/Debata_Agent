@@ -304,8 +304,7 @@ class _ModelDetail(QWidget):
         self._meta_deps.setWordWrap(True)
         meta_v.addWidget(self._meta_deps)
         self._meta_err = QLabel("")
-        self._meta_err.setProperty("role", "small")
-        self._meta_err.setStyleSheet("color: #C0584F;")
+        self._meta_err.setProperty("role", "error")
         self._meta_err.setWordWrap(True)
         meta_v.addWidget(self._meta_err)
 

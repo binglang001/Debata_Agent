@@ -35,6 +35,15 @@ from agents.persona_import import (
 from agents.persona_loader import validate_persona_name
 from ui.wizard.context import WizardContext
 from ui.wizard.persona_creator import PersonaCreatorStepView
+from ui.wizard.persona_render import (
+    admin_entries as _admin_entries,
+)
+from ui.wizard.persona_render import (
+    admin_entries_from_brief as _admin_entries_from_brief,
+)
+from ui.wizard.persona_render import (
+    render_minimal_persona as _render_minimal_persona,
+)
 
 from ..theme import Spacing
 from ..widgets import FramelessDialog, show_message
@@ -638,36 +647,6 @@ class _PersonaRefineDialog(FramelessDialog):
             self.accept()
 
 
-def _admin_entries(admin_qq: str, admin_name: str) -> list[dict[str, object]]:
-    if not admin_qq:
-        return []
-    entry: dict[str, object] = {"qq": int(admin_qq), "role": "owner"}
-    if admin_name:
-        entry["name"] = admin_name
-    return [entry]
-
-
-def _admin_entries_from_brief(brief: PersonaBrief | None) -> list[dict[str, object]]:
-    if brief is None:
-        return []
-    entries: list[dict[str, object]] = []
-    for item in brief.admins:
-        qq = str(item.get("qq", "")).strip()
-        name = str(item.get("name", "")).strip()
-        relation = str(item.get("relation", "")).strip()
-        if not qq:
-            continue
-        entry: dict[str, object] = {"qq": int(qq), "role": "owner"}
-        if name:
-            entry["name"] = name
-        if relation:
-            entry["relation"] = relation
-        entries.append(entry)
-    if entries:
-        return entries
-    return _admin_entries(brief.admin_qq, brief.admin_name)
-
-
 def _extract_persona_prompt(persona_file: Path) -> str:
     module = _load_persona_module(persona_file)
     prompt = getattr(module, "PERSONA_PROMPT", "")
@@ -704,28 +683,3 @@ def _load_persona_module(persona_file: Path):
     spec.loader.exec_module(module)
     return module
 
-
-def _render_minimal_persona(
-    name: str,
-    xml: str,
-    admins: list[dict[str, object]] | None = None,
-    gender: str = "",
-) -> str:
-    safe = xml.replace("'''", "\\'\\'\\'")
-    persona_vars: dict[str, object] = {"name": name, "admins": admins or []}
-    if gender:
-        persona_vars["gender"] = gender
-    vars_text = _format_python_literal(persona_vars)
-    return (
-        '"""自动生成的人格档案。"""\n\n'
-        "PERSONA_PROMPT = '''\n"
-        f"{safe}\n"
-        "'''\n\n"
-        f"PERSONA_VARS = {vars_text}\n"
-    )
-
-
-def _format_python_literal(value: Any) -> str:
-    import pprint
-
-    return pprint.pformat(value, width=96, sort_dicts=False)
