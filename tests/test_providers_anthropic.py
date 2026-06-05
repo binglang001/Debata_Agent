@@ -130,6 +130,28 @@ def test_anthropic_response_preserves_reasoning_blocks():
     ]
 
 
+def test_anthropic_response_extracts_cache_usage():
+    provider = AnthropicProvider("anthropic_test", api_key="sk-ant-test")
+    response = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(
+            input_tokens=100,
+            output_tokens=20,
+            cache_read_input_tokens=70,
+            cache_creation_input_tokens=15,
+        ),
+        stop_reason="end_turn",
+        model="claude-test",
+    )
+
+    result = provider._build_result_from_response(response, "fallback")
+
+    assert result.usage.prompt_tokens == 100
+    assert result.usage.completion_tokens == 20
+    assert result.usage.cached_tokens == 70
+    assert result.usage.cache_creation_tokens == 15
+
+
 def test_convert_messages_tool_result():
     messages = [
         {"role": "user", "content": "查询"},

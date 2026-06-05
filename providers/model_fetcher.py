@@ -7,6 +7,8 @@ anthropic 协议返回已知模型列表（官方无 /models 端点）。
 from __future__ import annotations
 
 import logging
+import os
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -33,9 +35,38 @@ _ANTHROPIC_KNOWN = [
 _SKIP_PREFIXES = ("dall-e", "whisper", "tts", "o1", "babbage", "davinci", "omni")
 
 
+@dataclass(slots=True)
+class FetchedModel:
+    """远程 /models 获取到的模型，并补齐本地已知能力。"""
+
+    id: str
+    display_name: str = ""
+    capabilities: set[str] = field(default_factory=set)
+    context_length: int = 0
+    status: str = ""
+    notes: str = ""
+    source: str = "remote"
+
+
 def _should_skip(model_id: str) -> bool:
     lower = model_id.lower()
     return any(lower.startswith(p) for p in _SKIP_PREFIXES)
+
+
+def _client_kwargs(timeout: float) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "timeout": timeout,
+        "trust_env": True,
+    }
+    proxy = (
+        os.getenv("HTTPS_PROXY")
+        or os.getenv("https_proxy")
+        or os.getenv("HTTP_PROXY")
+        or os.getenv("http_proxy")
+    )
+    if proxy:
+        kwargs["proxy"] = proxy
+    return kwargs
 
 
 async def fetch_model_list(
@@ -74,14 +105,7 @@ async def fetch_model_list(
         "Content-Type": "application/json",
     }
 
-    proxy = None
-    try:
-        import os
-        proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
-    except Exception:
-        pass
-
-    async with httpx.AsyncClient(proxy=proxy, timeout=timeout) as client:
+    async with httpx.AsyncClient(**_client_kwargs(timeout)) as client:
         try:
             resp = await client.get(url, headers=headers)
         except httpx.TransportError as e:
@@ -129,3 +153,44 @@ async def fetch_model_list(
         ids.sort()
         logger.info(f"从 {url} 获取到 {len(ids)} 个模型")
         return ids
+
+
+async def fetch_model_infos(
+    base_url: str,
+    api_key: str,
+    protocol: str,
+    *,
+    provider_id: str = "",
+    timeout: float = 15.0,
+) -> list[FetchedModel]:
+    """获取模型列表，并用本地能力矩阵补齐能力字段。
+
+    远程 /models 通常只返回 ID；能力信息由 providers/model_capabilities.yaml
+    确定性补充。未知模型不猜能力，只保留 ID。
+    """
+    ids = await fetch_model_list(base_url, api_key, protocol, timeout=timeout)
+    return [_fetched_model(mid, provider_id=provider_id) for mid in ids]
+
+
+def _fetched_model(model_id: str, *, provider_id: str = "") -> FetchedModel:
+    if provider_id:
+        try:
+            from .model_capabilities import model_capability
+
+            info = model_capability(provider_id, model_id)
+            if info is not None:
+                return FetchedModel(
+                    id=model_id,
+                    display_name=info.display_name,
+                    capabilities=set(info.capabilities),
+                    context_length=info.context_length,
+                    status=info.status,
+                    notes=info.notes,
+                    source="remote+capabilities",
+                )
+        except Exception:
+            logger.debug("补齐模型能力失败 provider=%s model=%s", provider_id, model_id, exc_info=True)
+    return FetchedModel(id=model_id)
+
+
+__all__ = ["FetchedModel", "fetch_model_infos", "fetch_model_list"]

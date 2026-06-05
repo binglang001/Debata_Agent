@@ -17,7 +17,7 @@ from typing import Any
 from app_config.schema import AgentConfig
 from providers.base import IProvider
 
-from .base import AgentRunResult, ToolExecutor
+from .base import AgentRunResult, StatusCallback, ToolExecutor, UsageRecorder
 from .runner import AgentRunner
 
 logger = logging.getLogger(__name__)
@@ -30,9 +30,14 @@ class ChatAgent:
         self,
         provider: IProvider,
         cfg: AgentConfig,
+        *,
+        usage_recorder: UsageRecorder | None = None,
+        status_callback: StatusCallback | None = None,
     ) -> None:
         self.provider = provider
         self.cfg = cfg
+        self.usage_recorder = usage_recorder
+        self.status_callback = status_callback
         self._runner = AgentRunner(provider, cfg)
 
     async def run(
@@ -58,4 +63,7 @@ class ChatAgent:
             task_contract=task_contract,
             pending_context_provider=pending_context_provider,
             max_loops=max_loops,
+            usage_recorder=self.usage_recorder,
+            status_callback=self.status_callback,
+            status_label="主模型",
         )

@@ -46,6 +46,8 @@ class PersonaCreatorStepView(BaseStepView):
 
     def __init__(self, context: WizardContext, parent=None) -> None:
         super().__init__(context, parent)
+        self.usage_recorder = None
+        self.status_callback = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -90,7 +92,7 @@ class PersonaCreatorStepView(BaseStepView):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, Spacing.MD, 0)
-        layout.setSpacing(Spacing.SM)
+        layout.setSpacing(Spacing.MD)
 
         self._name_edit = QLineEdit()
         self._name_edit.setPlaceholderText(COPY["persona_create.name_placeholder"])
@@ -115,13 +117,14 @@ class PersonaCreatorStepView(BaseStepView):
         self._admins_box = QWidget()
         self._admins_layout = QVBoxLayout(self._admins_box)
         self._admins_layout.setContentsMargins(0, 0, 0, 0)
-        self._admins_layout.setSpacing(Spacing.XS)
+        self._admins_layout.setSpacing(Spacing.SM)
         layout.addWidget(self._admins_box)
-        add_admin_btn = QPushButton("+")
-        add_admin_btn.setProperty("role", "secondary")
+        add_admin_btn = QPushButton("+ 添加")
+        add_admin_btn.setProperty("role", "text")
         add_admin_btn.setToolTip("添加一个熟悉的人")
         add_admin_btn.clicked.connect(lambda: self._add_admin_row())
-        add_admin_btn.setFixedWidth(42)
+        add_admin_btn.setMinimumWidth(64)
+        add_admin_btn.setFixedHeight(28)
         layout.addWidget(add_admin_btn, 0, Qt.AlignmentFlag.AlignLeft)
         self._add_admin_row()
 
@@ -306,8 +309,9 @@ class PersonaCreatorStepView(BaseStepView):
         self._sync_admin_remove_buttons()
 
     def _sync_admin_remove_buttons(self) -> None:
-        for row in self._admin_rows:
-            row.remove_btn.setEnabled(len(self._admin_rows) > 1)
+        for idx, row in enumerate(self._admin_rows):
+            row.remove_btn.setVisible(idx > 0)
+            row.remove_btn.setEnabled(idx > 0)
 
     def _admin_entries_from_form(self) -> list[dict[str, str]]:
         entries: list[dict[str, str]] = []
@@ -400,7 +404,12 @@ class PersonaCreatorStepView(BaseStepView):
             max_tokens=max(8192, m.max_tokens),
             first_token_timeout_seconds=60.0,
         )
-        return PersonaGenAgent(provider, cfg)
+        return PersonaGenAgent(
+            provider,
+            cfg,
+            usage_recorder=self.usage_recorder,
+            status_callback=self.status_callback,
+        )
 
     def _on_generate(self) -> None:
         brief = self._current_brief()
@@ -609,8 +618,8 @@ class _AdminRow:
         self.relation_edit = QLineEdit()
         self.relation_edit.setPlaceholderText("关系描述（可选）")
         layout.addWidget(self.relation_edit, 2)
-        self.remove_btn = QPushButton("−")
-        self.remove_btn.setProperty("role", "secondary")
+        self.remove_btn = QPushButton("删除")
+        self.remove_btn.setProperty("role", "text")
         self.remove_btn.setToolTip("移除这一行")
-        self.remove_btn.setFixedWidth(42)
+        self.remove_btn.setFixedSize(48, 28)
         layout.addWidget(self.remove_btn)

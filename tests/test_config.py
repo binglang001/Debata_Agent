@@ -78,6 +78,11 @@ def test_legacy_tool_result_overrides_still_load():
     assert cfg.behavior.context.tool_result_soft_overrides["read_file"] == 900
 
 
+def test_proactive_context_budget_defaults_to_4k():
+    cfg = _minimal_config()
+    assert cfg.behavior.proactive_context_token_budget == 4096
+
+
 def test_agent_provider_must_exist():
     """chat agent 的 provider 必须在 providers 中定义。"""
     with pytest.raises(ValueError, match="未在 providers 中定义"):

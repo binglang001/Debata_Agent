@@ -1,8 +1,8 @@
 """设置页 —— 全字段可改 + 即时保存 + 重启提示。
 
-6 节：模型 / 功能 / 渠道 / 角色 / 外观 / 高级。
+左侧导航按模型、功能、渠道、记忆、软件行为、Token预算和日志诊断分区。
 每个字段改动立即写入磁盘；hot 字段（白名单 / log 级别 / 主题）立即生效；
-其它字段标记 needs_restart，顶部状态条提示用户重启 Debata 服务。
+其它字段标记 needs_restart，底部状态条提示用户重启 Debata 服务。
 """
 
 from __future__ import annotations
@@ -25,10 +25,14 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -46,6 +50,7 @@ from app_config.schema import (
 
 from ..theme import Spacing
 from ..widgets import FramelessDialog, show_message
+from ..widgets.model_combo import ModelComboBox
 from ..widgets.wheel_freeze import install_wheel_freeze
 from ..wizard.components import SectionCard, WhitelistEditor, WhitelistState
 from .copy import DASHBOARD_COPY
@@ -133,6 +138,16 @@ def _progress_slot(progress: QProgressBar, *, width: int | None = None, height: 
     lay.addWidget(progress)
     lay.addStretch(1)
     return slot
+
+
+def _tool_budget_group_hint(group_name: str) -> str:
+    hints = {
+        "消息动作": "发送、撤回、上传和唤醒类工具。结果只需要说明真实执行状态。",
+        "查询工具": "联系人、用户信息、天气和搜索。列表类工具应分页，不一次返回全部。",
+        "资料工具": "文件、历史、合并转发和代码输出。资料过长时写完整文件，不把头尾预览当正文。",
+        "子 Agent": "资料处理入口。工具会等待子 Agent 完成，并把摘要、正文片段和结果文件作为本次工具结果返回。",
+    }
+    return hints.get(group_name, "")
 
 
 # ============================================================
@@ -238,6 +253,69 @@ class _SaveStatusBar(QFrame):
         self._info.style().polish(self._info)
 
 
+class CollapsibleSection(QFrame):
+    """设置页内的轻量折叠区。用于隐藏专业项但不销毁控件。"""
+
+    def __init__(
+        self,
+        title: str,
+        subtitle: str = "",
+        *,
+        expanded: bool = True,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("Card")
+        self._expanded = bool(expanded)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
+        outer.setSpacing(Spacing.XS)
+
+        head = QHBoxLayout()
+        head.setSpacing(Spacing.SM)
+        self._toggle_btn = QPushButton()
+        self._toggle_btn.setProperty("role", "secondary")
+        self._toggle_btn.setMinimumWidth(72)
+        self._toggle_btn.setFixedHeight(30)
+        self._toggle_btn.clicked.connect(self._toggle)
+        head.addWidget(self._toggle_btn)
+
+        title_box = QVBoxLayout()
+        title_box.setContentsMargins(0, 0, 0, 0)
+        title_lbl = QLabel(title)
+        title_lbl.setProperty("role", "title-3")
+        title_box.addWidget(title_lbl)
+        if subtitle:
+            subtitle_lbl = QLabel(subtitle)
+            subtitle_lbl.setProperty("role", "secondary")
+            subtitle_lbl.setWordWrap(True)
+            title_box.addWidget(subtitle_lbl)
+        head.addLayout(title_box, 1)
+        outer.addLayout(head)
+
+        self._body = QWidget()
+        self._body_lay = QVBoxLayout(self._body)
+        self._body_lay.setContentsMargins(0, Spacing.XS, 0, 0)
+        self._body_lay.setSpacing(Spacing.SM)
+        outer.addWidget(self._body)
+        self._render_state()
+
+    def add_content(self, widget: QWidget) -> None:
+        self._body_lay.addWidget(widget)
+
+    def add_layout(self, layout) -> None:
+        self._body_lay.addLayout(layout)
+
+    def _toggle(self) -> None:
+        self._expanded = not self._expanded
+        self._render_state()
+
+    def _render_state(self) -> None:
+        self._toggle_btn.setText("收起" if self._expanded else "展开")
+        self._body.setVisible(self._expanded)
+
+
 # ============================================================
 # 添加提供商对话框
 # ============================================================
@@ -310,9 +388,17 @@ class _AddProviderDialog(FramelessDialog):
         self._base_url_edit.setPlaceholderText("https://api.example.com/v1")
         form.addRow(self._base_url_label, self._base_url_edit)
 
-        self._model_edit = QLineEdit()
+        self._model_edit = ModelComboBox()
         self._model_edit.setPlaceholderText("模型 ID")
-        form.addRow(QLabel("默认模型 ID"), self._model_edit)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self._model_edit, 1)
+        self._fetch_models_btn = QPushButton("获取模型")
+        self._fetch_models_btn.setProperty("role", "secondary")
+        self._fetch_models_btn.clicked.connect(self._on_fetch_models)
+        model_row.addWidget(self._fetch_models_btn)
+        model_wrap = QWidget()
+        model_wrap.setLayout(model_row)
+        form.addRow(QLabel("默认模型 ID"), model_wrap)
 
         self._key_edit = QLineEdit()
         self._key_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -367,7 +453,7 @@ class _AddProviderDialog(FramelessDialog):
         if preset == "custom" and not self._base_url_edit.text().strip():
             show_message(self, "缺少 Base URL", "自定义模式必须填 Base URL。")
             return
-        if not self._model_edit.text().strip():
+        if not self._model_edit.current_model_id():
             show_message(self, "缺少模型 ID", "至少填一个默认模型 ID。")
             return
         if not self._key_edit.text():
@@ -378,10 +464,84 @@ class _AddProviderDialog(FramelessDialog):
             "preset": preset,
             "display_name": self._dname_edit.text().strip() or pid,
             "base_url": self._base_url_edit.text().strip(),
-            "model": self._model_edit.text().strip(),
+            "model": self._model_edit.current_model_id(),
             "api_key": self._key_edit.text(),
         }
         self.accept()
+
+    def _on_fetch_models(self) -> None:
+        preset = self._preset_combo.currentData()
+        key = self._key_edit.text().strip()
+        if not key:
+            show_message(self, "缺少密钥", "请先填写 API 密钥。")
+            return
+        base_url = self._base_url_edit.text().strip()
+        protocol = "anthropic" if preset == "anthropic" else "openai_compat"
+        if preset != "custom":
+            base_url = self._preset_base_url(str(preset))
+            protocol = self._preset_protocol(str(preset))
+        if not base_url:
+            show_message(self, "缺少 Base URL", "请先填写 Base URL。")
+            return
+        self._fetch_models_btn.setEnabled(False)
+        self._fetch_models_btn.setText("获取中")
+
+        async def _do_fetch() -> None:
+            try:
+                from providers.model_fetcher import fetch_model_infos
+                from providers.registry import normalize_base_url
+
+                provider_id = "" if preset == "custom" else str(preset)
+                models = await fetch_model_infos(
+                    normalize_base_url(base_url, protocol),
+                    key,
+                    protocol,
+                    provider_id=provider_id,
+                    timeout=8.0,
+                )
+                self._model_edit.set_models(
+                    [m.id for m in models],
+                    provider_id=provider_id,
+                    current=self._model_edit.current_model_id(),
+                )
+            except Exception as e:
+                show_message(self, "获取模型失败", str(e))
+            finally:
+                self._fetch_models_btn.setEnabled(True)
+                self._fetch_models_btn.setText("获取模型")
+
+        try:
+            asyncio.get_event_loop().create_task(_do_fetch())
+        except RuntimeError:
+            self._fetch_models_btn.setEnabled(True)
+            self._fetch_models_btn.setText("获取模型")
+            show_message(self, "获取模型失败", "事件循环未就绪")
+
+    def _preset_base_url(self, preset: str) -> str:
+        try:
+            from providers.presets_loader import load_all_presets
+
+            parent = self.parent()
+            paths = getattr(getattr(parent, "_runtime", None), "paths", None)
+            if paths is None:
+                return ""
+            info = load_all_presets(paths.PROVIDER_PRESETS_DIR).get(preset)
+            return info.base_url if info else ""
+        except Exception:
+            return ""
+
+    def _preset_protocol(self, preset: str) -> str:
+        try:
+            from providers.presets_loader import load_all_presets
+
+            parent = self.parent()
+            paths = getattr(getattr(parent, "_runtime", None), "paths", None)
+            if paths is None:
+                return "openai_compat"
+            info = load_all_presets(paths.PROVIDER_PRESETS_DIR).get(preset)
+            return info.protocol if info else "openai_compat"
+        except Exception:
+            return "openai_compat"
 
 
 class _ASREditDialog(FramelessDialog):
@@ -492,6 +652,8 @@ class _ASREditDialog(FramelessDialog):
         body.addLayout(btn_row)
 
     def _on_type_changed(self) -> None:
+        if not hasattr(self, "_api_key"):
+            return
         is_local = self._type_combo.currentData() == "local"
         _set_form_field_visible(self._form, self._device, is_local)
         _set_form_field_visible(self._form, self._lang, is_local)
@@ -533,7 +695,10 @@ class _ASREditDialog(FramelessDialog):
 class _TTSEditDialog(FramelessDialog):
     """TTS 配置编辑弹窗：本地（可选参考音频/语气/目录）或 API（provider+key+专有字段）。"""
 
-    _API_PROVIDERS = ["baidu", "xfyun", "volcengine"]
+    _API_PROVIDERS = [
+        ("EdgeTTS（推荐 · 无需密钥）", "edge"),
+        ("科大讯飞", "xfyun"),
+    ]
 
     def __init__(self, feat, parent=None) -> None:
         super().__init__("配置语音合成（TTS）", parent)
@@ -541,18 +706,28 @@ class _TTSEditDialog(FramelessDialog):
         self.result_data: dict | None = None
 
         body = self.body_layout()
-        intro = QLabel("本地模式用 VoxCPM2 合成语音：可只填音色/语气描述，也可加参考音频做音色克隆；API 模式用百度/讯飞/火山引擎云端服务。")
+        intro = QLabel(
+            "本地模式用 VoxCPM2 合成语音；API 模式推荐 EdgeTTS（无需密钥，但可能因网络或微软服务策略失败），"
+            "也可使用科大讯飞流式语音合成。"
+        )
         intro.setProperty("role", "secondary")
         intro.setWordWrap(True)
         body.addWidget(intro)
+        guide_row = QHBoxLayout()
+        guide_row.addStretch(1)
+        guide_btn = QPushButton("图文教程")
+        guide_btn.setProperty("role", "secondary")
+        guide_btn.clicked.connect(self._open_tts_guide)
+        guide_row.addWidget(guide_btn)
+        body.addLayout(guide_row)
 
         form = QFormLayout()
         self._form = form
         form.setSpacing(Spacing.SM)
 
         self._type_combo = QComboBox()
-        self._type_combo.addItem("本地（推荐 · VoxCPM2）", "local")
-        self._type_combo.addItem("云端 API", "api")
+        self._type_combo.addItem("云端 API（推荐 · EdgeTTS）", "api")
+        self._type_combo.addItem("本地（VoxCPM2）", "local")
         self._type_combo.currentIndexChanged.connect(self._on_type_changed)
         form.addRow(QLabel("运行方式"), self._type_combo)
 
@@ -606,13 +781,12 @@ class _TTSEditDialog(FramelessDialog):
 
         # API 模式
         self._prov = QComboBox()
-        for p in self._API_PROVIDERS:
-            self._prov.addItem(p, p)
+        for label, value in self._API_PROVIDERS:
+            self._prov.addItem(label, value)
         self._prov.currentIndexChanged.connect(self._on_type_changed)
-        if feat.provider:
-            idx = self._prov.findData(feat.provider)
-            if idx >= 0:
-                self._prov.setCurrentIndex(idx)
+        idx = self._prov.findData(feat.provider or "edge")
+        if idx >= 0:
+            self._prov.setCurrentIndex(idx)
         form.addRow(QLabel("API Provider"), self._prov)
 
         self._api_key = QLineEdit()
@@ -620,31 +794,24 @@ class _TTSEditDialog(FramelessDialog):
         self._api_key.setPlaceholderText("API Key（留空保留现有）")
         form.addRow(QLabel("API Key"), self._api_key)
 
-        # 专有字段
-        self._baidu_secret = QLineEdit()
-        self._baidu_secret.setEchoMode(QLineEdit.EchoMode.Password)
-        self._baidu_secret.setText(feat.extra_credentials.get("secret_key", "") if feat.extra_credentials else "")
-        self._baidu_secret.setPlaceholderText("百度语音 Secret Key")
-        form.addRow(QLabel("Secret Key（百度）"), self._baidu_secret)
+        creds = feat.extra_credentials if feat.extra_credentials else {}
+        self._api_voice = QLineEdit(creds.get("voice", ""))
+        self._api_voice.setPlaceholderText("Edge 默认 zh-CN-XiaoxiaoNeural；讯飞默认 x4_xiaoyan")
+        form.addRow(QLabel("说话人"), self._api_voice)
 
         self._xfyun_appid = QLineEdit()
-        self._xfyun_appid.setText(feat.extra_credentials.get("app_id", "") if feat.extra_credentials else "")
-        self._xfyun_appid.setPlaceholderText("控制台获取")
+        self._xfyun_appid.setText(creds.get("app_id", ""))
+        self._xfyun_appid.setPlaceholderText("讯飞控制台 AppID")
         form.addRow(QLabel("App ID（讯飞）"), self._xfyun_appid)
         self._xfyun_secret = QLineEdit()
         self._xfyun_secret.setEchoMode(QLineEdit.EchoMode.Password)
-        self._xfyun_secret.setText(feat.extra_credentials.get("api_secret", "") if feat.extra_credentials else "")
+        self._xfyun_secret.setText(creds.get("api_secret", ""))
         self._xfyun_secret.setPlaceholderText("API Secret（讯飞）")
         form.addRow(QLabel("API Secret（讯飞）"), self._xfyun_secret)
 
-        self._volc_appid = QLineEdit()
-        self._volc_appid.setText(feat.extra_credentials.get("app_id", "") if feat.extra_credentials else "")
-        self._volc_appid.setPlaceholderText("火山引擎 App ID")
-        form.addRow(QLabel("App ID（火山）"), self._volc_appid)
-
         body.addLayout(form)
 
-        idx_t = self._type_combo.findData(feat.type or "local")
+        idx_t = self._type_combo.findData(feat.type or "api")
         if idx_t >= 0:
             self._type_combo.setCurrentIndex(idx_t)
         self._on_type_changed()
@@ -672,25 +839,23 @@ class _TTSEditDialog(FramelessDialog):
         _set_form_field_visible(self._form, self._timesteps, is_local)
         is_api = not is_local
         _set_form_field_visible(self._form, self._prov, is_api)
-        _set_form_field_visible(self._form, self._api_key, is_api)
         prov = self._prov.currentData() if is_api else ""
-        _set_form_field_visible(self._form, self._baidu_secret, is_api and prov == "baidu")
+        _set_form_field_visible(self._form, self._api_key, is_api and prov == "xfyun")
+        _set_form_field_visible(self._form, self._api_voice, is_api)
         _set_form_field_visible(self._form, self._xfyun_appid, is_api and prov == "xfyun")
         _set_form_field_visible(self._form, self._xfyun_secret, is_api and prov == "xfyun")
-        _set_form_field_visible(self._form, self._volc_appid, is_api and prov == "volcengine")
 
     def _on_ok(self) -> None:
         is_local = self._type_combo.currentData() == "local"
         extra: dict[str, str] = {}
         if not is_local:
             prov = self._prov.currentData()
-            if prov == "baidu":
-                extra["secret_key"] = self._baidu_secret.text().strip()
-            elif prov == "xfyun":
+            voice = self._api_voice.text().strip()
+            if voice:
+                extra["voice"] = voice
+            if prov == "xfyun":
                 extra["app_id"] = self._xfyun_appid.text().strip()
                 extra["api_secret"] = self._xfyun_secret.text().strip()
-            elif prov == "volcengine":
-                extra["app_id"] = self._volc_appid.text().strip()
         self.result_data = {
             "type": "local" if is_local else "api",
             "device": self._device.currentText(),
@@ -705,6 +870,12 @@ class _TTSEditDialog(FramelessDialog):
             "extra_credentials": extra,
         }
         self.accept()
+
+    def _open_tts_guide(self) -> None:
+        parent = self.parent()
+        opener = getattr(parent, "_open_feature_guide", None)
+        if callable(opener):
+            opener("tts_api")
 
 
 class _EmbeddingEditDialog(FramelessDialog):
@@ -742,9 +913,20 @@ class _EmbeddingEditDialog(FramelessDialog):
                 self._prov.setCurrentIndex(idx)
         form.addRow(QLabel("Provider"), self._prov)
 
-        self._model = QLineEdit(emb.api_model or "")
+        self._model = ModelComboBox()
+        if emb.api_model:
+            self._model.setText(emb.api_model)
         self._model.setPlaceholderText("如 text-embedding-v4 / embedding-3 / doubao-embedding-vision-251215")
-        form.addRow(QLabel("模型 ID"), self._model)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self._model, 1)
+        self._fetch_btn = QPushButton("获取模型")
+        self._fetch_btn.setProperty("role", "secondary")
+        self._fetch_btn.clicked.connect(self._on_fetch_models)
+        model_row.addWidget(self._fetch_btn)
+        model_wrap = QWidget()
+        model_wrap.setLayout(model_row)
+        self._model_row = model_wrap
+        form.addRow(QLabel("模型 ID"), model_wrap)
 
         self._key = QLineEdit()
         self._key.setEchoMode(QLineEdit.EchoMode.Password)
@@ -808,7 +990,7 @@ class _EmbeddingEditDialog(FramelessDialog):
     def _on_type_changed(self) -> None:
         is_local = self._type_combo.currentData() == "local"
         _set_form_field_visible(self._form, self._prov, not is_local)
-        _set_form_field_visible(self._form, self._model, not is_local)
+        _set_form_field_visible(self._form, self._model_row, not is_local)
         _set_form_field_visible(self._form, self._key, not is_local)
         _set_form_field_visible(self._form, self._local_quality, is_local)
         _set_form_field_visible(self._form, self._local_dir_row, is_local)
@@ -872,13 +1054,13 @@ class _EmbeddingEditDialog(FramelessDialog):
             if not pid:
                 show_message(self, "缺 provider", "请选一个 provider")
                 return
-            if not self._model.text().strip():
+            if not self._model.current_model_id():
                 show_message(self, "缺模型 ID", "请填 embedding 模型 ID")
                 return
             self.result_data = {
                 "type": "api",
                 "provider": pid,
-                "model": self._model.text().strip(),
+                "model": self._model.current_model_id(),
                 "api_key": self._key.text(),
             }
         else:
@@ -888,6 +1070,63 @@ class _EmbeddingEditDialog(FramelessDialog):
                 "local_model_dir": self._local_dir.text().strip() or self._default_local_dir(),
             }
         self.accept()
+
+    def _on_fetch_models(self) -> None:
+        pid = self._prov.currentData()
+        if not pid:
+            show_message(self, "缺 provider", "请先选择 provider")
+            return
+        parent = self.parent()
+        if not hasattr(parent, "_fetch_models_for_provider"):
+            show_message(self, "无法获取", "当前窗口不支持获取模型")
+            return
+        self._fetch_btn.setEnabled(False)
+        self._fetch_btn.setText("获取中")
+
+        async def _do_fetch() -> None:
+            try:
+                models = await parent._fetch_models_for_provider(str(pid))  # type: ignore[attr-defined]
+                preset = parent._provider_preset_id(str(pid))  # type: ignore[attr-defined]
+                ids = [getattr(m, "id", str(m)) for m in models]
+                embedding_ids = self._filter_embedding_ids(preset, ids)
+                self._model.set_models(
+                    embedding_ids or ids,
+                    provider_id=preset,
+                    current=self._model.current_model_id(),
+                )
+                if not self._model.current_model_id():
+                    recommended = self._recommended_embedding_model(preset)
+                    if recommended:
+                        self._model.setText(recommended)
+            except Exception as e:
+                show_message(self, "获取模型失败", str(e))
+            finally:
+                self._fetch_btn.setEnabled(True)
+                self._fetch_btn.setText("获取模型")
+
+        try:
+            asyncio.get_event_loop().create_task(_do_fetch())
+        except RuntimeError:
+            self._fetch_btn.setEnabled(True)
+            self._fetch_btn.setText("获取模型")
+            show_message(self, "获取模型失败", "事件循环未就绪")
+
+    def _filter_embedding_ids(self, preset: str, model_ids: list[str]) -> list[str]:
+        try:
+            from providers.model_capabilities import model_supports
+
+            return [mid for mid in model_ids if model_supports(preset, mid, "embedding")]
+        except Exception:
+            return []
+
+    def _recommended_embedding_model(self, preset: str) -> str:
+        try:
+            from providers.model_capabilities import recommended_model
+
+            model = recommended_model(preset, "embedding")
+            return model.id if model else ""
+        except Exception:
+            return ""
 
 
 class _VisionEditDialog(FramelessDialog):
@@ -933,9 +1172,19 @@ class _VisionEditDialog(FramelessDialog):
         self._prov.currentIndexChanged.connect(self._on_prov_changed)
         form.addRow(QLabel("Provider"), self._prov)
 
-        self._model = QLineEdit(current_model or "")
+        self._model = ModelComboBox()
+        if current_model:
+            self._model.setText(current_model)
         self._model.setPlaceholderText("如 doubao-seed-2-0-lite-260428 / glm-5v-turbo / gpt-5.5")
-        form.addRow(QLabel("视觉模型 ID"), self._model)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self._model, 1)
+        self._fetch_btn = QPushButton("获取模型")
+        self._fetch_btn.setProperty("role", "secondary")
+        self._fetch_btn.clicked.connect(self._on_fetch_models)
+        model_row.addWidget(self._fetch_btn)
+        model_wrap = QWidget()
+        model_wrap.setLayout(model_row)
+        form.addRow(QLabel("视觉模型 ID"), model_wrap)
 
         self._key = QLineEdit()
         self._key.setEchoMode(QLineEdit.EchoMode.Password)
@@ -964,24 +1213,88 @@ class _VisionEditDialog(FramelessDialog):
     def _on_prov_changed(self) -> None:
         pid = self._prov.currentData()
         preset = self._provider_presets.get(pid, "")
-        default = self.DEFAULT_MODELS.get(preset, "")
-        if default and not self._model.text().strip():
+        default = self._recommended_vision_model(preset) or self.DEFAULT_MODELS.get(preset, "")
+        if default and not self._model.current_model_id():
             self._model.setText(default)
+        known = self._known_vision_models(preset)
+        if known:
+            self._model.set_models(known, provider_id=preset, current=self._model.current_model_id())
 
     def _on_ok(self) -> None:
         pid = self._prov.currentData()
         if not pid:
             show_message(self, "缺 provider", "请选一个 provider")
             return
-        if not self._model.text().strip():
+        if not self._model.current_model_id():
             show_message(self, "缺模型 ID", "请填视觉模型 ID")
             return
         self.result_data = {
             "provider": pid,
-            "model": self._model.text().strip(),
+            "model": self._model.current_model_id(),
             "api_key": self._key.text(),
         }
         self.accept()
+
+    def _on_fetch_models(self) -> None:
+        pid = self._prov.currentData()
+        if not pid:
+            show_message(self, "缺 provider", "请先选择 provider")
+            return
+        parent = self.parent()
+        if not hasattr(parent, "_fetch_models_for_provider"):
+            show_message(self, "无法获取", "当前窗口不支持获取模型")
+            return
+        self._fetch_btn.setEnabled(False)
+        self._fetch_btn.setText("获取中")
+
+        async def _do_fetch() -> None:
+            try:
+                models = await parent._fetch_models_for_provider(str(pid))  # type: ignore[attr-defined]
+                preset = self._provider_presets.get(str(pid), "")
+                ids = [getattr(m, "id", str(m)) for m in models]
+                vision_ids = self._filter_vision_ids(preset, ids)
+                self._model.set_models(
+                    vision_ids or ids,
+                    provider_id=preset,
+                    current=self._model.current_model_id(),
+                )
+            except Exception as e:
+                show_message(self, "获取模型失败", str(e))
+            finally:
+                self._fetch_btn.setEnabled(True)
+                self._fetch_btn.setText("获取模型")
+
+        try:
+            asyncio.get_event_loop().create_task(_do_fetch())
+        except RuntimeError:
+            self._fetch_btn.setEnabled(True)
+            self._fetch_btn.setText("获取模型")
+            show_message(self, "获取模型失败", "事件循环未就绪")
+
+    def _filter_vision_ids(self, preset: str, model_ids: list[str]) -> list[str]:
+        try:
+            from providers.model_capabilities import model_supports
+
+            return [mid for mid in model_ids if model_supports(preset, mid, "vision")]
+        except Exception:
+            return []
+
+    def _known_vision_models(self, preset: str) -> list[str]:
+        try:
+            from providers.model_capabilities import known_model_ids
+
+            return known_model_ids(preset, capability="vision")
+        except Exception:
+            return []
+
+    def _recommended_vision_model(self, preset: str) -> str:
+        try:
+            from providers.model_capabilities import recommended_model
+
+            model = recommended_model(preset, "vision")
+            return model.id if model else ""
+        except Exception:
+            return ""
 
 
 class _WeatherEditDialog(FramelessDialog):
@@ -1069,36 +1382,38 @@ class SettingsPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # 内部滚动区（所有 section）
-        from PySide6.QtWidgets import QScrollArea
-        inner_scroll = QScrollArea()
-        inner_scroll.setWidgetResizable(True)
-        inner_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        inner_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        main_row = QHBoxLayout()
+        main_row.setContentsMargins(0, 0, 0, 0)
+        main_row.setSpacing(Spacing.MD)
 
-        sections = QWidget()
-        sections_lay = QVBoxLayout(sections)
-        sections_lay.setContentsMargins(0, 0, 0, 0)
-        sections_lay.setSpacing(Spacing.MD)
+        self._settings_nav = QListWidget()
+        self._settings_nav.setObjectName("SettingsNav")
+        self._settings_nav.setFixedWidth(168)
+        self._settings_nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        main_row.addWidget(self._settings_nav)
 
-        sections_lay.addWidget(self._build_model_section())
-        sections_lay.addWidget(self._build_features_section())
-        # adapter 节稍后通过 _rebuild_adapter_form 动态重建
+        self._settings_stack = QStackedWidget()
+        main_row.addWidget(self._settings_stack, 1)
+
+        outer.addLayout(main_row, 1)
+
+        self._add_settings_page("models", "模型", self._build_model_section())
+        self._add_settings_page("features", "功能", self._build_features_section())
+
         self._adapter_container = QVBoxLayout()
         self._adapter_container.setContentsMargins(0, 0, 0, 0)
         self._adapter_container.setSpacing(Spacing.MD)
         adapter_wrap = QWidget()
         adapter_wrap.setLayout(self._adapter_container)
-        sections_lay.addWidget(adapter_wrap)
-        sections_lay.addWidget(self._build_persona_section())
-        sections_lay.addWidget(self._build_emoji_section())
-        sections_lay.addWidget(self._build_appearance_section())
-        sections_lay.addWidget(self._build_memory_section())
-        sections_lay.addWidget(self._build_token_budget_section())
-        sections_lay.addWidget(self._build_advanced_section())
+        self._add_settings_page("adapter", "渠道", adapter_wrap)
 
-        inner_scroll.setWidget(sections)
-        outer.addWidget(inner_scroll, 1)
+        self._add_settings_page("memory", "记忆", self._build_memory_section())
+        self._add_settings_page("behavior", "软件行为", self._build_software_behavior_section())
+        self._add_settings_page("token_budget", "Token预算", self._build_token_budget_section())
+        self._add_settings_page("diagnostics", "日志与诊断", self._build_diagnostics_section())
+
+        self._settings_nav.currentRowChanged.connect(self._settings_stack.setCurrentIndex)
+        self._settings_nav.setCurrentRow(0)
 
         # 底部状态条（始终可见，不滚动）
         self._status = _SaveStatusBar()
@@ -1111,6 +1426,25 @@ class SettingsPage(QWidget):
 
         # 滚轮冻结
         self._wheel_freeze_filter = install_wheel_freeze(self)
+
+    def _add_settings_page(self, key: str, title: str, content: QWidget) -> None:
+        item = QListWidgetItem(title)
+        item.setData(Qt.ItemDataRole.UserRole, key)
+        self._settings_nav.addItem(item)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(Spacing.MD)
+        lay.addWidget(content)
+        lay.addStretch(1)
+        scroll.setWidget(page)
+        self._settings_stack.addWidget(scroll)
 
     # ============================================================
     # 公共辅助
@@ -1460,6 +1794,56 @@ class SettingsPage(QWidget):
         preset = getattr(self._runtime.provider_registry, "presets", {}).get(preset_name)
         return getattr(preset, "protocol", "openai_compat")
 
+    def _provider_preset_id(self, name: str) -> str:
+        p = self._cfg().providers.get(name)
+        return (p.preset or "") if p is not None else ""
+
+    def _provider_endpoint_from_config(self, name: str) -> tuple[str, str, str, str]:
+        """返回 provider 的 preset/protocol/base_url/api_key，优先使用当前配置。"""
+        p = self._cfg().providers.get(name)
+        if p is None:
+            raise ValueError(f"未知 provider：{name}")
+        preset_id = (p.preset or "").lower()
+        preset = None
+        if preset_id:
+            preset = getattr(self._runtime.provider_registry, "presets", {}).get(preset_id)
+            if preset is None:
+                try:
+                    from providers.presets_loader import load_all_presets
+
+                    preset = load_all_presets(self._runtime.paths.PROVIDER_PRESETS_DIR).get(preset_id)
+                except Exception:
+                    preset = None
+        protocol = p.protocol or getattr(preset, "protocol", None) or "openai_compat"
+        base_url = p.base_url or getattr(preset, "base_url", "") or ""
+        if not base_url:
+            raise ValueError(f"provider {name} 缺少 Base URL")
+        api_key = ""
+        if p.api_key_id:
+            try:
+                api_key = self._runtime.secrets.get(p.api_key_id) or ""
+            except Exception:
+                api_key = ""
+        if not api_key:
+            provider = getattr(self._runtime, "providers", {}).get(name)
+            api_key = getattr(provider, "api_key", "") or ""
+        if not api_key:
+            raise ValueError(f"provider {name} 没有可用 API 密钥")
+        return preset_id, protocol, base_url, api_key
+
+    async def _fetch_models_for_provider(self, name: str):
+        from providers.model_fetcher import fetch_model_infos
+        from providers.registry import normalize_base_url
+
+        preset_id, protocol, base_url, api_key = self._provider_endpoint_from_config(name)
+        return await fetch_model_infos(
+            normalize_base_url(base_url, protocol),
+            api_key,
+            protocol,
+            provider_id=preset_id,
+            timeout=8.0,
+        )
+
     def _on_test_provider(
         self,
         name: str,
@@ -1622,12 +2006,29 @@ class SettingsPage(QWidget):
         form.addRow(QLabel("Provider"), prov_combo)
 
         # 模型 ID
-        model_edit = QLineEdit(agent_cfg.model)
+        model_edit = ModelComboBox()
+        model_edit.setText(agent_cfg.model)
         model_edit.setPlaceholderText("如 deepseek-v4-flash / claude-sonnet-4-6")
-        model_edit.editingFinished.connect(
-            lambda *_, an=agent_name, e=model_edit: self._on_agent_model_changed(an, e.text().strip())
+        if model_edit.lineEdit() is not None:
+            model_edit.lineEdit().editingFinished.connect(
+                lambda an=agent_name, e=model_edit: self._on_agent_model_changed(an, e.current_model_id())
+            )
+        model_edit.activated.connect(
+            lambda *_args, an=agent_name, e=model_edit: self._on_agent_model_changed(an, e.current_model_id())
         )
-        form.addRow(QLabel("模型 ID"), model_edit)
+        fetch_btn = QPushButton("获取模型")
+        fetch_btn.setProperty("role", "secondary")
+        fetch_btn.clicked.connect(
+            lambda *_, an=agent_name, pc=prov_combo, me=model_edit, btn=fetch_btn:
+            self._on_fetch_agent_models(an, pc.currentData(), me, btn)
+        )
+        model_row = QHBoxLayout()
+        model_row.setSpacing(Spacing.SM)
+        model_row.addWidget(model_edit, 1)
+        model_row.addWidget(fetch_btn)
+        model_wrap = QWidget()
+        model_wrap.setLayout(model_row)
+        form.addRow(QLabel("模型 ID"), model_wrap)
 
         if agent_name == "chat":
             loops_spin = QSpinBox()
@@ -1688,6 +2089,42 @@ class SettingsPage(QWidget):
             return
         a.provider = new_provider
         self._save_now(needs_restart=True, change_desc=f"agents.{agent_name}.provider={new_provider}")
+
+    def _on_fetch_agent_models(
+        self,
+        agent_name: str,
+        provider_id: str,
+        model_edit: ModelComboBox,
+        button: QPushButton,
+    ) -> None:
+        if not provider_id:
+            self._status.mark_error("请先选择 provider")
+            return
+        button.setEnabled(False)
+        button.setText("获取中")
+
+        async def _do_fetch() -> None:
+            try:
+                models = await self._fetch_models_for_provider(str(provider_id))
+                preset = self._provider_preset_id(str(provider_id))
+                model_edit.set_models(
+                    [m.id for m in models],
+                    provider_id=preset,
+                    current=model_edit.current_model_id(),
+                )
+                self._status.set_changes(self._count_changes(), needs_restart=False)
+            except Exception as e:
+                self._status.mark_error(f"获取 {agent_name} 模型失败：{e}")
+            finally:
+                button.setEnabled(True)
+                button.setText("获取模型")
+
+        try:
+            asyncio.get_event_loop().create_task(_do_fetch())
+        except RuntimeError:
+            button.setEnabled(True)
+            button.setText("获取模型")
+            self._status.mark_error("事件循环未就绪")
 
     def _on_agent_model_changed(self, agent_name: str, model: str) -> None:
         if self._suppress_signals or not model:
@@ -1966,7 +2403,7 @@ class SettingsPage(QWidget):
 
         feat = self._cfg().features.tts
         head = QHBoxLayout()
-        chk = QCheckBox("用声音说话（TTS · VoxCPM2）")
+        chk = QCheckBox("用声音说话（TTS）")
         chk.setChecked(feat.enabled)
         self._tts_chk = chk
         head.addWidget(chk)
@@ -2015,8 +2452,10 @@ class SettingsPage(QWidget):
         if data["type"] == "api":
             t.provider = data["provider"]
             t.extra_credentials = data.get("extra_credentials", {})
-            if data.get("api_key"):
-                sid = t.api_key_id or "tts_key"
+            if data["provider"] == "edge":
+                t.api_key_id = None
+            elif data.get("api_key"):
+                sid = t.api_key_id or f"tts_{data['provider']}"
                 t.api_key_id = sid
                 self._set_secret(sid, data["api_key"])
         else:
@@ -2052,7 +2491,11 @@ class SettingsPage(QWidget):
             if t.default_prompt and not detail:
                 detail = f" · prompt={t.default_prompt}"
             return f"本地 · {t.local_model} · device={t.device}{detail}"
-        return f"API · provider={t.provider or '?'}"
+        if t.provider == "edge":
+            return "API · EdgeTTS（无需密钥）"
+        voice = t.extra_credentials.get("voice", "") if t.extra_credentials else ""
+        detail = f" · voice={voice}" if voice else ""
+        return f"API · provider={t.provider or '?'}{detail}"
 
     def _build_embedding_card(self) -> QWidget:
         """RAG embedding 配置卡片。"""
@@ -2329,6 +2772,183 @@ class SettingsPage(QWidget):
 
         card.add_layout(form)
 
+        advanced = CollapsibleSection(
+            "NapCat 连接高级参数",
+            "这些参数通常不需要改。只有在首条消息经常等待、断线重连异常或托管进程启动过慢时再调整。",
+            expanded=False,
+        )
+        adv_form = QFormLayout()
+        adv_form.setSpacing(Spacing.SM)
+
+        startup_timeout = QDoubleSpinBox()
+        startup_timeout.setRange(0.0, 30.0)
+        startup_timeout.setSingleStep(0.5)
+        startup_timeout.setValue(_cfg().startup_connect_timeout_seconds)
+        startup_timeout.setSuffix(" 秒")
+        startup_timeout.setToolTip("Runtime 启动时最多等待 NapCat 首次连接的时间；超过后后台继续重连。")
+        startup_timeout.editingFinished.connect(
+            lambda s=startup_timeout: self._on_adapter_field_changed(
+                _cfg(), "startup_connect_timeout_seconds", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("启动等待连接"), startup_timeout)
+
+        api_wait = QDoubleSpinBox()
+        api_wait.setRange(0.0, 30.0)
+        api_wait.setSingleStep(0.5)
+        api_wait.setValue(_cfg().api_wait_connected_timeout_seconds)
+        api_wait.setSuffix(" 秒")
+        api_wait.setToolTip("调用 OneBot API 前等待连接建立的最长时间。0 表示不等待。")
+        api_wait.editingFinished.connect(
+            lambda s=api_wait: self._on_adapter_field_changed(
+                _cfg(), "api_wait_connected_timeout_seconds", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("API 前等待连接"), api_wait)
+
+        api_timeout = QDoubleSpinBox()
+        api_timeout.setRange(1.0, 300.0)
+        api_timeout.setSingleStep(5.0)
+        api_timeout.setValue(_cfg().api_timeout_seconds)
+        api_timeout.setSuffix(" 秒")
+        api_timeout.setToolTip("单次 OneBot API 调用的超时。")
+        api_timeout.editingFinished.connect(
+            lambda s=api_timeout: self._on_adapter_field_changed(
+                _cfg(), "api_timeout_seconds", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("API 超时"), api_timeout)
+
+        fast_attempts = QSpinBox()
+        fast_attempts.setRange(0, 50)
+        fast_attempts.setValue(_cfg().fast_reconnect_attempts)
+        fast_attempts.setToolTip("断线后的快速重试次数。")
+        fast_attempts.editingFinished.connect(
+            lambda s=fast_attempts: self._on_adapter_field_changed(
+                _cfg(), "fast_reconnect_attempts", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("快速重试次数"), fast_attempts)
+
+        fast_interval = QDoubleSpinBox()
+        fast_interval.setRange(0.0, 10.0)
+        fast_interval.setSingleStep(0.1)
+        fast_interval.setValue(_cfg().fast_reconnect_interval_seconds)
+        fast_interval.setSuffix(" 秒")
+        fast_interval.setToolTip("快速重试阶段每次等待多久。")
+        fast_interval.editingFinished.connect(
+            lambda s=fast_interval: self._on_adapter_field_changed(
+                _cfg(), "fast_reconnect_interval_seconds", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("快速重试间隔"), fast_interval)
+
+        reconnect_interval = QDoubleSpinBox()
+        reconnect_interval.setRange(0.1, 120.0)
+        reconnect_interval.setSingleStep(0.5)
+        reconnect_interval.setValue(_cfg().reconnect_interval_seconds)
+        reconnect_interval.setSuffix(" 秒")
+        reconnect_interval.setToolTip("快速重试结束后的指数退避起点。")
+        reconnect_interval.editingFinished.connect(
+            lambda s=reconnect_interval: self._on_adapter_field_changed(
+                _cfg(), "reconnect_interval_seconds", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("慢速重连起点"), reconnect_interval)
+
+        backoff_max = QDoubleSpinBox()
+        backoff_max.setRange(1.0, 600.0)
+        backoff_max.setSingleStep(5.0)
+        backoff_max.setValue(_cfg().reconnect_backoff_max_seconds)
+        backoff_max.setSuffix(" 秒")
+        backoff_max.setToolTip("指数退避的最大等待时间。")
+        backoff_max.editingFinished.connect(
+            lambda s=backoff_max: self._on_adapter_field_changed(
+                _cfg(), "reconnect_backoff_max_seconds", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("退避上限"), backoff_max)
+
+        jitter = QDoubleSpinBox()
+        jitter.setRange(0.0, 10.0)
+        jitter.setSingleStep(0.1)
+        jitter.setValue(_cfg().reconnect_jitter_seconds)
+        jitter.setSuffix(" 秒")
+        jitter.setToolTip("慢速重连等待的随机抖动上限，避免固定节拍重试。")
+        jitter.editingFinished.connect(
+            lambda s=jitter: self._on_adapter_field_changed(
+                _cfg(), "reconnect_jitter_seconds", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("重连抖动"), jitter)
+
+        max_reconnect = QSpinBox()
+        max_reconnect.setRange(-1, 100000)
+        max_reconnect.setValue(_cfg().max_reconnect_attempts)
+        max_reconnect.setSpecialValueText("无限")
+        max_reconnect.setToolTip("-1 表示无限重连。")
+        max_reconnect.editingFinished.connect(
+            lambda s=max_reconnect: self._on_adapter_field_changed(
+                _cfg(), "max_reconnect_attempts", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("最大重连次数"), max_reconnect)
+
+        ping_interval = QDoubleSpinBox()
+        ping_interval.setRange(1.0, 300.0)
+        ping_interval.setSingleStep(5.0)
+        ping_interval.setValue(_cfg().ping_interval_seconds)
+        ping_interval.setSuffix(" 秒")
+        ping_interval.setToolTip("WebSocket ping 间隔。")
+        ping_interval.editingFinished.connect(
+            lambda s=ping_interval: self._on_adapter_field_changed(
+                _cfg(), "ping_interval_seconds", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("Ping 间隔"), ping_interval)
+
+        ping_timeout = QDoubleSpinBox()
+        ping_timeout.setRange(1.0, 300.0)
+        ping_timeout.setSingleStep(5.0)
+        ping_timeout.setValue(_cfg().ping_timeout_seconds)
+        ping_timeout.setSuffix(" 秒")
+        ping_timeout.setToolTip("WebSocket ping 未响应多久判定断线。")
+        ping_timeout.editingFinished.connect(
+            lambda s=ping_timeout: self._on_adapter_field_changed(
+                _cfg(), "ping_timeout_seconds", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("Ping 超时"), ping_timeout)
+
+        warmup = QDoubleSpinBox()
+        warmup.setRange(0.0, 60.0)
+        warmup.setSingleStep(0.5)
+        warmup.setValue(_cfg().process_warmup_seconds)
+        warmup.setSuffix(" 秒")
+        warmup.setToolTip("托管 NapCat 进程启动后，连接前等待的时间。")
+        warmup.editingFinished.connect(
+            lambda s=warmup: self._on_adapter_field_changed(
+                _cfg(), "process_warmup_seconds", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("托管进程预热"), warmup)
+
+        voice_delay = QDoubleSpinBox()
+        voice_delay.setRange(0.0, 8.0)
+        voice_delay.setSingleStep(0.5)
+        voice_delay.setValue(_cfg().voice_fetch_delay_seconds)
+        voice_delay.setSuffix(" 秒")
+        voice_delay.setToolTip("调用 NapCat 语音转文字前先等待多久。")
+        voice_delay.editingFinished.connect(
+            lambda s=voice_delay: self._on_adapter_field_changed(
+                _cfg(), "voice_fetch_delay_seconds", s.value()
+            )
+        )
+        adv_form.addRow(QLabel("语音转写等待"), voice_delay)
+
+        advanced.add_layout(adv_form)
+        card.add_content(advanced)
+
         # 白名单（hot，立即生效）
         sep = QFrame()
         sep.setProperty("role", "separator")
@@ -2556,6 +3176,154 @@ class SettingsPage(QWidget):
         card.add_content(self._build_embedding_card())
         return card
 
+    def _build_software_behavior_section(self) -> SectionCard:
+        card = SectionCard(
+            title="软件行为",
+            subtitle="界面主题、消息节奏、主动思考和陌生人限速。常用项在上方，高风险项保持收起前的简洁说明。",
+        )
+        card.add_content(self._build_appearance_section())
+
+        b = self._cfg().behavior
+        form = QFormLayout()
+        form.setSpacing(Spacing.SM)
+
+        merge_spin = QDoubleSpinBox()
+        merge_spin.setRange(0.0, 60.0)
+        merge_spin.setSingleStep(0.5)
+        merge_spin.setValue(b.merge_window_seconds)
+        merge_spin.setSuffix(" 秒")
+        merge_spin.setToolTip("同一窗口内收到的连续消息会合并成一次模型调用。")
+        merge_spin.editingFinished.connect(
+            lambda: self._on_behavior_field("merge_window_seconds", merge_spin.value())
+        )
+        form.addRow(QLabel("消息合并窗口"), merge_spin)
+
+        recall_spin = QDoubleSpinBox()
+        recall_spin.setRange(0.0, 60.0)
+        recall_spin.setSingleStep(0.5)
+        recall_spin.setValue(b.recall_merge_window_seconds)
+        recall_spin.setSuffix(" 秒")
+        recall_spin.setToolTip("撤回事件在该时间内合并处理，避免频繁打断。")
+        recall_spin.editingFinished.connect(
+            lambda: self._on_behavior_field("recall_merge_window_seconds", recall_spin.value())
+        )
+        form.addRow(QLabel("撤回合并窗口"), recall_spin)
+
+        hist_spin = QSpinBox()
+        hist_spin.setRange(1, 1000)
+        hist_spin.setValue(b.default_history_fetch_count)
+        hist_spin.setToolTip("总结工具默认拉取的历史条数。")
+        hist_spin.editingFinished.connect(
+            lambda: self._on_behavior_field("default_history_fetch_count", hist_spin.value())
+        )
+        form.addRow(QLabel("默认拉历史条数"), hist_spin)
+
+        chars_spin = QDoubleSpinBox()
+        chars_spin.setRange(0.1, 50.0)
+        chars_spin.setSingleStep(0.5)
+        chars_spin.setValue(b.typing.chars_per_second)
+        chars_spin.setToolTip("影响分条发送时模拟打字的等待时间。")
+        chars_spin.editingFinished.connect(
+            lambda: self._on_behavior_nested("typing", "chars_per_second", chars_spin.value())
+        )
+        form.addRow(QLabel("打字速度（字/秒）"), chars_spin)
+
+        card.add_layout(form)
+
+        proactive_section = CollapsibleSection(
+            "主动思考",
+            "后台定时判断是否需要主动开口。频率越高，成本越高。",
+            expanded=False,
+        )
+        proactive_hint = QLabel("主动思考会定时判断是否需要主动开口。频率越高，成本越高。")
+        proactive_hint.setProperty("role", "secondary")
+        proactive_hint.setWordWrap(True)
+        proactive_section.add_content(proactive_hint)
+
+        proactive_form = QFormLayout()
+        proactive_form.setSpacing(Spacing.SM)
+        proactive_spin = QDoubleSpinBox()
+        proactive_spin.setRange(10.0, 86400.0)
+        proactive_spin.setSingleStep(60.0)
+        proactive_spin.setValue(b.proactive_think_interval_seconds)
+        proactive_spin.setSuffix(" 秒")
+        proactive_spin.editingFinished.connect(
+            lambda: self._on_behavior_field("proactive_think_interval_seconds", proactive_spin.value())
+        )
+        proactive_form.addRow(QLabel("主动思考间隔"), proactive_spin)
+
+        proactive_budget = QSpinBox()
+        proactive_budget.setRange(1024, 65536)
+        proactive_budget.setSingleStep(1024)
+        proactive_budget.setValue(b.proactive_context_token_budget)
+        proactive_budget.setSuffix(" token")
+        proactive_budget.setToolTip("主动思考路由器读取近期上下文和记忆的预算。默认 4K。")
+        proactive_budget.editingFinished.connect(
+            lambda: self._on_behavior_field("proactive_context_token_budget", proactive_budget.value())
+        )
+        proactive_form.addRow(QLabel("主动思考上下文"), proactive_budget)
+        proactive_section.add_layout(proactive_form)
+        card.add_content(proactive_section)
+
+        rate_section = CollapsibleSection(
+            "陌生人限速",
+            "控制未加入白名单的会话成本。好友和管理员不受此限制。",
+            expanded=False,
+        )
+        rate_hint = QLabel("陌生人限速用于控制未加入白名单的会话成本。")
+        rate_hint.setProperty("role", "secondary")
+        rate_hint.setWordWrap(True)
+        rate_section.add_content(rate_hint)
+
+        rate_form = QFormLayout()
+        rate_form.setSpacing(Spacing.SM)
+        rl_chk = QCheckBox("启用速率限制（非好友）")
+        rl_chk.setChecked(b.rate_limit.enabled)
+        rl_chk.toggled.connect(lambda on: self._on_behavior_nested("rate_limit", "enabled", on))
+        rate_form.addRow(QLabel("速率限制"), rl_chk)
+
+        rl_window = QSpinBox()
+        rl_window.setRange(1, 3600)
+        rl_window.setValue(b.rate_limit.window_seconds)
+        rl_window.setSuffix(" 秒")
+        rl_window.editingFinished.connect(lambda: self._on_behavior_nested("rate_limit", "window_seconds", rl_window.value()))
+        rate_form.addRow(QLabel("窗口"), rl_window)
+
+        rl_max = QSpinBox()
+        rl_max.setRange(1, 1000)
+        rl_max.setValue(b.rate_limit.max_messages)
+        rl_max.setSuffix(" 条")
+        rl_max.editingFinished.connect(lambda: self._on_behavior_nested("rate_limit", "max_messages", rl_max.value()))
+        rate_form.addRow(QLabel("最多条数"), rl_max)
+        rate_section.add_layout(rate_form)
+        card.add_content(rate_section)
+
+        return card
+
+    def _build_diagnostics_section(self) -> SectionCard:
+        card = SectionCard(
+            title="日志与诊断",
+            subtitle="日志级别和诊断入口。过于详细的日志建议只在排查问题时临时开启 DEBUG。",
+        )
+
+        form = QFormLayout()
+        form.setSpacing(Spacing.SM)
+        log_combo = QComboBox()
+        for lvl in ("DEBUG", "INFO", "WARNING", "ERROR"):
+            log_combo.addItem(lvl, lvl)
+        idx = log_combo.findData(self._cfg().app.log_level)
+        if idx >= 0:
+            log_combo.setCurrentIndex(idx)
+        log_combo.currentIndexChanged.connect(lambda *_: self._on_log_level_changed(log_combo.currentData()))
+        form.addRow(QLabel("日志级别"), log_combo)
+        card.add_layout(form)
+
+        diag = QLabel("KV 缓存、工具输出和启动耗时诊断由测试与日志页面查看。需要排查时先切到 DEBUG，完成后改回 INFO。")
+        diag.setProperty("role", "secondary")
+        diag.setWordWrap(True)
+        card.add_content(diag)
+        return card
+
     def _build_token_budget_section(self) -> SectionCard:
         card = SectionCard(
             title="Token预算",
@@ -2567,13 +3335,26 @@ class SettingsPage(QWidget):
         b = self._cfg().behavior
 
         hint = QLabel(
-            "工作上下文控制每轮最多放入多少历史和记忆；输出预留留给模型回复；"
-            "工具预算按工具分别控制，资料过长时会写入 workspace artifact。"
+            "工作上下文控制每轮最多放入多少历史和记忆；输出预留留给模型回复。"
+            "工具预算按工具分别控制，资料过长时会写入 workspace artifact，不会把不完整正文当完整内容给模型。"
         )
         hint.setProperty("role", "secondary")
         hint.setWordWrap(True)
         card.add_content(hint)
 
+        action_row = QHBoxLayout()
+        restore_btn = QPushButton("恢复推荐 Token 预算")
+        restore_btn.setProperty("role", "secondary")
+        restore_btn.clicked.connect(self._restore_default_tool_budgets)
+        action_row.addStretch(1)
+        action_row.addWidget(restore_btn)
+        card.add_layout(action_row)
+
+        context_section = CollapsibleSection(
+            "上下文总预算",
+            "控制每轮可放入的历史、记忆、摘要和默认工具结果预算。通常使用推荐值即可。",
+            expanded=False,
+        )
         context_form = QFormLayout()
         context_form.setSpacing(Spacing.SM)
 
@@ -2640,26 +3421,62 @@ class SettingsPage(QWidget):
         )
         context_form.addRow(QLabel("未列出工具硬上限默认"), default_hard)
 
-        card.add_layout(context_form)
+        context_section.add_layout(context_form)
+        card.add_content(context_section)
 
-        tool_title = QLabel("按工具结果预算")
-        tool_title.setProperty("role", "title-3")
-        card.add_content(tool_title)
+        tool_section = CollapsibleSection(
+            "按工具结果预算",
+            "每个工具单独控制 inline / artifact / hard 上限。建议只在确认工具输出不够用时调整。",
+            expanded=False,
+        )
         tool_hint = QLabel(
             "inline 是直接回传给模型的预算；artifact 是资料型工具改写文件的阈值；"
             "hard 是事故兜底上限。留空 artifact/hard 表示按 inline 或默认硬上限处理。"
         )
         tool_hint.setProperty("role", "secondary")
         tool_hint.setWordWrap(True)
-        card.add_content(tool_hint)
+        tool_section.add_content(tool_hint)
 
         defaults = default_tool_result_budgets()
         budgets = b.context.tool_result_budgets
-        for tool_name in sorted(defaults):
-            budget = budgets.get(tool_name) or defaults[tool_name]
-            if tool_name not in budgets:
-                budgets[tool_name] = budget
-            card.add_content(self._build_tool_budget_row(tool_name, budget))
+        grouped_tools = {
+            "消息动作": [
+                "send_private_messages",
+                "send_group_message",
+                "send_voice_message",
+                "upload_file",
+                "recall_message",
+                "set_friend_add_request",
+                "set_group_add_request",
+                "no_action",
+                "schedule_wakeup",
+            ],
+            "查询工具": ["list_contacts", "get_user_info", "get_weather", "web_search"],
+            "资料工具": [
+                "describe_image",
+                "read_file",
+                "run_python",
+                "get_forward_msg",
+                "recall_history",
+                "get_recent_chat_messages",
+            ],
+            "子 Agent": ["start_agent_task", "summarize_chat_history", "summarize_conversation"],
+        }
+        for group_name, tool_names in grouped_tools.items():
+            group_section = CollapsibleSection(
+                group_name,
+                _tool_budget_group_hint(group_name),
+                expanded=False,
+            )
+            for tool_name in tool_names:
+                if tool_name not in defaults:
+                    continue
+                budget = budgets.get(tool_name) or defaults[tool_name]
+                if tool_name not in budgets:
+                    budgets[tool_name] = budget
+                group_section.add_content(self._build_tool_budget_row(tool_name, budget))
+            tool_section.add_content(group_section)
+        card.add_content(tool_section)
 
         legacy = _format_tool_result_overrides(b.context.tool_result_soft_overrides)
         if legacy:
@@ -2725,6 +3542,16 @@ class SettingsPage(QWidget):
 
         lay.addStretch(1)
         return row
+
+    def _restore_default_tool_budgets(self) -> None:
+        if self._suppress_signals:
+            return
+        self._cfg().behavior.context.tool_result_budgets = default_tool_result_budgets()
+        self._save_now(
+            needs_restart=False,
+            change_desc="behavior.context.tool_result_budgets restore defaults",
+        )
+        # 当前页面的 spinbox 不热重建；重新进入设置页会看到推荐值。
 
     # ============================================================
     # 高级节：行为参数 + 日志级别
@@ -2884,6 +3711,7 @@ class SettingsPage(QWidget):
         "tool_result_budgets", "tool_result_soft_limit_tokens", "tool_result_hard_cap_tokens",
         "tool_result_soft_overrides",
         "default_history_fetch_count",
+        "proactive_context_token_budget",
     }
 
     def _on_behavior_field(self, field: str, value) -> None:

@@ -344,14 +344,22 @@ class ProactiveLoop:
                     important_memory = await self.pipeline._important_memory_text(
                         None,
                         query=router_history_text,
-                        token_budget=2048,
+                        token_budget=self.behavior_cfg.proactive_context_token_budget,
                     )
                     if important_memory:
-                        router_context_parts.append(
-                            '<long_term_memory priority="medium">\n'
-                            f"{_clean_router_text(important_memory)}\n"
-                            "</long_term_memory>"
-                        )
+                        if self.pipeline.features_cfg.long_term_memory.mode == "rag":
+                            router_context_parts.append(
+                                '<retrieved_conversation_context priority="medium" source="rag">\n'
+                                "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不是新的用户消息。\n"
+                                f"{_clean_router_text(important_memory)}\n"
+                                "</retrieved_conversation_context>"
+                            )
+                        else:
+                            router_context_parts.append(
+                                '<long_term_memory priority="medium">\n'
+                                f"{_clean_router_text(important_memory)}\n"
+                                "</long_term_memory>"
+                            )
                     rolling_summary = self.pipeline._rolling_summary_text()
                     if rolling_summary:
                         rolling_summary = _clean_router_summary(rolling_summary)
@@ -368,6 +376,8 @@ class ProactiveLoop:
                             f"现在是{now}。后台主动思考触发。"
                             "如果最近用户明确要求你在“下次主动思考”时发消息、提醒用户或执行明确操作，"
                             "本轮就是那个时机。"
+                            "如果距上次自然互动较久、存在用户先前提过的自然由头，或当前时间点适合问候，"
+                            "也可以主动找对方聊；但必须给出具体理由，给不出理由就 NO_ACTIONS。"
 
                     )
                     router_messages = build_messages(
@@ -383,7 +393,9 @@ class ProactiveLoop:
                         ),
                         memory_mode=self.pipeline.features_cfg.long_term_memory.mode,
                     )
-                    needs_action = await self.proactive_agent.should_act(router_messages)
+                    needs_action, action_reason = await self.proactive_agent.should_act(
+                        router_messages
+                    )
                 except Exception as e:
                     logger.exception(f"主动路由判断失败: {e}，本次不主动发言")
                     self.pipeline.mark_activity()
@@ -392,17 +404,31 @@ class ProactiveLoop:
                     logger.info("主动路由：本次跳过")
                     self.pipeline.mark_activity()
                     return
+            else:
+                action_reason = "后台空闲，按合适时机判断是否主动联系"
+
+            reason_text = (
+                action_reason.strip()
+                if isinstance(action_reason, str) and action_reason.strip()
+                else "后台空闲，按合适时机判断是否主动联系"
+            )
 
             task_context = (
                 "<proactive_turn priority=\"critical\">\n"
                 f"现在是{now}。本轮由系统后台主动思考触发，不是用户刚发来的新消息。\n"
+                f"本轮触发理由：{reason_text}\n"
                 "请根据近期上下文、重要记忆、滚动摘要和未完成事项判断是否需要主动行动。\n"
                 "如果有人要求你在之后、下次空闲或下次主动思考时执行某事，本轮就是可执行时机；"
                 "只处理仍未完成且仍有意义的事项。\n"
+                "如果这是合适的主动问候时机，可以按系统提示中的自然开场习惯起一个话头。\n"
                 "需要联系用户就调用发送工具；没有需要执行的事就调用 no_action。\n"
                 "</proactive_turn>"
             )
-            await self.pipeline.run_one_turn(task_context, lock_already_held=True)
+            await self.pipeline.run_one_turn(
+                task_context,
+                lock_already_held=True,
+                history_conversation_id="system:proactive",
+            )
         finally:
             self.pipeline.reply_lock.release()
 

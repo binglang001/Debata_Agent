@@ -98,8 +98,16 @@ def build_combined_system_prompt(
     # 7. QQ 格式参考（最末，方便模型查询）
     parts.append(QQ_FORMAT_REFERENCE.strip())
 
-    # 8. 重要记忆（中等稳定，放在末尾，整体替换时只影响末尾 token）
+    # 8. 重要记忆 / RAG 检索上下文（中等稳定，放在末尾，整体替换时只影响末尾 token）
     if important_memory_text:
+        if memory_mode == "rag":
+            parts.append(
+                f'<retrieved_conversation_context priority="medium" source="rag">\n'
+                "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不代表新的用户消息。\n"
+                f"{important_memory_text.strip()}\n"
+                f"</retrieved_conversation_context>"
+            )
+            return "\n\n".join(parts)
         parts.append(
             f'<long_term_memory priority="medium">\n'
             f"{important_memory_text.strip()}\n"

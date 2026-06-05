@@ -266,6 +266,31 @@ class MessageBatch:
             self._pending = remaining
             return matched
 
+    async def remove_by_message_ids(
+        self,
+        message_ids: set[str],
+        *,
+        conversation_id: str | None = None,
+    ) -> list[PendingMessageItem]:
+        """从待处理队列移除已撤回的消息，返回被移除项。"""
+        if not message_ids:
+            return []
+        normalized = {str(mid) for mid in message_ids if str(mid)}
+        if not normalized:
+            return []
+        async with self._lock:
+            removed: list[PendingMessageItem] = []
+            remaining: list[PendingMessageItem] = []
+            for item in self._pending:
+                if str(item.message_id) in normalized and (
+                    conversation_id is None or item.conversation_id == conversation_id
+                ):
+                    removed.append(item)
+                else:
+                    remaining.append(item)
+            self._pending = remaining
+            return removed
+
     async def peek_locked(self) -> list[PendingMessageItem]:
         """需要在外部 `async with batch.lock:` 块内调用。
         用于"在发送前最后检查是否有新消息打断"场景。"""

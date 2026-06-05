@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ValidationError
 
+from adapters.types import FriendInfo, GroupInfo, GroupMemberInfo, UserInfo
 from core.chat_timeline import ChatTimelineMessage, ChatTimelineStore
 from tools import (
     DEFAULT_NO_FEEDBACK_TOOLS,
@@ -100,6 +101,101 @@ class FakeSendAdapter:
         self._next_msg_id += 1
         self.voice_sent.append((target, audio_path))
         return msg_id
+
+
+class FullFakeAdapter(FakeSendAdapter):
+    """覆盖所有平台工具会触达的适配器方法。"""
+
+    async def list_friends(self):
+        return [FriendInfo(user_id="1001", nickname="Alice")]
+
+    async def list_groups(self):
+        return [GroupInfo(group_id="2001", group_name="测试群", member_count=2)]
+
+    async def list_group_members(self, group_id: str):
+        return [
+            GroupMemberInfo(user_id="1001", nickname="Alice", card="AliceCard"),
+            GroupMemberInfo(user_id="1002", nickname="Bob"),
+        ]
+
+    async def get_user_info(self, user_id: str):
+        return UserInfo(user_id=user_id, nickname="Alice", sex="unknown", age=18)
+
+    async def get_forward_msg(self, forward_id: str):
+        if forward_id == "root":
+            return [
+                {
+                    "sender": {"nickname": "Alice", "user_id": "1001"},
+                    "message_id": "f1",
+                    "content": "第一条[CQ:image,summary=[图片],file=a.jpg,url=https://example.com/a.jpg]",
+                },
+                {
+                    "sender": {"nickname": "Bob", "user_id": "1002"},
+                    "message_id": "f2",
+                    "content": "[CQ:forward,id=child]",
+                },
+            ]
+        if forward_id == "child":
+            return [
+                {
+                    "sender": {"nickname": "Carol", "user_id": "1003"},
+                    "message_id": "f3",
+                    "content": "内层消息",
+                }
+            ]
+        return []
+
+    async def handle_friend_request(self, flag: str, approve: bool, remark: str = "") -> None:
+        self.friend_request = {"flag": flag, "approve": approve, "remark": remark}
+
+    async def handle_group_request(
+        self,
+        flag: str,
+        sub_type: str,
+        approve: bool,
+        reason: str = "",
+    ) -> None:
+        self.group_request = {
+            "flag": flag,
+            "sub_type": sub_type,
+            "approve": approve,
+            "reason": reason,
+        }
+
+    async def get_group_history(self, group_id: str, count: int = 100):
+        return [{"message_id": "h1", "raw_message": "群历史", "sender": {"nickname": "A"}}]
+
+    async def recall(self, message_id: str) -> bool:
+        self.recalled = message_id
+        return True
+
+    async def upload_file(self, target, file_path: Path, *, display_name: str | None = None) -> None:
+        self.uploaded = {"target": target, "file_path": file_path, "display_name": display_name}
+
+
+class FakeVision:
+    async def describe(self, image_url: str, prompt: str = ""):
+        return {"summary": "一张测试图片", "description": f"图片={image_url}; 问题={prompt or '-'}"}
+
+
+class FakeWebSearch:
+    async def search(self, query: str) -> str:
+        return f"1. 结果\n摘要\nhttps://example.com/search?q={query}"
+
+
+class FakeWeather:
+    async def query(self, city: str, days: int = 1) -> str:
+        return f"{city} {days} 天天气晴"
+
+
+class FakeTTS:
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+
+    async def synthesize(self, text: str, *, reference_audio=None, prompt: str = "") -> Path:
+        path = self.workspace / "voice.wav"
+        path.write_bytes(b"RIFFfake")
+        return path
 
 
 # ============================================================
@@ -323,6 +419,295 @@ def test_registry_upload_file_can_be_disabled():
     cfg = _make_config()
     reg = build_default_registry(cfg, include_upload_file=False)
     assert "upload_file" not in reg
+
+
+@pytest.mark.asyncio
+async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
+    """逐个调用所有工具，检查真实执行链路下的返回结构足够清晰。"""
+    from memory import ArchiveStore, HistoryManager, ImportantMemoryManager
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "note.txt").write_text("old line\nsecond line\n", encoding="utf-8")
+    (workspace / "delete-me.txt").write_text("delete", encoding="utf-8")
+    upload_path = workspace / "report.md"
+    upload_path.write_text("# report\n", encoding="utf-8")
+
+    history = HistoryManager(tmp_path / "history.jsonl")
+    await history.load()
+    await history.add_user_message(
+        "历史消息",
+        metadata={"timestamp": "2026-06-01 12:00:00"},
+        conversation_id="private:123",
+    )
+    archive = ArchiveStore(tmp_path / "archive.jsonl")
+    await archive.load()
+    await archive.append_many(
+        [
+            {
+                "role": "user",
+                "content": "归档消息 keyword",
+                "conversation_id": "private:123",
+                "metadata": {"timestamp": "2026-06-01 11:00:00"},
+            }
+        ]
+    )
+    important = ImportantMemoryManager(tmp_path / "important.json")
+    await important.load()
+
+    timeline = ChatTimelineStore()
+    timeline.append(_timeline_message("m1", "最近消息"))
+    wakeups: list[dict] = []
+    agent_tasks: list[dict] = []
+    sent_actions: list[dict] = []
+
+    async def fake_wakeup(delay_seconds, reminder, target, mode, message_text):
+        wakeups.append(
+            {
+                "delay_seconds": delay_seconds,
+                "reminder": reminder,
+                "target": target,
+                "mode": mode,
+                "message_text": message_text,
+            }
+        )
+
+    async def fake_agent_task(payload):
+        agent_tasks.append(payload)
+        return {
+            "ok": True,
+            "status": "completed",
+            "task_id": "agent-test",
+            "brief": "子 Agent 已完成。",
+            "result_file": "agent_tasks/agent-test/result.md",
+            "content": "子 Agent 结果",
+            "summary": "子 Agent 结果",
+        }
+
+    async def fake_send_actions(actions, source_tool):
+        sent_actions.append({"source_tool": source_tool, "actions": actions})
+        return {
+            "ok": True,
+            "status": "sent",
+            "brief": f"模拟发送 {len(actions)} 条消息，QQ 可见。",
+            "qq_visible": True,
+            "send_id": "send-test",
+            "count": len(actions),
+            "sent": [
+                {
+                    "conversation_id": f"{a['target_scope']}:{a['target_id']}",
+                    "msg_id": f"msg-{idx}",
+                    "order": a.get("order", idx),
+                    "qq_visible": True,
+                }
+                for idx, a in enumerate(actions, start=1)
+            ],
+            "sent_messages": [
+                {
+                    "conversation_id": f"{a['target_scope']}:{a['target_id']}",
+                    "content": a.get("label") or a.get("content") or "",
+                    "qq_visible": True,
+                }
+                for a in actions
+            ],
+        }
+
+    adapter = FullFakeAdapter()
+    ctx = ToolContext(
+        adapter=adapter,
+        important=important,
+        conversation_id="private:123",
+        history=history,
+        archive=archive,
+        vision=FakeVision(),
+        web_search=FakeWebSearch(),
+        weather=FakeWeather(),
+        tts=FakeTTS(workspace),
+        wakeup_cb=fake_wakeup,
+        workspace_dir=workspace,
+        send_actions_cb=fake_send_actions,
+        agent_task_cb=fake_agent_task,
+        extras={
+            "chat_timeline": timeline,
+            "default_reply_target": {"target_type": "private", "target_id": 123},
+            "latest_user_message": "帮我测试工具",
+        },
+    )
+    reg = ToolRegistry(get_default_specs())
+    executor = reg.get_executor(ctx)
+
+    calls: dict[str, dict] = {
+        "start_agent_task": {
+            "prompt": "读取资料并写出结果",
+            "sources": [{"type": "inline_text", "value": "资料"}],
+            "output_format": "markdown",
+            "output_name": "result.md",
+            "max_loops": 5,
+        },
+        "no_action": {},
+        "schedule_wakeup": {
+            "delay_seconds": 1,
+            "mode": "send_message",
+            "message_text": "提醒",
+        },
+        "describe_image": {"image_url": "https://example.com/a.jpg", "question": "看图"},
+        "web_search": {"query": "Debata"},
+        "get_weather": {"city": "北京", "days": 1},
+        "send_voice_message": {
+            "target_type": "private",
+            "target_id": 123,
+            "text": "语音测试",
+            "prompt": "年轻女性，自然口语",
+        },
+        "save_important_memory": {"memory_text": "用户喜欢红茶"},
+        "delete_important_memory": {"keyword": "红茶"},
+        "send_private_messages": {
+            "targets": [{"target_qq": 123, "content": "你好", "order": 1}],
+            "send_only": True,
+        },
+        "send_group_message": {
+            "group_id": 456,
+            "targets": [{"content": "群消息", "order": 1}],
+            "send_only": True,
+        },
+        "recall_message": {"message_id": 100},
+        "upload_file": {
+            "target_type": "private",
+            "target_id": 123,
+            "file_path": "report.md",
+        },
+        "list_contacts": {"scope": "friends", "limit": 10},
+        "get_user_info": {"user_id": 1001},
+        "get_forward_msg": {"forward_id": "root", "recursive": True, "max_depth": 2},
+        "get_recent_chat_messages": {"conversation_id": "private:123", "limit": 10},
+        "set_friend_add_request": {"flag": "friend-flag", "approve": True, "remark": "A"},
+        "set_group_add_request": {
+            "flag": "group-flag",
+            "sub_type": "add",
+            "approve": False,
+            "reason": "拒绝",
+        },
+        "summarize_chat_history": {"group_id": 456, "custom_prompt": "总结"},
+        "summarize_conversation": {
+            "conversation_id": "private:123",
+            "range_hint": "2026-06-01",
+            "goal": "总结",
+        },
+        "recall_history": {"conversation_id": "private:123", "keyword": "keyword", "limit": 5},
+        "read_file": {"path": "note.txt", "max_lines": 10},
+        "write_file": {"path": "created.txt", "content": "created"},
+        "edit_file": {"path": "note.txt", "old": "old line", "new": "new line"},
+        "list_files": {"path": ".", "pattern": "*.txt", "limit": 20},
+        "delete_file": {"path": "delete-me.txt"},
+        "run_python": {"code": "print('ok')", "timeout_seconds": 5},
+    }
+    assert set(calls) == {spec.name for spec in get_default_specs()}
+
+    results: dict[str, dict] = {}
+    for name, args in calls.items():
+        result = await executor(name, args)
+        results[name] = result
+        assert isinstance(result, dict), name
+        assert "ok" in result, name
+        if result.get("ok"):
+            assert any(k in result for k in ("brief", "status", "data", "sent", "scheduled", "path")), name
+        encoded = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        assert "_condensed" not in result, name
+        assert len(encoded) < 12000, name
+
+    assert results["get_forward_msg"]["status"] == "artifact"
+    assert results["get_forward_msg"]["artifact"]["path"].startswith("runtime/forwards/")
+    assert results["get_forward_msg"]["data"]["nested_forward_count"] == 1
+    forward_artifact = workspace / results["get_forward_msg"]["artifact"]["path"]
+    forward_tree = json.loads(forward_artifact.read_text(encoding="utf-8"))
+    assert forward_tree["messages"][0]["segments"][1]["url"] == "https://example.com/a.jpg"
+    assert (
+        forward_tree["messages"][1]["segments"][0]["node"]["messages"][0]
+        ["segments"][0]["text"]
+        == "内层消息"
+    )
+
+    assert results["get_recent_chat_messages"]["content"].count("最近消息") == 1
+    assert results["get_recent_chat_messages"]["data"]["range"] == "continuous"
+    assert results["get_recent_chat_messages"]["data"]["last_msg_id"] == "m1"
+
+    assert results["read_file"]["data"]["range"] == "continuous_page"
+    assert "old line" in results["read_file"]["content"]
+
+    assert results["start_agent_task"]["task_id"] == "agent-test"
+    assert results["start_agent_task"]["status"] == "completed"
+    assert results["start_agent_task"]["result_file"] == "agent_tasks/agent-test/result.md"
+    assert agent_tasks[0]["sources"][0]["type"] == "inline_text"
+    assert agent_tasks[0]["max_loops"] == 5
+
+    assert results["no_action"]["no_action"] is True
+    assert results["schedule_wakeup"]["scheduled"] is True
+    assert wakeups[0]["delay_seconds"] == 1
+    assert wakeups[0]["target"] == {"target_type": "private", "target_id": 123}
+    assert "提醒" in wakeups[0]["reminder"]
+
+    assert results["describe_image"]["summary"] == "一张测试图片"
+    assert results["describe_image"]["data"]["image_ref"] == "https://example.com/a.jpg"
+    assert "问题=看图" in results["describe_image"]["description"]
+    assert results["web_search"]["query"] == "Debata"
+    assert "https://example.com/search?q=Debata" in results["web_search"]["result"]
+    assert results["get_weather"]["data"] == {"city": "北京", "days": 1}
+    assert "北京 1 天天气晴" in results["get_weather"]["result"]
+
+    assert results["send_voice_message"]["status"] == "sent"
+    assert results["send_private_messages"]["status"] == "sent"
+    assert results["send_group_message"]["status"] == "sent"
+    assert [
+        item["source_tool"] for item in sent_actions
+    ] == ["send_voice_message", "send_private_messages", "send_group_message"]
+    assert sent_actions[0]["actions"][0]["kind"] == "voice"
+    assert sent_actions[1]["actions"][0]["target_scope"] == "private"
+    assert sent_actions[1]["actions"][0]["content"] == "你好"
+    assert sent_actions[2]["actions"][0]["target_scope"] == "group"
+    assert sent_actions[2]["actions"][0]["target_id"] == "456"
+
+    assert results["save_important_memory"]["saved"] is True
+    assert results["save_important_memory"]["scope"] == "user:123"
+    assert results["delete_important_memory"]["deleted"] == 1
+    assert important.items() == []
+
+    assert results["recall_message"]["data"]["message_id"] == "100"
+    assert adapter.recalled == "100"
+    assert results["upload_file"]["data"]["target_type"] == "private"
+    assert adapter.uploaded["file_path"] == upload_path
+    assert adapter.uploaded["display_name"] == "report.md"
+
+    assert results["list_contacts"]["data"]["scope"] == "friends"
+    assert results["list_contacts"]["friends"][0]["nickname"] == "Alice"
+    assert results["get_user_info"]["data"]["user_id"] == "1001"
+    assert results["get_user_info"]["info"]["nickname"] == "Alice"
+    assert adapter.friend_request == {"flag": "friend-flag", "approve": True, "remark": "A"}
+    assert adapter.group_request == {
+        "flag": "group-flag",
+        "sub_type": "add",
+        "approve": False,
+        "reason": "拒绝",
+    }
+
+    assert results["summarize_chat_history"]["task_id"] == "agent-test"
+    assert agent_tasks[1]["output_name"] == "group_456_summary.md"
+    assert agent_tasks[1]["sources"][0]["data"]["messages"][0]["raw_message"] == "群历史"
+    assert results["summarize_conversation"]["task_id"] == "agent-test"
+    assert agent_tasks[2]["output_name"] == "conversation_summary.md"
+    assert agent_tasks[2]["sources"][0]["conversation_id"] == "private:123"
+    assert results["recall_history"]["count"] == 1
+    assert "归档消息 keyword" in results["recall_history"]["content"]
+
+    assert results["write_file"]["path"] == "created.txt"
+    assert (workspace / "created.txt").read_text(encoding="utf-8") == "created"
+    assert results["edit_file"]["data"]["old_length"] == len("old line")
+    assert (workspace / "note.txt").read_text(encoding="utf-8").startswith("new line")
+    assert results["list_files"]["data"]["count"] >= 1
+    assert any(item["path"] == "created.txt" for item in results["list_files"]["entries"])
+    assert results["delete_file"]["path"] == "delete-me.txt"
+    assert not (workspace / "delete-me.txt").exists()
+    assert results["run_python"]["returncode"] == 0
+    assert results["run_python"]["stdout"].strip() == "ok"
 
 
 def test_registry_no_feedback_names_includes_known():
@@ -713,6 +1098,9 @@ def test_typing_delay_empty():
 
 def test_contains_forbidden_positive():
     assert contains_forbidden("我给 QQ 12345 发的消息")
+    assert contains_forbidden("思考过程\nRAG里提到撤回消息")
+    assert contains_forbidden("<retrieved_conversation_context source=\"rag\">旧消息</retrieved_conversation_context>")
+    assert contains_forbidden("工具结果 · call_123")
 
 
 def test_contains_forbidden_negative():
@@ -1082,6 +1470,37 @@ async def test_get_forward_msg_keeps_parent_when_nested_forward_expired(tmp_path
     nested = tree["messages"][0]["segments"][0]["node"]
     assert nested["status"] == "expired"
     assert nested["forward_id"] == "expired-inner"
+
+
+@pytest.mark.asyncio
+async def test_get_forward_msg_preserves_unescaped_summary_image_url(tmp_path):
+    class Adapter:
+        async def get_forward_msg(self, forward_id: str):
+            return [
+                {
+                    "sender": {"nickname": "Alice"},
+                    "raw_message": (
+                        "[CQ:image,summary=[图片],file=a.jpg,"
+                        "url=https://img.example/a.jpg]"
+                    ),
+                }
+            ]
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext(adapter=Adapter(), workspace_dir=workspace))
+
+    result = await executor("get_forward_msg", {"forward_id": "outer"})
+
+    assert result["ok"] is True
+    path = workspace / result["artifact"]["path"]
+    tree = json.loads(path.read_text(encoding="utf-8"))
+    segment = tree["messages"][0]["segments"][0]
+    assert segment["summary"] == "[图片]"
+    assert segment["file"] == "a.jpg"
+    assert segment["url"] == "https://img.example/a.jpg"
 
 
 @pytest.mark.asyncio
@@ -1662,7 +2081,13 @@ async def test_summarize_conversation_starts_agent_task(tmp_path):
 
     async def fake_agent_task(payload):
         calls.append(payload)
-        return {"ok": True, "status": "queued", "task_id": "agent-test"}
+        return {
+            "ok": True,
+            "status": "completed",
+            "task_id": "agent-test",
+            "result_file": "agent_tasks/agent-test/result.md",
+            "content": "茶会总结",
+        }
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
@@ -1680,7 +2105,7 @@ async def test_summarize_conversation_starts_agent_task(tmp_path):
     )
 
     assert result["ok"] is True
-    assert result["status"] == "queued"
+    assert result["status"] == "completed"
     assert result["task_id"] == "agent-test"
     assert calls
     assert "茶会" in calls[0]["prompt"]
@@ -1695,7 +2120,13 @@ async def test_start_agent_task_requires_prompt_and_calls_runtime():
 
     async def fake_agent_task(payload):
         calls.append(payload)
-        return {"ok": True, "status": "queued", "task_id": "agent-1"}
+        return {
+            "ok": True,
+            "status": "completed",
+            "task_id": "agent-1",
+            "result_file": "agent_tasks/agent-1/result.md",
+            "content": "提取结果",
+        }
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
@@ -1708,6 +2139,7 @@ async def test_start_agent_task_requires_prompt_and_calls_runtime():
             "sources": [{"type": "inline_text", "value": "A: hi"}],
             "output_format": "markdown",
             "max_loops": 30,
+            "timeout_seconds": 900,
         },
     )
 
@@ -1716,6 +2148,7 @@ async def test_start_agent_task_requires_prompt_and_calls_runtime():
     assert calls[0]["prompt"] == "提取对话，保留发送者"
     assert calls[0]["sources"][0]["type"] == "inline_text"
     assert calls[0]["max_loops"] == 30
+    assert calls[0]["timeout_seconds"] == 900
 
 
 # ============================================================

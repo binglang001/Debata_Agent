@@ -76,6 +76,28 @@ def test_inbound_markdown_preserves_image_url_and_forward_id():
     assert "msg_id=m1" in markdown
 
 
+def test_raw_cq_parser_preserves_url_after_unescaped_summary():
+    store = ChatTimelineStore()
+    raw = "[CQ:image,summary=[图片],file=abc.jpg,url=https://example.com/a.png]"
+    store.append_inbound_event(
+        _incoming(
+            message_id="m1",
+            text="[图片]",
+            raw_message=raw,
+            media=[],
+        ),
+        conversation_id="private:123",
+        text="",
+        timestamp=1_780_000_000.0,
+    )
+
+    markdown = store.to_markdown(store.recent("private:123", 10))
+
+    assert "summary=[图片]" in markdown
+    assert "file=abc.jpg" in markdown
+    assert "url=https://example.com/a.png" in markdown
+
+
 def test_sliding_window_keeps_latest_messages_only():
     store = ChatTimelineStore(max_per_conversation=3)
     for idx in range(5):

@@ -179,6 +179,17 @@ async def test_rag_memory_indexes_history_in_background(tmp_path: Path):
                 "content": "群里的茶会安排在周五",
                 "conversation_id": "group:2",
             },
+            {
+                "role": "assistant",
+                "content": "工具型 AI 回复不进 RAG",
+                "tool_calls": [{"id": "tc", "function": {"name": "no_action"}}],
+                "conversation_id": "private:1",
+            },
+            {
+                "role": "assistant",
+                "content": "主动思考内容不进 RAG",
+                "conversation_id": "system:proactive",
+            },
         ]
     )
 
@@ -189,6 +200,8 @@ async def test_rag_memory_indexes_history_in_background(tmp_path: Path):
     out = await service.retrieve_for_query("猫", conversation_id="private:1")
     assert "相关历史 · RAG 召回" in out
     assert "用户说自己喜欢猫" in out
+    assert "工具型 AI 回复" not in out
+    assert "主动思考内容" not in out
     assert "茶会安排" not in out
 
     out_other = await service.retrieve_for_query("猫", conversation_id="private:404")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -108,6 +109,30 @@ async def test_voxcpm2_warmup_is_concurrency_safe(monkeypatch):
     await asyncio.gather(svc.warmup(), svc.warmup(), svc.warmup())
 
     assert calls == 1
+    assert svc._model is model
+    assert svc._ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_voxcpm2_warmup_resolves_device_off_event_loop(monkeypatch):
+    svc = VoxCPM2Service(device="auto")
+    main_thread = threading.current_thread()
+    model = object()
+
+    def fake_select_device():
+        assert threading.current_thread() is not main_thread
+        return "cpu"
+
+    def fake_load(device):
+        assert threading.current_thread() is not main_thread
+        assert device == "cpu"
+        return model
+
+    monkeypatch.setattr(svc, "_select_device", fake_select_device)
+    monkeypatch.setattr(svc, "_load_model_sync", fake_load)
+
+    await svc.warmup()
+
     assert svc._model is model
     assert svc._ready.is_set()
 

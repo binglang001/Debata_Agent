@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 import pytest
@@ -28,6 +29,7 @@ from app_config.schema import AgentConfig
 from providers.base import IProvider
 from providers.protocols.openai_compat import OpenAICompatProvider
 from utils.cache_metrics import MetricsProvider
+from utils.token_budget import TokenEstimator
 
 pytestmark = pytest.mark.live
 
@@ -75,6 +77,52 @@ def _make_agent_cfg() -> AgentConfig:
     )
 
 
+def _prompt_diagnostics(
+    messages: list[dict],
+    *,
+    tools_schema: list[dict] | None = None,
+    label: str = "",
+) -> dict[str, object]:
+    estimator = TokenEstimator()
+    system_text = "\n".join(
+        str(m.get("content") or "") for m in messages if m.get("role") == "system"
+    )
+    current_context_text = "\n".join(
+        str(m.get("content") or "") for m in messages
+        if m.get("role") == "user" and "<current_context" in str(m.get("content") or "")
+    )
+    tools_text = "" if tools_schema is None else repr(tools_schema)
+    return {
+        "label": label,
+        "message_count": len(messages),
+        "roles": [m.get("role") for m in messages],
+        "estimated_prompt_tokens": estimator.estimate_messages(messages),
+        "system_chars": len(system_text),
+        "system_hash": _short_hash(system_text),
+        "current_context_chars": len(current_context_text),
+        "current_context_hash": _short_hash(current_context_text),
+        "tools_count": len(tools_schema or []),
+        "tools_hash": _short_hash(tools_text),
+    }
+
+
+def _short_hash(text: str) -> str:
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _print_prompt_diagnostics(diag: dict[str, object]) -> None:
+    print(
+        "\n[prompt] "
+        f"{diag['label']} messages={diag['message_count']} roles={diag['roles']} "
+        f"est_tokens={diag['estimated_prompt_tokens']} "
+        f"system={diag['system_chars']}#{diag['system_hash']} "
+        f"context={diag['current_context_chars']}#{diag['current_context_hash']} "
+        f"tools={diag['tools_count']}#{diag['tools_hash']}"
+    )
+
+
 # ============================================================
 # 用例 1：连续多轮对话整体命中率
 # ============================================================
@@ -111,6 +159,9 @@ async def test_cache_hit_rate_multi_turn():
                 important_memory_text="",
                 current_context=None,
                 memory_mode="file",
+            )
+            _print_prompt_diagnostics(
+                _prompt_diagnostics(messages, label=f"multi_turn:{i}")
             )
             result = await metrics_provider.chat_completion(
                 messages,
@@ -185,6 +236,9 @@ async def test_task_context_appended_preserves_prefix_cache():
                 current_context=ctx,
                 memory_mode="file",
             )
+            _print_prompt_diagnostics(
+                _prompt_diagnostics(messages, label=f"task_context:{i}")
+            )
             result = await metrics_provider.chat_completion(
                 messages,
                 model=cfg.model,
@@ -251,6 +305,9 @@ async def test_stable_prefix_high_cache_rate():
                 important_memory_text="",
                 current_context=None,
                 memory_mode="file",
+            )
+            _print_prompt_diagnostics(
+                _prompt_diagnostics(messages, label=f"stable_prefix:{i + 1}")
             )
             result = await metrics_provider.chat_completion(
                 messages,
@@ -335,6 +392,13 @@ async def test_tool_definitions_do_not_break_cache():
                 current_context=None,
                 memory_mode="file",
             )
+            _print_prompt_diagnostics(
+                _prompt_diagnostics(
+                    messages,
+                    tools_schema=tools_schema,
+                    label=f"with_tools:{i}",
+                )
+            )
             result = await metrics_provider.chat_completion(
                 messages,
                 model=cfg.model,
@@ -359,6 +423,58 @@ async def test_tool_definitions_do_not_break_cache():
         assert len(good) >= len(samples[1:]) - 1, (
             f"带 tools 参数时非首轮缓存不足：{len(good)}/{len(samples)-1} 轮 > 85%\n"
             f"完整报告：\n{metrics_provider.report.to_text()}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_proactive_context_keeps_stable_prefix_cache():
+    """主动思考 current_context 放在末尾，默认 4K 上下文不应破坏稳定前缀缓存。"""
+    _skip_if_no_key()
+
+    base = _make_deepseek_provider()
+    metrics_provider = MetricsProvider(base)
+    persona = _make_persona()
+    cfg = _make_agent_cfg()
+    history = [
+        {"role": "user", "content": "你下次空闲时提醒我整理聊天样例。"},
+        {"role": "assistant", "content": "好，我会在合适的时候提醒你。"},
+    ]
+    contexts = [
+        "<proactive_turn priority=\"critical\">\n现在是 10:00。后台主动思考触发。\n</proactive_turn>",
+        "<proactive_turn priority=\"critical\">\n现在是 10:10。后台主动思考触发。\n</proactive_turn>",
+        "<proactive_turn priority=\"critical\">\n现在是 10:20。后台主动思考触发。\n</proactive_turn>",
+    ]
+
+    try:
+        for i, ctx in enumerate(contexts, 1):
+            messages = build_messages(
+                persona=persona,
+                history=history,
+                important_memory_text="",
+                current_context=ctx,
+                memory_mode="file",
+            )
+            _print_prompt_diagnostics(
+                _prompt_diagnostics(messages, label=f"proactive:{i}")
+            )
+            result = await metrics_provider.chat_completion(
+                messages,
+                model=cfg.model,
+                tools=None,
+                max_tokens=128,
+                stream=False,
+                timeout=60.0,
+            )
+            history.append({"role": "assistant", "content": result.content or ""})
+    finally:
+        await metrics_provider.aclose()
+
+    print("\n" + metrics_provider.report.to_text())
+    samples = metrics_provider.report.samples
+    if len(samples) >= 2:
+        assert samples[1].hit_rate > 0.8, (
+            "主动思考上下文可能破坏了稳定前缀缓存："
+            f"\n{metrics_provider.report.to_text()}"
         )
 
 

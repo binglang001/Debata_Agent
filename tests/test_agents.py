@@ -28,8 +28,9 @@ from agents.persona_loader import (
     validate_persona_name,
 )
 from agents.proactive_agent import ProactiveRouterAgent, _is_action_decision
+from agents.runner import AgentRunner
 from app_config.schema import AgentConfig
-from providers.base import CompletionResult
+from providers.base import CompletionResult, IProvider, ToolCall, Usage
 
 # ============================================================
 # persona_loader
@@ -132,6 +133,7 @@ def test_tool_use_protocol_file_mode():
 def test_tool_use_protocol_rag_mode():
     s = build_tool_use_protocol("rag")
     assert "RAG 会话向量检索" in s
+    assert "retrieved_conversation_context" in s
     assert "save_important_memory" in s
     assert "没有 save_important_memory" in s
     assert "必须主动保存" not in s
@@ -212,8 +214,11 @@ def test_build_combined_system_prompt_memory_mode_default():
 
 def test_build_combined_system_prompt_rag_mode_no_active_save():
     p = _persona()
-    sys = build_combined_system_prompt(p, memory_mode="rag")
+    sys = build_combined_system_prompt(p, important_memory_text="历史片段", memory_mode="rag")
     assert "RAG 会话向量检索" in sys
+    assert "<retrieved_conversation_context" in sys
+    assert "历史片段" in sys
+    assert "<long_term_memory" not in sys
     assert "save_important_memory" in sys
     assert "没有 save_important_memory" in sys
     assert "必须主动保存" not in sys
@@ -546,8 +551,338 @@ def test_runner_assistant_record_preserves_reasoning_content():
     assert record["reasoning_content"] == "plan"
 
 
+@pytest.mark.asyncio
+async def test_runner_max_loops_adds_no_tool_finalization():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) == 1:
+                return CompletionResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="tc-1",
+                            name="needs_feedback",
+                            arguments="{}",
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                    usage=Usage(prompt_tokens=10),
+                )
+            assert tools is None
+            assert "工具循环达到上限" in messages[-1]["content"]
+            return CompletionResult(
+                content="已达到工具轮数上限，当前只完成了前半部分。",
+                finish_reason="stop",
+                usage=Usage(prompt_tokens=5),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(_name, _args):
+        return {"ok": True, "brief": "done"}
+
+    runner = AgentRunner(
+        FakeProvider(),
+        AgentConfig(provider="fake", model="fake", max_loops=1),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "处理资料"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "needs_feedback",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "max_loops"
+    assert result.final_content == "已达到工具轮数上限，当前只完成了前半部分。"
+    assert result.prompt_tokens == 15
+    assert result.records[-1]["content"] == result.final_content
+
+
+@pytest.mark.asyncio
+async def test_runner_async_agent_task_tools_do_not_finish_as_no_feedback():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) == 1:
+                return CompletionResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="tc-agent",
+                            name="start_agent_task",
+                            arguments='{"prompt":"整理资料"}',
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                    usage=Usage(prompt_tokens=7),
+                )
+            assert messages[-1]["role"] == "tool"
+            assert "agent-test" in messages[-1]["content"]
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(id="tc-na", name="no_action", arguments="{}")
+                ],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=8),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        if name == "start_agent_task":
+            return {
+                "ok": True,
+                "status": "completed",
+                "task_id": "agent-test",
+                "result_file": "agent_tasks/agent-test/result.md",
+                "content": "任务结果",
+            }
+        if name == "no_action":
+            return {"ok": True, "no_action": True}
+        raise AssertionError(name)
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(provider="fake", model="fake", max_loops=3),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "启动后台任务"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "start_agent_task",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "no_action",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "no_action"
+    assert len(provider.calls) == 2
+    assert result.prompt_tokens == 15
+
+
+@pytest.mark.asyncio
+async def test_runner_failed_no_action_does_not_finish_tool_loop():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) == 1:
+                return CompletionResult(
+                    tool_calls=[ToolCall(id="tc-na-fail", name="no_action", arguments="{}")],
+                    finish_reason="tool_calls",
+                    usage=Usage(prompt_tokens=5),
+                )
+            assert "policy_rejected" in messages[-1]["content"]
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_private_messages",
+                        arguments='{"send_only": true, "targets": [{"target_qq": 123, "content": "已处理"}]}',
+                    )
+                ],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=6),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        if name == "no_action":
+            return {"ok": False, "status": "policy_rejected"}
+        if name == "send_private_messages":
+            return {"ok": True, "status": "sent"}
+        raise AssertionError(name)
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(provider="fake", model="fake", max_loops=3),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "交付结果"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "no_action",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "send_private_messages",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "send_only_complete"
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_runner_stop_after_tool_finishes_immediately():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-write",
+                        name="write_file",
+                        arguments='{"path": "result.md", "content": "done"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=5),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        assert name == "write_file"
+        return {"ok": True, "path": "result.md", "stop_after_tool": True}
+
+    runner = AgentRunner(
+        FakeProvider(),
+        AgentConfig(provider="fake", model="fake", max_loops=3),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "写结果"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "tool_stop"
+    assert result.loop_count == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_drops_plain_text_draft_before_retry():
+    leaked_draft = "思考过程\nRAG里提到撤回消息，所以我应该这样回复"
+
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) == 1:
+                return CompletionResult(
+                    content=leaked_draft,
+                    finish_reason="stop",
+                    usage=Usage(prompt_tokens=5),
+                )
+            joined = "\n".join(str(m.get("content") or "") for m in messages)
+            assert leaked_draft not in joined
+            assert "上一轮纯文本已被系统丢弃" in joined
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(id="tc-na", name="no_action", arguments="{}")
+                ],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=6),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        assert name == "no_action"
+        return {"ok": True, "no_action": True}
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(provider="fake", model="fake", max_loops=3),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "不要泄漏内部分析"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "no_action",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "no_action"
+    assert len(provider.calls) == 2
+    assert not any(
+        r.get("role") == "assistant" and r.get("content") == leaked_draft
+        for r in result.records
+    )
+
+
 def test_proactive_router_treats_only_clean_take_actions_as_action():
     assert _is_action_decision("TAKE_ACTIONS") is True
+    assert _is_action_decision("TAKE_ACTIONS: 用户要求下次主动思考时提醒") is True
     assert _is_action_decision(" TAKE_ACTIONS ") is True
     assert _is_action_decision("<｜｜DSML｜｜TOOL_CALLS>\n<｜｜DSML｜｜INVOKE NAME=send_private_messages>") is False
     assert _is_action_decision("两分钟到了，提醒用户。\n\n<｜｜DSML｜｜TOOL_CALLS>") is False
@@ -565,4 +900,18 @@ async def test_proactive_router_provider_dsml_content_returns_false():
         AgentConfig(provider="fake", model="router", max_tokens=64),
     )
 
-    assert await agent.should_act([]) is False
+    assert await agent.should_act([]) == (False, "")
+
+
+@pytest.mark.asyncio
+async def test_proactive_router_returns_reason():
+    class FakeProvider:
+        async def chat_completion(self, *_args, **_kwargs):
+            return CompletionResult(content="TAKE_ACTIONS: 用户要求空闲后提醒他")
+
+    agent = ProactiveRouterAgent(
+        FakeProvider(),
+        AgentConfig(provider="fake", model="router", max_tokens=64),
+    )
+
+    assert await agent.should_act([]) == (True, "用户要求空闲后提醒他")

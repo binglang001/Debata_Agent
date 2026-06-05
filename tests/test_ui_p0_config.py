@@ -62,14 +62,25 @@ def test_settings_feature_dialogs_accept_on_ok(qapp):
     tts = TTSFeatureConfig(
         enabled=True,
         type="api",
-        provider="baidu",
-        extra_credentials={"secret_key": "secret"},
+        provider="xfyun",
+        api_key_id="tts_xfyun",
+        extra_credentials={"app_id": "app", "api_secret": "secret", "voice": "x4_xiaoyan"},
     )
     tts_dlg = _TTSEditDialog(tts)
     tts_dlg._type_combo.setCurrentIndex(tts_dlg._type_combo.findData("api"))
     tts_dlg._on_ok()
     assert tts_dlg.result() == QDialog.DialogCode.Accepted
-    assert tts_dlg.result_data["provider"] == "baidu"
+    assert tts_dlg.result_data["provider"] == "xfyun"
+
+    edge_tts = TTSFeatureConfig(enabled=True, type="api", provider="edge")
+    edge_dlg = _TTSEditDialog(edge_tts)
+    edge_dlg._type_combo.setCurrentIndex(edge_dlg._type_combo.findData("api"))
+    edge_dlg._prov.setCurrentIndex(edge_dlg._prov.findData("edge"))
+    edge_dlg._api_voice.setText("zh-CN-XiaoyiNeural")
+    edge_dlg._on_ok()
+    assert edge_dlg.result() == QDialog.DialogCode.Accepted
+    assert edge_dlg.result_data["provider"] == "edge"
+    assert edge_dlg.result_data["extra_credentials"] == {"voice": "zh-CN-XiaoyiNeural"}
 
     emb = EmbeddingFeatureConfig(
         enabled=True,
@@ -119,10 +130,12 @@ def test_wizard_persist_keeps_asr_tts_api_config(qapp, tmp_paths, fake_keyring):
         ctx.tts.extra = {
             "enabled": True,
             "type": "api",
-            "provider": "baidu",
+            "provider": "xfyun",
             "api_key": "tts-key",
             "extra_credentials": {
-                "secret_key": "tts-secret",
+                "app_id": "tts-app",
+                "api_secret": "tts-secret",
+                "voice": "x4_xiaoyan",
             },
         }
 
@@ -139,10 +152,42 @@ def test_wizard_persist_keeps_asr_tts_api_config(qapp, tmp_paths, fake_keyring):
         assert secrets.get("asr_xfyun") == "asr-key"
 
         assert cfg.features.tts.type == "api"
-        assert cfg.features.tts.provider == "baidu"
-        assert cfg.features.tts.api_key_id == "tts_baidu"
-        assert cfg.features.tts.extra_credentials == {"secret_key": "tts-secret"}
-        assert secrets.get("tts_baidu") == "tts-key"
+        assert cfg.features.tts.provider == "xfyun"
+        assert cfg.features.tts.api_key_id == "tts_xfyun"
+        assert cfg.features.tts.extra_credentials == {
+            "app_id": "tts-app",
+            "api_secret": "tts-secret",
+            "voice": "x4_xiaoyan",
+        }
+        assert secrets.get("tts_xfyun") == "tts-key"
+    finally:
+        win._completed_emitted = True
+        win.close()
+        win.deleteLater()
+
+
+def test_wizard_persist_edge_tts_needs_no_secret(qapp, tmp_paths, fake_keyring):
+    secrets = SecretsManager(tmp_paths)
+    secrets.initialize()
+    win = WizardWindow(tmp_paths, secrets)
+    try:
+        ctx = win._context
+        ctx.main.api_key = "main-key"
+        ctx.tts.enabled = True
+        ctx.tts.extra = {
+            "enabled": True,
+            "type": "api",
+            "provider": "edge",
+            "api_key": "",
+            "extra_credentials": {},
+        }
+
+        win._persist()
+
+        cfg = load_config(tmp_paths, set_global=False)
+        assert cfg.features.tts.type == "api"
+        assert cfg.features.tts.provider == "edge"
+        assert cfg.features.tts.api_key_id is None
     finally:
         win._completed_emitted = True
         win.close()
@@ -205,6 +250,25 @@ def test_wizard_embedding_api_can_use_independent_provider(qapp):
         view.deleteLater()
 
 
+def test_wizard_embedding_default_does_not_reuse_deepseek_main(qapp):
+    from ui.wizard.context import WizardContext
+
+    ctx = WizardContext()
+    ctx.main.preset = "deepseek"
+    ctx.main.model = "deepseek-v4-flash"
+    ctx.embedding_provider = ""
+    view = EmbeddingStepView(ctx)
+    try:
+        view._rb_rag.setChecked(True)
+        view._refresh_provider_choices()
+
+        assert view._api_provider.currentData() == "new:volcengine"
+        assert view._api_model.text() == "doubao-embedding-vision-251215"
+        assert view._api_provider.findData("existing:deepseek_main") < 0
+    finally:
+        view.deleteLater()
+
+
 def test_wizard_embedding_endpoint_recovers_independent_provider_preset(qapp):
     from ui.wizard.context import WizardContext
 
@@ -237,6 +301,7 @@ def test_wizard_embedding_volcengine_uses_current_model(qapp):
         idx = view._api_provider.findData("new:volcengine")
         assert idx >= 0
         view._api_provider.setCurrentIndex(idx)
+        view._on_provider_changed()
 
         assert view._api_model.text() == "doubao-embedding-vision-251215"
     finally:

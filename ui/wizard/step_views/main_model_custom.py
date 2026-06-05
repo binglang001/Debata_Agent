@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...theme import Spacing
+from ...widgets.model_combo import ModelComboBox
 from ..components import ApiKeyInput, SectionCard
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
@@ -91,10 +92,7 @@ class MainModelCustomStepView(BaseStepView):
 
         # 模型（可编辑下拉 + 获取按钮）
         model_row = QHBoxLayout()
-        self._model_combo = QComboBox()
-        self._model_combo.setEditable(True)
-        self._model_combo.setMinimumWidth(280)
-        self._model_combo.setPlaceholderText("点击「获取模型」或手动输入模型 ID")
+        self._model_combo = ModelComboBox()
         self._model_combo.currentTextChanged.connect(lambda *_: self._key_input.set_test_state("idle") if hasattr(self, "_key_input") else None)
         model_row.addWidget(self._model_combo, 1)
         self._fetch_btn = QPushButton("获取模型")
@@ -219,13 +217,18 @@ class MainModelCustomStepView(BaseStepView):
 
         async def _do_fetch():
             try:
-                from providers.model_fetcher import fetch_model_list
+                from providers.model_fetcher import fetch_model_infos
                 from providers.registry import normalize_base_url
                 normalized = normalize_base_url(url, protocol)
-                models = await fetch_model_list(normalized, key, protocol, timeout=8.0)
-                self._model_combo.clear()
-                for m in models:
-                    self._model_combo.addItem(m)
+                models = await fetch_model_infos(
+                    normalized,
+                    key,
+                    protocol,
+                    provider_id=str(preset or ""),
+                    timeout=8.0,
+                )
+                model_ids = [m.id for m in models]
+                self._model_combo.set_models(model_ids, provider_id=str(preset or ""))
                 if models:
                     self._model_combo.setCurrentIndex(0)
                 self._key_input.set_test_state("success", f"已获取 {len(models)} 个模型")
@@ -259,7 +262,7 @@ class MainModelCustomStepView(BaseStepView):
 
     def save(self) -> bool:
         preset = self._provider_combo.currentData()
-        model = self._model_combo.currentText().strip()
+        model = self._model_combo.current_model_id()
         key = self._key_input.text().strip()
         base_url = self._base_url_edit.text().strip()
 
@@ -311,7 +314,7 @@ class MainModelCustomStepView(BaseStepView):
 
     async def _test_current(self) -> tuple[bool, str]:
         preset = self._provider_combo.currentData()
-        model = self._model_combo.currentText().strip() or "test"
+        model = self._model_combo.current_model_id() or "test"
         key = self._key_input.text().strip()
         info = _PRESET_DEFAULTS.get(preset, {})
         url = self._base_url_edit.text().strip() if preset == "custom" else info.get("url", "")

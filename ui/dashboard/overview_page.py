@@ -1,10 +1,10 @@
-"""总览页 —— 4 张卡片。
+"""总览页。
 
 卡片：
-    1. 渠道状态（NapCat 连接、地址、可重连）
+    1. 主模型实时状态
     2. 模型健康（显示 Runtime 启动时的 provider 连通性检测）
-    3. 累计概况（当前可统计的历史条数 / 重要记忆）
-    4. 当前人格（仅显示名称，提示去 personas 页切换）
+    3. 渠道状态（NapCat 连接、地址、可重连）
+    4. 用量统计（请求数 / token / KV 缓存）
 """
 
 from __future__ import annotations
@@ -12,12 +12,15 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -27,6 +30,55 @@ from .copy import DASHBOARD_COPY
 from .layout import STATUS_BADGE_MAP
 
 logger = logging.getLogger(__name__)
+
+
+def _fmt_int(value: int) -> str:
+    return f"{int(value):,}"
+
+
+def _fmt_rate(value: float) -> str:
+    return f"{value * 100:.1f}%"
+
+
+def _provider_badge(ok_count: int, err_count: int, total: int, errors: list[str]) -> tuple[str, str]:
+    if total <= 0:
+        return "未装配", "badge-idle"
+    if err_count <= 0 and ok_count == total:
+        return f"全部可用 {ok_count}/{total}", "badge-success"
+    if ok_count > 0:
+        reason = _dominant_error(errors)
+        return f"部分可用 {ok_count}/{total} · {reason}", "badge-warning"
+    reason = _dominant_error(errors)
+    return f"全部异常 · {reason}", "badge-error"
+
+
+def _dominant_error(errors: list[str]) -> str:
+    if not errors:
+        return "检测中"
+    joined = " ".join(errors)
+    if "鉴权" in joined or "API 密钥" in joined:
+        return "鉴权错误"
+    if "超时" in joined:
+        return "请求超时"
+    if "限流" in joined:
+        return "被限流"
+    if "余额" in joined or "计费" in joined:
+        return "计费异常"
+    if "网络不通" in joined:
+        return "网络异常"
+    if "模型" in joined or "接口不存在" in joined:
+        return "模型异常"
+    return "请求报错"
+
+
+def _activity_face(state: str) -> str:
+    if state == "thinking":
+        return "(思考中)"
+    if state == "tool":
+        return "(调用工具)"
+    if state == "error":
+        return "(出错)"
+    return "(空闲)"
 
 
 class _StatCard(QFrame):
@@ -40,6 +92,7 @@ class _StatCard(QFrame):
         outer.setSpacing(Spacing.SM)
 
         head = QHBoxLayout()
+        self._head = head
         self._title_label = QLabel(title)
         self._title_label.setProperty("role", "title-3")
         head.addWidget(self._title_label)
@@ -50,15 +103,25 @@ class _StatCard(QFrame):
         outer.addLayout(head)
 
         self._body = QVBoxLayout()
-        self._body.setSpacing(Spacing.XS)
+        self._body.setSpacing(Spacing.SM)
         outer.addLayout(self._body)
         outer.addStretch(1)
+        self.setMinimumHeight(150)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def set_badge(self, text: str, role: str = "badge-idle") -> None:
+        if not text:
+            self.clear_badge()
+            return
+        self._right_label.show()
         self._right_label.setText(text)
         self._right_label.setProperty("role", role)
         self._right_label.style().unpolish(self._right_label)
         self._right_label.style().polish(self._right_label)
+
+    def clear_badge(self) -> None:
+        self._right_label.hide()
+        self._right_label.clear()
 
     def clear_body(self) -> None:
         while self._body.count():
@@ -80,12 +143,59 @@ class _StatCard(QFrame):
         wrap.setLayout(row)
         self._body.addWidget(wrap)
 
+    def add_status_line(self, key: str, value: str) -> None:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(Spacing.SM)
+        k = QLabel(key)
+        k.setProperty("role", "secondary")
+        k.setWordWrap(False)
+        row.addWidget(k, 1)
+        v = QLabel(value)
+        v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        v.setWordWrap(False)
+        v.setMinimumWidth(132)
+        row.addWidget(v, 0)
+        wrap = QWidget()
+        wrap.setLayout(row)
+        self._body.addWidget(wrap)
+
+    def add_metric_row(self, items: list[tuple[str, str]]) -> None:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(Spacing.LG)
+        for label, value in items:
+            box = QVBoxLayout()
+            box.setContentsMargins(0, 0, 0, 0)
+            box.setSpacing(Spacing.XS)
+            k = QLabel(label)
+            k.setProperty("role", "secondary")
+            k.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            v = QLabel(value)
+            v.setProperty("role", "title-3")
+            v.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            box.addWidget(k)
+            box.addWidget(v)
+            wrap = QWidget()
+            wrap.setLayout(box)
+            wrap.setMinimumWidth(112)
+            row.addWidget(wrap, 1)
+        outer = QWidget()
+        outer.setLayout(row)
+        self._body.addWidget(outer)
+
     def add_widget(self, w: QWidget) -> None:
         self._body.addWidget(w)
+
+    def set_header_control(self, widget: QWidget) -> None:
+        self._right_label.hide()
+        self._head.addWidget(widget)
 
 
 class OverviewPage(QWidget):
     """4 张卡片的总览页。每 5 秒刷新一次。"""
+
+    _NARROW_WIDTH = 760
 
     def __init__(self, runtime: Any, parent=None) -> None:
         super().__init__(parent)
@@ -93,22 +203,48 @@ class OverviewPage(QWidget):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(Spacing.MD)
+        outer.setSpacing(0)
 
-        grid = QGridLayout()
-        grid.setSpacing(Spacing.MD)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer.addWidget(self._scroll, 1)
+
+        content = QWidget()
+        self._scroll.setWidget(content)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(Spacing.MD)
 
         self._adapter_card = _StatCard(DASHBOARD_COPY["overview.adapter_title"])
         self._providers_card = _StatCard(DASHBOARD_COPY["overview.providers_title"])
-        self._stats_card = _StatCard(DASHBOARD_COPY["overview.stats_title"])
-        self._persona_card = _StatCard(DASHBOARD_COPY["topbar.persona_label"].rstrip("：:"))
+        self._usage_card = _StatCard("用量统计")
+        self._activity_card = _StatCard("主模型状态")
+        self._activity_card.setMinimumHeight(150)
+        self._providers_card.setMinimumHeight(190)
+        self._adapter_card.setMinimumHeight(190)
+        self._usage_card.setMinimumHeight(190)
 
-        grid.addWidget(self._adapter_card, 0, 0)
-        grid.addWidget(self._providers_card, 0, 1)
-        grid.addWidget(self._stats_card, 1, 0)
-        grid.addWidget(self._persona_card, 1, 1)
-        outer.addLayout(grid)
-        outer.addStretch(1)
+        self._usage_range_combo = QComboBox()
+        self._usage_range_combo.addItem("本日", "today")
+        self._usage_range_combo.addItem("7 天", "7d")
+        self._usage_range_combo.addItem("30 天", "30d")
+        self._usage_range_combo.addItem("总计", "all")
+        self._usage_range_combo.currentIndexChanged.connect(lambda *_: self.refresh())
+        self._usage_card.set_header_control(self._usage_range_combo)
+
+        self._middle_row = QWidget()
+        self._middle_grid = QGridLayout(self._middle_row)
+        self._middle_grid.setContentsMargins(0, 0, 0, 0)
+        self._middle_grid.setSpacing(Spacing.MD)
+        self._middle_narrow = False
+
+        content_layout.addWidget(self._activity_card, 1)
+        content_layout.addWidget(self._middle_row, 2)
+        content_layout.addWidget(self._usage_card, 2)
+
+        self._apply_responsive_layout(self.width())
 
         # 5 秒刷新
         self._timer = QTimer(self)
@@ -116,6 +252,32 @@ class OverviewPage(QWidget):
         self._timer.timeout.connect(self.refresh)
         self._timer.start()
         self.refresh()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._apply_responsive_layout(event.size().width())
+
+    def _apply_responsive_layout(self, width: int) -> None:
+        narrow = width < self._NARROW_WIDTH
+        if narrow == self._middle_narrow and self._middle_grid.count():
+            return
+        self._middle_narrow = narrow
+        self._middle_grid.removeWidget(self._providers_card)
+        self._middle_grid.removeWidget(self._adapter_card)
+        if narrow:
+            self._middle_grid.addWidget(self._providers_card, 0, 0)
+            self._middle_grid.addWidget(self._adapter_card, 1, 0)
+            self._middle_grid.setColumnStretch(0, 1)
+            self._middle_grid.setColumnStretch(1, 0)
+            self._middle_grid.setRowStretch(0, 1)
+            self._middle_grid.setRowStretch(1, 1)
+        else:
+            self._middle_grid.addWidget(self._providers_card, 0, 0)
+            self._middle_grid.addWidget(self._adapter_card, 0, 1)
+            self._middle_grid.setColumnStretch(0, 1)
+            self._middle_grid.setColumnStretch(1, 1)
+            self._middle_grid.setRowStretch(0, 1)
+            self._middle_grid.setRowStretch(1, 0)
 
     def refresh(self) -> None:
         rt = self._runtime
@@ -153,10 +315,11 @@ class OverviewPage(QWidget):
             health = getattr(rt, "provider_health", {}) or {}
             ok_count = 0
             err_count = 0
+            errors: list[str] = []
             for name in (rt.providers or {}):
                 item = health.get(name)
                 if item is None:
-                    self._providers_card.add_line(name, "检测中")
+                    self._providers_card.add_status_line(name, "检测中")
                     continue
                 if getattr(item, "status", "") == "ok":
                     ok_count += 1
@@ -164,48 +327,70 @@ class OverviewPage(QWidget):
                     value = f"可用 · {latency}ms" if latency else "可用"
                 else:
                     err_count += 1
-                    value = getattr(item, "message", "无响应")
-                self._providers_card.add_line(name, value)
+                    message = getattr(item, "message", "无响应")
+                    errors.append(message)
+                    value = f"异常 · {_dominant_error([message])}"
+                self._providers_card.add_status_line(name, value)
             if not rt.providers:
-                self._providers_card.add_line("—", "未装配")
+                self._providers_card.add_status_line("—", "未装配")
                 self._providers_card.set_badge("未装配", "badge-idle")
-            elif err_count:
-                self._providers_card.set_badge(
-                    DASHBOARD_COPY["overview.provider_status_error"],
-                    "badge-error",
-                )
-            elif ok_count == len(rt.providers):
-                self._providers_card.set_badge(
-                    DASHBOARD_COPY["overview.provider_status_ok"],
-                    "badge-success",
-                )
             else:
-                self._providers_card.set_badge("检测中", "badge-idle")
+                badge, role = _provider_badge(ok_count, err_count, len(rt.providers), errors)
+                self._providers_card.set_badge(badge, role)
         except Exception as e:  # noqa: BLE001
             self._providers_card.add_line("出错", str(e)[:80])
 
-        # —— 累计概况（当前只显示已能可靠统计的数据）——
-        self._stats_card.clear_body()
+        # —— 用量统计 ——
+        self._usage_card.clear_body()
+        self._usage_card.clear_badge()
         try:
-            # 这里走 best-effort：直接读 history 缓存长度（不发起 IO）
-            length = rt._hist_len if hasattr(rt, "_hist_len") else 0
-            self._stats_card.add_line("历史条数", str(length))
-            self._stats_card.add_line(
-                "重要记忆",
-                str(len(rt.important.items())) if rt.important else "0",
-            )
-            self._stats_card.set_badge("", "badge-idle")
+            usage_store = getattr(rt, "usage_stats", None)
+            range_name = self._usage_range_combo.currentData() or "today"
+            if usage_store is None:
+                self._usage_card.add_metric_row([("状态", "未就绪")])
+            else:
+                summary = usage_store.summarize(range_name)
+                self._usage_card.add_metric_row(
+                    [
+                        ("请求数", _fmt_int(summary.request_count)),
+                        ("总 token", _fmt_int(summary.total_tokens)),
+                        ("KV 命中率", _fmt_rate(summary.cache_hit_rate)),
+                    ]
+                )
+                self._usage_card.add_metric_row(
+                    [
+                        ("输入 token", _fmt_int(summary.prompt_tokens)),
+                        ("输出 token", _fmt_int(summary.completion_tokens)),
+                        ("思考 token", _fmt_int(summary.reasoning_tokens)),
+                    ]
+                )
+                self._usage_card.add_metric_row(
+                    [
+                        ("KV 命中 token", _fmt_int(summary.cached_tokens)),
+                        ("KV 写入 token", _fmt_int(summary.cache_creation_tokens)),
+                    ]
+                )
         except Exception as e:  # noqa: BLE001
-            self._stats_card.add_line("出错", str(e)[:80])
+            self._usage_card.add_line("出错", str(e)[:80])
 
-        # —— 当前人格 ——
-        self._persona_card.clear_body()
+        # —— 主模型实时状态 ——
+        self._activity_card.clear_body()
         try:
-            name = rt.persona.name if rt.persona else "—"
-            self._persona_card.add_line("名称", name)
-            hint = QLabel("在「角色」页里切换或新建")
-            hint.setProperty("role", "secondary")
-            hint.setWordWrap(True)
-            self._persona_card.add_widget(hint)
+            activity = getattr(rt, "model_activity", {}) or {}
+            state = str(activity.get("state") or "idle")
+            face = QLabel(_activity_face(state))
+            face.setProperty("role", "title-2")
+            self._activity_card.add_widget(face)
+            self._activity_card.add_line("状态", str(activity.get("text") or "空闲"))
+            model = str(activity.get("model") or "")
+            if model:
+                self._activity_card.add_line("模型", model)
+            tools = activity.get("tool_names") or []
+            if tools:
+                self._activity_card.add_line("工具", "、".join(map(str, tools)))
+            role = "badge-success" if state == "idle" else "badge-warning"
+            if state == "error":
+                role = "badge-error"
+            self._activity_card.set_badge(str(activity.get("agent") or "主模型"), role)
         except Exception as e:  # noqa: BLE001
-            self._persona_card.add_line("出错", str(e)[:80])
+            self._activity_card.add_line("出错", str(e)[:80])

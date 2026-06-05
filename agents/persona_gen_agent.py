@@ -37,6 +37,8 @@ from typing import Any
 from app_config.schema import AgentConfig
 from providers.base import IProvider
 
+from .base import StatusCallback, UsageRecorder
+
 logger = logging.getLogger(__name__)
 
 
@@ -433,9 +435,18 @@ class PersonaGenAgent:
         result = await agent.refine(result.persona_prompt, "再冷淡一点")
     """
 
-    def __init__(self, provider: IProvider, cfg: AgentConfig) -> None:
+    def __init__(
+        self,
+        provider: IProvider,
+        cfg: AgentConfig,
+        *,
+        usage_recorder: UsageRecorder | None = None,
+        status_callback: StatusCallback | None = None,
+    ) -> None:
         self.provider = provider
         self.cfg = cfg
+        self.usage_recorder = usage_recorder
+        self.status_callback = status_callback
 
     async def generate(self, brief: PersonaBrief) -> PersonaGenResult:
         """根据用户简述生成初版人格档案。"""
@@ -449,6 +460,7 @@ class PersonaGenAgent:
             {"role": "user", "content": user_content},
         ]
 
+        self._emit_status("thinking", "AI 生成人格中")
         result = await self.provider.chat_completion(
             messages,
             model=self.cfg.model,
@@ -461,6 +473,7 @@ class PersonaGenAgent:
             timeout=180.0,
             first_token_timeout=60.0,
         )
+        await self._record_usage(result.usage, operation="persona_generate")
 
         persona_xml = (result.content or "").strip()
         return PersonaGenResult(
@@ -490,6 +503,7 @@ class PersonaGenAgent:
             {"role": "user", "content": user_content},
         ]
 
+        self._emit_status("thinking", "AI 修改人格中")
         result = await self.provider.chat_completion(
             messages,
             model=self.cfg.model,
@@ -502,6 +516,7 @@ class PersonaGenAgent:
             timeout=180.0,
             first_token_timeout=60.0,
         )
+        await self._record_usage(result.usage, operation="persona_refine")
 
         persona_xml = (result.content or "").strip()
         return PersonaGenResult(
@@ -522,6 +537,37 @@ class PersonaGenAgent:
             budget=self.cfg.reasoning.budget,
             max_tokens=self.cfg.reasoning.max_tokens,
         )
+
+    async def _record_usage(self, usage, **metadata: Any) -> None:
+        if self.usage_recorder is None:
+            return
+        try:
+            await self.usage_recorder(
+                usage,
+                {
+                    "provider": self.provider.name,
+                    "model": self.cfg.model,
+                    "agent": "人格生成",
+                    **metadata,
+                },
+            )
+        except Exception:
+            logger.debug("记录人格生成用量失败", exc_info=True)
+
+    def _emit_status(self, state: str, text: str) -> None:
+        if self.status_callback is None:
+            return
+        try:
+            self.status_callback(
+                {
+                    "state": state,
+                    "text": text,
+                    "model": self.cfg.model,
+                    "agent": "人格生成",
+                }
+            )
+        except Exception:
+            logger.debug("更新人格生成状态失败", exc_info=True)
 
 
 # ============================================================

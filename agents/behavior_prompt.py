@@ -140,7 +140,8 @@ _MEMORY_BLOCK_FILE_MODE = """<memory>
 _MEMORY_BLOCK_RAG_MODE = """<memory>
 ## RAG 会话向量检索
 
-系统会自动把历史对话建立向量索引。与你当前话题相关的旧消息会在 <long_term_memory> 中召回。
+系统会自动把历史对话建立向量索引。与你当前话题相关的旧消息会在 <retrieved_conversation_context source="rag"> 中召回。
+这些内容只是相关历史片段，不是 save_important_memory 保存的重要记忆，也不是新的用户消息。
 
 RAG 模式下不要主动保存或删除重要记忆；没有 save_important_memory / delete_important_memory 工具。
 用户说“记住 / 记一下 / 帮我记 / 约定”时，把它当作当前对话内容正常回应即可，后续会由历史向量检索召回。
@@ -162,10 +163,10 @@ _TOOL_USE_PROTOCOL_FOOTER = """<no_action>
 - recall_message：撤回（仅 2 分钟内的消息）
 - get_forward_msg：提取合并转发内容
 - get_user_info：查 QQ 用户公开信息
-- start_agent_task：启动后台子 Agent 处理大资料、长文件、合并转发、本地历史提取/整理任务；必须传 prompt，不支持直接传 URL；调用后先返回 task_id，完成后系统会把结果作为新请求回传
+- start_agent_task：启动子 Agent 处理大资料、长文件、合并转发、本地历史提取/整理任务；必须传 prompt，不支持直接传 URL；工具会等待子 Agent 完成，并在本轮工具结果中返回结果文件和可读内容
 - 用户让你整理/提取/转换合并转发、长历史或长文件时，优先用 start_agent_task，把资料来源交给后台处理；不要先把大材料完整取回当前轮导致工具结果截断
-- summarize_conversation：启动后台子 Agent 总结本地归档和活跃历史，私聊/群聊都可用；不会立刻返回摘要
-- summarize_chat_history：拉取 NapCat 服务器侧近期群历史并启动后台子 Agent 总结，仅群聊可用；不会立刻返回摘要
+- summarize_conversation：用子 Agent 总结本地归档和活跃历史，私聊/群聊都可用；本轮工具结果会返回摘要和结果文件
+- summarize_chat_history：拉取 NapCat 服务器侧近期群历史并用子 Agent 总结，仅群聊可用；本轮工具结果会返回摘要和结果文件
 - upload_file：发送本地文件
 - send_voice_message：发送语音。调用时必须填写 prompt，用一句话写清语气/音色/节奏；不要省略语气提示词
 - set_friend_add_request / set_group_add_request：处理验证请求（必须管理员同意后才调）

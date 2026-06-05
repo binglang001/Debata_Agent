@@ -454,7 +454,11 @@ class WizardWindow(QMainWindow):
         tts_key_id = None
         if c.tts.enabled:
             textra = c.tts.extra or {}
-            if textra.get("type") == "api" and textra.get("api_key"):
+            if (
+                textra.get("type") == "api"
+                and textra.get("provider") != "edge"
+                and textra.get("api_key")
+            ):
                 tts_provider = textra.get("provider") or "api"
                 tts_key_id = f"tts_{tts_provider}"
                 self._secrets.set(tts_key_id, textra["api_key"])
@@ -643,9 +647,9 @@ class WizardWindow(QMainWindow):
             textra = c.tts.extra or {}
             features.tts = TTSFeatureConfig(
                 enabled=True,
-                type=textra.get("type", "local"),
+                type=textra.get("type", "api"),
                 local_model=textra.get("local_model", "voxcpm2"),
-                provider=textra.get("provider") or None,
+                provider=textra.get("provider") or "edge",
                 api_key_id=tts_key_id,
                 extra_credentials=textra.get("extra_credentials", {}),
                 reference_audio=textra.get("reference_audio", ""),

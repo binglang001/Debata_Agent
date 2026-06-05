@@ -159,9 +159,14 @@ def extract_cache_metrics(
     """
     sample = CacheMetricsSample(
         prompt_tokens=result.usage.prompt_tokens,
+        cached_tokens=result.usage.cached_tokens,
+        cache_creation_tokens=result.usage.cache_creation_tokens,
         completion_tokens=result.usage.completion_tokens,
         model=model or result.model,
     )
+
+    if sample.cached_tokens or sample.cache_creation_tokens:
+        return sample
 
     raw = result.raw
     # OpenAI 风格（DeepSeek/GLM/Moonshot 等都用 openai SDK）

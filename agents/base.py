@@ -6,14 +6,19 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from providers.base import Usage
+
 # 工具执行器签名
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+UsageRecorder = Callable[[Usage, dict[str, Any]], Awaitable[None]]
+StatusCallback = Callable[[dict[str, Any]], None]
 
 
 FinishReason = Literal[
     "no_action",
     "send_only_complete",
     "all_no_feedback",
+    "tool_stop",
     "no_tool_after_retry",
     "max_loops",
     "api_error",

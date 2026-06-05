@@ -234,6 +234,8 @@ async def test_runtime_start_assembles_all_components(assembled_project):
         assert rt.persona is not None and rt.persona.name == "test_bot"
         assert rt.history is not None
         assert rt.important is not None
+        assert rt.usage_stats is not None
+        assert rt.model_activity["state"] == "idle"
         assert "fake_main" in rt.providers, "provider 未实例化"
         if rt._provider_health_task is not None:
             await rt._provider_health_task
@@ -440,6 +442,70 @@ async def test_runtime_starts_local_tts_warmup_in_background(
         assert build_configs[0][1]["load_denoiser"] is False
         assert build_configs[0][1]["cfg_value"] == 2.0
         assert build_configs[0][1]["inference_timesteps"] == 10
+    finally:
+        await rt.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_starts_edge_tts_with_configured_voice(
+    assembled_project, monkeypatch
+):
+    project_root, paths = assembled_project
+
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data.setdefault("features", {})["tts"] = {
+        "enabled": True,
+        "type": "api",
+        "provider": "edge",
+        "api_key_id": None,
+        "extra_credentials": {
+            "voice": "zh-CN-XiaoyiNeural",
+            "rate": "+10%",
+            "volume": "+5%",
+            "pitch": "+0Hz",
+        },
+    }
+    with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+    instances = []
+
+    class FakeEdgeTTS:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.warmups = 0
+            instances.append(self)
+
+        async def warmup(self):
+            self.warmups += 1
+
+        async def synthesize(self, text, *, reference_audio=None, prompt=""):
+            return paths.WORKSPACE_DIR / "fake.mp3"
+
+        async def aclose(self):
+            pass
+
+    import features.tts
+
+    monkeypatch.setattr(features.tts, "_get_edge_service", lambda: FakeEdgeTTS)
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+        for _ in range(50):
+            if instances and instances[0].warmups:
+                break
+            await asyncio.sleep(0.02)
+
+        assert instances
+        assert rt.tts is instances[0]
+        assert rt.pipeline.tts is instances[0]
+        assert instances[0].kwargs["voice"] == "zh-CN-XiaoyiNeural"
+        assert instances[0].kwargs["rate"] == "+10%"
+        assert instances[0].kwargs["volume"] == "+5%"
+        assert instances[0].kwargs["pitch"] == "+0Hz"
+        assert instances[0].warmups == 1
     finally:
         await rt.shutdown()
 

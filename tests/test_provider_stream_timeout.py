@@ -81,6 +81,24 @@ def test_openai_thinking_extra_body_disables_by_default():
     }
 
 
+def test_openai_usage_extracts_cached_tokens():
+    usage_obj = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=20,
+        total_tokens=120,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=80),
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=5),
+    )
+
+    usage = OpenAICompatProvider._extract_usage(usage_obj)
+
+    assert usage.prompt_tokens == 100
+    assert usage.completion_tokens == 20
+    assert usage.reasoning_tokens == 5
+    assert usage.cached_tokens == 80
+    assert usage.total_tokens == 120
+
+
 def test_openai_thinking_extra_body_enables_only_when_requested():
     provider = OpenAICompatProvider(
         "deepseek_test",

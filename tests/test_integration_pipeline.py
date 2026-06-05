@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 from typing import Any
@@ -30,8 +31,10 @@ import pytest
 from adapters.base import IAdapter
 from adapters.types import (
     IncomingMessage,
+    IncomingNotice,
     MediaSegment,
     MediaType,
+    NoticeType,
     Target,
     UserInfo,
 )
@@ -53,6 +56,7 @@ from app_config.schema import (
 )
 from core.message_pipeline import MessagePipeline, _recommended_context_budget
 from core.proactive_loop import ProactiveLoop
+from core.recall_handler import RecallHandler
 from core.state import PendingMessageItem, PendingRequestStore
 from core.wakeup import WakeupScheduler
 from memory import (
@@ -139,7 +143,7 @@ class ScriptedProvider(IProvider):
         tools: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> CompletionResult:
-        self.calls.append({"messages": messages, "model": model, "tools": tools})
+        self.calls.append({"messages": copy.deepcopy(messages), "model": model, "tools": tools})
         if not self._script:
             # 默认无脚本时返回 no_action 收尾（防止死循环）
             tc = ToolCall(id="auto", name="no_action", arguments="{}")
@@ -160,6 +164,7 @@ class FakeAdapter(IAdapter):
         super().__init__(name)
         self.sent: list[tuple[Target, str]] = []
         self.voice_sent: list[tuple[Target, Any]] = []
+        self.uploaded: list[tuple[Target, Any, str | None]] = []
         self.recalled: list[str] = []
         self.voice_text = ""
         self.voice_fetch_calls: list[str] = []
@@ -215,6 +220,9 @@ class FakeAdapter(IAdapter):
     async def fetch_voice_text(self, message_id: str) -> str:
         self.voice_fetch_calls.append(message_id)
         return self.voice_text
+
+    async def upload_file(self, target, file_path, *, display_name=None):
+        self.uploaded.append((target, file_path, display_name))
 
 
 # ============================================================
@@ -316,8 +324,8 @@ def _ai_send_group(group_id: str = "5555", content: str = "群好", send_only: b
 
 
 def _ai_no_action(reason: str = "无需回复") -> CompletionResult:
-    args = {"reason": reason}
-    tc = ToolCall(id="tc-na", name="no_action", arguments=json.dumps(args))
+    _ = reason
+    tc = ToolCall(id="tc-na", name="no_action", arguments="{}")
     return CompletionResult(tool_calls=[tc], finish_reason="tool_calls")
 
 
@@ -338,15 +346,12 @@ async def _drain_pipeline(pipeline: MessagePipeline, max_wait: float = 1.0) -> N
         )
         receipt_tasks = getattr(pipeline, "_send_receipt_tasks", {})
         receipt_tasks_done = all(task.done() for task in receipt_tasks.values())
-        agent_task_tasks = getattr(pipeline, "_agent_task_tasks", {})
-        agent_task_tasks_done = all(task.done() for task in agent_task_tasks.values())
         if (
             (batch_task is None or batch_task.done())
             and (requeue is None or requeue.done())
             and all(t.done() for t in rag_tasks)
             and send_workers_done
             and receipt_tasks_done
-            and agent_task_tasks_done
         ):
             return
     raise AssertionError(f"pipeline 在 {max_wait}s 内未完成")
@@ -531,9 +536,9 @@ class FakeProactiveRouter:
         self.decision = decision
         self.calls: list[list[dict[str, Any]]] = []
 
-    async def should_act(self, messages: list[dict[str, Any]]) -> bool:
+    async def should_act(self, messages: list[dict[str, Any]]) -> tuple[bool, str]:
         self.calls.append(messages)
-        return self.decision
+        return self.decision, "测试触发理由" if self.decision else ""
 
 
 @pytest.mark.asyncio
@@ -724,6 +729,32 @@ async def test_proactive_action_runs_under_acquired_lock(build_pipeline):
     )
     assert "本轮由系统后台主动思考触发" in joined
     assert "不是用户刚发来的新消息" in joined
+    assert "本轮触发理由：测试触发理由" in joined
+
+
+@pytest.mark.asyncio
+async def test_proactive_action_records_are_system_scoped(build_pipeline):
+    pipeline, _, _, history, _ = await build_pipeline([_ai_no_action()])
+    router = FakeProactiveRouter(True)
+    loop = ProactiveLoop(
+        pipeline=pipeline,
+        proactive_agent=router,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+    pipeline.last_activity_at = time.monotonic() - (
+        pipeline.behavior_cfg.proactive_think_interval_seconds + 1
+    )
+
+    await loop._maybe_act()
+
+    records = await history.records()
+    proactive_records = [
+        record
+        for record in records
+        if record.get("conversation_id") == "system:proactive"
+    ]
+    assert proactive_records
+    assert all(record.get("role") != "user" for record in proactive_records)
 
 
 @pytest.mark.asyncio
@@ -781,12 +812,11 @@ async def test_agent_task_materializes_sources_without_url(build_pipeline, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_agent_task_max_loops_writes_partial_result(build_pipeline, tmp_path):
+async def test_agent_task_max_loops_returns_partial_result(build_pipeline, tmp_path):
     pipeline, _, _, _, _ = await build_pipeline([])
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     pipeline.workspace_dir = workspace
-    delivered: list[dict[str, Any]] = []
 
     async def fake_run(_messages, *, max_loops=None, **_kwargs):
         assert max_loops == 17
@@ -797,22 +827,9 @@ async def test_agent_task_max_loops_writes_partial_result(build_pipeline, tmp_pa
             finish_reason="max_loops",
         )
 
-    async def fake_deliver(task_id, *, status, result_path, conversation_id, default_target, error):
-        delivered.append(
-            {
-                "task_id": task_id,
-                "status": status,
-                "result_path": result_path,
-                "conversation_id": conversation_id,
-                "default_target": default_target,
-                "error": error,
-            }
-        )
-
     pipeline.chat_agent.run = fake_run  # type: ignore[method-assign]
-    pipeline._deliver_agent_task_result = fake_deliver  # type: ignore[method-assign]
 
-    await pipeline._run_agent_task(
+    result = await pipeline._run_agent_task(
         "task-partial",
         {
             "prompt": "整理资料并输出 Markdown",
@@ -829,9 +846,188 @@ async def test_agent_task_max_loops_writes_partial_result(build_pipeline, tmp_pa
     text = result_path.read_text(encoding="utf-8")
     assert "部分结果" in text
     assert "整理资料并输出 Markdown" in text
-    assert delivered[0]["status"] == "partial"
-    assert delivered[0]["result_path"] == result_path
-    assert "工具循环上限" in delivered[0]["error"]
+    assert result["ok"] is True
+    assert result["status"] == "partial"
+    assert result["result_file"] == "agent_tasks/task-partial/result.md"
+    assert "工具循环上限" in result["error"]
+    assert "content" in result and "部分结果" in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_agent_task_returns_after_target_output_written(build_pipeline, tmp_path):
+    output_name = "target_result.md"
+    write_args = {
+        "path": f"agent_tasks/task-write/{output_name}",
+        "content": "# 结果\n\n完成。",
+    }
+    pipeline, provider, _, _, _ = await build_pipeline(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-write-target",
+                        name="write_file",
+                        arguments=json.dumps(write_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            _ai_no_action(),
+        ]
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pipeline.workspace_dir = workspace
+
+    result = await pipeline._run_agent_task(
+        "task-write",
+        {
+            "prompt": "写出结果文件",
+            "output_format": "markdown",
+            "output_name": output_name,
+        },
+        conversation_id="private:123",
+        default_target=None,
+    )
+
+    assert len(provider.calls) == 1
+    result_path = workspace / "agent_tasks" / "task-write" / output_name
+    assert result_path.exists()
+    assert result["status"] == "completed"
+    assert result["result_file"] == f"agent_tasks/task-write/{output_name}"
+    assert result["content"] == "# 结果\n\n完成。"
+    assert result["data"]["finish_reason"] == "tool_stop"
+
+
+@pytest.mark.asyncio
+async def test_agent_task_timeout_returns_existing_target_output(
+    build_pipeline,
+    tmp_path,
+    monkeypatch,
+):
+    pipeline, _, _, _, _ = await build_pipeline([])
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pipeline.workspace_dir = workspace
+
+    import core.message_pipeline as message_pipeline
+
+    monkeypatch.setattr(
+        message_pipeline,
+        "_agent_task_timeout_seconds",
+        lambda *_args, **_kwargs: 0.01,
+    )
+
+    async def fake_run(_messages, **_kwargs):
+        result_path = workspace / "agent_tasks" / "task-timeout" / "result.md"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text("# 结果\n\n已经写出。", encoding="utf-8")
+        await asyncio.sleep(3600)
+
+    pipeline.chat_agent.run = fake_run  # type: ignore[method-assign]
+
+    result = await pipeline._run_agent_task(
+        "task-timeout",
+        {
+            "prompt": "写出结果后模拟挂起",
+            "output_format": "markdown",
+            "output_name": "result.md",
+        },
+        conversation_id="private:123",
+        default_target=None,
+    )
+
+    result_path = workspace / "agent_tasks" / "task-timeout" / "result.md"
+    assert result_path.exists()
+    assert result["ok"] is True
+    assert result["status"] == "completed"
+    assert result["result_file"] == "agent_tasks/task-timeout/result.md"
+    assert "超时" in result["error"]
+    assert pipeline._agent_task_meta["task-timeout"]["timeout_with_existing_output"] is True
+
+
+@pytest.mark.asyncio
+async def test_start_agent_task_result_is_in_band_same_turn(build_pipeline, tmp_path):
+    start_args = {
+        "prompt": "整理资料",
+        "sources": [{"type": "inline_text", "value": "资料"}],
+        "output_format": "markdown",
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-start",
+                        name="start_agent_task",
+                        arguments=json.dumps(start_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            _ai_send_private(target_qq="123", content="后台结果已完成", send_only=True),
+        ]
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pipeline.workspace_dir = workspace
+
+    async def fake_run_agent_task(task_id, _payload, *, conversation_id, default_target):
+        result_path = workspace / "agent_tasks" / task_id / "result.md"
+        result_path.parent.mkdir(parents=True)
+        result_path.write_text("# 结果\n\n完成。", encoding="utf-8")
+        return {
+            "ok": True,
+            "status": "completed",
+            "brief": "子 Agent 已完成：结果",
+            "task_id": task_id,
+            "result_file": f"agent_tasks/{task_id}/result.md",
+            "path": f"agent_tasks/{task_id}/result.md",
+            "content": "# 结果\n\n完成。",
+            "summary": "结果",
+            "data": {"task_id": task_id, "result_file": f"agent_tasks/{task_id}/result.md"},
+        }
+
+    pipeline._run_agent_task = fake_run_agent_task  # type: ignore[method-assign]
+
+    await pipeline.enqueue(_msg(user_id="123", text="先把能做的完成", message_id="m-start"))
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert len(provider.calls) == 2
+    second_messages = provider.calls[1]["messages"]
+    tool_records = [m for m in second_messages if m.get("role") == "tool"]
+    assert tool_records
+    assert "agent_tasks/" in tool_records[-1]["content"]
+    assert "agent_task_result" not in "\n".join(str(m.get("content") or "") for m in second_messages)
+    assert any(
+        sent_target.target_id == "123" and text == "后台结果已完成"
+        for sent_target, text in adapter.sent
+    )
+    records = await history.records()
+    joined_records = "\n".join(str(record.get("content", "")) for record in records)
+    assert "agent_task_result" not in joined_records
+    assert "后台结果已完成" in joined_records
+
+
+@pytest.mark.asyncio
+async def test_wakeup_turn_keeps_full_tool_schema_with_task_contract(build_pipeline):
+    pipeline, provider, adapter, _, _ = await build_pipeline([_ai_no_action()])
+
+    await pipeline.run_wakeup_turn(
+        "30 秒到了，请发送消息。",
+        target={"target_type": "private", "target_id": 123},
+        mode="wakeup",
+    )
+
+    assert len(provider.calls) == 1
+    names = {
+        schema["function"]["name"]
+        for schema in provider.calls[0]["tools"]
+    }
+    assert "schedule_wakeup" in names
+    assert "start_agent_task" in names
+    assert "summarize_chat_history" in names
+    assert "summarize_conversation" in names
 
 
 @pytest.mark.asyncio
@@ -1160,6 +1356,110 @@ async def test_same_conversation_message_while_model_thinking_returns_stale(buil
     assert "m-old" in timeline_markdown
     assert "m-new" in timeline_markdown
     assert "旧回复" not in timeline_markdown
+
+
+@pytest.mark.asyncio
+async def test_recalled_pending_message_is_not_processed_as_new_task(build_pipeline):
+    """合并窗口内被撤回的消息只记录状态，不再触发主模型接旧话。"""
+    pipeline, provider, adapter, history, _ = await build_pipeline(
+        [_ai_send_private(target_qq="123", content="不该发", send_only=True)]
+    )
+    recall = RecallHandler(
+        pipeline=pipeline,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="发错了的内容", message_id="m-recall"))
+    await recall.on_notice(
+        IncomingNotice(
+            adapter="fake",
+            timestamp=1.1,
+            self_id="999",
+            notice_type=NoticeType.FRIEND_RECALL,
+            user_id="123",
+            message_id="m-recall",
+        )
+    )
+    await _drain_pipeline(pipeline, max_wait=1.0)
+    await recall.shutdown()
+
+    assert provider.calls == []
+    assert adapter.sent == []
+    records = await history.records()
+    assert any(
+        record.get("role") == "system"
+        and record.get("conversation_id") == "private:123"
+        and "m-recall" in str(record.get("content") or "")
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_recall_while_model_thinking_marks_send_stale(build_pipeline):
+    """模型思考中的触发消息被撤回时，旧回复不能继续发出。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    send_args = {
+        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+        "send_only": False,
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline([])
+    call_count = 0
+
+    async def blocking_chat_completion(messages, *, model, tools=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        provider.calls.append({"messages": messages, "model": model, "tools": tools})
+        if call_count == 1:
+            started.set()
+            await release.wait()
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_private_messages",
+                        arguments=json.dumps(send_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return CompletionResult(
+            tool_calls=[ToolCall(id="tc-na", name="no_action", arguments="{}")],
+            finish_reason="tool_calls",
+        )
+
+    provider.chat_completion = blocking_chat_completion  # type: ignore[method-assign]
+    recall = RecallHandler(
+        pipeline=pipeline,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="马上撤回", message_id="m-old"))
+    await started.wait()
+    await recall.on_notice(
+        IncomingNotice(
+            adapter="fake",
+            timestamp=1.1,
+            self_id="999",
+            notice_type=NoticeType.FRIEND_RECALL,
+            user_id="123",
+            message_id="m-old",
+        )
+    )
+    release.set()
+    await _drain_pipeline(pipeline, max_wait=3.0)
+    await recall.shutdown()
+
+    assert adapter.sent == []
+    records = await history.records()
+    stale_results = [
+        json.loads(record["content"])
+        for record in records
+        if record.get("role") == "tool" and record.get("tool_call_id") == "tc-send"
+    ]
+    assert stale_results
+    assert stale_results[-1]["status"] == "stale"
+    assert stale_results[-1]["recalled_messages"][0]["msg_id"] == "m-old"
 
 
 @pytest.mark.asyncio

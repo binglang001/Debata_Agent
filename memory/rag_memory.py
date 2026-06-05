@@ -352,6 +352,11 @@ def _record_to_candidate(
     role = str(record.get("role") or "")
     if role not in {"user", "assistant"}:
         return None
+    conversation_id = str(record.get("conversation_id") or "") or None
+    if conversation_id and conversation_id.startswith("system:"):
+        return None
+    if role == "assistant" and record.get("tool_calls"):
+        return None
     text = _record_content_text(record.get("content"))
     if not text:
         return None
@@ -359,7 +364,6 @@ def _record_to_candidate(
     if not text:
         return None
     meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    conversation_id = str(record.get("conversation_id") or "") or None
     timestamp = str(meta.get("timestamp") or record.get("timestamp") or "")
     stable_payload = {
         "role": role,

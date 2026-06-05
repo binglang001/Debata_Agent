@@ -85,6 +85,14 @@ class Runtime:
         self.tts: Any = None
         self.provider_health: dict[str, Any] = {}
         self.feature_failures: dict[str, str] = {}
+        self.usage_stats: Any = None
+        self.model_activity: dict[str, Any] = {
+            "state": "idle",
+            "text": "空闲",
+            "model": "",
+            "agent": "主模型",
+            "updated_at": time.time(),
+        }
         self._provider_health_task: asyncio.Task | None = None
         self._shutdown_started = False
         self._shutdown_complete = False
@@ -111,6 +119,10 @@ class Runtime:
         self.secrets = SecretsManager(self.paths)
         self.secrets.initialize()
         self.config = load_config(self.paths)
+        from .usage_stats import UsageStatsStore
+
+        self.usage_stats = UsageStatsStore(self.paths.LOGS_DIR / "model_usage.jsonl")
+        await self.usage_stats.load()
         self._apply_feature_provider_overrides()
         # 按 config 调整全局日志级别（main.py 启动时只设了 INFO）
         try:
@@ -193,7 +205,12 @@ class Runtime:
                 f"agents.chat.provider={chat_cfg.provider!r} 不在 providers 中。"
                 f"已实例化: {list(self.providers.keys())}"
             )
-        self.chat_agent = ChatAgent(self.providers[chat_cfg.provider], chat_cfg)
+        self.chat_agent = ChatAgent(
+            self.providers[chat_cfg.provider],
+            chat_cfg,
+            usage_recorder=self._record_model_usage,
+            status_callback=self._update_model_activity,
+        )
 
         if self.config.agents.proactive is not None:
             pcfg = self.config.agents.proactive
@@ -202,7 +219,10 @@ class Runtime:
                     f"agents.proactive.provider={pcfg.provider!r} 不在 providers 中"
                 )
             self.proactive_agent = ProactiveRouterAgent(
-                self.providers[pcfg.provider], pcfg
+                self.providers[pcfg.provider],
+                pcfg,
+                usage_recorder=self._record_model_usage,
+                status_callback=self._update_model_activity,
             )
 
         if self.config.agents.summary is not None:
@@ -216,9 +236,10 @@ class Runtime:
                 self.providers[scfg.provider],
                 scfg,
                 self.config.behavior.summarize,
+                usage_recorder=self._record_model_usage,
+                status_callback=self._update_model_activity,
             )
 
-        self._schedule_provider_health_check()
         logger.debug("Runtime 阶段完成：Agent 构造 %.2fs", time.monotonic() - stage_t0)
 
         # ----- 6. Features service（按 enabled 实例化）-----
@@ -397,6 +418,7 @@ class Runtime:
         logger.debug("Runtime 阶段完成：Adapter/主动循环启动 %.2fs", time.monotonic() - stage_t0)
 
         logger.info("Runtime 启动完成（耗时 %.1fs）", time.monotonic() - start_t0)
+        self._schedule_provider_health_check()
 
     def _model_context_length(self, provider_id: str, model_id: str) -> int | None:
         """从 provider preset 中读取模型上下文硬上限，找不到则返回 None。"""
@@ -669,48 +691,60 @@ class Runtime:
                 self._disable_feature_after_failure("tts", e)
         elif tcfg.enabled and tcfg.type == "api":
             api_key = self.secrets.get(tcfg.api_key_id) if tcfg.api_key_id else None
-            if tcfg.provider == "baidu":
+            provider = tcfg.provider or "edge"
+            if provider == "edge":
                 try:
-                    from features.tts import _get_baidu_service
-                    secret_key = tcfg.extra_credentials.get("secret_key", "")
-                    self.tts = _get_baidu_service()(
-                        api_key=api_key or "",
-                        secret_key=secret_key,
+                    from features.tts import _get_edge_service
+
+                    voice = tcfg.extra_credentials.get("voice", "") or "zh-CN-XiaoxiaoNeural"
+                    self.tts = _get_edge_service()(
+                        voice=voice,
+                        rate=tcfg.extra_credentials.get("rate", "+0%"),
+                        volume=tcfg.extra_credentials.get("volume", "+0%"),
+                        pitch=tcfg.extra_credentials.get("pitch", "+0Hz"),
+                        output_dir=self.paths.WORKSPACE_DIR / ".run",
                     )
-                    logger.info("TTS 已启用：百度云端")
+                    logger.info(
+                        "TTS 已启用：EdgeTTS（免费在线服务，可能因网络或服务策略失败）voice=%s",
+                        voice,
+                    )
                     self._fire_warmup("tts", self.tts)
                 except Exception as e:  # noqa: BLE001
-                    logger.warning(f"百度 TTS 初始化失败：{e}")
+                    logger.warning(f"EdgeTTS 初始化失败：{e}")
                     self._disable_feature_after_failure("tts", e)
-            elif tcfg.provider == "xfyun":
+            elif provider == "xfyun":
                 try:
                     from features.tts import _get_iflytek_service
+                    voice = tcfg.extra_credentials.get("voice", "") or "x4_xiaoyan"
                     self.tts = _get_iflytek_service()(
                         app_id=tcfg.extra_credentials.get("app_id", ""),
                         api_key=api_key or "",
                         api_secret=tcfg.extra_credentials.get("api_secret", ""),
+                        voice_name=voice,
+                        speed=int(tcfg.extra_credentials.get("speed", "50") or 50),
+                        volume=int(tcfg.extra_credentials.get("volume", "50") or 50),
+                        pitch=int(tcfg.extra_credentials.get("pitch", "50") or 50),
+                        aue=tcfg.extra_credentials.get("aue", "lame") or "lame",
+                        output_dir=self.paths.WORKSPACE_DIR / ".run",
                     )
-                    logger.info("TTS 已启用：讯飞云端")
+                    logger.info("TTS 已启用：讯飞云端 voice=%s", voice)
                     self._fire_warmup("tts", self.tts)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"讯飞 TTS 初始化失败：{e}")
                     self._disable_feature_after_failure("tts", e)
-            elif tcfg.provider == "volcengine":
-                try:
-                    from features.tts import _get_volcengine_service
-                    self.tts = _get_volcengine_service()(
-                        app_id=tcfg.extra_credentials.get("app_id", ""),
-                        access_token=api_key or "",
-                    )
-                    logger.info("TTS 已启用：火山引擎云端")
-                    self._fire_warmup("tts", self.tts)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"火山引擎 TTS 初始化失败：{e}")
-                    self._disable_feature_after_failure("tts", e)
-            else:
-                logger.warning(f"TTS provider={tcfg.provider!r} 未知，跳过")
+            elif provider in {"baidu", "volcengine"}:
+                logger.warning(
+                    "TTS provider=%s 已从新运行时入口移除；请改用 edge 或 xfyun",
+                    provider,
+                )
                 self._disable_feature_after_failure(
-                    "tts", RuntimeError(f"TTS provider={tcfg.provider!r} 未知")
+                    "tts",
+                    RuntimeError(f"TTS provider={provider!r} 已移除，请改用 edge 或 xfyun"),
+                )
+            else:
+                logger.warning(f"TTS provider={provider!r} 未知，跳过")
+                self._disable_feature_after_failure(
+                    "tts", RuntimeError(f"TTS provider={provider!r} 未知")
                 )
 
         # 本地模型在 Runtime 启动后后台预热；首次调用若未完成则等待同一个加载任务。
@@ -786,7 +820,7 @@ class Runtime:
                         provider,
                         model=model,
                         api_key=api_key,
-                        timeout_seconds=8.0,
+                        timeout_seconds=15.0,
                     )
                 else:
                     protocol = self._provider_protocol(name)
@@ -794,7 +828,7 @@ class Runtime:
                         provider,
                         model=model,
                         protocol=protocol,
-                        timeout_seconds=8.0,
+                        timeout_seconds=15.0,
                     )
                 self.provider_health[name] = result
             except Exception as e:  # noqa: BLE001
@@ -832,6 +866,31 @@ class Runtime:
             pass
         except Exception as e:  # noqa: BLE001
             logger.debug("Provider 健康检查后台任务失败：%s", e, exc_info=True)
+
+    async def _record_model_usage(self, usage: Any, metadata: dict[str, Any]) -> None:
+        if self.usage_stats is None:
+            return
+        await self.usage_stats.record(
+            usage,
+            provider=str(metadata.get("provider") or ""),
+            model=str(metadata.get("model") or ""),
+            agent=str(metadata.get("agent") or ""),
+            operation=str(metadata.get("operation") or ""),
+        )
+
+    def _update_model_activity(self, payload: dict[str, Any]) -> None:
+        state = str(payload.get("state") or "idle")
+        text = str(payload.get("text") or "空闲")
+        self.model_activity = {
+            "state": state,
+            "text": text,
+            "model": str(payload.get("model") or ""),
+            "agent": str(payload.get("agent") or "主模型"),
+            "loop": payload.get("loop"),
+            "tool_names": list(payload.get("tool_names") or []),
+            "finish_reason": str(payload.get("finish_reason") or ""),
+            "updated_at": time.time(),
+        }
 
     def _provider_chat_model_map(self) -> dict[str, str]:
         result: dict[str, str] = {}

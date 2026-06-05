@@ -344,9 +344,17 @@ class OpenAICompatProvider(IProvider):
         details = getattr(usage_obj, "completion_tokens_details", None)
         if details is not None:
             reasoning = getattr(details, "reasoning_tokens", 0) or 0
+        cached = 0
+        prompt_details = getattr(usage_obj, "prompt_tokens_details", None)
+        if prompt_details is not None:
+            cached = getattr(prompt_details, "cached_tokens", 0) or 0
+        cached = cached or getattr(usage_obj, "prompt_cache_hit_tokens", 0) or 0
+        cache_creation = getattr(usage_obj, "prompt_cache_miss_tokens", 0) or 0
         return Usage(
             prompt_tokens=int(prompt),
             completion_tokens=int(completion),
             reasoning_tokens=int(reasoning),
+            cached_tokens=int(cached),
+            cache_creation_tokens=int(cache_creation),
             total_tokens=int(total),
         )

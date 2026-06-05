@@ -367,15 +367,17 @@ class ASRFeatureConfig(StrictModel):
 
 
 class TTSFeatureConfig(StrictModel):
-    """语音合成配置。本地模式走 VoxCPM2 插件；API 模式支持百度/讯飞/火山引擎。"""
+    """语音合成配置。本地模式走 VoxCPM2 插件；API 模式推荐 EdgeTTS，也支持讯飞。"""
 
     enabled: bool = False
-    type: Literal["api", "local"] = "local"
+    type: Literal["api", "local"] = "api"
 
     # type=api 字段
-    provider: str | None = None
+    provider: str | None = "edge"
+    """API provider。推荐 edge（无需密钥）；讯飞使用 xfyun。百度/火山已从新运行时入口移除。"""
     api_key_id: str | None = None
     extra_credentials: dict[str, str] = Field(default_factory=dict)
+    """API 扩展配置。通用 voice 表示说话人；讯飞还需要 app_id/api_secret。"""
 
     # type=local 字段
     local_model: str = "voxcpm2"
@@ -392,10 +394,18 @@ class TTSFeatureConfig(StrictModel):
         if not self.enabled:
             return self
         if self.type == "api":
-            if not self.provider and not self.api_key_id:
+            provider = self.provider or "edge"
+            if provider == "edge":
+                self.provider = "edge"
+                return self
+            if provider == "xfyun" and not self.api_key_id:
                 raise ValueError(
-                    "features.tts.enabled=True 且 type=api，但 provider 和 api_key_id 都为空。\n"
-                    "  请指定 provider 或填 api_key_id。"
+                    "features.tts.enabled=True 且 type=api/provider=xfyun，但 api_key_id 为空。"
+                )
+            if provider not in {"edge", "xfyun"}:
+                raise ValueError(
+                    "features.tts.enabled=True 且 type=api，但 provider 不受支持。\n"
+                    "  可用 provider: edge（推荐，无需密钥）、xfyun。"
                 )
         else:  # local
             if not self.local_model:
@@ -662,6 +672,9 @@ class BehaviorConfig(StrictModel):
     proactive_think_interval_seconds: float = Field(default=600.0, ge=10.0)
     """主动思考间隔（秒）。每过此时长由 ProactiveAgent 判定一次是否需要主动开口。
     主动思考依赖 agents.proactive 配置；若未配置则此字段无效。"""
+
+    proactive_context_token_budget: int = Field(default=4096, ge=1024)
+    """主动思考路由器可使用的上下文预算。默认 4K，避免后台判断吃掉过多上下文和成本。"""
 
     pending_request_timeout_seconds: float = Field(default=1800.0, ge=60.0)
     """好友/群加入请求暂存的过期时间（秒）。超时后未审核的请求被丢弃。"""

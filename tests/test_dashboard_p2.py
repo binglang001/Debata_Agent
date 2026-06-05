@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,17 +31,20 @@ from app_config.schema import (
 from memory.important import ImportantMemoryManager
 from memory.rag_store import RagEntry
 from ui.dashboard.chats_page import (
+    _conversation_list_signature,
     _format_tool_call_for_display,
     _group_records_by_conversation,
     _scrollbar_near_bottom,
 )
 from ui.dashboard.logs_page import _format_record
 from ui.dashboard.memory_page import MemoryPage
-from ui.dashboard.personas_page import PersonasPage
+from ui.dashboard.overview_page import OverviewPage
+from ui.dashboard.personas_page import PersonasPage, _PersonaCreatorDialog
 from ui.dashboard.settings_page import SettingsPage
 from ui.widgets.window_chrome import _resize_edges_for_local_pos
 from ui.wizard.components import ApiKeyInput
 from ui.wizard.context import WizardContext
+from ui.wizard.persona_creator import PersonaCreatorStepView
 from ui.wizard.step_views.features import _TTSFeatureCard
 from ui.wizard.step_views.welcome import WelcomeStepView
 
@@ -109,6 +113,57 @@ def test_chats_group_records_prefers_explicit_conversation_id():
     assert len(by_key["private:10001"]["records"]) == 2
     assert by_key["system:global"]["records"][0]["content"] == "主动思考：本次跳过"
     assert by_key["group:20002"]["records"][0]["tool_call_id"] == "tc"
+
+
+def test_chats_groups_proactive_records_as_system():
+    records = [
+        {"role": "user", "content": "群消息", "conversation_id": "group:20002"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [],
+            "conversation_id": "system:proactive",
+        },
+        {
+            "role": "tool",
+            "content": '{"ok":true}',
+            "tool_call_id": "tc-proactive",
+            "conversation_id": "system:proactive",
+        },
+    ]
+
+    grouped = _group_records_by_conversation(records)
+    by_key = {item["key"]: item for item in grouped}
+
+    assert "system:proactive" in by_key
+    assert by_key["system:proactive"]["label"] == "系统记录 · 主动思考"
+    assert by_key["system:proactive"]["records"][1]["tool_call_id"] == "tc-proactive"
+
+
+def test_chats_unknown_assistant_without_context_does_not_attach_to_previous_chat():
+    records = [
+        {"role": "system", "content": "全局事件"},
+        {"role": "assistant", "content": "后台旧记录"},
+        {"role": "user", "content": "hi", "conversation_id": "private:10001"},
+    ]
+
+    grouped = _group_records_by_conversation(records)
+    by_key = {item["key"]: item for item in grouped}
+
+    assert by_key["unknown:history"]["records"][0]["content"] == "后台旧记录"
+    assert by_key["private:10001"]["records"][0]["content"] == "hi"
+
+
+def test_chats_conversation_signature_tracks_visible_list_changes():
+    conversations = [
+        {"key": "group:1", "records": [{"content": "a"}], "preview": "a"},
+        {"key": "system:global", "records": [{"content": "s"}], "preview": "s"},
+    ]
+
+    assert _conversation_list_signature(conversations) == [
+        ("group:1", 1, "a"),
+        ("system:global", 1, "s"),
+    ]
 
 
 def test_chats_formats_send_tool_call_readably():
@@ -213,6 +268,25 @@ def test_tts_feature_card_local_reference_audio_is_optional(qapp, monkeypatch):
     assert card.state()["reference_audio"] == ""
 
 
+def test_persona_creator_admin_row_buttons_are_visible_and_spaced(qapp):
+    view = PersonaCreatorStepView(WizardContext())
+    try:
+        assert len(view._admin_rows) == 1
+        first = view._admin_rows[0]
+        assert first.remove_btn.isHidden()
+
+        view._add_admin_row()
+        second = view._admin_rows[1]
+
+        assert first.remove_btn.isHidden()
+        assert second.remove_btn.text() == "删除"
+        assert not second.remove_btn.isHidden()
+        assert second.remove_btn.width() >= 48
+        assert view._admins_layout.spacing() >= 8
+    finally:
+        view.deleteLater()
+
+
 def test_api_key_input_progress_slot_keeps_layout_height(qapp):
     widget = ApiKeyInput(allow_empty_test=True)
     try:
@@ -267,6 +341,147 @@ def test_settings_restore_opened_config_writes_snapshot(tmp_paths):
     assert page._runtime.config.app.theme == "auto"
     assert page._status.calls[-1] == (0, True)
     assert page.refreshed is True
+
+
+def test_settings_page_uses_navigation_sections(qapp, tmp_paths):
+    cfg = _minimal_root_config()
+
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "paths": tmp_paths,
+            "secrets": type("Secrets", (), {"get": lambda self, _key: ""})(),
+            "provider_registry": type("Registry", (), {"presets": {}})(),
+            "providers": {},
+            "provider_health": {},
+        },
+    )()
+    page = SettingsPage(runtime)
+    try:
+        labels = [page._settings_nav.item(i).text() for i in range(page._settings_nav.count())]
+    finally:
+        page.deleteLater()
+
+    assert "软件行为" in labels
+    assert "Token预算" in labels
+    assert "日志与诊断" in labels
+    assert "角色" not in labels
+    assert "外观" not in labels
+
+
+def test_settings_page_collapses_advanced_budget_and_napcat_options(qapp, tmp_paths):
+    from ui.dashboard.settings_page import CollapsibleSection
+
+    cfg = _minimal_root_config()
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "paths": tmp_paths,
+            "secrets": type("Secrets", (), {"get": lambda self, _key: ""})(),
+            "provider_registry": type("Registry", (), {"presets": {}})(),
+            "providers": {},
+            "provider_health": {},
+        },
+    )()
+    page = SettingsPage(runtime)
+    try:
+        sections = page.findChildren(CollapsibleSection)
+        titles = []
+        collapsed = []
+        for section in sections:
+            labels = section.findChildren(QtWidgets.QLabel)
+            buttons = section.findChildren(QtWidgets.QPushButton)
+            if labels:
+                titles.append(labels[0].text())
+            if buttons:
+                collapsed.append(buttons[0].text() == "展开")
+
+        assert "NapCat 连接高级参数" in titles
+        assert "上下文总预算" in titles
+        assert "按工具结果预算" in titles
+        assert any(collapsed)
+
+        label_text = "\n".join(label.text() for label in page.findChildren(QtWidgets.QLabel))
+        assert "API 前等待连接" in label_text
+        assert "托管进程预热" in label_text
+    finally:
+        page.deleteLater()
+
+
+def test_overview_page_shows_usage_activity_and_provider_counts(qapp):
+    class FakeUsageStore:
+        def summarize(self, range_name):
+            assert range_name == "today"
+            return SimpleNamespace(
+                request_count=3,
+                prompt_tokens=1000,
+                completion_tokens=200,
+                reasoning_tokens=50,
+                cached_tokens=800,
+                cache_creation_tokens=120,
+                total_tokens=1250,
+                cache_hit_rate=0.8,
+            )
+
+    cfg = _minimal_root_config()
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "adapter": None,
+            "config": cfg,
+            "providers": {"ok": object(), "bad": object()},
+            "provider_health": {
+                "ok": SimpleNamespace(status="ok", latency_ms=123, message="可用"),
+                "bad": SimpleNamespace(status="error", message="请求超时"),
+            },
+            "_hist_len": 0,
+            "important": None,
+            "usage_stats": FakeUsageStore(),
+            "model_activity": {
+                "state": "tool",
+                "text": "调用工具：get_weather",
+                "model": "deepseek-chat",
+                "agent": "主模型",
+                "tool_names": ["get_weather"],
+            },
+            "persona": type("Persona", (), {"name": "Mika"})(),
+        },
+    )()
+    page = OverviewPage(runtime)
+    try:
+        labels = "\n".join(label.text() for label in page.findChildren(QtWidgets.QLabel))
+
+        assert "部分可用 1/2 · 请求超时" in labels
+        assert "ok" in labels
+        assert "可用 · 123ms" in labels
+        assert "bad" in labels
+        assert "异常 · 请求超时" in labels
+        assert "渠道状态" in labels
+        assert "用量统计" in labels
+        assert "请求数" in labels
+        assert "3" in labels
+        assert "输入 token" in labels
+        assert "输出 token" in labels
+        assert "总 token" in labels
+        assert "1,250" in labels
+        assert "KV 命中 token" in labels
+        assert "800" in labels
+        assert "KV 写入 token" in labels
+        assert "120" in labels
+        assert "80.0%" in labels
+        assert "主模型状态" in labels
+        assert "(调用工具)" in labels
+        assert "get_weather" in labels
+        assert "累计概况" not in labels
+        assert "当前角色" not in labels
+        assert page._usage_card._right_label.isHidden()
+    finally:
+        page.deleteLater()
 
 
 def test_memory_page_rag_mode_shows_index_view(qapp):
@@ -368,6 +583,25 @@ def test_personas_page_can_build_and_save_generated_persona(qapp, tmp_path):
         assert "'gender': 'female'" in text
     finally:
         page.deleteLater()
+
+
+def test_persona_creator_dialog_wires_runtime_usage_callbacks(qapp):
+    context = WizardContext()
+
+    class RuntimeStub:
+        async def _record_model_usage(self, usage, metadata):
+            return None
+
+        def _update_model_activity(self, payload):
+            return None
+
+    runtime = RuntimeStub()
+    dlg = _PersonaCreatorDialog(context, runtime=runtime)
+    try:
+        assert dlg._creator.usage_recorder == runtime._record_model_usage
+        assert dlg._creator.status_callback == runtime._update_model_activity
+    finally:
+        dlg.deleteLater()
 
 
 def test_personas_page_selects_active_persona_on_refresh(qapp, tmp_path):

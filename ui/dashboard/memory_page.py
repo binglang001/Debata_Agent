@@ -111,7 +111,7 @@ class MemoryPage(QWidget):
         self._empty.hide()
         self._rag_empty = EmptyState(
             "暂无 RAG 索引",
-            "有长期记忆并完成向量化后会显示在这里",
+            "RAG 模式会自动索引历史对话；有可索引消息并完成向量化后会显示在这里",
         )
         outer.addWidget(self._rag_empty)
         self._rag_empty.hide()

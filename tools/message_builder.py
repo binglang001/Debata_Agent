@@ -30,6 +30,19 @@ FORBIDDEN_TAGS: tuple[str, ...] = (
     "[TO:",
     "我给 QQ",
     "我在群",
+    "思考过程",
+    "<retrieved_conversation_context",
+    "</retrieved_conversation_context>",
+    "<task_context",
+    "</task_context>",
+    "<agent_task_result",
+    "</agent_task_result>",
+    "<send_receipt",
+    "</send_receipt>",
+    "工具结果 ·",
+    "调用了：",
+    "RAG里提到",
+    "RAG 里提到",
 )
 
 

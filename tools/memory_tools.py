@@ -43,10 +43,18 @@ async def save_important_memory(args: SaveMemoryArgs, ctx: ToolContext) -> dict:
 
     return {
         "ok": True,
+        "status": "done",
+        "brief": "已检查并保存重要记忆。" if result["saved"] else "重要记忆已存在，未重复保存。",
         "saved": result["saved"],
         "duplicate": result.get("duplicate", False),
         "scope": scope,
         "pinned": args.pinned,
+        "data": {
+            "saved": result["saved"],
+            "duplicate": result.get("duplicate", False),
+            "scope": scope,
+            "pinned": args.pinned,
+        },
     }
 
 
@@ -69,4 +77,13 @@ async def delete_important_memory(args: DeleteMemoryArgs, ctx: ToolContext) -> d
     except RuntimeError as e:
         return {"ok": False, "error": str(e)}
 
-    return {"ok": True, "deleted": deleted}
+    return {
+        "ok": True,
+        "status": "done",
+        "brief": f"已删除 {deleted} 条匹配的重要记忆。",
+        "deleted": deleted,
+        "data": {
+            "keyword": args.keyword,
+            "deleted": deleted,
+        },
+    }

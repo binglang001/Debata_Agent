@@ -203,7 +203,7 @@ class PersonasPage(QWidget):
         context = self._build_creator_context()
         if context is None:
             return
-        dlg = _PersonaCreatorDialog(context, self)
+        dlg = _PersonaCreatorDialog(context, runtime=self._runtime, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         try:
@@ -298,7 +298,7 @@ class PersonasPage(QWidget):
         except Exception as e:  # noqa: BLE001
             show_message(self, "无法读取", str(e), is_danger=True)
             return
-        dlg = _PersonaRefineDialog(name, prompt, context, self)
+        dlg = _PersonaRefineDialog(name, prompt, context, runtime=self._runtime, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         updated = dlg.result_prompt
@@ -470,10 +470,12 @@ class PersonasPage(QWidget):
 class _PersonaCreatorDialog(FramelessDialog):
     """仪表盘里复用向导的人格生成界面。"""
 
-    def __init__(self, context: WizardContext, parent=None) -> None:
+    def __init__(self, context: WizardContext, runtime=None, parent=None) -> None:
         super().__init__("AI 生成角色", parent)
         self.setMinimumSize(1100, 760)
         self._creator = PersonaCreatorStepView(context, self)
+        self._creator.usage_recorder = getattr(runtime, "_record_model_usage", None)
+        self._creator.status_callback = getattr(runtime, "_update_model_activity", None)
         self._creator.invalid_input.connect(
             lambda msg: show_message(self, "还没完成", msg, is_danger=True)
         )
@@ -510,6 +512,7 @@ class _PersonaRefineDialog(FramelessDialog):
         persona_name: str,
         current_prompt: str,
         context: WizardContext,
+        runtime=None,
         parent=None,
     ) -> None:
         super().__init__(f"修改角色 · {persona_name}", parent)
@@ -518,6 +521,7 @@ class _PersonaRefineDialog(FramelessDialog):
         self._persona_name = persona_name
         self._current_prompt = current_prompt
         self._context = context
+        self._runtime = runtime
         self._agent: PersonaGenAgent | None = self._build_persona_agent()
 
         title = QLabel(f"当前角色：{persona_name}")
@@ -586,7 +590,12 @@ class _PersonaRefineDialog(FramelessDialog):
             max_tokens=max(8192, m.max_tokens),
             first_token_timeout_seconds=60.0,
         )
-        return PersonaGenAgent(provider, cfg)
+        return PersonaGenAgent(
+            provider,
+            cfg,
+            usage_recorder=getattr(self._runtime, "_record_model_usage", None),
+            status_callback=getattr(self._runtime, "_update_model_activity", None),
+        )
 
     def _on_generate(self) -> None:
         import asyncio
@@ -696,9 +705,17 @@ def _load_persona_module(persona_file: Path):
     return module
 
 
-def _render_minimal_persona(name: str, xml: str, admins: list[dict[str, object]] | None = None) -> str:
+def _render_minimal_persona(
+    name: str,
+    xml: str,
+    admins: list[dict[str, object]] | None = None,
+    gender: str = "",
+) -> str:
     safe = xml.replace("'''", "\\'\\'\\'")
-    vars_text = _format_python_literal({"name": name, "admins": admins or []})
+    persona_vars: dict[str, object] = {"name": name, "admins": admins or []}
+    if gender:
+        persona_vars["gender"] = gender
+    vars_text = _format_python_literal(persona_vars)
     return (
         '"""自动生成的人格档案。"""\n\n'
         "PERSONA_PROMPT = '''\n"

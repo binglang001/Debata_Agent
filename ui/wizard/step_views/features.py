@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...theme import Spacing
+from ...widgets.model_combo import ModelComboBox
 from ..components import ApiKeyInput, SectionCard
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
@@ -281,8 +282,9 @@ class _SimpleFeatureToggle(QFrame):
 class _VisionFeatureCard(QFrame):
     """看懂图片：开关 + provider 选择 + model + API 密钥（custom 时含 base_url）。"""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, context: WizardContext, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._context = context
         self.setObjectName("Card")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
@@ -291,7 +293,7 @@ class _VisionFeatureCard(QFrame):
         # 头：复选框 + 描述
         head = QHBoxLayout()
         self._check = QCheckBox(COPY["features.vision_title"])
-        self._check.toggled.connect(self._toggle_body)
+        self._check.toggled.connect(self._on_enabled_changed)
         head.addWidget(self._check)
         head.addStretch(1)
         _add_guide_button(head, "vision", self)
@@ -328,9 +330,17 @@ class _VisionFeatureCard(QFrame):
         form.addRow(self._base_url_label, self._base_url_edit)
 
         # model
-        self._model_edit = QLineEdit()
+        model_row = QHBoxLayout()
+        self._model_edit = ModelComboBox()
         self._model_edit.setPlaceholderText("如 doubao-seed-2-0-lite-260428 / glm-5v-turbo / gpt-5.5")
-        form.addRow(QLabel("视觉模型 ID"), self._model_edit)
+        model_row.addWidget(self._model_edit, 1)
+        self._fetch_models_btn = QPushButton("获取模型")
+        self._fetch_models_btn.setProperty("role", "secondary")
+        self._fetch_models_btn.clicked.connect(self._on_fetch_models)
+        model_row.addWidget(self._fetch_models_btn)
+        model_wrap = QWidget()
+        model_wrap.setLayout(model_row)
+        form.addRow(QLabel("视觉模型 ID"), model_wrap)
 
         # 密钥
         self._key_input = ApiKeyInput(placeholder="该 provider 的 API 密钥")
@@ -348,14 +358,19 @@ class _VisionFeatureCard(QFrame):
         outer.addWidget(self._body)
         self._body.setVisible(False)
 
-        # 初始化默认到 volcengine（默认条目；refresh 时再覆盖）
-        idx = self._preset_combo.findData("volcengine")
+        # 初始化默认到项目推荐视觉模型（refresh 时再覆盖）
+        idx = self._preset_combo.findData(self._recommended_vision_preset())
         if idx >= 0:
             self._preset_combo.setCurrentIndex(idx)
         self._on_preset_changed(idx if idx >= 0 else 0)
 
     def _toggle_body(self, on: bool) -> None:
         self._body.setVisible(on)
+
+    def _on_enabled_changed(self, on: bool) -> None:
+        if on:
+            self._apply_smart_default()
+        self._toggle_body(on)
 
     def _on_preset_changed(self, idx: int) -> None:
         preset = self._preset_combo.itemData(idx) or "volcengine"
@@ -369,20 +384,131 @@ class _VisionFeatureCard(QFrame):
         # main 模式：model + key 都可继承主模型 —— 仍允许编辑
         is_main = preset == "main"
         self._key_input.setEnabled(not is_main)
+        self._fetch_models_btn.setEnabled(not is_main)
 
         # 自动填默认 model（仅当用户没改过）
-        cur = self._model_edit.text().strip()
+        cur = self._model_edit.current_model_id()
         known_defaults = {p["model"] for p in _VISION_PRESETS.values() if p["model"]}
         if not cur or cur in known_defaults:
-            self._model_edit.setText(info.get("model", ""))
+            if is_main:
+                self._model_edit.setEditText(self._context.main.model)
+            else:
+                self._model_edit.setEditText(info.get("model", ""))
 
-        self._hint_lbl.setText(info.get("hint", ""))
+        self._hint_lbl.setText(self._vision_hint(preset, info.get("hint", "")))
+
+    def _apply_smart_default(self) -> None:
+        if self._main_supports_vision():
+            idx = self._preset_combo.findData("main")
+            if idx >= 0:
+                self._preset_combo.setCurrentIndex(idx)
+            self._model_edit.setEditText(self._context.main.model)
+            return
+        preset = self._recommended_vision_preset()
+        idx = self._preset_combo.findData(preset)
+        if idx >= 0:
+            self._preset_combo.setCurrentIndex(idx)
+        model = self._recommended_vision_model(preset)
+        if model:
+            self._model_edit.setEditText(model)
+
+    def _main_supports_vision(self) -> bool:
+        try:
+            from providers.model_capabilities import model_supports
+
+            return model_supports(self._context.main.preset, self._context.main.model, "vision")
+        except Exception:
+            return False
+
+    def _recommended_vision_preset(self) -> str:
+        try:
+            from providers.model_capabilities import recommended_provider
+
+            provider = recommended_provider("vision")
+            if provider and provider.id in _VISION_PRESETS:
+                return provider.id
+        except Exception:
+            pass
+        return "volcengine"
+
+    def _recommended_vision_model(self, preset: str) -> str:
+        try:
+            from providers.model_capabilities import recommended_model
+
+            model = recommended_model(preset, "vision")
+            if model:
+                return model.id
+        except Exception:
+            pass
+        return _VISION_PRESETS.get(preset, {}).get("model", "")
+
+    def _vision_hint(self, preset: str, fallback: str) -> str:
+        if preset == "main":
+            if self._main_supports_vision():
+                return "主模型已知支持图像理解，可复用同一个 provider 和密钥。"
+            return "当前主模型未在能力文件中标记为支持图像理解。若你确认它支持，可手动使用。"
+        return fallback
+
+    def _on_fetch_models(self) -> None:
+        preset = self._preset_combo.currentData() or "volcengine"
+        if preset == "main":
+            self._hint_lbl.setText("复用主模型时无需单独获取视觉模型。")
+            return
+        base_url = (
+            self._base_url_edit.text().strip()
+            if preset == "custom"
+            else _VISION_PRESETS.get(preset, {}).get("url", "")
+        )
+        key = self._key_input.text().strip()
+        if not base_url:
+            self._hint_lbl.setText("请先填写 Base URL。")
+            return
+        if not key:
+            self._key_input.set_test_state("error", "请先填写 API 密钥")
+            return
+
+        self._fetch_models_btn.setEnabled(False)
+        self._fetch_models_btn.setText("获取中...")
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self._fetch_models_btn.setEnabled(True)
+            self._fetch_models_btn.setText("获取模型")
+            self._hint_lbl.setText("事件循环未就绪")
+            return
+
+        async def _do_fetch() -> None:
+            try:
+                from providers.model_fetcher import fetch_model_infos
+                from providers.registry import normalize_base_url
+
+                protocol = "anthropic" if preset == "anthropic" else "openai_compat"
+                models = await fetch_model_infos(
+                    normalize_base_url(base_url, protocol),
+                    key,
+                    protocol,
+                    provider_id="" if preset == "custom" else str(preset),
+                    timeout=8.0,
+                )
+                self._model_edit.set_models(
+                    [m.id for m in models],
+                    provider_id="" if preset == "custom" else str(preset),
+                )
+                self._key_input.set_test_state("success", f"已获取 {len(models)} 个模型")
+            except Exception as e:
+                self._key_input.set_test_state("error", f"获取失败：{e}")
+            finally:
+                self._fetch_models_btn.setEnabled(preset != "main")
+                self._fetch_models_btn.setText("获取模型")
+
+        loop.create_task(_do_fetch())
 
     async def _test_current(self) -> tuple[bool, str]:
         preset = self._preset_combo.currentData() or "volcengine"
         if preset == "main":
             return False, "复用主模型时请在主模型页面测试连接"
-        model = self._model_edit.text().strip()
+        model = self._model_edit.current_model_id()
         key = self._key_input.text().strip()
         base_url = (
             self._base_url_edit.text().strip()
@@ -433,7 +559,7 @@ class _VisionFeatureCard(QFrame):
         return {
             "enabled": self._check.isChecked(),
             "preset": self._preset_combo.currentData() or "volcengine",
-            "model": self._model_edit.text().strip(),
+            "model": self._model_edit.current_model_id(),
             "base_url": self._base_url_edit.text().strip(),
             "api_key": self._key_input.text(),
         }
@@ -447,7 +573,7 @@ class _VisionFeatureCard(QFrame):
             self._preset_combo.setCurrentIndex(idx)
         self._on_preset_changed(self._preset_combo.currentIndex())
         if extra.get("model"):
-            self._model_edit.setText(extra["model"])
+            self._model_edit.setEditText(extra["model"])
         if extra.get("base_url"):
             self._base_url_edit.setText(extra["base_url"])
         if choice.api_key:
@@ -834,7 +960,10 @@ class _ASRFeatureCard(QFrame):
 class _TTSFeatureCard(QFrame):
     """用声音说话：开关 + 本地/API 选择 + 本地音色配置 + API provider。"""
 
-    _API_PROVIDERS = ["baidu", "xfyun", "volcengine"]
+    _API_PROVIDERS = [
+        ("EdgeTTS（推荐 · 无需密钥）", "edge"),
+        ("科大讯飞", "xfyun"),
+    ]
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -848,7 +977,7 @@ class _TTSFeatureCard(QFrame):
         self._check.toggled.connect(self._toggle_body)
         head.addWidget(self._check)
         head.addStretch(1)
-        _add_guide_button(head, "tts_voxcpm", self)
+        _add_guide_button(head, "tts_api", self)
         outer.addLayout(head)
 
         d = QLabel(COPY["features.tts_desc"])
@@ -868,8 +997,8 @@ class _TTSFeatureCard(QFrame):
         form.setSpacing(Spacing.SM)
 
         self._type_combo = QComboBox()
-        self._type_combo.addItem("本地（推荐 · VoxCPM2）", "local")
-        self._type_combo.addItem("云端 API", "api")
+        self._type_combo.addItem("云端 API（推荐 · EdgeTTS）", "api")
+        self._type_combo.addItem("本地（VoxCPM2）", "local")
         self._type_combo.currentIndexChanged.connect(self._on_type_changed)
         form.addRow(QLabel("运行方式"), self._type_combo)
 
@@ -920,33 +1049,27 @@ class _TTSFeatureCard(QFrame):
 
         # API 模式字段
         self._api_provider_combo = QComboBox()
-        for p in self._API_PROVIDERS:
-            self._api_provider_combo.addItem(p, p)
+        for label, value in self._API_PROVIDERS:
+            self._api_provider_combo.addItem(label, value)
         self._api_provider_combo.currentIndexChanged.connect(self._on_type_changed)
         form.addRow(QLabel("API Provider"), self._api_provider_combo)
 
         self._api_key_edit = QLineEdit()
         self._api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self._api_key_edit.setPlaceholderText("API Key")
+        self._api_key_edit.setPlaceholderText("讯飞 API Key")
         form.addRow(QLabel("API 密钥"), self._api_key_edit)
 
-        # 专有字段
-        self._baidu_secret = QLineEdit()
-        self._baidu_secret.setEchoMode(QLineEdit.EchoMode.Password)
-        self._baidu_secret.setPlaceholderText("百度语音 Secret Key")
-        form.addRow(QLabel("Secret Key"), self._baidu_secret)
+        self._api_voice = QLineEdit()
+        self._api_voice.setPlaceholderText("讯飞默认 x4_xiaoyan；Edge 默认 zh-CN-XiaoxiaoNeural")
+        form.addRow(QLabel("说话人"), self._api_voice)
 
         self._xfyun_appid = QLineEdit()
-        self._xfyun_appid.setPlaceholderText("控制台获取")
+        self._xfyun_appid.setPlaceholderText("讯飞控制台 AppID")
         form.addRow(QLabel("App ID"), self._xfyun_appid)
         self._xfyun_secret = QLineEdit()
         self._xfyun_secret.setEchoMode(QLineEdit.EchoMode.Password)
         self._xfyun_secret.setPlaceholderText("API Secret")
         form.addRow(QLabel("API Secret"), self._xfyun_secret)
-
-        self._volc_appid = QLineEdit()
-        self._volc_appid.setPlaceholderText("火山引擎 App ID")
-        form.addRow(QLabel("App ID"), self._volc_appid)
 
         body_layout.addLayout(form)
 
@@ -970,8 +1093,8 @@ class _TTSFeatureCard(QFrame):
         body_layout.addLayout(local_actions)
 
         hint = QLabel(
-            "VoxCPM2 可以只靠音色/语气描述生成语音；填 3-10 秒参考音频时会按该音色克隆。"
-            "模型约 3GB，若未就绪请点「安装指引」。"
+            "EdgeTTS 无需额外配置，但依赖微软在线服务，可能因网络或服务策略合成失败。"
+            "讯飞需要先在控制台开通在线语音合成并填写密钥。"
         )
         hint.setProperty("role", "secondary")
         hint.setWordWrap(True)
@@ -995,12 +1118,11 @@ class _TTSFeatureCard(QFrame):
         _set_form_field_visible(self._form, self._timesteps, is_local)
         is_api = not is_local
         _set_form_field_visible(self._form, self._api_provider_combo, is_api)
-        _set_form_field_visible(self._form, self._api_key_edit, is_api)
         prov = self._api_provider_combo.currentData() if is_api else ""
-        _set_form_field_visible(self._form, self._baidu_secret, is_api and prov == "baidu")
+        _set_form_field_visible(self._form, self._api_key_edit, is_api and prov == "xfyun")
+        _set_form_field_visible(self._form, self._api_voice, is_api)
         _set_form_field_visible(self._form, self._xfyun_appid, is_api and prov == "xfyun")
         _set_form_field_visible(self._form, self._xfyun_secret, is_api and prov == "xfyun")
-        _set_form_field_visible(self._form, self._volc_appid, is_api and prov == "volcengine")
         self._download_btn.setVisible(is_local)
         self._open_dir_btn.setVisible(is_local)
         self._check_model()
@@ -1036,6 +1158,8 @@ class _TTSFeatureCard(QFrame):
                 self._on_download,
             )
             return False
+        if st["provider"] == "edge":
+            return True
         if not st["api_key"]:
             if hasattr(parent, "invalid_input"):
                 parent.invalid_input.emit("开了「用声音说话」的 API 模式就要填 API 密钥")  # type: ignore[attr-defined]
@@ -1043,15 +1167,11 @@ class _TTSFeatureCard(QFrame):
         extra = st["extra_credentials"]
         provider = st["provider"]
         missing = []
-        if provider == "baidu" and not extra.get("secret_key"):
-            missing.append("Secret Key")
-        elif provider == "xfyun":
+        if provider == "xfyun":
             if not extra.get("app_id"):
                 missing.append("App ID")
             if not extra.get("api_secret"):
                 missing.append("API Secret")
-        elif provider == "volcengine" and not extra.get("app_id"):
-            missing.append("App ID")
         if missing:
             if hasattr(parent, "invalid_input"):
                 parent.invalid_input.emit(
@@ -1077,16 +1197,15 @@ class _TTSFeatureCard(QFrame):
         extra: dict[str, str] = {}
         if self._type_combo.currentData() == "api":
             prov = self._api_provider_combo.currentData()
-            if prov == "baidu":
-                extra["secret_key"] = self._baidu_secret.text().strip()
-            elif prov == "xfyun":
+            voice = self._api_voice.text().strip()
+            if voice:
+                extra["voice"] = voice
+            if prov == "xfyun":
                 extra["app_id"] = self._xfyun_appid.text().strip()
                 extra["api_secret"] = self._xfyun_secret.text().strip()
-            elif prov == "volcengine":
-                extra["app_id"] = self._volc_appid.text().strip()
         return {
             "enabled": self._check.isChecked(),
-            "type": self._type_combo.currentData() or "local",
+            "type": self._type_combo.currentData() or "api",
             "device": self._device_combo.currentText(),
             "reference_audio": self._ref_audio_edit.text().strip(),
             "default_prompt": self._prompt_edit.text().strip(),
@@ -1102,7 +1221,7 @@ class _TTSFeatureCard(QFrame):
     def set_state(self, choice) -> None:
         self._check.setChecked(choice.enabled)
         extra = choice.extra or {}
-        tp = extra.get("type", "local")
+        tp = extra.get("type", "api")
         idx = self._type_combo.findData(tp)
         if idx >= 0:
             self._type_combo.setCurrentIndex(idx)
@@ -1124,10 +1243,9 @@ class _TTSFeatureCard(QFrame):
         if extra.get("api_key"):
             self._api_key_edit.setText(extra["api_key"])
         creds = extra.get("extra_credentials", {})
-        self._baidu_secret.setText(creds.get("secret_key", ""))
+        self._api_voice.setText(creds.get("voice", ""))
         self._xfyun_appid.setText(creds.get("app_id", ""))
         self._xfyun_secret.setText(creds.get("api_secret", ""))
-        self._volc_appid.setText(creds.get("app_id", ""))
         self._on_type_changed()
 
 
@@ -1152,7 +1270,7 @@ class FeaturesStepView(BaseStepView):
         outer.addWidget(card)
 
         # vision
-        self._vision = _VisionFeatureCard()
+        self._vision = _VisionFeatureCard(self.context)
         card.add_content(self._vision)
 
         # weather

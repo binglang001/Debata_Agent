@@ -22,6 +22,8 @@ from typing import Any
 from app_config.schema import AgentConfig, SummarizeConfig
 from providers.base import IProvider, ProviderError, ReasoningConfig
 
+from .base import StatusCallback, UsageRecorder
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,10 +35,15 @@ class SummaryAgent:
         provider: IProvider,
         cfg: AgentConfig,
         summarize_cfg: SummarizeConfig,
+        *,
+        usage_recorder: UsageRecorder | None = None,
+        status_callback: StatusCallback | None = None,
     ) -> None:
         self.provider = provider
         self.cfg = cfg
         self.summarize_cfg = summarize_cfg
+        self.usage_recorder = usage_recorder
+        self.status_callback = status_callback
 
     async def summarize_rolling(
         self,
@@ -73,6 +80,7 @@ class SummaryAgent:
         )
 
         try:
+            self._emit_status("thinking", "滚动摘要生成中")
             result = await self.provider.chat_completion(
                 [
                     {
@@ -91,11 +99,14 @@ class SummaryAgent:
                 timeout=self.cfg.first_token_timeout_seconds * 6 + 60.0,
                 first_token_timeout=self.cfg.first_token_timeout_seconds * 2,
             )
+            await self._record_usage(result.usage, operation="rolling_summary")
         except ProviderError as e:
             logger.error(f"滚动摘要失败（API）: {e}")
+            self._emit_status("error", "滚动摘要失败")
             return None
         except Exception as e:
             logger.exception(f"滚动摘要异常: {e}")
+            self._emit_status("error", "滚动摘要异常")
             return None
 
         parsed = _parse_json_object(result.content or "")
@@ -145,6 +156,7 @@ class SummaryAgent:
 
         try:
             # 总结一次性吐 8k+ tokens，整体 timeout 比首 token 宽得多
+            self._emit_status("thinking", "历史总结生成中")
             result = await self.provider.chat_completion(
                 [
                     {
@@ -164,11 +176,14 @@ class SummaryAgent:
                 timeout=self.cfg.first_token_timeout_seconds * 6 + 60.0,
                 first_token_timeout=self.cfg.first_token_timeout_seconds * 2,
             )
+            await self._record_usage(result.usage, operation="history_summary")
         except ProviderError as e:
             logger.error(f"记忆总结失败（API）: {e}")
+            self._emit_status("error", "历史总结失败")
             return None
         except Exception as e:
             logger.exception(f"记忆总结异常: {e}")
+            self._emit_status("error", "历史总结异常")
             return None
 
         parsed = _parse_json_object(result.content or "")
@@ -201,6 +216,37 @@ class SummaryAgent:
             max_tokens=self.cfg.reasoning.max_tokens,
         )
 
+    async def _record_usage(self, usage, **metadata: Any) -> None:
+        if self.usage_recorder is None:
+            return
+        try:
+            await self.usage_recorder(
+                usage,
+                {
+                    "provider": self.provider.name,
+                    "model": self.cfg.model,
+                    "agent": "历史总结",
+                    **metadata,
+                },
+            )
+        except Exception:
+            logger.debug("记录总结模型用量失败", exc_info=True)
+
+    def _emit_status(self, state: str, text: str) -> None:
+        if self.status_callback is None:
+            return
+        try:
+            self.status_callback(
+                {
+                    "state": state,
+                    "text": text,
+                    "model": self.cfg.model,
+                    "agent": "历史总结",
+                }
+            )
+        except Exception:
+            logger.debug("更新总结模型状态失败", exc_info=True)
+
 
 class DuplicateChecker:
     """重要记忆去重判定器（用小模型）。
@@ -212,9 +258,14 @@ class DuplicateChecker:
         self,
         provider: IProvider,
         cfg: AgentConfig,
+        *,
+        usage_recorder: UsageRecorder | None = None,
+        status_callback: StatusCallback | None = None,
     ) -> None:
         self.provider = provider
         self.cfg = cfg
+        self.usage_recorder = usage_recorder
+        self.status_callback = status_callback
 
     async def __call__(self, existing: list[dict[str, Any]], new_text: str) -> bool:
         if not existing or not new_text:
@@ -230,6 +281,7 @@ class DuplicateChecker:
 
         try:
             # 去重判定只要一个布尔结果，用 cfg 的温度和窗口
+            self._emit_status("thinking", "记忆去重判断中")
             result = await self.provider.chat_completion(
                 [{"role": "user", "content": prompt}],
                 model=self.cfg.model,
@@ -242,12 +294,46 @@ class DuplicateChecker:
                 timeout=self.cfg.first_token_timeout_seconds,
                 first_token_timeout=self.cfg.first_token_timeout_seconds,
             )
+            await self._record_usage(result.usage, operation="duplicate_check")
         except Exception as e:
             logger.warning(f"去重检查失败: {e}，默认不跳过")
+            self._emit_status("error", "记忆去重失败")
             return False
 
         text = (result.content or "").strip().lower()
+        self._emit_status("idle", "记忆去重完成")
         return '"duplicate": true' in text or '"duplicate":true' in text
+
+    async def _record_usage(self, usage, **metadata: Any) -> None:
+        if self.usage_recorder is None:
+            return
+        try:
+            await self.usage_recorder(
+                usage,
+                {
+                    "provider": self.provider.name,
+                    "model": self.cfg.model,
+                    "agent": "记忆去重",
+                    **metadata,
+                },
+            )
+        except Exception:
+            logger.debug("记录记忆去重用量失败", exc_info=True)
+
+    def _emit_status(self, state: str, text: str) -> None:
+        if self.status_callback is None:
+            return
+        try:
+            self.status_callback(
+                {
+                    "state": state,
+                    "text": text,
+                    "model": self.cfg.model,
+                    "agent": "记忆去重",
+                }
+            )
+        except Exception:
+            logger.debug("更新记忆去重状态失败", exc_info=True)
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:

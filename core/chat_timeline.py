@@ -19,7 +19,6 @@ from adapters.types import IncomingMessage, MediaSegment, MediaType
 from utils import get_time
 
 _PARAM_SPLIT_RE = re.compile(r",(?=\w+=)")
-_CQ_RE = re.compile(r"\[CQ:(?P<body>[^\]]+)\]")
 
 
 @dataclass(slots=True)
@@ -279,13 +278,13 @@ def _parse_cq_segments(raw_message: str) -> list[dict[str, Any]]:
     if not raw_message:
         return []
     segments: list[dict[str, Any]] = []
-    for match in _CQ_RE.finditer(raw_message):
-        body = match.group("body")
+    for segment_match in _iter_cq_segments(raw_message):
+        body = segment_match["body"]
         if "," in body:
             cq_type, params_str = body.split(",", 1)
         else:
             cq_type, params_str = body, ""
-        raw = match.group(0)
+        raw = segment_match["raw"]
         segments.append(
             {
                 "type": cq_type,
@@ -293,6 +292,33 @@ def _parse_cq_segments(raw_message: str) -> list[dict[str, Any]]:
                 "raw": raw,
             }
         )
+    return segments
+
+
+def _iter_cq_segments(raw_message: str) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    i = 0
+    while True:
+        start = raw_message.find("[CQ:", i)
+        if start < 0:
+            break
+        pos = start + 4
+        while True:
+            end = raw_message.find("]", pos)
+            if end < 0:
+                return segments
+            tail = raw_message[end + 1 :]
+            if not re.match(r"^,\w+=", tail):
+                break
+            pos = end + 1
+        raw = raw_message[start : end + 1]
+        segments.append(
+            {
+                "body": raw_message[start + 4 : end],
+                "raw": raw,
+            }
+        )
+        i = end + 1
     return segments
 
 

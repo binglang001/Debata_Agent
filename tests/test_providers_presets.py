@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 
+from providers.model_fetcher import fetch_model_list
 from providers.presets_loader import (
     ModelInfo,
     ProviderPreset,
@@ -40,6 +42,75 @@ def test_model_info_defaults():
     assert m.display_name == "x"
     assert m.capabilities == []
     assert m.context_length == 0
+
+
+class _DummyModelsResponse:
+    status_code = 200
+
+    def json(self):
+        return {"data": [{"id": "chat-model"}]}
+
+
+@pytest.mark.asyncio
+async def test_fetch_model_list_uses_env_proxy_without_forcing_none(monkeypatch):
+    clients = []
+
+    async def fake_get(self, url, headers=None):
+        assert url == "https://api.test/models"
+        return _DummyModelsResponse()
+
+    original_init = httpx.AsyncClient.__init__
+
+    def fake_init(self, *args, **kwargs):
+        clients.append(kwargs)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", fake_init)
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    ids = await fetch_model_list(
+        "https://api.test/v1",
+        "sk",
+        "openai_compat",
+        timeout=3.0,
+    )
+
+    assert ids == ["chat-model"]
+    assert clients[-1]["proxy"] == "http://127.0.0.1:7897"
+    assert clients[-1]["trust_env"] is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_model_list_omits_proxy_when_env_empty(monkeypatch):
+    clients = []
+
+    async def fake_get(self, url, headers=None):
+        return _DummyModelsResponse()
+
+    original_init = httpx.AsyncClient.__init__
+
+    def fake_init(self, *args, **kwargs):
+        clients.append(kwargs)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", fake_init)
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    ids = await fetch_model_list(
+        "https://api.test/v1",
+        "sk",
+        "openai_compat",
+        timeout=3.0,
+    )
+
+    assert ids == ["chat-model"]
+    assert "proxy" not in clients[-1]
+    assert clients[-1]["trust_env"] is True
 
 
 # ============================================================
@@ -126,6 +197,31 @@ def test_load_all_presets_uses_cache(tmp_path):
     (tmp_path / "good" / "preset.yaml").unlink()
     second = load_all_presets(tmp_path)
     assert second.keys() == first.keys()
+
+
+def test_model_capability_defaults_cover_vision_and_embedding():
+    from providers.model_capabilities import (
+        capability_badges,
+        model_supports,
+        recommended_model,
+        recommended_provider,
+    )
+
+    assert model_supports("volcengine", "doubao-seed-2-0-lite-260428", "vision")
+    assert not model_supports("deepseek", "deepseek-v4-flash", "vision")
+
+    emb_provider = recommended_provider("embedding")
+    assert emb_provider is not None
+    assert emb_provider.id == "volcengine"
+
+    emb_model = recommended_model("volcengine", "embedding")
+    assert emb_model is not None
+    assert emb_model.id == "doubao-embedding-vision-251215"
+    assert emb_model.supports("embedding")
+
+    badges = capability_badges("volcengine", "doubao-seed-2-0-lite-260428")
+    assert "视觉" in badges
+    assert "工具" in badges
 
 
 def test_load_all_presets_skips_invalid(tmp_path):

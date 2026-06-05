@@ -44,6 +44,7 @@ class ChatsPage(QWidget):
         self._runtime = runtime
         self._records: list[dict] = []
         self._conversations: list[dict] = []
+        self._list_signature: list[tuple[str, int, str]] = []
         self._current_key: str | None = None
         self._current_detail_html = ""
 
@@ -128,10 +129,19 @@ class ChatsPage(QWidget):
         detail_was_at_bottom = _scrollbar_near_bottom(detail_bar)
 
         self._conversations = _group_records_by_conversation(self._records)
-        self._list.clear()
         if not self._conversations:
+            self._list_signature = []
+            self._list.clear()
             self._show_empty(True)
             return
+
+        new_signature = _conversation_list_signature(self._conversations)
+        if new_signature == self._list_signature:
+            self._refresh_current_detail()
+            return
+        self._list_signature = new_signature
+
+        self._list.clear()
         self._show_empty(False)
         restore_row = -1
         for i, conv in enumerate(self._conversations):
@@ -154,6 +164,16 @@ class ChatsPage(QWidget):
                     stick_to_bottom=detail_was_at_bottom,
                 ),
             )
+
+    def _refresh_current_detail(self) -> None:
+        if not self._current_key:
+            return
+        item = self._list.currentItem()
+        if item is None:
+            return
+        if item.data(Qt.ItemDataRole.UserRole) != self._current_key:
+            return
+        self._on_item_changed(item, item)
 
     def _on_item_changed(self, item: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if item is None:
@@ -240,7 +260,8 @@ def _group_records_by_conversation(records: list[dict]) -> list[dict]:
 
     新记录优先读 metadata；旧记录从 MessagePipeline 写入的正文头部解析。
     优先使用 record.conversation_id；无会话 ID 的 system/tool 归入系统记录。
-    旧记录没有 conversation_id 时，assistant 仍归入最近的 user 会话以兼容历史。
+    旧记录没有 conversation_id 时，assistant 仅在紧跟用户消息时归入最近会话，
+    避免后台/撤回等系统轮次漂移到普通会话。
     """
     conversations: dict[str, dict] = {}
     order: list[str] = []
@@ -271,8 +292,12 @@ def _group_records_by_conversation(records: list[dict]) -> list[dict]:
             conv = _ensure("system:global", "系统记录")
         else:
             if current_key is None:
-                current_key = "system:global"
-            conv = _ensure(current_key, "系统记录" if current_key == "system:global" else current_key)
+                conv = _ensure("unknown:history", "未标记来源")
+            else:
+                conv = _ensure(
+                    current_key,
+                    "系统记录" if current_key.startswith("system:") else current_key,
+                )
         conv["records"].append(rec)
         content = (rec.get("content") or "").strip()
         if content:
@@ -315,8 +340,32 @@ def _conversation_info_from_id(conversation_id: str) -> dict[str, str]:
     if scope == "private":
         return {"key": conversation_id, "label": f"私聊 {target_id}"}
     if scope == "system":
-        return {"key": conversation_id, "label": "系统记录"}
+        return {"key": conversation_id, "label": _system_conversation_label(target_id)}
     return {"key": conversation_id, "label": conversation_id}
+
+
+def _system_conversation_label(target_id: str) -> str:
+    labels = {
+        "global": "系统记录 · 全局",
+        "proactive": "系统记录 · 主动思考",
+        "wakeup": "系统记录 · 定时唤醒",
+        "agent_task": "系统记录 · 后台任务",
+        "request": "系统记录 · 请求处理",
+    }
+    return labels.get(target_id, f"系统记录 · {target_id}")
+
+
+def _conversation_list_signature(conversations: list[dict]) -> list[tuple[str, int, str]]:
+    signature: list[tuple[str, int, str]] = []
+    for conv in conversations:
+        signature.append(
+            (
+                str(conv.get("key") or ""),
+                len(conv.get("records") or []),
+                str(conv.get("preview") or ""),
+            )
+        )
+    return signature
 
 
 def _format_tool_call_for_display(tool_call: dict) -> str:
