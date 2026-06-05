@@ -223,7 +223,7 @@ QFrame#EmojiTile {{
 }}
 
 QLabel#EmojiDropHint {{
-    border: 2px dashed {p.border_strong};
+    border: 2px dashed {p.text_disabled};
     border-radius: {Radius.DEFAULT}px;
     padding: {Spacing.LG}px;
 }}
