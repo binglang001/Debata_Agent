@@ -30,7 +30,7 @@ from agents.persona_loader import (
 from agents.proactive_agent import ProactiveRouterAgent, _is_action_decision
 from agents.runner import AgentRunner
 from app_config.schema import AgentConfig
-from providers.base import CompletionResult, IProvider, ToolCall, Usage
+from providers.base import CompletionResult, IProvider, ToolCall, Usage, normalize_messages
 
 # ============================================================
 # persona_loader
@@ -385,8 +385,38 @@ def test_build_messages_rag_memory_is_tail_context_for_cache_stability():
     assert "RAG 片段 B" not in second[0]["content"]
     assert [m["role"] for m in first] == ["system", "user", "system", "system"]
     assert "旧消息" in first[1]["content"]
-    assert "RAG 片段 A" in first[2]["content"]
-    assert "task_context" in first[3]["content"]
+    assert "task_context" in first[2]["content"]
+    assert "RAG 片段 A" in first[3]["content"]
+
+
+def test_build_messages_can_reuse_persisted_task_context_record_for_prefix_stability():
+    p = _persona()
+    history = [{"role": "user", "content": "本轮用户消息"}]
+    task_record = {
+        "role": "system",
+        "content": "<task_context priority=\"medium\">\n现在是 10:00。\n</task_context>",
+        "metadata": {"kind": "task_context_snapshot"},
+        "conversation_id": "private:1",
+    }
+
+    current = build_messages(
+        p,
+        history,
+        current_context_record=task_record,
+        memory_mode="rag",
+    )
+    next_turn = build_messages(
+        p,
+        [*history, task_record, {"role": "assistant", "content": ""}],
+        current_context_record={
+            "role": "system",
+            "content": "<task_context priority=\"medium\">\n现在是 10:01。\n</task_context>",
+        },
+        memory_mode="rag",
+    )
+
+    assert normalize_messages(current[:3]) == normalize_messages(next_turn[:3])
+    assert current[2]["content"] == task_record["content"]
 
 
 def test_build_messages_user_event_is_final_user_message():

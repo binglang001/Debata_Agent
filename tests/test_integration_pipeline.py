@@ -374,6 +374,25 @@ async def _wait_until(predicate, max_wait: float = 1.0) -> None:
 
 
 @pytest.mark.asyncio
+async def test_main_reply_persists_task_context_snapshot_for_kv_prefix(build_pipeline):
+    pipeline, provider, _, history, _ = await build_pipeline([_ai_no_action()])
+
+    await pipeline.enqueue(_msg(user_id="123", text="测缓存", message_id="kv-1"))
+    await _drain_pipeline(pipeline)
+
+    records = await history.records()
+    roles = [r.get("role") for r in records[:4]]
+    assert roles == ["user", "system", "assistant", "tool"]
+    assert records[1].get("metadata", {}).get("kind") == "task_context_snapshot"
+    assert "<task_context" in records[1]["content"]
+
+    first_call = provider.calls[0]["messages"]
+    assert first_call[1]["role"] == "user"
+    assert first_call[2]["role"] == "system"
+    assert first_call[2]["content"] == records[1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_basic_private_message_flow(build_pipeline):
     """私聊：enqueue → batch → chat_agent → tool → adapter.send_text。
 

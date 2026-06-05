@@ -53,7 +53,7 @@ from typing import Any
 
 from adapters.base import IAdapter
 from adapters.types import IncomingMessage, MediaType, Target
-from agents import ChatAgent, Persona, SummaryAgent, build_messages
+from agents import ChatAgent, Persona, SummaryAgent, build_messages, build_task_context
 from agents.base import AgentRunResult
 from app_config.schema import BehaviorConfig, FeaturesConfig, WhitelistConfig
 from memory import (
@@ -741,6 +741,24 @@ def _record_conversation_id(record: dict[str, Any]) -> str | None:
     return None
 
 
+def _make_task_context_record(
+    task_context: str,
+    *,
+    conversation_id: str | None = None,
+) -> dict[str, Any] | None:
+    content = build_task_context(task_context)
+    if not content:
+        return None
+    record: dict[str, Any] = {
+        "role": "system",
+        "content": content,
+        "metadata": {"kind": "task_context_snapshot"},
+    }
+    if conversation_id:
+        record["conversation_id"] = conversation_id
+    return record
+
+
 def _earliest_record_ts(records: list[dict[str, Any]]) -> str | None:
     timestamps: list[str] = []
     for record in records:
@@ -1272,6 +1290,10 @@ class MessagePipeline:
 
         # 构造给 LLM 的 messages（emoji_hint / pending_requests 已在 _build_task_context 内拼装）
         task_context = self._build_task_context(now, conversation_id)
+        task_context_record = _make_task_context_record(
+            task_context,
+            conversation_id=conversation_id,
+        )
 
         history_window = await self._select_working_history(conversation_id)
         estimator = self._token_estimator()
@@ -1293,7 +1315,7 @@ class MessagePipeline:
             history=history_window,
             important_memory_text=important_text,
             rolling_summary_text=self._rolling_summary_text(estimator),
-            current_context=task_context,
+            current_context_record=task_context_record,
             memory_mode=self.features_cfg.long_term_memory.mode,
         )
 
@@ -1339,9 +1361,14 @@ class MessagePipeline:
             )
 
             # 写 records
-            if result.records:
+            records_to_add = [
+                record
+                for record in [task_context_record, *list(result.records or [])]
+                if record is not None
+            ]
+            if records_to_add:
                 await self.history.add_records(
-                    result.records,
+                    records_to_add,
                     conversation_id=conversation_id,
                 )
 

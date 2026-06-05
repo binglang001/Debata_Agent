@@ -155,6 +155,7 @@ def build_messages(
     important_memory_text: str = "",
     rolling_summary_text: str = "",
     current_context: str = "",
+    current_context_record: dict[str, Any] | None = None,
     system_override: str | None = None,
     *,
     memory_mode: Literal["file", "rag"] = "file",
@@ -167,6 +168,8 @@ def build_messages(
         history: 历史对话（来自 HistoryManager）
         important_memory_text: 已按当前会话 scope / RAG 规则选出的重要记忆文本
         current_context: 本次调用的临时上下文（时间、表情包等）
+        current_context_record: 已持久化的 task_context system 记录。主回复路径用它
+            保证下一轮重建 history 时字节前缀与上一轮请求一致。
         system_override: 完全自定义的 system prompt（仅特殊用途，如 proactive 路由）
         memory_mode: "file" / "rag"，决定 tool_use_protocol 内的 memory 块写法
         user_event: 带外触发轮的尾部 user 事件。仅用于唤醒/主动/请求等没有真实用户消息的轮次。
@@ -211,6 +214,20 @@ def build_messages(
 
     messages.extend(history)
 
+    if current_context_record is not None:
+        content = str(current_context_record.get("content") or "")
+        if content:
+            messages.append(
+                {
+                    "role": current_context_record.get("role", "system"),
+                    "content": content,
+                }
+            )
+    else:
+        task_ctx = build_task_context(current_context)
+        if task_ctx:
+            messages.append({"role": "system", "content": task_ctx})
+
     if memory_mode == "rag" and important_memory_text:
         messages.append(
             {
@@ -223,10 +240,6 @@ def build_messages(
                 ),
             }
         )
-
-    task_ctx = build_task_context(current_context)
-    if task_ctx:
-        messages.append({"role": "system", "content": task_ctx})
 
     if user_event:
         messages.append({"role": "user", "content": user_event.strip()})
