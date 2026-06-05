@@ -263,15 +263,22 @@ async def _probe_openai_compat_embedding(
     timeout_seconds: float,
     extra_headers: dict[str, str],
 ) -> ProviderHealth:
-    url = base_url.rstrip("/") + "/embeddings"
+    endpoint = "/embeddings"
+    payload = {
+        "model": model,
+        "input": ["test"],
+    }
+    if _is_volcengine_multimodal_embedding(model):
+        endpoint = "/embeddings/multimodal"
+        payload = {
+            "model": model,
+            "input": [{"type": "text", "text": "test"}],
+        }
+    url = base_url.rstrip("/") + endpoint
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         **extra_headers,
-    }
-    payload = {
-        "model": model,
-        "input": ["test"],
     }
     async with httpx.AsyncClient(**_client_kwargs(timeout_seconds)) as client:
         resp = await client.post(url, headers=headers, json=payload)
@@ -296,6 +303,10 @@ async def _probe_openai_compat_embedding(
     if not isinstance(first, dict) or not isinstance(first.get("embedding"), list):
         return ProviderHealth("error", "Embedding 响应缺少向量")
     return ProviderHealth("ok", "可用")
+
+
+def _is_volcengine_multimodal_embedding(model: str) -> bool:
+    return model.startswith("doubao-embedding-vision-")
 
 
 async def _probe_anthropic(

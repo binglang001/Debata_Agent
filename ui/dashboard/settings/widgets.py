@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -131,20 +131,21 @@ class CollapsibleSection(QFrame):
         self._expanded = bool(expanded)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
-        outer.setSpacing(Spacing.XS)
+        outer.setContentsMargins(Spacing.MD, Spacing.MD, Spacing.MD, Spacing.MD)
+        outer.setSpacing(Spacing.SM)
 
         head = QHBoxLayout()
         head.setSpacing(Spacing.SM)
         self._toggle_btn = QPushButton()
-        self._toggle_btn.setProperty("role", "secondary")
-        self._toggle_btn.setMinimumWidth(72)
+        self._toggle_btn.setProperty("role", "collapse-toggle")
+        self._toggle_btn.setFixedWidth(30)
         self._toggle_btn.setFixedHeight(30)
         self._toggle_btn.clicked.connect(self._toggle)
-        head.addWidget(self._toggle_btn)
+        head.addWidget(self._toggle_btn, 0, Qt.AlignmentFlag.AlignTop)
 
         title_box = QVBoxLayout()
         title_box.setContentsMargins(0, 0, 0, 0)
+        title_box.setSpacing(Spacing.XS)
         title_lbl = QLabel(title)
         title_lbl.setProperty("role", "title-3")
         title_box.addWidget(title_lbl)
@@ -174,7 +175,8 @@ class CollapsibleSection(QFrame):
         self._render_state()
 
     def _render_state(self) -> None:
-        self._toggle_btn.setText("收起" if self._expanded else "展开")
+        self._toggle_btn.setText("v" if self._expanded else ">")
+        self._toggle_btn.setToolTip("收起" if self._expanded else "展开")
         self._body.setVisible(self._expanded)
 
 

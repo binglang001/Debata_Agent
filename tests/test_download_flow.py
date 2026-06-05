@@ -340,6 +340,39 @@ def test_plugin_install_status_requires_download_sources(tmp_path: Path):
     assert manager._detect_install_status(meta) == PluginStatus.INSTALLED
 
 
+def test_embedding_plugin_accepts_sentence_transformer_bin_weights(tmp_path: Path):
+    from plugins.base import PluginManager
+
+    manager = PluginManager(tmp_path / "plugins")
+    model_dir = tmp_path / "bge"
+    (model_dir / "1_Pooling").mkdir(parents=True)
+    for filename in (
+        "config.json",
+        "modules.json",
+        "sentence_bert_config.json",
+        "tokenizer_config.json",
+        "vocab.txt",
+        "1_Pooling/config.json",
+    ):
+        (model_dir / filename).write_text("{}", encoding="utf-8")
+    (model_dir / "pytorch_model.bin").write_bytes(b"x")
+
+    meta = PluginMeta(
+        name="embedding_bge_zh",
+        display_name="BGE",
+        kind="embedding",
+        model_dir=str(model_dir),
+        download_sources=[
+            DownloadSource(
+                url="https://example.com/model.safetensors",
+                dest_filename="model.safetensors",
+            ),
+        ],
+    )
+
+    assert manager._detect_install_status(meta) == PluginStatus.INSTALLED
+
+
 def test_downloader_uses_only_configured_proxy(monkeypatch):
     from plugins import downloader
 

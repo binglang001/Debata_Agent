@@ -43,6 +43,7 @@ from ui.dashboard.memory_page import MemoryPage
 from ui.dashboard.overview_page import OverviewPage
 from ui.dashboard.personas_page import PersonasPage, _PersonaCreatorDialog
 from ui.dashboard.settings_page import SettingsPage
+from ui.widgets.model_combo import ModelComboBox
 from ui.widgets.window_chrome import _resize_edges_for_local_pos
 from ui.wizard.components import ApiKeyInput
 from ui.wizard.context import WizardContext
@@ -270,6 +271,21 @@ def test_tts_feature_card_local_reference_audio_is_optional(qapp, monkeypatch):
     assert card.state()["reference_audio"] == ""
 
 
+def test_model_combo_focus_does_not_reopen_popup(qapp, monkeypatch):
+    combo = ModelComboBox()
+    try:
+        combo.add_model("deepseek-chat")
+        calls = []
+        monkeypatch.setattr(combo, "showPopup", lambda: calls.append("popup"))
+
+        combo.setFocus(Qt.FocusReason.MouseFocusReason)
+        qapp.processEvents()
+
+        assert calls == []
+    finally:
+        combo.deleteLater()
+
+
 def test_persona_creator_admin_row_buttons_are_visible_and_spaced(qapp):
     view = PersonaCreatorStepView(WizardContext())
     try:
@@ -400,7 +416,12 @@ def test_settings_page_collapses_advanced_budget_and_napcat_options(qapp, tmp_pa
             if labels:
                 titles.append(labels[0].text())
             if buttons:
-                collapsed.append(buttons[0].text() == "展开")
+                collapsed.append(section._body.isHidden())
+                assert buttons[0].property("role") == "collapse-toggle"
+                assert buttons[0].minimumWidth() == 30
+                assert buttons[0].maximumWidth() == 30
+                assert buttons[0].minimumHeight() == 30
+                assert buttons[0].maximumHeight() == 30
 
         assert "NapCat 连接高级参数" in titles
         assert "上下文总预算" in titles
@@ -410,6 +431,33 @@ def test_settings_page_collapses_advanced_budget_and_napcat_options(qapp, tmp_pa
         label_text = "\n".join(label.text() for label in page.findChildren(QtWidgets.QLabel))
         assert "API 前等待连接" in label_text
         assert "托管进程预热" in label_text
+    finally:
+        page.deleteLater()
+
+
+def test_settings_page_scrolls_only_right_content(qapp, tmp_paths):
+    cfg = _minimal_root_config()
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "paths": tmp_paths,
+            "secrets": type("Secrets", (), {"get": lambda self, _key: ""})(),
+            "provider_registry": type("Registry", (), {"presets": {}})(),
+            "providers": {},
+            "provider_health": {},
+        },
+    )()
+    page = SettingsPage(runtime)
+    try:
+        assert page._settings_scroll.widget() is page._settings_stack
+        assert page._settings_scroll.parentWidget() is page
+        assert page._settings_nav.parentWidget() is page
+        assert page._status.parentWidget() is page
+        assert page._settings_scroll.isAncestorOf(page._settings_stack)
+        assert not page._settings_scroll.isAncestorOf(page._settings_nav)
+        assert not page._settings_scroll.isAncestorOf(page._status)
     finally:
         page.deleteLater()
 
@@ -487,7 +535,11 @@ def test_overview_page_shows_usage_activity_and_provider_counts(qapp):
     try:
         labels = "\n".join(label.text() for label in page.findChildren(QtWidgets.QLabel))
 
-        assert "部分可用 1/2 · 请求超时" in labels
+        assert page._providers_card._right_label.text() == "1/2 可用"
+        assert page._providers_card._right_label.maximumWidth() == 112
+        assert page._providers_card._right_label.maximumHeight() == 22
+        assert page._providers_card._right_label.toolTip() == "部分可用 1/2 · 请求超时"
+        assert "部分可用 1/2 · 请求超时" not in labels
         assert "ok" in labels
         assert "可用 · 123ms" in labels
         assert "bad" in labels
@@ -513,6 +565,70 @@ def test_overview_page_shows_usage_activity_and_provider_counts(qapp):
         assert page._usage_card._right_label.isHidden()
     finally:
         page.deleteLater()
+
+
+def test_overview_cards_keep_content_driven_height(qapp):
+    page = OverviewPage(
+        type(
+            "RuntimeStub",
+            (),
+            {
+                "adapter": None,
+                "config": _minimal_root_config(),
+                "providers": {},
+                "provider_health": {},
+                "_hist_len": 0,
+                "important": None,
+                "usage_stats": None,
+                "model_activity": {},
+            },
+        )()
+    )
+    try:
+        cards = [
+            page._activity_card,
+            page._providers_card,
+            page._adapter_card,
+            page._usage_card,
+        ]
+        for card in cards:
+            assert card.sizePolicy().verticalPolicy() == QtWidgets.QSizePolicy.Policy.Preferred
+    finally:
+        page.deleteLater()
+
+
+def test_dashboard_theme_apply_short_circuits_same_resolved_theme(qapp, monkeypatch):
+    import ui.dashboard.main_window as main_window_module
+
+    class FakeApp:
+        def __init__(self) -> None:
+            self.stylesheets: list[str] = []
+
+        def setStyleSheet(self, qss: str) -> None:
+            self.stylesheets.append(qss)
+
+    page = SimpleNamespace(
+        _theme_choice="light",
+        _current_theme="light",
+        _applied_theme=None,
+        _theme_btn=SimpleNamespace(
+            text="",
+            tooltip="",
+            setText=lambda value: setattr(page._theme_btn, "text", value),
+            setToolTip=lambda value: setattr(page._theme_btn, "tooltip", value),
+        ),
+    )
+    fake_app = FakeApp()
+    monkeypatch.setattr(main_window_module.QApplication, "instance", lambda: fake_app)
+    monkeypatch.setattr(main_window_module, "cached_qss", lambda palette: f"qss:{palette.name}")
+
+    DashboardWindow._apply_theme(page, "light")
+    DashboardWindow._apply_theme(page, "light")
+    DashboardWindow._apply_theme(page, "dark")
+
+    assert fake_app.stylesheets == ["qss:light", "qss:dark"]
+    assert page._theme_choice == "dark"
+    assert page._current_theme == "dark"
 
 
 def test_memory_page_rag_mode_shows_index_view(qapp):

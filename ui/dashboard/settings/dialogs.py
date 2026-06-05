@@ -625,7 +625,7 @@ class _EmbeddingEditDialog(FramelessDialog):
         self._model = ModelComboBox()
         if emb.api_model:
             self._model.setText(emb.api_model)
-        self._model.setPlaceholderText("如 text-embedding-v4 / embedding-3 / doubao-embedding-vision-251215")
+        self._model.setPlaceholderText("如 text-embedding-v4 / embedding-3 / doubao-embedding-text-240515")
         model_row = QHBoxLayout()
         model_row.addWidget(self._model, 1)
         self._fetch_btn = QPushButton("获取模型")

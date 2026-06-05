@@ -39,16 +39,21 @@ def _fmt_rate(value: float) -> str:
     return f"{value * 100:.1f}%"
 
 
-def _provider_badge(ok_count: int, err_count: int, total: int, errors: list[str]) -> tuple[str, str]:
+def _provider_badge(
+    ok_count: int,
+    err_count: int,
+    total: int,
+    errors: list[str],
+) -> tuple[str, str, str]:
     if total <= 0:
-        return "未装配", "badge-idle"
+        return "未装配", "badge-idle", ""
     if err_count <= 0 and ok_count == total:
-        return f"全部可用 {ok_count}/{total}", "badge-success"
+        return "全部可用", "badge-success", f"{ok_count}/{total} 可用"
     if ok_count > 0:
         reason = _dominant_error(errors)
-        return f"部分可用 {ok_count}/{total} · {reason}", "badge-warning"
+        return f"{ok_count}/{total} 可用", "badge-warning", f"部分可用 {ok_count}/{total} · {reason}"
     reason = _dominant_error(errors)
-    return f"全部异常 · {reason}", "badge-error"
+    return "全部异常", "badge-error", f"全部异常 · {reason}"
 
 
 def _dominant_error(errors: list[str]) -> str:
@@ -98,22 +103,30 @@ class _StatCard(QFrame):
         head.addStretch(1)
         self._right_label = QLabel("")
         self._right_label.setProperty("role", "badge-idle")
+        self._right_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._right_label.setWordWrap(False)
+        self._right_label.setMaximumWidth(112)
+        self._right_label.setMaximumHeight(22)
+        self._right_label.setSizePolicy(
+            QSizePolicy.Policy.Maximum,
+            QSizePolicy.Policy.Fixed,
+        )
         head.addWidget(self._right_label)
         outer.addLayout(head)
 
         self._body = QVBoxLayout()
         self._body.setSpacing(Spacing.SM)
         outer.addLayout(self._body)
-        outer.addStretch(1)
         self.setMinimumHeight(150)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
-    def set_badge(self, text: str, role: str = "badge-idle") -> None:
+    def set_badge(self, text: str, role: str = "badge-idle", tooltip: str = "") -> None:
         if not text:
             self.clear_badge()
             return
         self._right_label.show()
         self._right_label.setText(text)
+        self._right_label.setToolTip(tooltip or text)
         self._right_label.setProperty("role", role)
         self._right_label.style().unpolish(self._right_label)
         self._right_label.style().polish(self._right_label)
@@ -121,6 +134,7 @@ class _StatCard(QFrame):
     def clear_badge(self) -> None:
         self._right_label.hide()
         self._right_label.clear()
+        self._right_label.setToolTip("")
 
     def clear_body(self) -> None:
         while self._body.count():
@@ -205,7 +219,7 @@ class OverviewPage(QWidget):
         outer.setSpacing(0)
 
         content = QWidget()
-        outer.addWidget(content, 1)
+        outer.addWidget(content)
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(Spacing.MD)
@@ -233,9 +247,10 @@ class OverviewPage(QWidget):
         self._middle_grid.setSpacing(Spacing.MD)
         self._middle_narrow = False
 
-        content_layout.addWidget(self._activity_card, 1)
-        content_layout.addWidget(self._middle_row, 2)
-        content_layout.addWidget(self._usage_card, 2)
+        content_layout.addWidget(self._activity_card)
+        content_layout.addWidget(self._middle_row)
+        content_layout.addWidget(self._usage_card)
+        content_layout.addStretch(1)
 
         self._apply_responsive_layout(self.width())
 
@@ -262,14 +277,14 @@ class OverviewPage(QWidget):
             self._middle_grid.addWidget(self._adapter_card, 1, 0)
             self._middle_grid.setColumnStretch(0, 1)
             self._middle_grid.setColumnStretch(1, 0)
-            self._middle_grid.setRowStretch(0, 1)
-            self._middle_grid.setRowStretch(1, 1)
+            self._middle_grid.setRowStretch(0, 0)
+            self._middle_grid.setRowStretch(1, 0)
         else:
             self._middle_grid.addWidget(self._providers_card, 0, 0)
             self._middle_grid.addWidget(self._adapter_card, 0, 1)
             self._middle_grid.setColumnStretch(0, 1)
             self._middle_grid.setColumnStretch(1, 1)
-            self._middle_grid.setRowStretch(0, 1)
+            self._middle_grid.setRowStretch(0, 0)
             self._middle_grid.setRowStretch(1, 0)
 
     def refresh(self) -> None:
@@ -328,8 +343,13 @@ class OverviewPage(QWidget):
                 self._providers_card.add_status_line("—", "未装配")
                 self._providers_card.set_badge("未装配", "badge-idle")
             else:
-                badge, role = _provider_badge(ok_count, err_count, len(rt.providers), errors)
-                self._providers_card.set_badge(badge, role)
+                badge, role, tooltip = _provider_badge(
+                    ok_count,
+                    err_count,
+                    len(rt.providers),
+                    errors,
+                )
+                self._providers_card.set_badge(badge, role, tooltip=tooltip)
         except Exception as e:  # noqa: BLE001
             self._providers_card.add_line("出错", str(e)[:80])
 

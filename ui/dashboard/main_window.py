@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from app_config.loader import save_config
 
-from ..theme import Spacing, build_qss, palette_for_theme, resolve_theme_name
+from ..theme import Spacing, cached_qss, palette_for_theme, resolve_theme_name
 from .chats_page import ChatsPage
 from .copy import DASHBOARD_COPY
 from .layout import DEFAULT_LAYOUT, NAV_ITEMS, STATUS_BADGE_MAP
@@ -59,6 +59,7 @@ class DashboardWindow(QMainWindow):
         self._runtime = runtime
         self._theme_choice = self._configured_theme()
         self._current_theme = resolve_theme_name(self._theme_choice)
+        self._applied_theme: str | None = None
 
         # 整窗用 WindowFrame 包一层：QSS 里 QFrame#WindowFrame 设了 border-radius
         root = QFrame()
@@ -348,16 +349,22 @@ class DashboardWindow(QMainWindow):
         self._persist_theme(target)
         self._apply_theme(target)
         settings = getattr(self, "_pages", {}).get("settings")
-        if settings is not None and hasattr(settings, "refresh"):
+        if (
+            settings is not None
+            and hasattr(settings, "refresh")
+            and self._stack.currentWidget() is settings
+        ):
             settings.refresh()
 
     def _apply_theme(self, target: str) -> None:
         palette = palette_for_theme(target)
+        resolved = resolve_theme_name(target)
         app = QApplication.instance()
-        if app:
-            app.setStyleSheet(build_qss(palette))
+        if app and self._applied_theme != resolved:
+            app.setStyleSheet(cached_qss(palette))
+            self._applied_theme = resolved
         self._theme_choice = target
-        self._current_theme = resolve_theme_name(target)
+        self._current_theme = resolved
         self._theme_btn.setText("☀" if self._current_theme == "dark" else "☾")
         self._theme_btn.setToolTip(
             f"{DASHBOARD_COPY['topbar.theme_toggle']}（当前：{'跟随系统' if target == 'auto' else target}）"

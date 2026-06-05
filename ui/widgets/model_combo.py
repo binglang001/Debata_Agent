@@ -1,12 +1,14 @@
 """模型下拉输入框。
 
 用于所有“可获取模型”的位置：远程获取后显示模型 ID，并用 tooltip 标注能力；
-输入框获得焦点时自动展开下拉，减少用户错过下拉按钮的概率。
+用户主动点击输入框或下拉按钮时展开候选项；仅获得焦点不自动展开，
+避免点击外部关闭 popup 时焦点事件又把下拉框弹出来。
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QComboBox
 
 from providers.model_capabilities import capability_badges
@@ -22,9 +24,10 @@ class ModelComboBox(QComboBox):
         self.setPlaceholderText("点击「获取模型」或手动输入模型 ID")
         self.activated.connect(self._on_activated)
 
-    def focusInEvent(self, event) -> None:  # type: ignore[override]
-        super().focusInEvent(event)
-        if self.count() > 0:
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        popup_was_visible = self.view().isVisible()
+        super().mousePressEvent(event)
+        if not popup_was_visible and self.count() > 0:
             self.showPopup()
 
     def set_models(

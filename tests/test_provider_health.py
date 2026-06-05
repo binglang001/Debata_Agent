@@ -159,3 +159,24 @@ async def test_probe_embedding_endpoint_uses_embeddings_api(monkeypatch):
     )
 
     assert result.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_probe_volcengine_vision_embedding_uses_multimodal_api(monkeypatch):
+    async def fake_post(self, url, headers=None, json=None):
+        assert url == "https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal"
+        assert json == {
+            "model": "doubao-embedding-vision-251215",
+            "input": [{"type": "text", "text": "test"}],
+        }
+        return _DummyResponse(200, {"data": [{"embedding": [0.1, 0.2]}]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    result = await probe_embedding_endpoint(
+        base_url="https://ark.cn-beijing.volces.com/api/v3",
+        api_key="sk",
+        model="doubao-embedding-vision-251215",
+    )
+
+    assert result.status == "ok"

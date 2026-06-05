@@ -92,6 +92,36 @@ async def test_openai_compat_embedding_uses_list_input_and_reports_body():
 
 
 @pytest.mark.asyncio
+async def test_volcengine_vision_embedding_uses_multimodal_endpoint():
+    from features.embedding import OpenAICompatEmbeddingService
+
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        seen.append({"path": request.url.path, "body": body})
+        return httpx.Response(200, json={"data": [{"embedding": [0.1, 0.2]}]})
+
+    service = OpenAICompatEmbeddingService(
+        base_url="https://ark.cn-beijing.volces.com/api/v3",
+        api_key="key",
+        model="doubao-embedding-vision-251215",
+    )
+    service._client = httpx.AsyncClient(
+        base_url=service.base_url,
+        transport=httpx.MockTransport(handler),
+    )
+
+    vector = await service.embed_one("test")
+
+    assert vector == [0.1, 0.2]
+    assert seen[0]["path"] == "/api/v3/embeddings/multimodal"
+    compact = seen[0]["body"].replace(b" ", b"")
+    assert b'"type":"text"' in compact
+    assert b'"text":"test"' in compact
+
+
+@pytest.mark.asyncio
 async def test_rag_store_crud(tmp_path: Path):
     store = RagStore(tmp_path / "r.jsonl")
     await store.load()

@@ -294,7 +294,7 @@ def test_wizard_embedding_default_does_not_reuse_deepseek_main(qapp):
         view._refresh_provider_choices()
 
         assert view._api_provider.currentData() == "new:volcengine"
-        assert view._api_model.text() == "doubao-embedding-vision-251215"
+        assert view._api_model.text() == "doubao-embedding-text-240515"
         assert view._api_provider.findData("existing:deepseek_main") < 0
     finally:
         view.deleteLater()
@@ -334,7 +334,7 @@ def test_wizard_embedding_volcengine_uses_current_model(qapp):
         view._api_provider.setCurrentIndex(idx)
         view._on_provider_changed()
 
-        assert view._api_model.text() == "doubao-embedding-vision-251215"
+        assert view._api_model.text() == "doubao-embedding-text-240515"
     finally:
         view.deleteLater()
 

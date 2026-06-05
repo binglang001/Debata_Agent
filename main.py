@@ -141,13 +141,13 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
     from app_config import AppPaths, SecretsManager
     from core import Runtime
     from ui.dashboard.main_window import DashboardWindow
-    from ui.theme import build_qss, palette_for_theme
+    from ui.theme import cached_qss, palette_for_theme
     from ui.tray import Tray
     from ui.wizard.window import WizardWindow
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    app.setStyleSheet(build_qss(palette_for_theme("auto")))
+    app.setStyleSheet(cached_qss(palette_for_theme("auto")))
 
     loop = qasync.QEventLoop(app)
     _asyncio.set_event_loop(loop)
@@ -358,7 +358,7 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
                 else:
                     begin_shutdown()
             else:
-                app.setStyleSheet(build_qss(palette_for_theme(cfg_check.app.theme)))
+                app.setStyleSheet(cached_qss(palette_for_theme(cfg_check.app.theme)))
                 missing = _find_missing_secrets(cfg_check, secrets_check)
                 if missing:
                     logger.warning(f"启动前检测：密钥缺失 {missing}")

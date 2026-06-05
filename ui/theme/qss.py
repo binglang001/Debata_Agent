@@ -370,6 +370,32 @@ QPushButton[role="ghost"]:disabled {{
     background-color: transparent;
 }}
 
+QPushButton[role="collapse-toggle"] {{
+    background-color: transparent;
+    color: {p.text_secondary};
+    border: 1px solid {p.border};
+    border-radius: {Radius.SMALL}px;
+    padding: 0px;
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 30px;
+    max-height: 30px;
+    font-size: {FontSize.BODY}px;
+    font-weight: 600;
+}}
+QPushButton[role="collapse-toggle"]:hover {{
+    background-color: {p.bg_hover};
+    color: {p.text_primary};
+}}
+QPushButton[role="collapse-toggle"]:pressed {{
+    background-color: {_darken(p.bg_hover, 0.05)};
+    color: {p.accent_primary};
+}}
+QPushButton[role="collapse-toggle"]:focus {{
+    border-color: {p.accent_primary};
+    outline: none;
+}}
+
 /* ============================================================
  * 危险按钮（朱砂红填充，仅用于不可逆操作）
  * ============================================================ */
@@ -1159,6 +1185,18 @@ def palette_for_theme(theme: str | None) -> Palette:
     return DARK if resolve_theme_name(theme) == "dark" else LIGHT
 
 
+_QSS_CACHE: dict[str, str] = {}
+
+
+def cached_qss(palette: Palette) -> str:
+    """返回已生成的主题 QSS，避免切换主题时重复拼接整份样式表。"""
+    cached = _QSS_CACHE.get(palette.name)
+    if cached is None:
+        cached = build_qss(palette)
+        _QSS_CACHE[palette.name] = cached
+    return cached
+
+
 # ============================================================
 # 默认导出
 # ============================================================
@@ -1177,6 +1215,7 @@ __all__ = [
     "ThemeName",
     "font_family",
     "build_qss",
+    "cached_qss",
     "palette_for_theme",
     "resolve_theme_name",
     "system_theme_name",

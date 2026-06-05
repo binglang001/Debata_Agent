@@ -20,10 +20,11 @@
 
 - 阿里百炼：[Embedding 文档](https://help.aliyun.com/zh/model-studio/)：`text-embedding-v4`
 - 智谱：[Embedding 文档](https://docs.bigmodel.cn/)：`embedding-3`
-- 火山方舟：[Embedding API](https://www.volcengine.com/docs/82379/1302003/)：`doubao-embedding-vision-251215`
+- 火山方舟：[Embedding API](https://www.volcengine.com/docs/82379/1302003/)：`doubao-embedding-text-240515`
 - OpenAI：[Embedding 文档](https://platform.openai.com/docs/guides/embeddings)：`text-embedding-3-small` 或 `text-embedding-3-large`
 
 DeepSeek 主要是聊天模型平台，不建议拿它复用做 Embedding；如果返回 400 或参数调用错误，通常是模型 ID、接口类型或 provider 不匹配，请换独立 Embedding provider。
+火山的 `doubao-embedding-vision-*` 是图文多模态向量模型，不适合作为普通文本 `/embeddings` 默认项；RAG 文本检索优先使用 `doubao-embedding-text-*`。
 
 ## 本地模式
 

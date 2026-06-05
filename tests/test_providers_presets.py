@@ -216,7 +216,7 @@ def test_model_capability_defaults_cover_vision_and_embedding():
 
     emb_model = recommended_model("volcengine", "embedding")
     assert emb_model is not None
-    assert emb_model.id == "doubao-embedding-vision-251215"
+    assert emb_model.id == "doubao-embedding-text-240515"
     assert emb_model.supports("embedding")
 
     badges = capability_badges("volcengine", "doubao-seed-2-0-lite-260428")

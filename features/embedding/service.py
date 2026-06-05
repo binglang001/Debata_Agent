@@ -90,10 +90,18 @@ class OpenAICompatEmbeddingService(IEmbeddingService):
     async def _request(self, inputs: list[str]) -> list[dict]:
         """发送 POST /embeddings 请求，返回 data 列表。"""
         client = self._get_client()
+        endpoint = "/embeddings"
+        payload = {"model": self.model, "input": inputs}
+        if _is_volcengine_multimodal_embedding(self.model):
+            endpoint = "/embeddings/multimodal"
+            payload = {
+                "model": self.model,
+                "input": [{"type": "text", "text": text} for text in inputs],
+            }
         try:
             resp = await client.post(
-                "/embeddings",
-                json={"model": self.model, "input": inputs},
+                endpoint,
+                json=payload,
             )
             resp.raise_for_status()
             data = resp.json().get("data")
@@ -129,6 +137,10 @@ class OpenAICompatEmbeddingService(IEmbeddingService):
     @property
     def dimension(self) -> int:
         return self._dim
+
+
+def _is_volcengine_multimodal_embedding(model: str) -> bool:
+    return model.startswith("doubao-embedding-vision-")
 
 
 __all__ = ["EmbeddingError", "IEmbeddingService", "OpenAICompatEmbeddingService"]

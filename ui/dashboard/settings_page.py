@@ -29,8 +29,9 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -47,7 +48,7 @@ from app_config.schema import (
 )
 
 from ..theme import Spacing
-from ..widgets import show_message
+from ..widgets import AutoSizeStack, show_message
 from ..widgets.model_combo import ModelComboBox
 from ..widgets.wheel_freeze import install_wheel_freeze
 from ..wizard.components import SectionCard, WhitelistEditor, WhitelistState
@@ -87,6 +88,7 @@ class SettingsPage(QWidget):
     def __init__(self, runtime: Any, parent=None) -> None:
         super().__init__(parent)
         self._runtime = runtime
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._agent_provider_combos: list[QComboBox] = []
         self._suppress_signals = False
         # 基线配置快照（深拷贝），用于比对改动项数
@@ -107,8 +109,16 @@ class SettingsPage(QWidget):
         self._settings_nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         main_row.addWidget(self._settings_nav)
 
-        self._settings_stack = QStackedWidget()
-        main_row.addWidget(self._settings_stack, 1)
+        self._settings_stack = AutoSizeStack()
+        self._settings_scroll = QScrollArea()
+        self._settings_scroll.setObjectName("SettingsContentScroll")
+        self._settings_scroll.setWidgetResizable(True)
+        self._settings_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._settings_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._settings_scroll.setWidget(self._settings_stack)
+        main_row.addWidget(self._settings_scroll, 1)
 
         outer.addLayout(main_row, 1)
 
@@ -127,7 +137,7 @@ class SettingsPage(QWidget):
         self._add_settings_page("token_budget", "Token预算", self._build_token_budget_section())
         self._add_settings_page("diagnostics", "日志与诊断", self._build_diagnostics_section())
 
-        self._settings_nav.currentRowChanged.connect(self._settings_stack.setCurrentIndex)
+        self._settings_nav.currentRowChanged.connect(self._on_settings_section_changed)
         self._settings_nav.setCurrentRow(0)
 
         # 底部状态条（始终可见，不滚动）
@@ -154,6 +164,13 @@ class SettingsPage(QWidget):
         lay.addWidget(content)
         lay.addStretch(1)
         self._settings_stack.addWidget(page)
+
+    def _on_settings_section_changed(self, row: int) -> None:
+        if row < 0:
+            return
+        self._settings_stack.setCurrentIndex(row)
+        self._settings_stack.sync_current_size()
+        self._settings_scroll.verticalScrollBar().setValue(0)
 
     # ============================================================
     # 公共辅助
@@ -1869,7 +1886,6 @@ class SettingsPage(QWidget):
             return
         if self._cfg().app.theme == target:
             self._current_theme = target
-            self.theme_changed.emit(target)
             return
         self._current_theme = target
         self._cfg().app.theme = target
