@@ -37,6 +37,13 @@ _ROUTER_TOOL_SHRINK_CTX = SimpleNamespace(
 )
 _ROUTER_TEXT_LIMIT_TOKENS = 256
 _ROUTER_TOOL_LIMIT_TOKENS = 96
+_OUT_OF_BAND_DENIED_TOOLS = frozenset(
+    {
+        "start_agent_task",
+        "summarize_conversation",
+        "summarize_chat_history",
+    }
+)
 _INTERNAL_ID_KEYS = {
     "msg_id",
     "msg_ids",
@@ -414,20 +421,24 @@ class ProactiveLoop:
             )
 
             task_context = (
-                "<proactive_turn priority=\"critical\">\n"
                 f"现在是{now}。本轮由系统后台主动思考触发，不是用户刚发来的新消息。\n"
-                f"本轮触发理由：{reason_text}\n"
+                "近期上下文、重要记忆、滚动摘要和未完成事项已在历史与上下文中提供。"
+            )
+            user_event = (
+                "[系统事件 · 非用户消息] 后台主动思考触发，不是用户新消息。\n"
+                f"触发理由：{reason_text}\n"
                 "请根据近期上下文、重要记忆、滚动摘要和未完成事项判断是否需要主动行动。\n"
                 "如果有人要求你在之后、下次空闲或下次主动思考时执行某事，本轮就是可执行时机；"
                 "只处理仍未完成且仍有意义的事项。\n"
                 "如果这是合适的主动问候时机，可以按系统提示中的自然开场习惯起一个话头。\n"
-                "需要联系用户就调用发送工具；没有需要执行的事就调用 no_action。\n"
-                "</proactive_turn>"
+                "不要延续或重复最近对话里已经完成的话题；需要联系用户就调用发送工具，没有合适的事就调用 no_action。"
             )
             await self.pipeline.run_one_turn(
                 task_context,
+                user_event=user_event,
                 lock_already_held=True,
                 history_conversation_id="system:proactive",
+                tool_denylist=_OUT_OF_BAND_DENIED_TOOLS,
             )
         finally:
             self.pipeline.reply_lock.release()

@@ -154,6 +154,48 @@ async def test_sqlite_vector_store_persists_and_filters_by_conversation(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_sqlite_vector_store_filters_hits_before_window_timestamp(tmp_path: Path):
+    from memory.rag_memory import RagDocument
+
+    store = SqliteVectorStore(tmp_path / "rag.sqlite3")
+    await store.load()
+    await store.upsert_many(
+        [
+            RagDocument(
+                id="old",
+                text="窗口外旧猫",
+                vector=[1.0, 0.0, 0.0],
+                conversation_id="private:1",
+                timestamp="2026-06-01 10:00:00",
+            ),
+            RagDocument(
+                id="current",
+                text="窗口内猫",
+                vector=[0.99, 0.0, 0.0],
+                conversation_id="private:1",
+                timestamp="2026-06-05 10:00:00",
+            ),
+            RagDocument(
+                id="missing-ts",
+                text="旧格式猫",
+                vector=[0.98, 0.0, 0.0],
+                conversation_id="private:1",
+                timestamp="",
+            ),
+        ]
+    )
+
+    hits = store.top_k(
+        [1.0, 0.0, 0.0],
+        k=5,
+        conversation_id="private:1",
+        before_ts="2026-06-03 00:00:00",
+    )
+
+    assert [hit.document.id for hit in hits] == ["old", "missing-ts"]
+
+
+@pytest.mark.asyncio
 async def test_rag_memory_indexes_history_in_background(tmp_path: Path):
     embedding = _FakeEmbedding()
     store = SqliteVectorStore(tmp_path / "rag.sqlite3")

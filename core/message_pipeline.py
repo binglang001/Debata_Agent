@@ -659,6 +659,13 @@ _RATE_LIMIT_REPLY_TEMPLATE = "已超出速率限制（{window_seconds} 秒内最
 _PREFIX_ESTIMATE_TOKENS = 12_000
 _CURRENT_CONVERSATION_MIN_RECORDS = 8
 _PROACTIVE_ROUTER_HISTORY_BUDGET = 16_384
+_OUT_OF_BAND_DENIED_TOOLS = frozenset(
+    {
+        "start_agent_task",
+        "summarize_conversation",
+        "summarize_chat_history",
+    }
+)
 
 
 def _recommended_context_budget(model: str, context_length: int | None = None) -> int:
@@ -732,6 +739,30 @@ def _record_conversation_id(record: dict[str, Any]) -> str | None:
     if user_id:
         return f"private:{user_id}"
     return None
+
+
+def _earliest_record_ts(records: list[dict[str, Any]]) -> str | None:
+    timestamps: list[str] = []
+    for record in records:
+        ts = _record_timestamp(record)
+        if isinstance(ts, str) and ts:
+            timestamps.append(ts)
+    return min(timestamps) if timestamps else None
+
+
+def _filter_tool_schemas(
+    schemas: list[dict[str, Any]],
+    denied_tools: set[str] | frozenset[str],
+) -> list[dict[str, Any]]:
+    if not denied_tools:
+        return schemas
+    result: list[dict[str, Any]] = []
+    for schema in schemas:
+        function = schema.get("function") if isinstance(schema, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if name not in denied_tools:
+            result.append(schema)
+    return result
 
 
 def _safe_agent_task_filename(name: str, *, default: str, suffix: str) -> str:
@@ -1014,6 +1045,7 @@ class MessagePipeline:
         self._agent_task_meta: dict[str, dict[str, Any]] = {}
         self.chat_timeline = ChatTimelineStore(max_per_conversation=1000)
         self._self_id_by_conversation: dict[str, str] = {}
+        self._warn_context_compaction_invariants()
 
     def mark_activity(self) -> None:
         """刷新活动时间。主动思考只在足够空闲后触发。"""
@@ -1241,9 +1273,13 @@ class MessagePipeline:
         # 构造给 LLM 的 messages（emoji_hint / pending_requests 已在 _build_task_context 内拼装）
         task_context = self._build_task_context(now, conversation_id)
 
+        history_window = await self._select_working_history(conversation_id)
+        estimator = self._token_estimator()
+
         important_text = await self._important_memory_text(
             conversation_id,
             query=items[-1].text if items else None,
+            before_ts=_earliest_record_ts(history_window),
         )
         logger.debug(
             "批处理记忆准备完成 conversation_id=%s memory_len=%s elapsed=%.3fs",
@@ -1251,9 +1287,6 @@ class MessagePipeline:
             len(important_text),
             time.monotonic() - batch_t0,
         )
-
-        history_window = await self._select_working_history(conversation_id)
-        estimator = self._token_estimator()
 
         messages = build_messages(
             persona=self.persona,
@@ -1532,6 +1565,7 @@ class MessagePipeline:
         conversation_id: str | None,
         *,
         query: str | None = None,
+        before_ts: str | None = None,
         token_budget: int | None = None,
     ) -> str:
         """按当前会话选择长期记忆注入文本。"""
@@ -1543,6 +1577,7 @@ class MessagePipeline:
             return await self.rag_memory.retrieve_for_query(
                 query,
                 conversation_id=conversation_id,
+                before_ts=before_ts,
                 top_k=self.features_cfg.long_term_memory.rag_top_k,
                 token_budget=budget,
                 estimator=estimator,
@@ -1640,6 +1675,25 @@ class MessagePipeline:
             - budget.summary_token_budget
             - _PREFIX_ESTIMATE_TOKENS,
         )
+
+    def _warn_context_compaction_invariants(self) -> None:
+        working_budget = self._working_history_budget()
+        summarize = self.behavior_cfg.summarize
+        if self.summary_agent is None or self.archive is None or self.rolling_summary is None:
+            logger.warning(
+                "未启用滚动摘要/归档压缩；长会话超过工作窗口后会逐条淘汰历史，KV 缓存命中率会下降"
+            )
+            return
+        trigger = summarize.trigger_at_tokens
+        if trigger is None:
+            trigger = int(self._context_budget().max_context_tokens * 0.75)
+        if trigger >= working_budget:
+            logger.warning(
+                "滚动摘要触发线高于工作窗口预算：trigger=%s working_budget=%s；"
+                "长会话可能先发生窗口淘汰，导致 KV 缓存前缀逐轮重建",
+                trigger,
+                working_budget,
+            )
 
     def _select_history_records(
         self,
@@ -1833,18 +1887,20 @@ class MessagePipeline:
                     "如果 reminder 要求通知这个目标，请调用发送消息工具；如果任务无需通知，可以 no_action。"
                 )
         task_context = (
-            "<wakeup_task priority=\"critical\">\n"
-            f"现在是{now}。这是定时唤醒，不是新用户消息。\n"
-            f"提醒任务：{reminder}\n"
-            "提醒任务应已包含设置时的用户原话、提醒目标和具体动作；优先按提醒任务执行。\n"
-            "只处理这条提醒任务；不要把历史中已经完成、无关或仅作为背景的请求当作当前任务重复执行。\n"
+            f"现在是{now}。这是定时唤醒轮的环境信息，不是新用户消息。\n"
             "固定消息发送应在设置阶段使用 schedule_wakeup 的 mode=send_message；本模式只处理需要查询、整理、判断或调用工具的复杂任务。\n"
-            "只有纯内部继续任务且确实无需通知时才 no_action。"
             f"{target_hint}"
-            "\n</wakeup_task>"
+        )
+        user_event = (
+            "[系统事件 · 非用户消息] 定时唤醒已到。\n"
+            f"提醒任务原文：{reminder}\n"
+            "现在就执行这条提醒；通常需要给提醒目标发送消息或完成提醒中指定的查询/判断。\n"
+            "只处理这一条提醒，做完即止；不要延续或重复最近对话里已完成、无关或仅作背景的话题。\n"
+            "只有这条提醒确实纯内部、无需通知时，才调用 no_action。"
         )
         await self.run_one_turn(
             task_context,
+            user_event=user_event,
             default_target=(
                 self._target_from_conversation_id(conversation_id)
                 if conversation_id
@@ -1854,6 +1910,7 @@ class MessagePipeline:
             history_conversation_id=conversation_id or "system:wakeup",
             task_contract=f"定时唤醒任务：{reminder}",
             task_phase="wakeup",
+            tool_denylist=_OUT_OF_BAND_DENIED_TOOLS,
         )
 
     # ============================================================
@@ -1864,6 +1921,7 @@ class MessagePipeline:
         self,
         task_context: str,
         *,
+        user_event: str | None = None,
         as_system_note: str | None = None,
         lock_already_held: bool = False,
         default_target: Target | None = None,
@@ -1872,6 +1930,7 @@ class MessagePipeline:
         task_contract: str | None = None,
         task_phase: str = "normal",
         tool_policy: dict[str, Any] | None = None,
+        tool_denylist: set[str] | frozenset[str] | None = None,
     ) -> None:
         """通用单轮 Agent 入口：注入 task_context，跑一轮，处理 collected。
 
@@ -1885,6 +1944,7 @@ class MessagePipeline:
             task_contract: 本轮任务锚点，传给 AgentRunner 防止工具循环漂移。
             task_phase: 本轮运行阶段，保留给日志归类和未来策略扩展。
             tool_policy: 本轮工具策略所需的结构化上下文。
+            tool_denylist: 本轮不暴露也不允许调用的工具名集合。
         """
         self.mark_activity()
         record_conversation_id = history_conversation_id or conversation_id
@@ -1894,16 +1954,19 @@ class MessagePipeline:
                 conversation_id=record_conversation_id,
             )
 
+        history_window = await self._select_working_history(conversation_id)
         messages = build_messages(
             persona=self.persona,
-            history=await self._select_working_history(conversation_id),
+            history=history_window,
             important_memory_text=await self._important_memory_text(
                 conversation_id,
-                query=task_context,
+                query=user_event or task_context,
+                before_ts=_earliest_record_ts(history_window),
             ),
             rolling_summary_text=self._rolling_summary_text(),
             current_context=task_context,
             memory_mode=self.features_cfg.long_term_memory.mode,
+            user_event=user_event,
         )
 
         ctx = self._build_tool_context(
@@ -1913,7 +1976,25 @@ class MessagePipeline:
             tool_policy=tool_policy,
         )
         executor = self.tool_registry.get_executor(ctx)
-        tools_schema = self.tool_registry.get_schemas()
+        denied_tools = set(tool_denylist or ())
+        tools_schema = _filter_tool_schemas(
+            self.tool_registry.get_schemas(),
+            denied_tools,
+        )
+        if denied_tools:
+            base_executor = executor
+
+            async def _guarded_executor(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+                if tool_name in denied_tools:
+                    return {
+                        "ok": False,
+                        "status": "denied",
+                        "error": f"本轮系统事件不允许调用工具 {tool_name}",
+                        "next": "只处理当前系统事件；如无需行动请调用 no_action。",
+                    }
+                return await base_executor(tool_name, args)
+
+            executor = _guarded_executor
 
         async def _run_locked() -> None:
             self._send_manager.begin_model_turn(conversation_id)

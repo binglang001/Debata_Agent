@@ -729,7 +729,12 @@ async def test_proactive_action_runs_under_acquired_lock(build_pipeline):
     )
     assert "本轮由系统后台主动思考触发" in joined
     assert "不是用户刚发来的新消息" in joined
-    assert "本轮触发理由：测试触发理由" in joined
+    assert "触发理由：测试触发理由" in joined
+    assert provider.calls[0]["messages"][-1]["role"] == "user"
+    names = {schema["function"]["name"] for schema in provider.calls[0]["tools"]}
+    assert "start_agent_task" not in names
+    assert "summarize_conversation" not in names
+    assert "summarize_chat_history" not in names
 
 
 @pytest.mark.asyncio
@@ -1010,7 +1015,7 @@ async def test_start_agent_task_result_is_in_band_same_turn(build_pipeline, tmp_
 
 
 @pytest.mark.asyncio
-async def test_wakeup_turn_keeps_full_tool_schema_with_task_contract(build_pipeline):
+async def test_wakeup_turn_uses_user_event_and_denies_long_running_tools(build_pipeline):
     pipeline, provider, adapter, _, _ = await build_pipeline([_ai_no_action()])
 
     await pipeline.run_wakeup_turn(
@@ -1025,9 +1030,13 @@ async def test_wakeup_turn_keeps_full_tool_schema_with_task_contract(build_pipel
         for schema in provider.calls[0]["tools"]
     }
     assert "schedule_wakeup" in names
-    assert "start_agent_task" in names
-    assert "summarize_chat_history" in names
-    assert "summarize_conversation" in names
+    assert "start_agent_task" not in names
+    assert "summarize_chat_history" not in names
+    assert "summarize_conversation" not in names
+    messages = provider.calls[0]["messages"]
+    assert messages[-1]["role"] == "user"
+    assert "[系统事件 · 非用户消息]" in messages[-1]["content"]
+    assert "定时唤醒已到" in messages[-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -1730,7 +1739,8 @@ async def test_wakeup_action_uses_normal_window_with_reminder_as_current_task(bu
     joined = "\n".join(str(m.get("content", "")) for m in messages)
     assert "旧消息：请执行已完成的无关任务" in joined
     assert "检查后台状态" in joined
-    assert "只处理这条提醒任务" in joined
+    assert "只处理这一条提醒" in joined
+    assert messages[-1]["role"] == "user"
     assert adapter.sent[-1][1] == "到点了"
 
 

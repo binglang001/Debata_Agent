@@ -362,6 +362,48 @@ def test_build_messages_memory_mode_propagates():
     assert "必须主动保存" in msgs_file[0]["content"]
 
 
+def test_build_messages_rag_memory_is_tail_context_for_cache_stability():
+    p = _persona()
+    history = [{"role": "user", "content": "旧消息"}]
+    first = build_messages(
+        p,
+        history,
+        important_memory_text="RAG 片段 A",
+        current_context="现在是 10:00",
+        memory_mode="rag",
+    )
+    second = build_messages(
+        p,
+        history,
+        important_memory_text="RAG 片段 B",
+        current_context="现在是 10:00",
+        memory_mode="rag",
+    )
+
+    assert first[0]["content"] == second[0]["content"]
+    assert "RAG 片段 A" not in first[0]["content"]
+    assert "RAG 片段 B" not in second[0]["content"]
+    assert [m["role"] for m in first] == ["system", "user", "system", "system"]
+    assert "旧消息" in first[1]["content"]
+    assert "RAG 片段 A" in first[2]["content"]
+    assert "task_context" in first[3]["content"]
+
+
+def test_build_messages_user_event_is_final_user_message():
+    p = _persona()
+    msgs = build_messages(
+        p,
+        [{"role": "assistant", "content": "旧回复"}],
+        current_context="现在是 10:00",
+        user_event="[系统事件 · 非用户消息] 定时唤醒已到。",
+    )
+
+    assert msgs[-1]["role"] == "user"
+    assert "系统事件" in msgs[-1]["content"]
+    assert msgs[-2]["role"] == "system"
+    assert "task_context" in msgs[-2]["content"]
+
+
 # ============================================================
 # Memory hooks（新加的 on_append）
 # ============================================================

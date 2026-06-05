@@ -67,13 +67,20 @@ class RequestHandler:
 
         # 触发 Agent 通知管理员
         task_context = (
-            f"现在是{get_time()}。收到好友添加请求。\n"
-            f"请求者信息：QQ {event.user_id}，昵称 {nickname}，"
-            f"附加消息：{info.comment}。【操作标识 flag={event.flag}】\n"
-            f"请按照验证审核规则处理：先通知管理员（发送私聊），等待管理员回复。"
-            f"管理员同意则调用对应工具通过，否则不操作。不要自行决定。"
+            f"现在是{get_time()}。收到好友添加请求；请求详情在本轮尾部系统事件中。"
         )
-        await self.pipeline.run_one_turn(task_context)
+        user_event = (
+            "[系统事件 · 非用户消息] 收到好友验证请求。\n"
+            f"申请人：QQ {event.user_id}，昵称 {nickname}。\n"
+            f"验证消息：「{info.comment}」。操作标识 flag={event.flag}。\n"
+            "请现在按验证审核规则处理：通常先通知管理员并等待回复；"
+            "管理员同意后再调用 set_friend_add_request，通过或拒绝都只处理这一条请求。"
+        )
+        await self.pipeline.run_one_turn(
+            task_context,
+            user_event=user_event,
+            tool_denylist={"start_agent_task", "summarize_conversation", "summarize_chat_history"},
+        )
 
     async def _handle_group(self, event: IncomingRequest) -> None:
         """处理加群/邀请请求。"""
@@ -100,14 +107,20 @@ class RequestHandler:
         self.pending_requests.put(info)
 
         task_context = (
-            f"现在是{get_time()}。收到{sub_label}。\n"
-            f"{sub_label}：请求者 QQ {event.user_id}，昵称 {nickname}，"
-            f"群号 {event.group_id}，附加消息：{info.comment}。"
-            f"sub_type={sub_type}，【操作标识 flag={event.flag}】\n"
-            f"请按照验证审核规则处理：先通知管理员（发送私聊），等待管理员回复。"
-            f"管理员同意则调用对应工具通过，否则不操作。不要自行决定。"
+            f"现在是{get_time()}。收到{sub_label}；请求详情在本轮尾部系统事件中。"
         )
-        await self.pipeline.run_one_turn(task_context)
+        user_event = (
+            f"[系统事件 · 非用户消息] 收到群验证请求：{sub_label}。\n"
+            f"申请人：QQ {event.user_id}，昵称 {nickname}；群号 {event.group_id}。\n"
+            f"验证消息：「{info.comment}」。sub_type={sub_type}，操作标识 flag={event.flag}。\n"
+            "请现在按验证审核规则处理：通常先通知管理员并等待回复；"
+            "管理员同意后再调用 set_group_add_request，通过或拒绝都只处理这一条请求。"
+        )
+        await self.pipeline.run_one_turn(
+            task_context,
+            user_event=user_event,
+            tool_denylist={"start_agent_task", "summarize_conversation", "summarize_chat_history"},
+        )
 
     async def _safe_user_info(self, user_id: str) -> dict:
         """获取用户信息，失败返回空 dict（不抛）。"""

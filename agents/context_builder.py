@@ -98,21 +98,15 @@ def build_combined_system_prompt(
     # 7. QQ 格式参考（最末，方便模型查询）
     parts.append(QQ_FORMAT_REFERENCE.strip())
 
-    # 8. 重要记忆 / RAG 检索上下文（中等稳定，放在末尾，整体替换时只影响末尾 token）
+    # 8. 文件模式重要记忆（较稳定，可留在 system 前缀）。
+    # RAG 召回每轮按 query 变化，不能放在稳定前缀；build_messages 会把它追加到尾部。
     if important_memory_text:
-        if memory_mode == "rag":
+        if memory_mode == "file":
             parts.append(
-                f'<retrieved_conversation_context priority="medium" source="rag">\n'
-                "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不代表新的用户消息。\n"
+                f'<long_term_memory priority="medium">\n'
                 f"{important_memory_text.strip()}\n"
-                f"</retrieved_conversation_context>"
+                f"</long_term_memory>"
             )
-            return "\n\n".join(parts)
-        parts.append(
-            f'<long_term_memory priority="medium">\n'
-            f"{important_memory_text.strip()}\n"
-            f"</long_term_memory>"
-        )
 
     return "\n\n".join(parts)
 
@@ -164,6 +158,7 @@ def build_messages(
     system_override: str | None = None,
     *,
     memory_mode: Literal["file", "rag"] = "file",
+    user_event: str | None = None,
 ) -> list[dict[str, Any]]:
     """组装一次 LLM 调用的完整 messages（不含 Task Contract 重注入，由 runner 处理）。
 
@@ -174,6 +169,7 @@ def build_messages(
         current_context: 本次调用的临时上下文（时间、表情包等）
         system_override: 完全自定义的 system prompt（仅特殊用途，如 proactive 路由）
         memory_mode: "file" / "rag"，决定 tool_use_protocol 内的 memory 块写法
+        user_event: 带外触发轮的尾部 user 事件。仅用于唤醒/主动/请求等没有真实用户消息的轮次。
 
     Returns:
         OpenAI 风格 messages 列表
@@ -186,10 +182,14 @@ def build_messages(
         messages.extend(history)
         if current_context:
             messages.append({"role": "system", "content": current_context})
+        if user_event:
+            messages.append({"role": "user", "content": user_event.strip()})
         return messages
 
     system_content = build_combined_system_prompt(
-        persona, important_memory_text, memory_mode=memory_mode
+        persona,
+        important_memory_text if memory_mode == "file" else "",
+        memory_mode=memory_mode,
     )
     messages = [{"role": "system", "content": system_content}]
 
@@ -211,8 +211,24 @@ def build_messages(
 
     messages.extend(history)
 
+    if memory_mode == "rag" and important_memory_text:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    '<retrieved_conversation_context priority="medium" source="rag">\n'
+                    "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不代表新的用户消息。\n"
+                    f"{important_memory_text.strip()}\n"
+                    "</retrieved_conversation_context>"
+                ),
+            }
+        )
+
     task_ctx = build_task_context(current_context)
     if task_ctx:
         messages.append({"role": "system", "content": task_ctx})
+
+    if user_event:
+        messages.append({"role": "user", "content": user_event.strip()})
 
     return messages

@@ -85,6 +85,7 @@ class SqliteVectorStore:
         *,
         k: int,
         conversation_id: str | None = None,
+        before_ts: str | None = None,
     ) -> list[RagHit]:
         if not query_vec or not self._entries:
             return []
@@ -92,6 +93,12 @@ class SqliteVectorStore:
         if conversation_id:
             candidates = [
                 entry for entry in candidates if entry.conversation_id == conversation_id
+            ]
+        if before_ts:
+            candidates = [
+                entry
+                for entry in candidates
+                if not entry.timestamp or entry.timestamp < before_ts
             ]
         scored = [
             RagHit(document=entry, score=cosine_similarity(query_vec, entry.vector))
@@ -272,6 +279,7 @@ class RagMemoryService:
         query: str,
         *,
         conversation_id: str | None = None,
+        before_ts: str | None = None,
         top_k: int | None = None,
         token_budget: int | None = None,
         estimator: TokenEstimator | None = None,
@@ -289,6 +297,7 @@ class RagMemoryService:
             qvec,
             k=top_k or self.top_k,
             conversation_id=conversation_id,
+            before_ts=before_ts,
         )
         if not hits:
             return ""
