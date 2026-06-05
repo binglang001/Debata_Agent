@@ -36,7 +36,9 @@ from ui.dashboard.chats_page import (
     _group_records_by_conversation,
     _scrollbar_near_bottom,
 )
+from ui.dashboard.layout import DEFAULT_LAYOUT
 from ui.dashboard.logs_page import _format_record
+from ui.dashboard.main_window import DashboardWindow
 from ui.dashboard.memory_page import MemoryPage
 from ui.dashboard.overview_page import OverviewPage
 from ui.dashboard.personas_page import PersonasPage, _PersonaCreatorDialog
@@ -410,6 +412,35 @@ def test_settings_page_collapses_advanced_budget_and_napcat_options(qapp, tmp_pa
         assert "托管进程预热" in label_text
     finally:
         page.deleteLater()
+
+
+def test_dashboard_content_width_uses_viewport_not_layout_stretch(qapp):
+    page = SimpleNamespace()
+    page._scroll = SimpleNamespace(
+        viewport=lambda: SimpleNamespace(width=lambda: 960),
+    )
+    page._stack = SimpleNamespace(
+        _min=0,
+        _max=0,
+        minimumWidth=lambda: page._stack._min,
+        maximumWidth=lambda: page._stack._max,
+        setMinimumWidth=lambda value: setattr(page._stack, "_min", value),
+        setMaximumWidth=lambda value: setattr(page._stack, "_max", value),
+        updateGeometry=lambda: None,
+    )
+
+    DashboardWindow._sync_content_width(page)
+
+    assert page._stack._min == 960
+    assert page._stack._max == 960
+
+    page._scroll = SimpleNamespace(
+        viewport=lambda: SimpleNamespace(width=lambda: DEFAULT_LAYOUT.page_max_width + 600),
+    )
+    DashboardWindow._sync_content_width(page)
+
+    assert page._stack._min == DEFAULT_LAYOUT.page_max_width
+    assert page._stack._max == DEFAULT_LAYOUT.page_max_width
 
 
 def test_overview_page_shows_usage_activity_and_provider_counts(qapp):

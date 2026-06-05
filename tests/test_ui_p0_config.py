@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +27,7 @@ from app_config.schema import (
     RootConfig,
     TTSFeatureConfig,
 )
+from ui.dashboard.layout import DEFAULT_LAYOUT
 from ui.dashboard.settings_page import (
     SettingsPage,
     _AddProviderDialog,
@@ -192,6 +194,35 @@ def test_wizard_persist_edge_tts_needs_no_secret(qapp, tmp_paths, fake_keyring):
         win._completed_emitted = True
         win.close()
         win.deleteLater()
+
+
+def test_wizard_content_width_uses_viewport_not_layout_stretch(qapp):
+    win = SimpleNamespace()
+    win._wizard_scroll = SimpleNamespace(
+        viewport=lambda: SimpleNamespace(width=lambda: 900),
+    )
+    win._page_host = SimpleNamespace(
+        _min=0,
+        _max=0,
+        minimumWidth=lambda: win._page_host._min,
+        maximumWidth=lambda: win._page_host._max,
+        setMinimumWidth=lambda value: setattr(win._page_host, "_min", value),
+        setMaximumWidth=lambda value: setattr(win._page_host, "_max", value),
+        updateGeometry=lambda: None,
+    )
+
+    WizardWindow._sync_page_width(win)
+
+    assert win._page_host._min == 900
+    assert win._page_host._max == 900
+
+    win._wizard_scroll = SimpleNamespace(
+        viewport=lambda: SimpleNamespace(width=lambda: DEFAULT_LAYOUT.page_max_width + 500),
+    )
+    WizardWindow._sync_page_width(win)
+
+    assert win._page_host._min == DEFAULT_LAYOUT.page_max_width
+    assert win._page_host._max == DEFAULT_LAYOUT.page_max_width
 
 
 def test_wizard_embedding_step_is_fixed_in_flow():

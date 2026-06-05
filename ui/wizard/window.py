@@ -14,7 +14,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QFrame,
@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -132,10 +134,10 @@ class WizardWindow(QMainWindow):
         root_layout.addWidget(topbar)
 
         # 中间：step 视图栈包 ScrollArea，仅在当前 step 溢出时滚动
-        from PySide6.QtWidgets import QScrollArea
         self._active_view: QWidget | None = None
         self._page_host = QWidget()
         self._page_host.setMaximumWidth(DEFAULT_LAYOUT.page_max_width)
+        self._page_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._page_lay = QVBoxLayout(self._page_host)
         self._page_lay.setContentsMargins(0, 0, 0, 0)
         self._page_lay.setSpacing(0)
@@ -145,12 +147,13 @@ class WizardWindow(QMainWindow):
         self._wizard_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._wizard_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._wizard_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._wizard_scroll.viewport().installEventFilter(self)
         scroll_content = QWidget()
         scroll_lay = QHBoxLayout(scroll_content)
         scroll_lay.setContentsMargins(0, 0, 0, 0)
         scroll_lay.setSpacing(0)
         scroll_lay.addStretch(1)
-        scroll_lay.addWidget(self._page_host, 1)
+        scroll_lay.addWidget(self._page_host, 0)
         scroll_lay.addStretch(1)
         self._wizard_scroll.setWidget(scroll_content)
 
@@ -192,6 +195,7 @@ class WizardWindow(QMainWindow):
                 v.request_advance.connect(self._on_next)
 
         self._jump_to(StepId.WELCOME)
+        QTimer.singleShot(0, self._sync_page_width)
 
     # ============================================================
     # UI 构造
@@ -268,6 +272,32 @@ class WizardWindow(QMainWindow):
     # 流转
     # ============================================================
 
+    def eventFilter(self, obj: object, event: QEvent) -> bool:  # noqa: N802
+        scroll = getattr(self, "_wizard_scroll", None)
+        if (
+            scroll is not None
+            and obj is scroll.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._sync_page_width()
+        return super().eventFilter(obj, event)
+
+    def _sync_page_width(self) -> None:
+        """Keep wizard pages centered without letting layout stretch squeeze them."""
+        scroll = getattr(self, "_wizard_scroll", None)
+        host = getattr(self, "_page_host", None)
+        if scroll is None or host is None:
+            return
+        viewport_width = scroll.viewport().width()
+        if viewport_width <= 0:
+            return
+        width = min(viewport_width, DEFAULT_LAYOUT.page_max_width)
+        if host.minimumWidth() == width and host.maximumWidth() == width:
+            return
+        host.setMinimumWidth(width)
+        host.setMaximumWidth(width)
+        host.updateGeometry()
+
     def _jump_to(self, step: StepId) -> None:
         if step not in self._views:
             return
@@ -287,6 +317,7 @@ class WizardWindow(QMainWindow):
             view.refresh()
         self._update_topbar()
         self._update_buttons()
+        self._sync_page_width()
         self._sync_scroll_height()
 
     def _sync_scroll_height(self) -> None:

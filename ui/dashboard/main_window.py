@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -90,22 +92,22 @@ class DashboardWindow(QMainWindow):
         content_lay.setSpacing(0)
 
         # stack 包 ScrollArea，仅在当前页溢出时滚动（AutoSizeStack 让 sizeHint 跟当前页走）
-        from PySide6.QtWidgets import QScrollArea
-
         from ..widgets import AutoSizeStack
         self._stack = AutoSizeStack()
         self._stack.setMaximumWidth(DEFAULT_LAYOUT.page_max_width)
+        self._stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.viewport().installEventFilter(self)
         scroll_content = QWidget()
         scroll_lay = QHBoxLayout(scroll_content)
         scroll_lay.setContentsMargins(0, 0, 0, 0)
         scroll_lay.setSpacing(0)
         scroll_lay.addStretch(1)
-        scroll_lay.addWidget(self._stack, 1)
+        scroll_lay.addWidget(self._stack, 0)
         scroll_lay.addStretch(1)
         self._scroll.setWidget(scroll_content)
         content_lay.addWidget(self._scroll, 1)
@@ -148,6 +150,7 @@ class DashboardWindow(QMainWindow):
         self._status_timer.start()
         self._refresh_topbar()
         self._apply_theme(self._theme_choice)
+        QTimer.singleShot(0, self._sync_content_width)
         QTimer.singleShot(800, self._show_feature_failures)
 
     # ============================================================
@@ -227,12 +230,39 @@ class DashboardWindow(QMainWindow):
     # 导航 / 状态
     # ============================================================
 
+    def eventFilter(self, obj: object, event: QEvent) -> bool:  # noqa: N802
+        scroll = getattr(self, "_scroll", None)
+        if (
+            scroll is not None
+            and obj is scroll.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._sync_content_width()
+        return super().eventFilter(obj, event)
+
+    def _sync_content_width(self) -> None:
+        """Keep dashboard pages centered without letting layout stretch squeeze them."""
+        scroll = getattr(self, "_scroll", None)
+        stack = getattr(self, "_stack", None)
+        if scroll is None or stack is None:
+            return
+        viewport_width = scroll.viewport().width()
+        if viewport_width <= 0:
+            return
+        width = min(viewport_width, DEFAULT_LAYOUT.page_max_width)
+        if stack.minimumWidth() == width and stack.maximumWidth() == width:
+            return
+        stack.setMinimumWidth(width)
+        stack.setMaximumWidth(width)
+        stack.updateGeometry()
+
     def _switch_to(self, key: str) -> None:
         page = self._pages.get(key)
         if page is None:
             return
         self._stack.setCurrentWidget(page)
         self._animate_current_page(page)
+        self._sync_content_width()
         self._scroll.verticalScrollBar().setValue(0)  # 切页回顶
         if hasattr(page, "refresh"):
             try:
