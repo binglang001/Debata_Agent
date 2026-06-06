@@ -112,6 +112,7 @@ class WizardWindow(QMainWindow):
 
         # 窗口图标
         from pathlib import Path
+
         from PySide6.QtGui import QIcon
         icon = Path(__file__).parent.parent / "icon.png"
         if icon.exists():

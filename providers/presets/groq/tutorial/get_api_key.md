@@ -1,19 +1,24 @@
 # 获取 Groq API Key
 
-Groq 以超低延迟推理著称（自研 LPU 芯片），提供主流开源模型的高速 API。走 OpenAI 兼容协议。
+Groq 自研 LPU 芯片做推理，延迟极低。走 OpenAI 兼容协议，Debata 直接对接。
 
 ## 1. 注册
 
-前往 [Groq Console](https://console.groq.com) 注册账号。支持 Google / GitHub 快捷登录。
+打开 [Groq Console](https://console.groq.com)，用 Google 或 GitHub 账号登录。
 
-## 2. 获取 API Key
 
-登录后在 [API Keys 页面](https://console.groq.com/keys) 点「Create API Key」生成。新用户有免费额度（速率有限）。
+## 2. 创建 API Key
+
+左边菜单点 [API Keys](https://console.groq.com/keys)，点 **Create API Key**。
+
+
+复制生成的 key——关掉弹窗后就看不到了。
+
 
 ## 3. 计费
 
-按 token 计费，价格极低。详见 [Groq 定价](https://groq.com/pricing/)。免费套餐有 RPM/TPM 限制，适合个人使用。
+[按 token 计费](https://groq.com/pricing/)，价格很低。新用户有免费额度，但速率有限。个人用足够，多群同时聊天建议上付费计划。
 
 ## 4. 填入 Debata
 
-启动向导 → 选「Groq」→ 粘贴 API Key → 选模型 → 保存。注意：Groq 的免费额度有速率限制，同时对话多的群聊建议用付费计划。
+启动向导 → 选 **Groq** → 粘贴 API Key → 选模型 → 保存。设置页 Models 节也能改。

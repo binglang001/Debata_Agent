@@ -1,36 +1,54 @@
 # RAG 长期记忆（Embedding）
 
-## 直接操作
+Debata 有两种记忆模式。文件模式零配置直接跑，RAG 模式需要配 embedding 服务但检索更精准。
 
-1. 先准备 Embedding 服务密钥：[阿里百炼](https://bailian.console.aliyun.com/) / [智谱](https://open.bigmodel.cn/usercenter/apikeys) / [火山方舟](https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey) / [OpenAI](https://platform.openai.com/api-keys)。
-2. 在向导或设置页把「长期记忆」切到 RAG。
-3. 选 API 服务或本地模型，填模型 ID，点「测试连接」。
-4. 通过后进入下一步；失败时看返回的 HTTP 状态和响应内容。
+## 选择模式
 
-## 记忆范围
+设置页 → 记忆 →「长期记忆模式」卡片。
 
-长期记忆仍是一份全局存储，不会按群或私聊拆库。每条记忆有两个范围字段：
+![记忆模式](https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/guide_rag_mode.png)
 
-- `scope`：`global`、`user:QQ号` 或 `group:群号`。机器人在当前会话里优先注入匹配当前私聊/群聊的记忆和全局记忆。
-- `pinned`：置顶。置顶记忆在所有会话中常驻注入，适合身份、长期约定、全局禁忌这类稳定信息。
+**文件模式**：AI 主动调工具保存记忆，写 `important.json`。单人聊天够用，完全透明。
 
-模型调用 `save_important_memory` 或用户触发“记住”关键词时，系统会默认按当前会话推断 scope。需要手动调整时，到仪表盘「重要记忆」页修改 scope 或勾选置顶。RAG 模式下保存元数据会同步重建索引。
+**RAG 模式**：后台自动提取记忆做向量索引，按语义检索。多群多用户长期运行更靠谱，但需要配 embedding。
 
-## API 模式推荐
+## 配 Embedding（RAG 模式）
 
-- 阿里百炼：[Embedding 文档](https://help.aliyun.com/zh/model-studio/)：`text-embedding-v4`
-- 智谱：[Embedding 文档](https://docs.bigmodel.cn/)：`embedding-3`
-- 火山方舟：[Embedding API](https://www.volcengine.com/docs/82379/1302003/)：`doubao-embedding-text-240515`
-- OpenAI：[Embedding 文档](https://platform.openai.com/docs/guides/embeddings)：`text-embedding-3-small` 或 `text-embedding-3-large`
+### API 模式
 
-DeepSeek 主要是聊天模型平台，不建议拿它复用做 Embedding；如果返回 400 或参数调用错误，通常是模型 ID、接口类型或 provider 不匹配，请换独立 Embedding provider。
-火山的 `doubao-embedding-vision-*` 是图文多模态向量模型，不适合作为普通文本 `/embeddings` 默认项；RAG 文本检索优先使用 `doubao-embedding-text-*`。
+设置页 → 模型 →「添加提供商」按钮。
 
-## 本地模式
+点击后，按照图示推荐配置来配置RAG提供商（推荐采用火山方舟）。
 
-在「模型管理」打开安装指引，下载后拖入模型文件夹。
+![添加提供商](https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/guide_rag_add_provider.png)
 
-- 轻量：`sentence-transformers/all-MiniLM-L6-v2`
-- 中文质量：`BAAI/bge-large-zh-v1.5`
+设置页 → 记忆。
+点击“编辑 Embedding 配置”，选 API 服务，填 provider + 模型 ID + Key，若上一步采用火山方舟，则推荐如图配置。
 
-切换 Embedding 模型后，旧向量不能混用。检索明显不准时，删除对应 persona 记忆目录下的 `rag.jsonl` 后重新积累记忆。
+![Embedding API 配置](https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/guide_rag_api.png)
+
+推荐：
+
+- 阿里百炼 `text-embedding-v4`
+- 智谱 `embedding-3`
+- 火山方舟 `doubao-embedding-text-240515`
+- OpenAI `text-embedding-3-small`
+
+DeepSeek 主要是聊天平台，不建议拿它做 Embedding。火山的 `doubao-embedding-vision-*` 是图文多模态向量模型，可通用。
+
+### 本地模式
+
+![Embedding 本地配置](https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/guide_rag_local.png)
+
+不需要网络。在模型管理页找到对应的 embedding 插件，按安装指引下载模型文件，拖到 `data/models/` 目录。
+
+轻量：`all-MiniLM-L6-v2`（约 23MB）
+中文好：`bge-large-zh-v1.5`（约 400MB）
+
+# 注意：配置完后点击下方“重启Debata服务”
+
+## 常见问题
+
+**换 Embedding 模型后检索不准？** 删除 `data/memory/{角色名}/rag.jsonl`，从头积累。
+
+**API 模式报 400？** 可能是模型 ID 填错了，或者 Embedding provider 和聊天用了同一个 DeepSeek key——换独立 provider。

@@ -133,9 +133,11 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
     """
     import asyncio as _asyncio
     import signal as _signal
+    from pathlib import Path
 
     import qasync  # type: ignore
     from PySide6.QtCore import QTimer
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
     from app_config import AppPaths, SecretsManager
@@ -144,9 +146,6 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
     from ui.theme import cached_qss, palette_for_theme
     from ui.tray import Tray
     from ui.wizard.window import WizardWindow
-
-    from pathlib import Path
-    from PySide6.QtGui import QIcon
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)

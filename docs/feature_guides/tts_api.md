@@ -19,12 +19,25 @@ EdgeTTS 是默认推荐项：
 讯飞适合需要稳定商业服务或指定发音人的场景。
 
 1. 打开讯飞在线语音合成页面：<https://www.xfyun.cn/services/online_tts?target=price>
-2. 创建或进入应用，开通“在线语音合成（流式版）”。
-3. 在控制台服务页获取 `AppID`、`APIKey`、`APISecret`。
-4. 在 Debata 设置里选择“云端 API”。
-5. API Provider 选择“科大讯飞”。
-6. 填写 `API Key`、`App ID`、`API Secret`。
-7. “说话人”可填控制台已开通的发音人参数，例如 `x4_xiaoyan`；留空使用默认值。
+2. 点击“免费试用包”下方的“立即购买”。
+3. 跳转进入登陆界面，点击右上角“注册账号”，根据指引注册账号。
+4. 注册后，点击“提交”按钮下方“跳过，返回原页面”。
+5. 跳转到购买页面后，点击上方“个人免费套餐”.
+6. 点击“在线语音合成”下方的“立即领取”。
+7. 弹出实名认证窗口，点击”确定“进入实名认证界面，根据指引完成实名认证。
+8. 重新进入刚刚的页面<https://www.xfyun.cn/free?target=price>，按照前述步骤点击“在线语音合成”下方的“立即领取”。
+9. 进入购买页面，点击”选择应用“输入框右侧的加号，如图填写后点击“提交”。
+
+![创建应用](https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/guide_tts_create_app.png)
+
+10. 滚动到页面底部，点击”确认下单“。
+11. 点击左侧“语音合成”下拉列表中“在线语音合成”，查看右侧 `AppID`、`APIKey`、`APISecret`。
+12. 在 Debata 设置里选择“云端 API”。
+13. API Provider 选择“科大讯飞”。
+14. 填写 `API Key`、`App ID`、`API Secret`。
+15. “说话人”可填控制台已开通的发音人参数，例如 `x4_xiaoyan`；留空使用默认值。
+
+**配置完后点击下方“重启Debata服务”**
 
 讯飞单次文本限制小于 8000 字节。小语种或特殊方言需要先在讯飞控制台开通对应发音人，否则会返回授权错误。
 

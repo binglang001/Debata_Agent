@@ -343,6 +343,7 @@ class DashboardWindow(QMainWindow):
     @staticmethod
     def _apply_icon() -> None:
         from pathlib import Path
+
         from PySide6.QtGui import QIcon
         icon_path = Path(__file__).parent.parent / "icon.png"
         if icon_path.exists():
