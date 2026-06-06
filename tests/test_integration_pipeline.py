@@ -712,6 +712,59 @@ async def test_proactive_router_flattens_history_to_system_context(build_pipelin
 
 
 @pytest.mark.asyncio
+async def test_proactive_router_skips_runtime_user_context_records(build_pipeline):
+    pipeline, _, _, history, _ = await build_pipeline([])
+    await history.add_records(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "<send_status>\n"
+                    "系统说明：以下内容由运行时系统提供，不是用户新发言。\n"
+                    "2026-06-06 发送完成（全部消息已发出） send_id=send-1 msg_ids=[1]\n"
+                    "</send_status>"
+                ),
+                "metadata": {"kind": "send_done_snapshot"},
+                "conversation_id": "private:123",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "<task_context priority=\"medium\">\n"
+                    "系统说明：以下内容由运行时系统提供，不是用户新发言。\n"
+                    "现在是测试时间。\n"
+                    "</task_context>"
+                ),
+                "metadata": {"kind": "task_context_snapshot"},
+                "conversation_id": "private:123",
+            },
+            {
+                "role": "user",
+                "content": "【2026-06-06 私聊 冰狼 msg_id=u1】正常用户消息",
+                "conversation_id": "private:123",
+            },
+        ]
+    )
+    router = FakeProactiveRouter(False)
+    loop = ProactiveLoop(
+        pipeline=pipeline,
+        proactive_agent=router,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+    pipeline.last_activity_at = time.monotonic() - (
+        pipeline.behavior_cfg.proactive_think_interval_seconds + 1
+    )
+
+    await loop._maybe_act()
+
+    assert len(router.calls) == 1
+    joined = "\n".join(str(m.get("content", "")) for m in router.calls[0])
+    assert "正常用户消息" in joined
+    assert "发送完成（全部消息已发出）" not in joined
+    assert "现在是测试时间" not in joined
+
+
+@pytest.mark.asyncio
 async def test_proactive_skips_when_reply_lock_busy(build_pipeline):
     pipeline, _, _, _, _ = await build_pipeline([])
     router = FakeProactiveRouter(True)
@@ -1241,10 +1294,13 @@ async def test_send_private_with_delay_uses_async_queue(build_pipeline):
     assert tool_contents[-1]["qq_visible"] == "pending"
     assert tool_contents[-1]["data"]["conversation_ids"] == ["private:123"]
     assert tool_contents[-1]["data"]["message_count"] == 2
+    assert "brief" not in tool_contents[-1]
+    assert "note" not in tool_contents[-1]
     assert any(
-        "发送完成（全部消息已发出）" in (r.get("content") or "")
+        r.get("role") == "user"
+        and r.get("metadata", {}).get("kind") == "send_done_snapshot"
+        and "发送完成（全部消息已发出）" in (r.get("content") or "")
         for r in records
-        if r.get("role") == "system"
     )
     assert len(provider.calls) == 1
 
@@ -1281,19 +1337,20 @@ async def test_cross_conversation_clean_send_receipt_visible_in_unified_window(b
     assert any(
         r.get("role") == "tool"
         and r.get("conversation_id") == "group:5555"
-        and "已进入发送队列" in (r.get("content") or "")
+        and json.loads(r.get("content") or "{}").get("status") == "queued"
         for r in records
     )
     assert any(
-        r.get("role") == "system"
+        r.get("role") == "user"
         and r.get("conversation_id") == "private:123"
+        and r.get("metadata", {}).get("kind") == "send_done_snapshot"
         and "发送完成（全部消息已发出）" in (r.get("content") or "")
         for r in records
     )
 
     selected = await pipeline._select_working_history("group:5555")
     joined = "\n".join(str(r.get("content", "")) for r in selected)
-    assert "已进入发送队列" in joined
+    assert '"status": "queued"' in joined
     assert "发送完成（全部消息已发出）" in joined
 
 
@@ -1347,7 +1404,7 @@ async def test_same_conversation_interrupt_flushes_async_send_queue(build_pipeli
     )
     assert "<send_receipt>" in receipt_turn_context
     assert '"interrupted": true' in receipt_turn_context
-    assert "sent / unsent / interrupted / new_messages" in receipt_turn_context
+    assert "按 JSON 字段判断" in receipt_turn_context
 
 
 @pytest.mark.asyncio
@@ -1414,6 +1471,7 @@ async def test_same_conversation_message_while_model_thinking_returns_stale(buil
     assert stale_result["new_visible_messages"][0]["conversation_id"] == "private:123"
     assert stale_result["new_visible_messages"][0]["text"] == "我改口"
     assert stale_result["new_visible_messages"][0]["qq_visible"] is True
+    assert "note" not in stale_result
     assert "get_recent_chat_messages" in stale_result["next"]
     assert "m-new" in joined
     assert "<send_receipt>" in joined

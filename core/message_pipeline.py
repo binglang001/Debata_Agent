@@ -279,17 +279,16 @@ class _AsyncSendManager:
             result = {
                 "ok": False,
                 "status": "stale",
-                "brief": "发送未执行：目标会话刚收到新消息，需要重新判断。",
+                "brief": "发送未执行：会话状态已变化。",
                 "qq_visible": False,
                 "send_id": send_id,
-                "note": "该会话消息状态已变化，请先看最新状态再决定发不发",
                 "stale_conversations": stale_convs,
                 "attempted_messages": self._attempted_items(normalized, send_id),
                 "new_visible_messages": new_visible_messages,
-                "next": "不要自动补发 attempted_messages；先阅读 new_visible_messages / recalled_messages，必要时调用 get_recent_chat_messages 确认 QQ 当前聊天记录后重新判断。",
+                "next": "重新判断；不要自动补发 attempted_messages。必要时调用 get_recent_chat_messages。",
             }
             if recalled_messages:
-                result["brief"] = "发送未执行：目标会话有消息被撤回，需要重新判断。"
+                result["brief"] = "发送未执行：会话有消息被撤回。"
                 result["recalled_messages"] = recalled_messages
             return result
 
@@ -323,14 +322,12 @@ class _AsyncSendManager:
         return {
             "ok": True,
             "status": "queued",
-            "brief": "消息已进入发送队列，QQ 可见状态待后台发送确认。",
             "qq_visible": "pending",
             "send_id": send_id,
             "data": {
                 "conversation_ids": list(groups.keys()),
                 "message_count": sum(len(items) for items in groups.values()),
             },
-            "note": "已进入发送队列；正常发完只静默记历史，被打断或失败才会追加 send_receipt。",
         }
 
     def pop_pending_receipts(self, conversation_id: str) -> list[dict[str, Any]]:
@@ -753,6 +750,31 @@ def _make_task_context_record(
         "role": "user",
         "content": content,
         "metadata": {"kind": "task_context_snapshot"},
+    }
+    if conversation_id:
+        record["conversation_id"] = conversation_id
+    return record
+
+
+def _make_runtime_context_record(
+    content: str,
+    *,
+    kind: str,
+    tag: str,
+    conversation_id: str | None = None,
+) -> dict[str, Any] | None:
+    content = content.strip()
+    if not content:
+        return None
+    record: dict[str, Any] = {
+        "role": "user",
+        "content": (
+            f"<{tag}>\n"
+            "系统说明：以下内容由运行时系统提供，不是用户新发言。\n"
+            f"{content}\n"
+            f"</{tag}>"
+        ),
+        "metadata": {"kind": kind},
     }
     if conversation_id:
         record["conversation_id"] = conversation_id
@@ -1477,11 +1499,15 @@ class MessagePipeline:
         msg_ids = ", ".join(
             str(item.get("msg_id")) for item in sent if item.get("msg_id") is not None
         )
-        await self.history.add_system_note(
+        record = _make_runtime_context_record(
             f"{get_time()} 发送完成（全部消息已发出）"
             f" send_id={receipt.get('send_id')} msg_ids=[{msg_ids}]",
+            kind="send_done_snapshot",
+            tag="send_status",
             conversation_id=conversation_id or None,
         )
+        if record is not None:
+            await self.history.add_records([record], conversation_id=conversation_id or None)
 
     def _schedule_send_receipt_turn(self, conversation_id: str) -> None:
         task = self._send_receipt_tasks.get(conversation_id)
@@ -1505,10 +1531,8 @@ class MessagePipeline:
             )
             task_context = (
                 "<send_receipt_task priority=\"high\">\n"
-                "下面是本轮需要处理的发送状态回执，"
-                "请以 sent / unsent / interrupted / new_messages 字段为准：\n"
+                "处理下面的运行时发送回执，按 JSON 字段判断：\n"
                 f"{receipt_block}\n"
-                "已发出的消息保持已发送；"
                 "未发出的消息不要自动补发，先结合新消息判断是否需要回应。\n"
                 "</send_receipt_task>"
             )
@@ -1525,10 +1549,7 @@ class MessagePipeline:
     def _format_send_receipt(self, receipt: dict[str, Any]) -> str:
         return (
             "<send_receipt>\n"
-            "发送回执：这是当前会话的发送状态记录，请以 sent / unsent / interrupted / new_messages 字段判断结果。\n"
-            "sent 表示已经发出，qq_visible=true；unsent 表示未发出，qq_visible=false；interrupted 表示发送是否被新消息中断；new_messages 是中断期间 QQ 上真实出现的新消息。\n"
-            "未发出的消息不要自动补发，先结合新消息判断是否需要回应。\n"
-            "如果当前 QQ 真实聊天状态不清楚，先调用 get_recent_chat_messages。\n"
+            "系统说明：运行时发送状态；按 JSON 字段判断，未发不要自动补发。\n"
             f"{json.dumps(receipt, ensure_ascii=False)}\n"
             "</send_receipt>"
         )

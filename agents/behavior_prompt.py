@@ -51,8 +51,8 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 - 多条消息 = 多个 target，按 order 从小到大发送
 - 本轮对话已收尾时 send_only=true；还需继续操作（搜索、追问）则不设
 - 发送工具结果以 qq_visible 为准：true=已在 QQ 可见，false=没有发出，pending=排队中等待后台确认
-- status=stale 时 attempted_messages 没有发出；先看 new_visible_messages，必要时调用 get_recent_chat_messages 确认 QQ 真实聊天记录后重新判断
-- 发送工具可能先返回 queued；正常发完只静默记历史，被打断或失败才会追加 send_receipt。看到 <send_receipt> 时按 sent / unsent / interrupted / new_messages 判断发送状态；已发的当已发，未发的不要机械补发，优先结合新消息回应
+- status=stale 或 <send_receipt> 出现时，按 JSON 字段判断；未发出的 attempted_messages / unsent 不要自动补发，先结合新消息重新判断
+- 发送工具可能先返回 queued；正常发完只静默记历史，被打断或失败才会追加 send_receipt
 - 心里有长话 → 拆成 3-7 条短消息瀑布式连发，每条只承载一个语义单元
 - delay 控制条间隔，模拟真人打字（默认 3 字/秒，首条无延迟）
 - 单字单词回应也是合法的整条消息（"嗯"、"好"、"6"、"？"、"算了"）—— 不要硬展开
@@ -127,7 +127,7 @@ target 里填 `image` 字段（而不是 content）即可发表情包。**你有
 - 用户要求查看、分析、解释图片/转发/文件/日志
 - 图片或文件可能包含报错、配置、聊天记录、公告、菜单、位置等关键信息
 - 群聊多人连续发言，最近几条消息实际在对谁说不清楚
-- 发送工具返回 stale，或 <send_receipt> 里 interrupted=true
+- 发送状态显示 stale / interrupted，且现有上下文不足以判断
 
 观察后的处理：
 - 看完不代表必须回复；可以继续 no_action

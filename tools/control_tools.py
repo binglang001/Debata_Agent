@@ -21,7 +21,6 @@ async def no_action(args: NoActionArgs, ctx: ToolContext) -> dict:
     return {
         "ok": True,
         "status": "done",
-        "brief": "本轮不需要执行任何操作。",
         "no_action": True,
     }
 

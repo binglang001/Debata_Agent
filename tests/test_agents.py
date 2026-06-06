@@ -166,7 +166,7 @@ def test_tool_trigger_policy_in_protocol():
     assert "get_forward_msg" in s
     assert "read_file" in s
     assert "stale" in s
-    assert "interrupted=true" in s
+    assert "stale / interrupted" in s
 
 
 def test_group_relevance_uses_clear_addressee_rules():

@@ -780,7 +780,7 @@ async def test_executor_no_action_works():
     result = await executor("no_action", {})
     assert result["ok"] is True
     assert result["status"] == "done"
-    assert "不需要执行" in result["brief"]
+    assert "brief" not in result
     assert result.get("no_action") is True
 
 

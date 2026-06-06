@@ -63,10 +63,20 @@ _ROLE_LABELS = {
 _ROUTER_SUMMARY_DROP_MARKERS = (
     "<send_receipt",
     "</send_receipt>",
+    "<send_status",
+    "</send_status>",
+    "<task_context",
+    "</task_context>",
     "错误：未调用工具",
     "send_private_messages",
     "send_group_message",
     "no_action",
+)
+_ROUTER_RUNTIME_CONTEXT_KINDS = frozenset(
+    {
+        "task_context_snapshot",
+        "send_done_snapshot",
+    }
 )
 _ROLE_PREFIX_PATTERN = re.compile(r"\[(?:assistant|tool|system)\]\s*", re.IGNORECASE)
 
@@ -76,6 +86,8 @@ def _format_proactive_router_history(records: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     tool_names: dict[str, str] = {}
     for record in records:
+        if _is_runtime_context_record(record):
+            continue
         role = str(record.get("role") or "unknown")
 
         if role == "assistant":
@@ -120,6 +132,14 @@ def _format_proactive_router_history(records: list[dict[str, Any]]) -> str:
         + "\n".join(lines)
         + "\n</recent_context>"
     )
+
+
+def _is_runtime_context_record(record: dict[str, Any]) -> bool:
+    meta = record.get("metadata")
+    if isinstance(meta, dict) and meta.get("kind") in _ROUTER_RUNTIME_CONTEXT_KINDS:
+        return True
+    content = str(record.get("content") or "")
+    return any(marker in content for marker in _ROUTER_SUMMARY_DROP_MARKERS)
 
 
 def _summarize_router_tool_result(tool_name: str, content: str) -> str:
