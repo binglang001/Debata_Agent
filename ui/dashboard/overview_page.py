@@ -77,12 +77,12 @@ def _dominant_error(errors: list[str]) -> str:
 
 def _activity_face(state: str) -> str:
     if state == "thinking":
-        return "(思考中)"
+        return "思考中"
     if state == "tool":
-        return "(调用工具)"
+        return "调用工具"
     if state == "error":
-        return "(出错)"
-    return "(空闲)"
+        return "出错"
+    return "空闲"
 
 
 class _StatCard(QFrame):

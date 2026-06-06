@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 )
 async def describe_image(args: DescribeImageArgs, ctx: ToolContext) -> dict:
     if ctx.vision is None:
+        ctx.extras["vision_unavailable_this_turn"] = "未启用图像理解功能"
         return {
             "ok": False,
             "status": "failed",
@@ -66,12 +67,14 @@ async def describe_image(args: DescribeImageArgs, ctx: ToolContext) -> dict:
         question = (args.question or args.prompt or "").strip()
         raw = await ctx.vision.describe(image_url, question)
     except Exception as e:
-        logger.warning("describe_image 失败: %s", _short_image_error(e))
+        short_error = _short_image_error(e)
+        ctx.extras["vision_unavailable_this_turn"] = short_error
+        logger.warning("describe_image 失败: %s", short_error)
         return {
             "ok": False,
             "status": "failed",
             "brief": "图片理解失败。",
-            "error": _short_image_error(e),
+            "error": short_error,
             "summary": "图片识别失败",
             "data": {
                 "image_ref": _compact_image_ref(args.image_url),

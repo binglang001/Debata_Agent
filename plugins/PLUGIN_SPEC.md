@@ -9,10 +9,14 @@ Debata 的插件用来接「本地模型 / 重资源依赖」的可选能力（T
 plugins/
 ├── __init__.py            # 导出 PluginManager
 ├── base.py                # PluginMeta / PluginManager / PluginStatus / PluginError
+├── downloader.py          # 模型下载辅助
 ├── PLUGIN_SPEC.md         # 你正在看的这份
 ├── voxcpm2/
-│   └── __plugin__.py      # 必需，导出 PLUGIN_META + build(config)
-└── embedding_minilm/
+│   ├── __plugin__.py      # 必需，导出 PLUGIN_META + build(config)
+│   └── voxcpm_impl.py     # 实际 TTS 实现（lazy import）
+├── embedding_minilm/
+│   └── __plugin__.py
+└── embedding_bge_zh/
     └── __plugin__.py
 ```
 
@@ -32,12 +36,23 @@ PLUGIN_META = PluginMeta(
     python_deps=["voxcpm>=2.0.0", "soundfile>=0.12.1"],
     download_url="https://huggingface.co/openbmb/VoxCPM2",
     config_schema={
-        "model_size": {
-            "type": "select",
-            "default": "large-v3",
-            "label": "模型大小",
-            "options": ["voxcpm2"],
-            "help": "本地 TTS 模型。",
+        "model_dir": {
+            "type": "string",
+            "default": "data/models/VoxCPM2",
+            "label": "模型目录",
+            "help": "VoxCPM2 模型文件所在目录。",
+        },
+        "reference_audio": {
+            "type": "string",
+            "default": "",
+            "label": "参考音频",
+            "help": "3-30 秒清晰干声，用于音色克隆。留空则只用音色描述。",
+        },
+        "default_prompt": {
+            "type": "string",
+            "default": "",
+            "label": "默认音色描述",
+            "help": "如「年轻女性，自然口语，带一点调侃」。",
         },
         "device": {
             "type": "select",
@@ -46,11 +61,23 @@ PLUGIN_META = PluginMeta(
             "options": ["auto", "cuda", "cpu"],
             "help": "auto 优先 cuda；无 GPU 自动回退 cpu。",
         },
-        "language": {
-            "type": "string",
-            "default": "zh",
-            "label": "默认语言",
-            "help": "ISO 639-1 代码；空字符串=自动检测。",
+        "load_denoiser": {
+            "type": "bool",
+            "default": False,
+            "label": "启用降噪",
+            "help": "需要 FFmpeg full-shared DLL 放在 data/tools/ffmpeg/bin/。",
+        },
+        "cfg_value": {
+            "type": "float",
+            "default": 2.0,
+            "label": "CFG 强度",
+            "help": "引导强度。越大越贴近描述但可能失真。",
+        },
+        "inference_timesteps": {
+            "type": "int",
+            "default": 10,
+            "label": "推理步数",
+            "help": "10-30 之间比较合适。越多音质越好但越慢。",
         },
     },
     auto_download=False,            # 历史兼容字段；当前 UI 统一显示「安装指引」
@@ -65,12 +92,13 @@ def build(config: dict) -> ITTSService:
 
 ## 实装侧契约
 
-- **必须 lazy 加载模型**：`PluginMeta` 解析、`build()` 调用都不能加载 model 文件，只有第一次真正调用 `transcribe()` / `synthesize()` / `embed_one()` 时才加载。否则启动会慢、内存暴涨。
+- **build() 不加载模型**：`build(config)` 只创建轻量 service 实例，不做任何模型 I/O。真正加载在 `warmup()` 里，由 Runtime 启动时用 `asyncio.to_thread` 后台执行。
 - **必须实现对应 `features/` 接口**：
   - kind=`tts`  → `features.tts.ITTSService`
   - kind=`embedding` → `features.embedding.IEmbeddingService`
-- **必须有 aclose()**：哪怕是 no-op；`PluginManager.shutdown_all()` 会调。
-- **重依赖只在 lazy import 内出现**：`__plugin__.py` 顶层只能 import 标准库 + `plugins.base` + `features.{kind}`。`torch` / `faster_whisper` 等只能在 `build()` 内部或子模块里 import。
+- **必须有 `warmup()` 方法**：异步方法，负责后台加载模型文件。幂等（多次调用不会重复加载）。主业务方法（如 `synthesize()`）内部 `await self._ready.wait()` 等待 warmup 完成。
+- **必须有 `aclose()`**：哪怕是 no-op；`PluginManager.shutdown_all()` 会调。
+- **重依赖只在 `build()` 内部做 lazy import**：`__plugin__.py` 顶层只能 import 标准库 + `plugins.base` + `features.{kind}`。`torch` / `voxcpm` 等重依赖用 `importlib.util` 动态导入，不在顶层 import。
 - **模型文件不入仓库**：`plugins/{name}/` 只放代码（`.py`）。模型文件放 `data/models/{model_dir}/`。
 
 ## 状态机
@@ -108,7 +136,7 @@ if cfg.features.tts.enabled and cfg.features.tts.type == "local":
 `tools/feature_tools.py` 会按 `ctx.tts is None` 决定 `send_voice_message` 是否实际工作；
 `tools/__init__.py::build_default_registry` 按 `features.tts.enabled` 决定要不要注册该工具。
 
-ASR 不出现在 tools 里。QQ/NapCat 渠道使用 NapCat 内置 `fetch_ptt_text`。
+ASR 已从项目中移除。QQ 语音转写走 NapCat 内置 `fetch_ptt_text`，无需 Debata 侧再做语音识别。
 
 ## 给开发者的清单
 

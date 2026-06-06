@@ -50,6 +50,7 @@ class DashboardWindow(QMainWindow):
         self.setWindowTitle(DASHBOARD_COPY["window.title"])
         self.setMinimumSize(DEFAULT_LAYOUT.min_width, DEFAULT_LAYOUT.min_height)
         self.resize(DEFAULT_LAYOUT.default_width, DEFAULT_LAYOUT.default_height)
+        self._apply_icon()
 
         # 无边框 + 自定义标题栏 + 透明 root 让 WindowFrame 的圆角 QSS 生效
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
@@ -338,6 +339,14 @@ class DashboardWindow(QMainWindow):
     def _toggle_theme(self) -> None:
         target = "dark" if self._current_theme == "light" else "light"
         self._on_theme_changed(target)
+
+    @staticmethod
+    def _apply_icon() -> None:
+        from pathlib import Path
+        from PySide6.QtGui import QIcon
+        icon_path = Path(__file__).parent.parent / "icon.png"
+        if icon_path.exists():
+            QApplication.instance().setWindowIcon(QIcon(str(icon_path)))
 
     def _configured_theme(self) -> str:
         try:

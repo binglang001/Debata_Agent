@@ -69,7 +69,7 @@ class ModelsPage(QWidget):
 
         self._empty = EmptyState(
             "暂无本地模型",
-            "插件目录下未发现本地模型。确认 plugins/ 目录下有模型定义。",
+            "未发现已安装的本地模型",
         )
         outer.addWidget(self._empty, 1)
 

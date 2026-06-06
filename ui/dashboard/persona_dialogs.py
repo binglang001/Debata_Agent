@@ -27,7 +27,7 @@ class _PersonaCreatorDialog(FramelessDialog):
     """仪表盘里复用向导的人格生成界面。"""
 
     def __init__(self, context: WizardContext, runtime=None, parent=None) -> None:
-        super().__init__("AI 生成角色", parent)
+        super().__init__("新建角色", parent)
         self.setMinimumSize(1100, 760)
         self._creator = PersonaCreatorStepView(context, self)
         self._creator.usage_recorder = getattr(runtime, "_record_model_usage", None)

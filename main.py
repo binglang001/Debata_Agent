@@ -145,9 +145,20 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
     from ui.tray import Tray
     from ui.wizard.window import WizardWindow
 
+    from pathlib import Path
+    from PySide6.QtGui import QIcon
+
     app = QApplication.instance() or QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet(cached_qss(palette_for_theme("auto")))
+
+    _icon_path = Path(__file__).parent / "ui" / "icon.png"
+    if _icon_path.exists():
+        app.setWindowIcon(QIcon(str(_icon_path)))
+        # Windows：让任务栏显示自定义图标而不是 python.exe 默认图标
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("debata.agent")
 
     loop = qasync.QEventLoop(app)
     _asyncio.set_event_loop(loop)

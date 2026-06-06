@@ -32,7 +32,7 @@ ChatAgent.run(messages, tools, executor)
        ├─ messaging tools → MessagePipeline 异步发送队列
        ├─ memory tools → ImportantMemoryManager（scope / pinned 元数据）
        ├─ platform tools → IAdapter.list_friends / get_user_info / ...
-       └─ feature tools → IVisionService / IWebSearchService / ...
+       └─ feature tools → VisionService / WebSearchService / ...
   ↓
 MessagePipeline.SendManager（真实发送 + 中断检测 + send_receipt）
   ↓
@@ -52,7 +52,7 @@ IAdapter.send_text() → 用户收到消息
 | `agents` | `providers`, `memory`, `app_config` | `ChatAgent`, `Persona`, `build_messages()`, prompts | ✅ |
 | `tools` | `adapters`, `memory`, `providers`, `app_config` | `ToolRegistry`, `ToolContext`, `build_default_registry()` | ✅ |
 | `core` | 上面全部 | `Runtime`, `MessagePipeline`, `EventBus` | ✅ |
-| `features` | `providers` | `IVisionService`, `IWebSearchService`, `IWeatherService`, `IEmbeddingService`, `ITTSService` | ✅（Vision/WebSearch/Weather/Embedding 已实装；TTS 支持 API 与本地 VoxCPM2；QQ 语音转写走 NapCat 内置能力） |
+| `features` | `providers` | `VisionService`, `WebSearchService`, `WeatherService`, `IEmbeddingService`, `ITTSService` | ✅（Vision/WebSearch/Weather/Embedding 已实装；TTS 支持 Edge TTS / iFlyTek API / 本地 VoxCPM2 三种实现；QQ 语音转写走 NapCat 内置能力） |
 | `plugins` | `features` | `PluginManager`, `PluginMeta`, `PluginStatus` | ✅（VoxCPM2 与本地 embedding 已接入） |
 | `ui` | `core`, `app_config` | `WizardWindow`, `DashboardWindow`, `Tray` | ✅ |
 | `utils` | - | `parse_raw_cq`, `MetricsProvider`, `get_time` | ✅ |
@@ -74,9 +74,9 @@ IAdapter.send_text() → 用户收到消息
 <long_term_memory priority="medium">   — 重要记忆变化时
 ```
 
-**稳定性递减顺序前置**，确保 LLM 的 KV 缓存命中率最大化。每轮变化的 `task_context`（时间、表情包列表、提示等）作为单独的 system 消息追加到 history 末尾，**不破坏前缀**。
+**稳定性递减顺序前置**，确保 LLM 的 KV 缓存命中率最大化。每轮变化的 `task_context`（时间、表情包列表、提示等）作为单独的 user 消息追加到 history 末尾，**不破坏前缀**。
 
-详见 [docs/ui_style_guide.md](ui_style_guide.md) 和 `agents/context_builder.py` 注释。
+详见 [KV 缓存基准](kv_cache_benchmark.md) 和 `agents/context_builder.py` 注释。
 
 ---
 
@@ -191,11 +191,13 @@ main.py → Runtime.start()
   7.6 PluginManager.scan() + build TTS/Embedding（若 type=local）
   8. NapCatAdapter
   9. ToolRegistry（按 features 启用）
-  10. WakeupScheduler / PendingRequestStore / RateLimiter
-  11. MessagePipeline（拼装上面全部）
-  12. RecallHandler / RequestHandler / ProactiveLoop
-  13. EventBus（订阅 pipeline + handlers）
-  14. adapter.start() / proactive_loop.start()
+  10. State（UsageStats / ModelActivity / ProviderHealth）
+  11. WakeupScheduler / PendingRequestStore / RateLimiter
+  12. MessagePipeline（拼装上面全部）
+  13. RecallHandler / RequestHandler
+  14. ProactiveLoop
+  15. EventBus（订阅 pipeline + handlers）
+  16. adapter.start() / proactive_loop.start()
 
 Runtime.wait_until_stop() → 等 SIGINT/SIGTERM
 

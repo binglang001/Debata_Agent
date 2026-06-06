@@ -130,7 +130,7 @@ DASHBOARD_COPY: dict[str, str] = {
     # 角色管理
     # ============================================================
     "personas.list_title": "角色列表",
-    "personas.add_button": "AI 生成角色",
+    "personas.add_button": "新建角色",
     "personas.activate_button": "切换为当前",
     "personas.duplicate_button": "复制一份",
     "personas.delete_button": "删除",
@@ -149,7 +149,7 @@ DASHBOARD_COPY: dict[str, str] = {
     # 模型管理
     # ============================================================
     "models.empty_title": "暂无本地模型",
-    "models.empty_subtitle": "插件目录下未发现本地模型。",
+    "models.empty_subtitle": "未发现已安装的本地模型。",
     "models.download_button": "安装指引",
     "models.open_dir_button": "打开目录",
     "models.rescan_button": "重新扫描",

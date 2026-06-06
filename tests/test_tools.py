@@ -2360,6 +2360,98 @@ async def test_start_agent_task_requires_prompt_and_calls_runtime():
     assert calls[0]["timeout_seconds"] == 900
 
 
+@pytest.mark.asyncio
+async def test_start_agent_task_rejects_image_ref_without_vision_service():
+    calls = []
+
+    async def fake_agent_task(payload):
+        calls.append(payload)
+        return {"ok": True, "status": "completed"}
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext(agent_task_cb=fake_agent_task))
+
+    result = await executor(
+        "start_agent_task",
+        {
+            "prompt": "看看这张图",
+            "sources": [{"type": "image_ref", "value": "incoming/a.png"}],
+            "output_format": "markdown",
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "图片理解能力" in result["error"]
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_agent_task_rejects_image_workspace_path_without_vision_service():
+    calls = []
+
+    async def fake_agent_task(payload):
+        calls.append(payload)
+        return {"ok": True, "status": "completed"}
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext(agent_task_cb=fake_agent_task))
+
+    result = await executor(
+        "start_agent_task",
+        {
+            "prompt": "描述这张图片的内容",
+            "sources": [{"type": "workspace_path", "value": "incoming/a.jpg"}],
+            "output_format": "markdown",
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "图片理解能力" in result["error"]
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_agent_task_rejects_image_retry_after_describe_image_failure():
+    class FailingVision:
+        async def describe(self, image_url: str, prompt: str = ""):
+            raise RuntimeError("vision failed")
+
+    calls = []
+
+    async def fake_agent_task(payload):
+        calls.append(payload)
+        return {"ok": True, "status": "completed"}
+
+    cfg = _make_config(vision_enabled=True)
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(vision=FailingVision(), agent_task_cb=fake_agent_task)
+    executor = reg.get_executor(ctx)
+
+    image_result = await executor(
+        "describe_image",
+        {"image_url": "https://example.com/a.jpg", "question": "看图"},
+    )
+    assert image_result["ok"] is False
+
+    result = await executor(
+        "start_agent_task",
+        {
+            "prompt": "描述这张图片的内容",
+            "sources": [{"type": "workspace_path", "value": "incoming/a.jpg"}],
+            "output_format": "markdown",
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "不能启动子 Agent 代替看图" in result["error"]
+    assert calls == []
+
+
 # ============================================================
 # platform: list_contacts 兜底
 # ============================================================

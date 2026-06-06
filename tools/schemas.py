@@ -427,7 +427,8 @@ class StartAgentTaskArgs(_ToolArgs):
         description=(
             "资料来源列表。支持 workspace_path/tool_call_id/tool_result_file/forward_id/"
             "conversation_history/message_id/image_ref/inline_text/inline_json/"
-            "workspace_glob/directory；不支持 URL。"
+            "workspace_glob/directory；不支持 URL。image_ref 仅用于已有可用图像理解能力时的资料整理，"
+            "不能用来绕过 describe_image 失败。"
         ),
     )
     output_format: Literal["markdown", "json", "text"] = Field(

@@ -92,7 +92,10 @@ class SettingsPage(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._agent_provider_combos: list[QComboBox] = []
         self._provider_status_labels: dict[str, QLabel] = {}
-        self._settings_content_sync_pending = False
+        self._settings_content_sync_timer = QTimer(self)
+        self._settings_content_sync_timer.setSingleShot(True)
+        self._settings_content_sync_timer.setInterval(0)
+        self._settings_content_sync_timer.timeout.connect(self._sync_settings_content_height)
         self._settings_layout_watch: list[QWidget] = []
         self._suppress_signals = False
         # 基线配置快照（深拷贝），用于比对改动项数
@@ -201,13 +204,11 @@ class SettingsPage(QWidget):
         return super().eventFilter(obj, event)
 
     def _schedule_settings_content_sync(self) -> None:
-        if self._settings_content_sync_pending:
+        if self._settings_content_sync_timer.isActive():
             return
-        self._settings_content_sync_pending = True
-        QTimer.singleShot(0, self._sync_settings_content_height)
+        self._settings_content_sync_timer.start()
 
     def _sync_settings_content_height(self) -> None:
-        self._settings_content_sync_pending = False
         stack = getattr(self, "_settings_stack", None)
         scroll = getattr(self, "_settings_scroll", None)
         if stack is None or scroll is None or stack.currentWidget() is None:
@@ -2152,8 +2153,7 @@ class SettingsPage(QWidget):
         card = SectionCard(
             title="Token预算",
             subtitle=(
-                "建议不要修改此项，除非你知道你在做什么。错误预算可能导致成本上升、"
-                "回复变慢，或工具结果过早写入文件。"
+                "建议保留默认值，改动不当可能导致成本上升或回复质量下降。"
             ),
         )
         b = self._cfg().behavior
@@ -2230,7 +2230,7 @@ class SettingsPage(QWidget):
                 default_inline.value(),
             )
         )
-        context_form.addRow(QLabel("未列出工具 inline 默认"), default_inline)
+        context_form.addRow(QLabel("默认 inline 预算"), default_inline)
 
         default_hard = QSpinBox()
         default_hard.setRange(512, 200_000)
@@ -2243,7 +2243,7 @@ class SettingsPage(QWidget):
                 default_hard.value(),
             )
         )
-        context_form.addRow(QLabel("未列出工具硬上限默认"), default_hard)
+        context_form.addRow(QLabel("默认硬截断上限"), default_hard)
 
         context_section.add_layout(context_form)
         card.add_content(context_section)

@@ -555,6 +555,23 @@ def test_settings_page_short_sections_do_not_scroll_to_blank_space(qapp, tmp_pat
         page.deleteLater()
 
 
+def test_settings_page_content_sync_reuses_single_timer(qapp, tmp_paths):
+    page = SettingsPage(_dashboard_runtime(tmp_paths))
+    try:
+        timers_before = page.findChildren(QtCore.QTimer)
+        assert page._settings_content_sync_timer in timers_before
+
+        for _ in range(100):
+            page._schedule_settings_content_sync()
+
+        timers_after = page.findChildren(QtCore.QTimer)
+        assert timers_after == timers_before
+        assert page._settings_content_sync_timer.isActive()
+    finally:
+        page.close()
+        page.deleteLater()
+
+
 def test_dashboard_settings_page_does_not_use_outer_scroll(qapp, tmp_paths):
     window = DashboardWindow(_dashboard_runtime(tmp_paths))
     try:
@@ -786,7 +803,7 @@ def test_overview_page_shows_usage_activity_and_provider_counts(qapp):
         assert "120" in labels
         assert "80.0%" in labels
         assert "主模型状态" in labels
-        assert "(调用工具)" in labels
+        assert "调用工具" in labels
         assert "get_weather" in labels
         assert "累计概况" not in labels
         assert "当前角色" not in labels
@@ -928,7 +945,7 @@ def test_personas_page_can_build_and_save_generated_persona(qapp, tmp_path):
     )()
     page = PersonasPage(runtime)
     try:
-        assert page._create_btn.text() == "AI 生成角色"
+        assert page._create_btn.text() == "新建角色"
         context = page._build_creator_context()
         assert context is not None
         assert context.main.api_key == "sk-test"

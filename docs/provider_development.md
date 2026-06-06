@@ -26,25 +26,25 @@
 `providers/presets/{name}/preset.yaml`：
 
 ```yaml
-name: MyProvider
-display_name: My Provider
+id: my_platform
+display_name: My Platform
 protocol: openai_compat
-base_url: https://api.myprovider.com/v1
+base_url: https://api.myplatform.com/v1
+reasoning_style: none          # none / thinking_extra_body / thinking_extra_header
 
 models:
   - id: my-model-pro
-    name: My Model Pro
+    display_name: My Model Pro
     capabilities: [chat, tool_call, reasoning]
     context_length: 128000
     pricing:
       input_per_million: 1.0
       output_per_million: 2.0
 
-registration_url: https://platform.myprovider.com
-docs_url: https://docs.myprovider.com
+registration_url: https://platform.myplatform.com
 ```
 
-`capabilities` 选项：`chat` / `tool_call` / `reasoning` / `vision`。
+`capabilities` 选项：`chat` / `tool_call` / `reasoning` / `vision` / `embedding`。
 
 `tests/test_providers_presets.py` 会自动加载校验。
 
@@ -93,7 +93,7 @@ class MyProtocolProvider(IProvider):
 `app_config/schema.py`:
 
 ```python
-ProtocolType = Literal["openai_compat", "anthropic", "gemini", "volcengine", "myprotocol"]
+ProtocolType = Literal["openai_compat", "anthropic"]  # 在此添加新协议名
 ```
 
 ### 3. registry 加分支

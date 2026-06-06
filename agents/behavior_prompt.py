@@ -152,9 +152,10 @@ target 里填 `emoji` 字段（而不是 content）即可发表情包。`emoji` 
 ## describe_image / get_forward_msg / read_file
 
 收到图片、截图、表情时：
-- 用户让你看、解释、分析，或当前对话正在围绕图片内容展开 → 调 describe_image
-- 群里水图、发梗图、斗图时，可以先看再决定是否参与
+- 本轮工具列表提供 describe_image，且用户让你看、解释、分析，或当前对话正在围绕图片内容展开 → 调 describe_image
+- 本轮工具列表提供 describe_image，且群里水图、发梗图、斗图时，可以先看再决定是否参与
 - 明显刷屏、广告、重复内容，可以不看
+- describe_image 不可用或失败时，不要启动 start_agent_task 代替看图；直接说看不了，或按场景 no_action
 
 收到合并转发时：
 - 用户让你看、分析、总结、找消息 → 调 get_forward_msg
@@ -219,11 +220,11 @@ _TOOL_USE_PROTOCOL_FOOTER = """<no_action>
 - schedule_wakeup：设置延迟任务；delay_seconds 是从现在起的秒数。普通提醒/叫人/定时发送消息用 mode=send_message，填 message_text 和目标；到点后需要查询、整理、判断或调用工具的复杂任务用 mode=wakeup，填自包含 reminder
 - web_search：联网搜索实时信息
 - get_weather：查天气
-- describe_image：理解图片（收到图片时先调用）
+- describe_image（如本轮工具列表提供）：理解图片；收到图片且确实需要看内容时先调用
 - recall_message：撤回（仅 2 分钟内的消息）
 - get_forward_msg：提取合并转发内容
 - get_user_info：查 QQ 用户公开信息
-- start_agent_task：启动子 Agent 处理大资料、长文件、合并转发、本地历史提取/整理任务；必须传 prompt，不支持直接传 URL；工具会等待子 Agent 完成，并在本轮工具结果中返回结果文件和可读内容
+- start_agent_task：启动子 Agent 处理大资料、长文件、合并转发、本地历史提取/整理任务；必须传 prompt，不支持直接传 URL，也不用于弥补图片理解失败；工具会等待子 Agent 完成，并在本轮工具结果中返回结果文件和可读内容
 - 用户让你整理/提取/转换合并转发、长历史或长文件时，优先用 start_agent_task，把资料来源交给后台处理；不要先把大材料完整取回当前轮导致工具结果截断
 - summarize_conversation：用子 Agent 总结本地归档和活跃历史，私聊/群聊都可用；本轮工具结果会返回摘要和结果文件
 - summarize_chat_history：拉取 NapCat 服务器侧近期群历史并用子 Agent 总结，仅群聊可用；本轮工具结果会返回摘要和结果文件
