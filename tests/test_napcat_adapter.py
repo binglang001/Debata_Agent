@@ -614,6 +614,20 @@ async def test_adapter_get_file_url_failure_returns_none():
 
 
 @pytest.mark.asyncio
+async def test_adapter_get_image_url_success():
+    conn = FakeConnection()
+    adapter = NapCatAdapter("napcat_test", conn)
+    await adapter.start()
+    conn.responders["get_image"] = {"file": "D:\\QQ\\NapCat\\temp\\abc.jpg"}
+
+    url = await adapter.get_image_url("abc.jpg")
+
+    assert url == "D:\\QQ\\NapCat\\temp\\abc.jpg"
+    assert conn.sent[-1]["action"] == "get_image"
+    assert conn.sent[-1]["params"] == {"file": "abc.jpg"}
+
+
+@pytest.mark.asyncio
 async def test_fetch_voice_text_retries_pending_result():
     conn = FakeConnection()
     adapter = NapCatAdapter("napcat_test", conn, voice_fetch_delay_seconds=0)

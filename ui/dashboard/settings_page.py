@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from copy import deepcopy
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -91,6 +92,8 @@ class SettingsPage(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._agent_provider_combos: list[QComboBox] = []
         self._provider_status_labels: dict[str, QLabel] = {}
+        self._settings_content_sync_pending = False
+        self._settings_layout_watch: list[QWidget] = []
         self._suppress_signals = False
         # 基线配置快照（深拷贝），用于比对改动项数
         self._baseline = deepcopy(self._cfg())
@@ -111,6 +114,7 @@ class SettingsPage(QWidget):
         main_row.addWidget(self._settings_nav)
 
         self._settings_stack = AutoSizeStack()
+        self._settings_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._settings_scroll = QScrollArea()
         self._settings_scroll.setObjectName("SettingsContentScroll")
         self._settings_scroll.setWidgetResizable(True)
@@ -118,6 +122,7 @@ class SettingsPage(QWidget):
         self._settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._settings_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._settings_scroll.viewport().installEventFilter(self)
         self._settings_scroll.setWidget(self._settings_stack)
         main_row.addWidget(self._settings_scroll, 1)
 
@@ -168,8 +173,12 @@ class SettingsPage(QWidget):
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(Spacing.MD)
+        lay.setAlignment(Qt.AlignmentFlag.AlignTop)
         content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        lay.addWidget(content)
+        lay.addWidget(content, 0, Qt.AlignmentFlag.AlignTop)
+        page.installEventFilter(self)
+        content.installEventFilter(self)
+        self._settings_layout_watch.extend([page, content])
         self._settings_stack.addWidget(page)
 
     def _on_settings_section_changed(self, row: int) -> None:
@@ -177,7 +186,43 @@ class SettingsPage(QWidget):
             return
         self._settings_stack.setCurrentIndex(row)
         self._settings_stack.sync_current_size()
+        self._schedule_settings_content_sync()
         self._settings_scroll.verticalScrollBar().setValue(0)
+
+    def eventFilter(self, obj: object, event: QEvent) -> bool:  # noqa: N802
+        scroll = getattr(self, "_settings_scroll", None)
+        if scroll is not None and obj is scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._schedule_settings_content_sync()
+        elif (
+            obj in getattr(self, "_settings_layout_watch", [])
+            and event.type() == QEvent.Type.LayoutRequest
+        ):
+            self._schedule_settings_content_sync()
+        return super().eventFilter(obj, event)
+
+    def _schedule_settings_content_sync(self) -> None:
+        if self._settings_content_sync_pending:
+            return
+        self._settings_content_sync_pending = True
+        QTimer.singleShot(0, self._sync_settings_content_height)
+
+    def _sync_settings_content_height(self) -> None:
+        self._settings_content_sync_pending = False
+        stack = getattr(self, "_settings_stack", None)
+        scroll = getattr(self, "_settings_scroll", None)
+        if stack is None or scroll is None or stack.currentWidget() is None:
+            return
+        viewport_height = scroll.viewport().height()
+        if viewport_height <= 0:
+            return
+
+        target_height = max(viewport_height, stack.sizeHint().height())
+        if stack.minimumHeight() != target_height or stack.maximumHeight() != target_height:
+            stack.setFixedHeight(target_height)
+            stack.updateGeometry()
+            widget = scroll.widget()
+            if widget is not None:
+                widget.updateGeometry()
 
     # ============================================================
     # 公共辅助
@@ -485,7 +530,8 @@ class SettingsPage(QWidget):
         if item is None:
             return "尚未检测"
         if getattr(item, "status", "") == "checking":
-            return getattr(item, "message", "") or "检测中"
+            message = getattr(item, "message", "") or ""
+            return "启动自动检测中" if message in ("", "检测中") else message
         if getattr(item, "status", "") == "ok":
             latency = getattr(item, "latency_ms", 0)
             return "可用" + (f" · {latency}ms" if latency else "")
@@ -504,6 +550,13 @@ class SettingsPage(QWidget):
         for _agent_name, agent in self._cfg()._iter_agents():
             if agent.provider == provider_name:
                 return agent.model
+        vision = self._cfg().features.vision
+        if (
+            vision.type == "api"
+            and vision.provider == provider_name
+            and vision.model
+        ):
+            return vision.model
         return ""
 
     def _embedding_model_for_provider(self, provider_name: str) -> str:
@@ -621,7 +674,7 @@ class SettingsPage(QWidget):
                 if not model:
                     emb_model = self._embedding_model_for_provider(name)
                     if not emb_model:
-                        status.setText("没有 Agent 或 RAG 使用该 provider，无法自动选择模型")
+                        status.setText("没有 Agent、Vision 或 RAG 使用该 provider，无法自动选择模型")
                         return
                     from providers import probe_embedding_provider_instance
 
@@ -1393,6 +1446,7 @@ class SettingsPage(QWidget):
             if w:
                 w.deleteLater()
         self._adapter_container.addWidget(self._build_adapter_section())
+        self._schedule_settings_content_sync()
 
     def _build_adapter_section(self) -> SectionCard:
         card = SectionCard(
@@ -1765,8 +1819,11 @@ class SettingsPage(QWidget):
         cfg: NapCatAdapterConfig,
         button: QPushButton | None = None,
     ) -> None:
-        """复用向导测试逻辑：client 模式真测；server 模式起监听 3s。"""
-        import asyncio
+        """非侵入式测试渠道状态。
+
+        设置页不能创建第二条 NapCat WebSocket：NapCat/OneBot 端常见单连接，
+        临时连接会挤掉正在收消息的主连接，随后 stop 临时连接会让后续收不到消息。
+        """
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
@@ -1781,58 +1838,36 @@ class SettingsPage(QWidget):
             button.setText("测试中")
 
         async def _do_test() -> None:
-            from adapters.napcat.connection import (
-                ForwardWSConnection,
-                ReverseWSConnection,
-            )
-            token = self._runtime.secrets.get(cfg.access_token_id) if cfg.access_token_id else None
-            conn = None
             try:
-                if cfg.mode == "client":
-                    ws_url = f"ws://{cfg.host}:{cfg.port}{cfg.path}"
-                    conn = ReverseWSConnection(
-                        ws_url=ws_url, access_token=token,
-                        reconnect_interval=1.0, max_reconnect_attempts=1,
-                        reconnect_backoff_max=1.0, ping_interval=20, ping_timeout=20,
-                        initial_connect_timeout=3.0,
-                    )
-                    await conn.start()
-                    for _ in range(8):
-                        if conn.is_connected:
-                            break
-                        await asyncio.sleep(0.25)
-                    if conn.is_connected:
-                        self._adapter_test_status.setText(f"✓ 已连上 NapCat ({ws_url})")
+                running = self._running_adapter_for_current_page()
+                if running is not None:
+                    if getattr(running, "is_connected", False):
+                        self._adapter_test_status.setText("✓ 当前 Runtime 渠道已连接")
                     else:
-                        self._adapter_test_status.setText("✗ 连不上，检查 NapCat 是否启动 / 地址端口")
+                        self._adapter_test_status.setText("⚠ 当前 Runtime 渠道未连接，后台会继续重连")
+                elif cfg.mode == "client":
+                    ok = await self._probe_tcp_port(cfg.host, cfg.port)
+                    if ok:
+                        self._adapter_test_status.setText(
+                            f"✓ TCP 端口可达 ws://{cfg.host}:{cfg.port}{cfg.path}（未建立 WS 会话）"
+                        )
+                    else:
+                        self._adapter_test_status.setText("✗ TCP 端口不可达，检查 NapCat 是否启动 / 地址端口")
                 else:
-                    conn = ForwardWSConnection(
-                        host=cfg.host, port=cfg.port, path=cfg.path,
-                        access_token=token, ping_interval=20, ping_timeout=20,
+                    available = await asyncio.to_thread(
+                        self._can_bind_adapter_port, cfg.host, cfg.port
                     )
-                    try:
-                        await conn.start()
-                    except OSError as e:
-                        self._adapter_test_status.setText(f"✗ 端口起不来：{e}")
-                        return
-                    for _ in range(12):
-                        if conn.is_connected:
-                            break
-                        await asyncio.sleep(0.25)
-                    if conn.is_connected:
-                        self._adapter_test_status.setText(f"✓ NapCat 已连入 ws://{cfg.host}:{cfg.port}{cfg.path}")
+                    if available:
+                        self._adapter_test_status.setText(
+                            f"✓ 本机端口可监听 ws://{cfg.host}:{cfg.port}{cfg.path}；保存重启后等待 NapCat 连入"
+                        )
                     else:
                         self._adapter_test_status.setText(
-                            "⚠ 端口可用已监听，但 NapCat 暂未连入"
+                            "⚠ 本机端口已被占用；如果 Debata 正在运行，这是正常的"
                         )
             except Exception as e:  # noqa: BLE001
                 self._adapter_test_status.setText(f"✗ 未能完成：{e}")
             finally:
-                if conn is not None:
-                    try:
-                        await conn.stop()
-                    except Exception:  # noqa: BLE001
-                        pass
                 self._adapter_test_progress.setRange(0, 100)
                 self._adapter_test_progress.setValue(100)
                 self._adapter_test_progress.setVisible(False)
@@ -1841,6 +1876,43 @@ class SettingsPage(QWidget):
                     button.setText("测试连接")
 
         loop.create_task(_do_test())
+
+    def _running_adapter_for_current_page(self):
+        adapter = getattr(self._runtime, "adapter", None)
+        if adapter is None:
+            return None
+        if getattr(adapter, "name", "") != getattr(self, "_adapter_name", ""):
+            return None
+        return adapter
+
+    @staticmethod
+    async def _probe_tcp_port(host: str, port: int, *, timeout: float = 2.0) -> bool:
+        writer = None
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=timeout,
+            )
+            return True
+        except (OSError, asyncio.TimeoutError):
+            return False
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _can_bind_adapter_port(host: str, port: int) -> bool:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.bind((host, port))
+                return True
+        except OSError:
+            return False
 
     # ============================================================
     # 人格节
@@ -2412,3 +2484,4 @@ class SettingsPage(QWidget):
                         break
         finally:
             self._suppress_signals = False
+        self._schedule_settings_content_sync()

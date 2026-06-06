@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from adapters.base import IAdapter
-from adapters.types import IncomingMessage, MediaType, Target
+from adapters.types import IncomingMessage, MediaSegment, MediaType, Target
 from agents import ChatAgent, Persona, SummaryAgent, build_messages, build_task_context
 from agents.base import AgentRunResult
 from app_config.schema import BehaviorConfig, FeaturesConfig, WhitelistConfig
@@ -2225,7 +2225,7 @@ class MessagePipeline:
 
         return "\n".join(parts)
 
-    def _recent_group_context(self, conversation_id: str, *, limit: int = 15) -> str:
+    def _recent_group_context(self, conversation_id: str, *, limit: int = 10) -> str:
         """给群聊轮次追加最近真实 QQ 可见消息，帮助判断发言对象和断层。"""
         if not conversation_id.startswith("group:"):
             return ""
@@ -2762,12 +2762,25 @@ class MessagePipeline:
         # 升级媒体占位为含 URL / 转录的版本
         for seg in event.media:
             try:
-                if seg.type == MediaType.IMAGE and seg.url:
-                    ws_path = await self._save_media_to_workspace(
-                        seg.url, suggested_name=f"img_{event.message_id}.jpg"
-                    )
-                    suffix = f" workspace={ws_path}" if ws_path else ""
-                    text = text.replace("[图片]", f"[图片 url={seg.url}{suffix}]", 1)
+                if seg.type == MediaType.IMAGE:
+                    source = await self._image_media_source(seg)
+                    ws_path = None
+                    if source:
+                        ws_path = await self._save_media_to_workspace(
+                            source, suggested_name=f"img_{event.message_id}.jpg"
+                        )
+                    if ws_path and seg.url:
+                        replacement = f"[图片 workspace={ws_path} url={seg.url}]"
+                    elif ws_path:
+                        replacement = f"[图片 workspace={ws_path}]"
+                    elif seg.url:
+                        replacement = f"[图片 url={seg.url}]"
+                    else:
+                        replacement = "[图片]"
+                    if "[图片]" in text:
+                        text = text.replace("[图片]", replacement, 1)
+                    else:
+                        text = f"{text} {replacement}".strip()
                 elif seg.type in (MediaType.VOICE, MediaType.RECORD):
                     # 先把语音文件落到 workspace，供本地/API ASR 使用；失败不阻塞后续 fallback。
                     ws_path = None
@@ -2828,6 +2841,20 @@ class MessagePipeline:
 
         return text
 
+    async def _image_media_source(self, seg: MediaSegment) -> str | None:
+        """优先用平台 file_id 换本地图片路径，普通 URL 只做兜底。"""
+        resolver = getattr(self.adapter, "get_image_url", None)
+        if seg.file_id and resolver is not None:
+            try:
+                source = await resolver(seg.file_id)
+                if source:
+                    return source
+            except (AttributeError, NotImplementedError):
+                pass
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"获取图片文件失败 file_id={seg.file_id}: {e}")
+        return seg.url or seg.file_id
+
     async def _transcribe_voice_with_asr(
         self, event: IncomingMessage, ws_path: str | None
     ) -> str:
@@ -2873,10 +2900,12 @@ class MessagePipeline:
         try:
             import re
             import shutil
+            from html import unescape
             from urllib.parse import unquote, urlparse
 
             import httpx
 
+            url = unescape((url or "").strip())
             incoming = self.workspace_dir / "incoming"
             incoming.mkdir(parents=True, exist_ok=True)
             parsed = urlparse(url)

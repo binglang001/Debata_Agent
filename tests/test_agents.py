@@ -173,10 +173,30 @@ def test_tool_trigger_policy_in_protocol():
 def test_group_relevance_uses_clear_addressee_rules():
     p = _persona()
     sys = build_combined_system_prompt(p)
+    assert "先分清当前会话是私聊还是群聊" in sys
+    assert "私聊里，对方通常是在跟你说" in sys
     assert "最近几条消息实际在对谁说" in sys
+    assert "群聊里出现\"你\"、\"你觉得\"、问号" in sys
     assert "不要自动理解成自己" in sys
     assert "最近聊天里的发言对象" in sys
-    assert "当前小线程" not in sys
+    assert "递话证据" in sys
+
+
+def test_group_relevance_does_not_treat_unaddressed_you_as_self():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "最近小线程是 A 问 B、B 回 A" in sys
+    assert "后续无 @ 的\"你觉得/你说/是不是\"默认仍在问 B" in sys
+    assert "不是在问你" in sys
+    assert "不能只凭字面有\"你\"、问号或\"要求你表态\"来成立" in sys
+
+
+def test_group_relevance_raises_threshold_after_boundary_message():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "没叫你 / 不是问你 / 别插话 / 滚" in sys
+    assert "附近未点名消息默认不要接" in sys
+    assert "除非后来明确 @你、引用你、叫你名字" in sys
 
 
 def test_direct_address_should_not_disappear_silently():

@@ -420,6 +420,7 @@ async def test_group_task_context_includes_recent_real_chat_window(build_pipelin
         if m.get("role") == "user" and "<task_context" in str(m.get("content") or "")
     )
     assert "<recent_group_messages" in task_context
+    assert 'limit="10"' in task_context
     assert "前一句" in task_context
     assert "接一句" in task_context
     assert "msg_id=g1" in task_context

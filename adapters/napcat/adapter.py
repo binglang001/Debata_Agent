@@ -423,6 +423,38 @@ class NapCatAdapter(IAdapter):
             logger.warning(f"获取文件 URL 失败 file_id={file_id}: {last_error}")
         return None
 
+    async def get_image_url(self, file_id: str) -> str | None:
+        if file_id and Path(file_id).exists():
+            return file_id
+        last_error: Exception | None = None
+        for params in (
+            {"file": file_id},
+            {"file_id": file_id},
+        ):
+            try:
+                data = await self._api.call("get_image", params)
+                value = (
+                    data.get("file")
+                    or data.get("file_path")
+                    or data.get("path")
+                    or data.get("url")
+                    or None
+                )
+                if value:
+                    return str(value)
+            except AdapterAPIError as e:
+                last_error = e
+                msg = str(e).lower()
+                if "no such file" in msg or "not found" in msg or "不存在" in msg:
+                    break
+                continue
+            except asyncio.TimeoutError as e:
+                last_error = e
+                break
+        if last_error is not None:
+            logger.warning(f"获取图片文件失败 file_id={file_id}: {last_error}")
+        return None
+
     async def upload_file(
         self,
         target: Target,

@@ -29,6 +29,109 @@ async def test_save_media_to_workspace_copies_local_napcat_temp_file(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_save_media_to_workspace_unescapes_remote_image_url(tmp_path, monkeypatch):
+    seen: list[str] = []
+
+    class FakeResponse:
+        content = b"image-bytes"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            seen.append(url)
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", FakeClient)
+
+    pipeline = MessagePipeline.__new__(MessagePipeline)
+    pipeline.workspace_dir = tmp_path / "workspace"
+
+    rel = await MessagePipeline._save_media_to_workspace(
+        pipeline,
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=x&amp;rkey=y",
+        suggested_name="img_1.jpg",
+    )
+
+    assert seen == [
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=x&rkey=y"
+    ]
+    assert rel == "incoming/img_1.jpg"
+    assert (pipeline.workspace_dir / rel).read_bytes() == b"image-bytes"
+
+
+@pytest.mark.asyncio
+async def test_build_readable_text_prefers_adapter_image_file_over_remote_url(
+    tmp_path,
+    monkeypatch,
+):
+    src = tmp_path / "NapCat" / "temp" / "abc.jpg"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(b"image-bytes")
+    remote_url = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=x&rkey=y"
+
+    class FakeAdapter:
+        async def get_image_url(self, file_id):
+            assert file_id == "abc.jpg"
+            return str(src)
+
+    class FailingClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str):
+            raise AssertionError(f"不应下载远程图片链接: {url}")
+
+    monkeypatch.setattr("httpx.AsyncClient", FailingClient)
+
+    pipeline = MessagePipeline.__new__(MessagePipeline)
+    pipeline.workspace_dir = tmp_path / "workspace"
+    pipeline.adapter = FakeAdapter()
+    pipeline.asr = None
+
+    event = IncomingMessage(
+        adapter="napcat",
+        timestamp=0,
+        self_id="1",
+        message_id="42",
+        scope="group",
+        user_id="10001",
+        nickname="Alice",
+        group_id="20002",
+        text="[图片]",
+        raw_message="[CQ:image,file=abc.jpg,url=https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=x&rkey=y]",
+        media=[
+            MediaSegment(
+                type=MediaType.IMAGE,
+                file_id="abc.jpg",
+                url=remote_url,
+            )
+        ],
+    )
+
+    text = await MessagePipeline._build_readable_text(pipeline, event)
+
+    assert text.startswith("[图片 workspace=incoming/img_42.jpg url=https://multimedia.nt.qq.com.cn/")
+    assert (pipeline.workspace_dir / "incoming" / "img_42.jpg").read_bytes() == b"image-bytes"
+
+
+@pytest.mark.asyncio
 async def test_build_readable_text_exposes_file_workspace_path(tmp_path):
     src = tmp_path / "NapCat" / "temp" / "问卷.pdf"
     src.parent.mkdir(parents=True)

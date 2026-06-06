@@ -70,10 +70,9 @@ class VisionService:
                 timeout=self.timeout_seconds,
                 first_token_timeout=self.timeout_seconds,
         )
-        except ProviderError as e:
-            logger.warning(f"vision describe 失败: {e}")
-            text = f"（图片识别失败：{e}）"
-            return {"summary": "图片识别失败", "description": text}
+        except ProviderError:
+            logger.warning("vision describe 失败: provider error")
+            raise
 
         content = (result.content or "").strip() or "（模型未返回内容）"
         parsed = _parse_json_object(content)

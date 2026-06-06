@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -27,6 +28,7 @@ from app_config.schema import (
     NapCatAdapterConfig,
     ProviderConfig,
     RootConfig,
+    VisionFeatureConfig,
 )
 from memory.important import ImportantMemoryManager
 from memory.rag_store import RagEntry
@@ -62,6 +64,35 @@ def _minimal_root_config() -> RootConfig:
         providers={"ds": ProviderConfig(preset="deepseek", api_key_id="ds_key")},
         adapters={"default": NapCatAdapterConfig()},
         agents=AgentsConfig(chat=AgentConfig(provider="ds", model="deepseek-chat")),
+    )
+
+
+class _EmptyHistory:
+    async def records(self):
+        return []
+
+
+class _EmptyImportant:
+    def items(self):
+        return []
+
+
+def _dashboard_runtime(tmp_paths, cfg: RootConfig | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        adapter=None,
+        config=cfg or _minimal_root_config(),
+        embedding_service=None,
+        history=_EmptyHistory(),
+        important=_EmptyImportant(),
+        model_activity={},
+        paths=tmp_paths,
+        persona=SimpleNamespace(name="Debata"),
+        provider_health={},
+        provider_registry=SimpleNamespace(presets={}),
+        providers={},
+        rag_store=None,
+        secrets=SimpleNamespace(get=lambda _key: ""),
+        usage_stats=None,
     )
 
 
@@ -413,7 +444,7 @@ def test_settings_provider_health_status_refreshes_without_manual_test(qapp, tmp
 
         runtime.provider_health["ds"] = ProviderHealth("checking", "检测中")
         page._refresh_provider_status_labels()
-        assert status.text() == "检测中"
+        assert status.text() == "启动自动检测中"
 
         runtime.provider_health["ds"] = ProviderHealth("ok", "可用", latency_ms=123)
         page._refresh_provider_status_labels()
@@ -495,6 +526,55 @@ def test_settings_page_scrolls_only_right_content(qapp, tmp_paths):
         page.deleteLater()
 
 
+def test_settings_page_short_sections_do_not_scroll_to_blank_space(qapp, tmp_paths):
+    page = SettingsPage(_dashboard_runtime(tmp_paths))
+    try:
+        page.resize(1014, 678)
+        page.show()
+        for _ in range(8):
+            qapp.processEvents()
+
+        labels = [page._settings_nav.item(i).text() for i in range(page._settings_nav.count())]
+
+        page._settings_nav.setCurrentRow(labels.index("功能"))
+        for _ in range(8):
+            qapp.processEvents()
+        assert page._settings_scroll.verticalScrollBar().maximum() > 0
+
+        for section_name in ("记忆", "软件行为", "Token预算", "日志与诊断"):
+            page._settings_nav.setCurrentRow(labels.index(section_name))
+            for _ in range(8):
+                qapp.processEvents()
+
+            assert page._settings_scroll.verticalScrollBar().maximum() == 0
+            assert page._settings_nav.verticalScrollBar().maximum() == 0
+            assert page._status.parentWidget() is page
+            assert not page._settings_scroll.isAncestorOf(page._status)
+    finally:
+        page.close()
+        page.deleteLater()
+
+
+def test_dashboard_settings_page_does_not_use_outer_scroll(qapp, tmp_paths):
+    window = DashboardWindow(_dashboard_runtime(tmp_paths))
+    try:
+        window.resize(DEFAULT_LAYOUT.default_width, DEFAULT_LAYOUT.default_height)
+        window.show()
+        qapp.processEvents()
+        window._switch_to("settings")
+        for _ in range(8):
+            qapp.processEvents()
+
+        settings = window._pages["settings"]
+        assert window._scroll.verticalScrollBar().maximum() == 0
+        assert settings._settings_nav.verticalScrollBar().maximum() == 0
+        assert settings._status.parentWidget() is settings
+        assert not settings._settings_scroll.isAncestorOf(settings._status)
+    finally:
+        window.close()
+        window.deleteLater()
+
+
 def test_settings_page_features_contains_emoji_without_extra_nav(qapp, tmp_paths):
     cfg = _minimal_root_config()
     runtime = type(
@@ -543,6 +623,69 @@ def test_settings_page_page_wrappers_do_not_add_trailing_stretch(qapp, tmp_paths
             assert layout is not None
             assert layout.count() == 1
             assert layout.itemAt(0).widget() is not None
+    finally:
+        page.deleteLater()
+
+
+def test_settings_provider_test_model_can_use_vision_provider(qapp, tmp_paths):
+    cfg = _minimal_root_config()
+    cfg.providers["vision"] = ProviderConfig(preset="volcengine", api_key_id="vision_key")
+    cfg.features.vision = VisionFeatureConfig(
+        enabled=False,
+        provider="vision",
+        model="doubao-seed-1-6-vision-250815",
+    )
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "paths": tmp_paths,
+            "secrets": type("Secrets", (), {"get": lambda self, _key: ""})(),
+            "provider_registry": type("Registry", (), {"presets": {}})(),
+            "providers": {},
+            "provider_health": {},
+        },
+    )()
+    page = SettingsPage(runtime)
+    try:
+        assert page._agent_model_for_provider("vision") == "doubao-seed-1-6-vision-250815"
+    finally:
+        page.deleteLater()
+
+
+@pytest.mark.asyncio
+async def test_settings_adapter_test_uses_running_adapter_without_new_ws(
+    qapp,
+    tmp_paths,
+    monkeypatch,
+):
+    cfg = _minimal_root_config()
+    running_adapter = SimpleNamespace(name="default", is_connected=True)
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "paths": tmp_paths,
+            "secrets": type("Secrets", (), {"get": lambda self, _key: ""})(),
+            "provider_registry": type("Registry", (), {"presets": {}})(),
+            "providers": {},
+            "provider_health": {},
+            "adapter": running_adapter,
+        },
+    )()
+    page = SettingsPage(runtime)
+    try:
+        async def fail_probe(*args, **kwargs):
+            raise AssertionError("当前 Runtime 渠道已存在时不应探测端口")
+
+        monkeypatch.setattr(SettingsPage, "_probe_tcp_port", fail_probe)
+        page._on_test_adapter(cfg.adapters["default"])
+        await asyncio.sleep(0)
+        qapp.processEvents()
+
+        assert page._adapter_test_status.text() == "✓ 当前 Runtime 渠道已连接"
     finally:
         page.deleteLater()
 
