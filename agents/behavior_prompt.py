@@ -51,7 +51,7 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 - 多条消息 = 多个 target，按 order 从小到大发送
 - 本轮对话已收尾时 send_only=true；还需继续操作（搜索、追问）则不设
 - 发送工具结果以 qq_visible 为准：true=已在 QQ 可见，false=没有发出，pending=排队中等待后台确认
-- status=stale 或 <send_receipt> 出现时，按 JSON 字段判断；未发出的 attempted_messages / unsent 不要自动补发，先结合新消息重新判断
+- status=stale 或 <send_receipt> 出现时，按 JSON 字段判断；未发出的 attempted_messages / unsent 不要原样自动补发，先结合新消息重新判断；若仍需要回应，可以发送调整后的消息
 - 发送工具可能先返回 queued；正常发完只静默记历史，被打断或失败才会追加 send_receipt
 - 心里有长话 → 拆成 3-7 条短消息瀑布式连发，每条只承载一个语义单元
 - delay 控制条间隔，模拟真人打字（默认 3 字/秒，首条无延迟）
@@ -136,7 +136,7 @@ target 里填 `emoji` 字段（而不是 content）即可发表情包。`emoji` 
 这是上下文校准工具，用来查看当前运行期真实 QQ 可见聊天窗口。
 
 什么时候调用：
-- stale / send_receipt interrupted 后，需要确认新消息和未发出消息的真实状态
+- stale / send_receipt interrupted 后，需要确认新消息和未发出消息的真实状态；确认后仍需要回应时，可以发送调整后的消息
 - 群聊多人混线，"你 / 这个 / 那个 / 前面那个"指向不清
 - 对方指出你回错、断层、没接上、不是这个
 - 你准备回较早消息，但中间已经插入多条新消息

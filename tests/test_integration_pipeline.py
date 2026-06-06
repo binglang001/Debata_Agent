@@ -1554,6 +1554,71 @@ async def test_same_conversation_message_while_model_thinking_returns_stale(buil
 
 
 @pytest.mark.asyncio
+async def test_late_inbound_after_final_async_send_restarts_deferred_batch(build_pipeline):
+    """最后一条异步发送期间来的新消息不能留下 sticky stale。"""
+    second_send_entered = asyncio.Event()
+    release_second_send = asyncio.Event()
+    first_args = {
+        "targets": [
+            {"target_qq": 123, "content": "第一条", "order": 1, "delay": 0.01},
+            {"target_qq": 123, "content": "第二条", "order": 2, "delay": 0.01},
+        ],
+        "send_only": True,
+    }
+    second_args = {
+        "targets": [{"target_qq": 123, "content": "新回复", "order": 1}],
+        "send_only": True,
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-first",
+                        name="send_private_messages",
+                        arguments=json.dumps(first_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-second",
+                        name="send_private_messages",
+                        arguments=json.dumps(second_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+    original_send_text = adapter.send_text
+
+    async def blocking_second_send(target: Target, content: str) -> str:
+        msg_id = await original_send_text(target, content)
+        if content == "第二条":
+            second_send_entered.set()
+            await release_second_send.wait()
+        return msg_id
+
+    adapter.send_text = blocking_second_send  # type: ignore[method-assign]
+
+    await pipeline.enqueue(_msg(user_id="123", text="开始", message_id="m-start"))
+    await asyncio.wait_for(second_send_entered.wait(), timeout=1.0)
+    await pipeline.enqueue(_msg(user_id="123", text="补一句", message_id="m-late"))
+    release_second_send.set()
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert [content for _, content in adapter.sent] == ["第一条", "第二条", "新回复"]
+    assert len(provider.calls) == 2
+    assert not pipeline._send_manager.should_defer_batch("private:123")
+    records = await history.records()
+    joined = "\n".join(str(r.get("content", "")) for r in records)
+    assert "补一句" in joined
+
+
+@pytest.mark.asyncio
 async def test_recalled_pending_message_is_not_processed_as_new_task(build_pipeline):
     """合并窗口内被撤回的消息只记录状态，不再触发主模型接旧话。"""
     pipeline, provider, adapter, history, _ = await build_pipeline(

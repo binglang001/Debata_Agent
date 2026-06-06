@@ -282,7 +282,11 @@ class _AsyncSendManager:
                 "stale_conversations": stale_convs,
                 "attempted_messages": self._attempted_items(normalized, send_id),
                 "new_visible_messages": new_visible_messages,
-                "next": "重新判断；不要自动补发 attempted_messages。必要时调用 get_recent_chat_messages。",
+                "next": (
+                    "重新判断；不要原样补发 attempted_messages。"
+                    "如果结合新消息后仍需要回应，可以发送调整后的消息。"
+                    "必要时调用 get_recent_chat_messages。"
+                ),
             }
             if recalled_messages:
                 result["recalled_messages"] = recalled_messages
@@ -333,6 +337,14 @@ class _AsyncSendManager:
         return receipts
 
     def mark_receipts_delivered(self, conversation_id: str) -> None:
+        state = self._state(conversation_id)
+        state.needs_resync = False
+        state.interrupt_messages.clear()
+        state.recall_events.clear()
+        state.interrupt_event.clear()
+
+    def clear_resync(self, conversation_id: str) -> None:
+        """清理已处理的 resync 标记。"""
         state = self._state(conversation_id)
         state.needs_resync = False
         state.interrupt_messages.clear()
@@ -477,6 +489,10 @@ class _AsyncSendManager:
                     receipt["errors"] = errors
                 clean = not interrupted and not errors
                 await self._handle_receipt(conversation_id, receipt, clean=clean)
+
+                if clean and state.needs_resync and not state.queue:
+                    self.clear_resync(conversation_id)
+                    self.pipeline._schedule_deferred_batch(conversation_id)
 
                 if interrupted:
                     state.interrupt_event.clear()
@@ -1278,6 +1294,26 @@ class MessagePipeline:
         # 保留引用，避免 task 在 await 跨边界时被 GC
         self._requeue_task = asyncio.create_task(_requeue_check())
 
+    def _schedule_deferred_batch(self, conversation_id: str) -> None:
+        """发送收尾竞态解除后，恢复处理此前被 defer 的入站消息。"""
+
+        async def _start_if_pending() -> None:
+            async with self.batch.lock:
+                items = [
+                    item
+                    for item in await self.batch.peek_locked()
+                    if item.conversation_id == conversation_id
+                ]
+            if not items:
+                return
+            if self._batch_task is not None and not self._batch_task.done():
+                return
+            self._batch_task = asyncio.create_task(
+                self._batch_loop(items[-1].raw_event.source_target)
+            )
+
+        self._requeue_task = asyncio.create_task(_start_if_pending())
+
     def _build_user_record(
         self,
         items: list[PendingMessageItem],
@@ -1620,7 +1656,7 @@ class MessagePipeline:
                 "<send_receipt_task priority=\"high\">\n"
                 "处理下面的运行时发送回执，按 JSON 字段判断：\n"
                 f"{receipt_block}\n"
-                "未发出的消息不要自动补发，先结合新消息判断是否需要回应。\n"
+                "未发出的消息不要原样自动补发，先结合新消息判断；仍需回应时发送调整后的消息。\n"
                 "</send_receipt_task>"
             )
             target = self._target_from_conversation_id(conversation_id)
@@ -1636,7 +1672,7 @@ class MessagePipeline:
     def _format_send_receipt(self, receipt: dict[str, Any]) -> str:
         return (
             "<send_receipt>\n"
-            "系统说明：运行时发送状态；按 JSON 字段判断，未发不要自动补发。\n"
+            "系统说明：运行时发送状态；按 JSON 字段判断，未发不要原样自动补发，可重判后调整发送。\n"
             f"{json.dumps(receipt, ensure_ascii=False)}\n"
             "</send_receipt>"
         )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -123,6 +124,40 @@ def test_process_manager_uses_cmd_for_windows_bat(tmp_path, monkeypatch):
         "/c",
         str(script),
         "--demo",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_process_manager_uses_taskkill_tree_on_windows(tmp_path, monkeypatch):
+    script = tmp_path / "start.bat"
+    script.write_text("@echo off\n", encoding="utf-8")
+    manager = NapCatProcessManager(script)
+    manager._process = SimpleNamespace(pid=4321)  # type: ignore[assignment]
+    calls: list[list[str]] = []
+
+    class FakeTaskkillProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok", None
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        calls.append(list(cmd))
+        assert kwargs["stdout"] is asyncio.subprocess.PIPE
+        assert kwargs["stderr"] is asyncio.subprocess.STDOUT
+        return FakeTaskkillProcess()
+
+    monkeypatch.setattr(
+        "adapters.napcat.process.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    await manager._terminate_windows_tree(force=False)
+    await manager._terminate_windows_tree(force=True)
+
+    assert calls == [
+        ["taskkill", "/PID", "4321", "/T"],
+        ["taskkill", "/F", "/PID", "4321", "/T"],
     ]
 
 
