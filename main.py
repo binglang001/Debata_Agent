@@ -526,7 +526,7 @@ def _run_cli_wizard(paths) -> None:
 
     if ws_mode_input == "2":
         mode = "server"
-        d_host = cur_napcat.host if cur_napcat else "127.0.0.1"
+        d_host = cur_napcat.host if (cur_napcat and cur_napcat.mode == "server") else "0.0.0.0"
         d_port = cur_napcat.port if cur_napcat else 8080
         d_path = cur_napcat.path if (cur_napcat and cur_napcat.mode == "server") else "/onebot/v11/ws"
     else:
@@ -535,7 +535,8 @@ def _run_cli_wizard(paths) -> None:
         d_port = cur_napcat.port if cur_napcat else 3001
         d_path = cur_napcat.path if (cur_napcat and cur_napcat.mode == "client") else "/"
 
-    host = input(f"  地址 [{d_host}]: ").strip() or d_host
+    host_label = "程序监听地址" if mode == "server" else "NapCat 地址"
+    host = input(f"  {host_label} [{d_host}]: ").strip() or d_host
     port = int(input(f"  端口 [{d_port}]: ").strip() or str(d_port))
     path = input(f"  WS 路径 [{d_path}]: ").strip() or d_path
 
@@ -643,6 +644,8 @@ def _run_cli_wizard(paths) -> None:
     print("  Provider    : DeepSeek（model=deepseek-v4-flash）")
     print(f"  Adapter mode: {mode}")
     print(f"  WS endpoint : ws://{host}:{port}{path}")
+    if mode == "server":
+        print("  NapCat 反向 WS 目标：填这台机器的局域网 IP，不要填 0.0.0.0 或 localhost")
     print(f"  Token       : {'(已绑定)' if napcat_token_id else '(无)'}")
     if admin_qq:
         print(f"  Admin QQ    : {admin_qq}（需手动添加到 persona_prompt.py）")
@@ -730,7 +733,8 @@ def _run_napcat_setup(paths) -> None:
     if ws_mode_input == "2":
         mode = "server"
         default_path = current.path if current.mode == "server" else "/onebot/v11/ws"
-        host = input(f"  程序监听地址 [{current.host}]: ").strip() or current.host
+        default_host = current.host if current.mode == "server" else "0.0.0.0"
+        host = input(f"  程序监听地址 [{default_host}]: ").strip() or default_host
         port = int(input(f"  程序监听端口 [{current.port}]: ").strip() or str(current.port))
         path = input(f"  WS 路径 [{default_path}]: ").strip() or default_path
     else:
@@ -782,7 +786,7 @@ def _run_napcat_setup(paths) -> None:
         print("  请确认 NapCat 那边「正向 WS」监听地址与此一致。")
     else:
         print(f"  程序将监听: {endpoint}")
-        print("  请确认 NapCat 那边「反向 WS」目标地址与此一致。")
+        print("  跨设备时，NapCat 那边「反向 WS」目标地址要填这台机器的局域网 IP，不要填 0.0.0.0 或 localhost。")
     print(f"  Token: {'(已设置)' if napcat_token_id else '(无)'}")
     print()
     print("测试连接：python main.py --test-adapter")
@@ -818,8 +822,11 @@ async def _test_adapter(project_root: Path, config_file: Path | None = None) -> 
     print(f"  mode     = {cfg.mode}")
     print(f"  endpoint = {endpoint}")
     print(f"  token_id = {cfg.access_token_id or '(无)'}")
-    print(f"  NapCat 这边应该: "
-          f"{'「正向 WS」监听 ' + endpoint if cfg.mode == 'client' else '「反向 WS」目标 = ' + endpoint}")
+    if cfg.mode == "client":
+        print(f"  NapCat 这边应该: 「正向 WS」监听 {endpoint}")
+    else:
+        print(f"  程序监听地址: {endpoint}")
+        print("  NapCat 这边应该: 「反向 WS」目标填这台机器的局域网 IP + 同端口/路径")
 
     print("\nAdapter 已启动。等 5 秒看连接情况...")
     for i in range(5):
@@ -838,7 +845,8 @@ async def _test_adapter(project_root: Path, config_file: Path | None = None) -> 
             print(f"   - NapCat 那边「正向 WS」是否在 {endpoint} 监听？")
             print("   - Token 是否一致？")
         else:
-            print(f"   - NapCat 那边「反向 WS」目标是否填了 {endpoint}？")
+            print("   - NapCat 那边「反向 WS」目标是否填了这台机器的局域网 IP？")
+            print(f"   - 端口和路径是否与程序监听一致：{cfg.port}{cfg.path}？")
             print("   - Token 是否一致？")
 
     await rt.shutdown()
