@@ -390,6 +390,38 @@ def test_settings_page_uses_navigation_sections(qapp, tmp_paths):
     assert "外观" not in labels
 
 
+def test_settings_provider_health_status_refreshes_without_manual_test(qapp, tmp_paths):
+    from providers.health import ProviderHealth
+
+    cfg = _minimal_root_config()
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "paths": tmp_paths,
+            "secrets": type("Secrets", (), {"get": lambda self, _key: ""})(),
+            "provider_registry": type("Registry", (), {"presets": {}})(),
+            "providers": {},
+            "provider_health": {},
+        },
+    )()
+    page = SettingsPage(runtime)
+    try:
+        status = page._provider_status_labels["ds"]
+        assert status.text() == "尚未检测"
+
+        runtime.provider_health["ds"] = ProviderHealth("checking", "检测中")
+        page._refresh_provider_status_labels()
+        assert status.text() == "检测中"
+
+        runtime.provider_health["ds"] = ProviderHealth("ok", "可用", latency_ms=123)
+        page._refresh_provider_status_labels()
+        assert status.text() == "可用 · 123ms"
+    finally:
+        page.deleteLater()
+
+
 def test_settings_page_collapses_advanced_budget_and_napcat_options(qapp, tmp_paths):
     from ui.dashboard.settings_page import CollapsibleSection
 

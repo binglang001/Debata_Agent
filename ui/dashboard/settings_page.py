@@ -12,7 +12,7 @@ import logging
 from copy import deepcopy
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -90,6 +90,7 @@ class SettingsPage(QWidget):
         self._runtime = runtime
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._agent_provider_combos: list[QComboBox] = []
+        self._provider_status_labels: dict[str, QLabel] = {}
         self._suppress_signals = False
         # 基线配置快照（深拷贝），用于比对改动项数
         self._baseline = deepcopy(self._cfg())
@@ -151,6 +152,11 @@ class SettingsPage(QWidget):
 
         # 滚轮冻结
         self._wheel_freeze_filter = install_wheel_freeze(self)
+
+        self._provider_status_timer = QTimer(self)
+        self._provider_status_timer.setInterval(1000)
+        self._provider_status_timer.timeout.connect(self._refresh_provider_status_labels)
+        self._provider_status_timer.start()
 
     def _add_settings_page(self, key: str, title: str, content: QWidget) -> None:
         item = QListWidgetItem(title)
@@ -333,6 +339,7 @@ class SettingsPage(QWidget):
         return card
 
     def _render_providers(self) -> None:
+        self._provider_status_labels.clear()
         # 清空旧 widget
         while self._providers_container.count():
             item = self._providers_container.takeAt(0)
@@ -458,6 +465,7 @@ class SettingsPage(QWidget):
         status = QLabel(self._provider_health_text(name))
         status.setProperty("role", "secondary")
         status.setWordWrap(True)
+        self._provider_status_labels[name] = status
         form.addRow(QLabel("状态"), status)
         progress = QProgressBar()
         progress.setRange(0, 100)
@@ -475,11 +483,22 @@ class SettingsPage(QWidget):
     def _provider_health_text(self, name: str) -> str:
         item = (getattr(self._runtime, "provider_health", {}) or {}).get(name)
         if item is None:
-            return "启动检测中或尚无检测结果"
+            return "尚未检测"
+        if getattr(item, "status", "") == "checking":
+            return getattr(item, "message", "") or "检测中"
         if getattr(item, "status", "") == "ok":
             latency = getattr(item, "latency_ms", 0)
             return "可用" + (f" · {latency}ms" if latency else "")
         return getattr(item, "message", "无响应")
+
+    def _refresh_provider_status_labels(self) -> None:
+        for name, label in list(self._provider_status_labels.items()):
+            try:
+                text = self._provider_health_text(name)
+            except Exception as e:  # noqa: BLE001
+                text = f"状态读取失败：{e}"
+            if label.text() != text:
+                label.setText(text)
 
     def _agent_model_for_provider(self, provider_name: str) -> str:
         for _agent_name, agent in self._cfg()._iter_agents():
@@ -2382,6 +2401,7 @@ class SettingsPage(QWidget):
                 self._ws_chk.setChecked(f.web_search.enabled)
             if hasattr(self, "_emb_summary_lbl"):
                 self._emb_summary_lbl.setText(self._embedding_summary())
+            self._refresh_provider_status_labels()
             # 主题单选按钮同步
             if hasattr(self, "_theme_group"):
                 target = self._cfg().app.theme
