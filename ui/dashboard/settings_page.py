@@ -1494,7 +1494,7 @@ class SettingsPage(QWidget):
         # 模式
         mode_combo = QComboBox()
         mode_combo.addItem("client（程序连 NapCat 正向 WS）", "client")
-        mode_combo.addItem("server（程序监听 NapCat 反向连入）", "server")
+        mode_combo.addItem("server（程序监听，NapCat 反向连入）", "server")
         idx = mode_combo.findData(_cfg().mode)
         if idx >= 0:
             mode_combo.setCurrentIndex(idx)
@@ -1504,8 +1504,14 @@ class SettingsPage(QWidget):
         form.addRow(QLabel("模式"), mode_combo)
 
         host_edit = QLineEdit(_cfg().host)
+        host_edit.setPlaceholderText("client: NapCat 地址；server: 监听地址，跨设备用 0.0.0.0")
         host_edit.editingFinished.connect(
-            lambda h=host_edit: self._on_adapter_field_changed(_cfg(), "host", h.text().strip() or "127.0.0.1")
+            lambda h=host_edit: self._on_adapter_field_changed(
+                _cfg(),
+                "host",
+                h.text().strip()
+                or ("0.0.0.0" if mode_combo.currentData() == "server" else "127.0.0.1"),
+            )
         )
         form.addRow(QLabel("地址"), host_edit)
 

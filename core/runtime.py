@@ -124,6 +124,18 @@ class Runtime:
         self.usage_stats = UsageStatsStore(self.paths.LOGS_DIR / "model_usage.jsonl")
         await self.usage_stats.load()
         self._apply_feature_provider_overrides()
+        try:
+            from utils.token_budget import warm_token_estimator
+
+            token_warm_t0 = time.monotonic()
+            warm_token_estimator(self.config.agents.chat.model)
+            logger.debug(
+                "token 估算器预热完成 model=%s 耗时 %.3fs",
+                self.config.agents.chat.model,
+                time.monotonic() - token_warm_t0,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("token 估算器预热失败，将在首次估算时回退：%s", e)
         # 按 config 调整全局日志级别（main.py 启动时只设了 INFO）
         try:
             logging.getLogger().setLevel(

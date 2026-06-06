@@ -57,7 +57,7 @@ from app_config.schema import (
 from core.message_pipeline import MessagePipeline, _recommended_context_budget
 from core.proactive_loop import ProactiveLoop
 from core.recall_handler import RecallHandler
-from core.state import PendingMessageItem, PendingRequestStore
+from core.state import PendingMessageItem, PendingRequestStore, RateLimiter
 from core.wakeup import WakeupScheduler
 from memory import (
     ArchiveStore,
@@ -245,7 +245,13 @@ class FakeAdapter(IAdapter):
 def build_pipeline(tmp_path):
     """返回 async 工厂。调用 build(script) 得到 (pipeline, provider, adapter, history, important)。"""
 
-    async def _build(script: list[CompletionResult], *, emoji_dir=None, workspace_dir=None):
+    async def _build(
+        script: list[CompletionResult],
+        *,
+        emoji_dir=None,
+        workspace_dir=None,
+        rate_limiter=None,
+    ):
         cfg = _make_root_config()
         provider = ScriptedProvider(script)
         chat_agent = ChatAgent(provider, cfg.agents.chat)
@@ -279,7 +285,7 @@ def build_pipeline(tmp_path):
             features_cfg=cfg.features,
             emoji_dir=emoji_dir,
             workspace_dir=workspace_dir,
-            rate_limiter=None,
+            rate_limiter=rate_limiter,
             summary_agent=None,
         )
         scheduler._on_fire = pipeline.run_wakeup_turn  # 双向依赖回填
@@ -487,6 +493,22 @@ async def test_group_message_flow(build_pipeline):
         t.scope == "group" and t.target_id == "5555" and c == "群好"
         for t, c in adapter.sent
     ), f"群消息未发出: {adapter.sent}"
+
+
+@pytest.mark.asyncio
+async def test_group_messages_bypass_private_rate_limiter(build_pipeline):
+    """群聊由群白名单/审核控制，不应套用陌生私聊频控。"""
+    limiter = RateLimiter(window_seconds=60, max_messages=0)
+    pipeline, provider, adapter, _, _ = await build_pipeline(
+        [_ai_send_group("5555", "群内正常回复", True)],
+        rate_limiter=limiter,
+    )
+
+    await pipeline.enqueue(_msg(user_id="stranger", group_id="5555", text="群里说话"))
+    await _drain_pipeline(pipeline)
+
+    assert len(provider.calls) == 1
+    assert [content for _, content in adapter.sent] == ["群内正常回复"]
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,12 @@ import pytest
 from adapters.base import AdapterAPIError, AdapterNotConnectedError
 from adapters.napcat.adapter import NapCatAdapter
 from adapters.napcat.api_call import NapCatApiCaller
-from adapters.napcat.connection import ConnectionStatus, NapCatConnection, ReverseWSConnection
+from adapters.napcat.connection import (
+    ConnectionStatus,
+    ForwardWSConnection,
+    NapCatConnection,
+    ReverseWSConnection,
+)
 from adapters.napcat.process import NapCatProcessManager
 from adapters.types import (
     FriendInfo,
@@ -298,6 +303,24 @@ def test_adapter_from_config_uses_startup_connect_timeout():
     assert conn.fast_reconnect_interval == 0.1
     assert conn.reconnect_jitter == 0.0
     assert adapter._api.wait_connected_timeout == 1.25  # type: ignore[attr-defined]
+
+
+def test_adapter_from_config_server_loopback_binds_all_interfaces():
+    class FakeSecrets:
+        def get(self, _key: str) -> None:
+            return None
+
+    from app_config.schema import NapCatAdapterConfig
+
+    cfg = NapCatAdapterConfig(mode="server", host="localhost", port=8082, path="/")
+
+    adapter = NapCatAdapter.from_config("napcat_test", cfg, FakeSecrets())  # type: ignore[arg-type]
+
+    conn = adapter._connection  # type: ignore[attr-defined]
+    assert isinstance(conn, ForwardWSConnection)
+    assert conn.host == "0.0.0.0"
+    assert conn.port == 8082
+    assert conn.path == "/"
 
 
 # ============================================================

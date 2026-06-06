@@ -177,7 +177,10 @@ COPY: dict[str, str] = {
     "adapter.mode_client": "Debata 连过去（client）",
     "adapter.mode_client_desc": "推荐。NapCat 配「正向 WS」监听，Debata 主动连接它。",
     "adapter.mode_server": "NapCat 连过来（server）",
-    "adapter.mode_server_desc": "NapCat 配「反向 WS」主动连出，Debata 监听端口等连入。",
+    "adapter.mode_server_desc": (
+        "NapCat 配「反向 WS」主动连出，Debata 监听端口等连入。"
+        "跨设备时监听地址用 0.0.0.0，NapCat 目标填 Debata 机器的局域网 IP。"
+    ),
     "adapter.ws_url_label": "NapCat WebSocket 地址",
     "adapter.ws_url_placeholder": "ws://127.0.0.1:6199",
     "adapter.token_label": "鉴权 Token（可选）",
