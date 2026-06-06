@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -30,6 +31,7 @@ from providers.base import (
     ProviderTimeoutError,
     ReasoningConfig,
     ToolCall,
+    normalize_messages,
 )
 
 from .base import AgentRunResult, FinishReason, StatusCallback, ToolExecutor, UsageRecorder
@@ -228,6 +230,12 @@ class AgentRunner:
                 agent=status_label,
                 operation="agent_loop",
                 loop=loop_count,
+                **_kv_prompt_diagnostics(
+                    msgs,
+                    tools,
+                    loop=loop_count,
+                    model=self.cfg.model,
+                ),
             )
             if result.reasoning_content:
                 reasoning_logs.append(result.reasoning_content)
@@ -466,6 +474,12 @@ class AgentRunner:
                 result.usage,
                 agent=status_label,
                 operation="agent_loop_max_loops_final",
+                **_kv_prompt_diagnostics(
+                    messages,
+                    None,
+                    loop=0,
+                    model=self.cfg.model,
+                ),
             )
             return result
         except Exception as e:
@@ -539,3 +553,53 @@ class AgentRunner:
             if r["name"] in SEND_TOOL_NAMES:
                 return "send_only_complete"
         return "all_no_feedback"
+
+
+def _kv_prompt_diagnostics(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    *,
+    loop: int,
+    model: str = "",
+) -> dict[str, Any]:
+    """生成轻量 KV 诊断信息，只记录结构和哈希，不记录正文。"""
+    normalized = normalize_messages(messages)
+    serialized = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    roles = [str(m.get("role") or "") for m in normalized]
+    joined_content = "\n".join(str(m.get("content") or "") for m in normalized)
+    tools_text = json.dumps(
+        tools or [],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    diag: dict[str, Any] = {
+        "kv_loop": int(loop),
+        "kv_message_count": len(normalized),
+        "kv_roles_hash": _short_hash("|".join(roles)),
+        "kv_system_count": sum(1 for role in roles if role == "system"),
+        "kv_assistant_count": sum(1 for role in roles if role == "assistant"),
+        "kv_tool_count": sum(1 for role in roles if role == "tool"),
+        "kv_tools_count": len(tools or []),
+        "kv_tools_hash": _short_hash(tools_text),
+        "kv_prefix_8k_hash": _short_hash(serialized[:8192]),
+        "kv_prefix_16k_hash": _short_hash(serialized[:16384]),
+        "kv_prefix_24k_hash": _short_hash(serialized[:24576]),
+        "kv_has_send_receipt": "<send_receipt" in joined_content,
+        "kv_has_recent_group_messages": "<recent_group_messages" in joined_content,
+        "kv_has_rag": "<retrieved_conversation_context" in joined_content,
+    }
+    return diag
+
+
+def _short_hash(text: str) -> str:
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]

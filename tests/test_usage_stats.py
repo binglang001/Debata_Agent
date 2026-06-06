@@ -44,3 +44,22 @@ async def test_usage_stats_records_and_summarizes_ranges(tmp_path, monkeypatch):
     reloaded = UsageStatsStore(tmp_path / "usage.jsonl")
     await reloaded.load()
     assert reloaded.summarize("all").request_count == 1
+
+
+@pytest.mark.asyncio
+async def test_usage_stats_records_extra_kv_diagnostics(tmp_path):
+    store = UsageStatsStore(tmp_path / "usage.jsonl")
+    await store.load()
+
+    await store.record(
+        Usage(prompt_tokens=10, completion_tokens=1, total_tokens=11),
+        provider="deepseek_main",
+        model="deepseek-chat",
+        agent="主模型",
+        operation="agent_loop",
+        extra={"kv_message_count": 3, "kv_prefix_8k_hash": "abc123"},
+    )
+
+    text = (tmp_path / "usage.jsonl").read_text(encoding="utf-8")
+    assert '"kv_message_count":3' in text
+    assert '"kv_prefix_8k_hash":"abc123"' in text

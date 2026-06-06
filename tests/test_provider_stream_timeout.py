@@ -9,7 +9,11 @@ import pytest
 
 from providers.base import ProviderTimeoutError, ReasoningConfig
 from providers.protocols.anthropic_proto import AnthropicProvider
-from providers.protocols.openai_compat import OpenAICompatProvider
+from providers.protocols.openai_compat import (
+    OpenAICompatProvider,
+    _dump_raw_prompt_request,
+    _raw_prompt_dump_payload,
+)
 
 
 class DelayedAsyncStream:
@@ -79,6 +83,51 @@ def test_openai_thinking_extra_body_disables_by_default():
     ) == {
         "thinking": {"type": "disabled"}
     }
+
+
+def test_openai_raw_prompt_dump_payload_only_keeps_request_fields():
+    payload = _raw_prompt_dump_payload(
+        provider="deepseek_main",
+        kwargs={
+            "model": "deepseek-v4-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function"}],
+            "tool_choice": "auto",
+            "timeout": 120,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "extra_body": {"thinking": {"type": "disabled"}},
+        },
+    )
+
+    assert payload["provider"] == "deepseek_main"
+    assert payload["model"] == "deepseek-v4-pro"
+    assert payload["message_count"] == 1
+    assert payload["tool_count"] == 1
+    assert payload["request"]["messages"][0]["content"] == "hi"
+    assert "timeout" not in payload["request"]
+
+
+def test_openai_raw_prompt_dump_writes_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("DIANA_KV_RAW_PROMPT_DUMP", "1")
+    monkeypatch.setenv("DIANA_KV_RAW_PROMPT_DUMP_DIR", str(tmp_path))
+
+    path = _dump_raw_prompt_request(
+        provider="deepseek_main",
+        kwargs={
+            "model": "deepseek-v4-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.6,
+            "stream": False,
+        },
+    )
+
+    assert path is not None
+    assert path.exists()
+    assert (tmp_path / "latest.json").exists()
+    text = path.read_text(encoding="utf-8")
+    assert '"provider": "deepseek_main"' in text
+    assert '"content": "hi"' in text
 
 
 def test_openai_usage_extracts_cached_tokens():
@@ -160,7 +209,7 @@ def test_openai_reasoning_controls_skip_known_non_reasoning_models():
 
 
 @pytest.mark.asyncio
-async def test_openai_reasoning_mode_replays_assistant_reasoning_content(monkeypatch):
+async def test_openai_reasoning_mode_does_not_replay_reasoning_content_by_default(monkeypatch):
     provider = OpenAICompatProvider(
         "deepseek_test",
         base_url="https://example.com/v1",
@@ -191,6 +240,52 @@ async def test_openai_reasoning_mode_replays_assistant_reasoning_content(monkeyp
     await provider.chat_completion(
         [
             {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "assistant", "content": "", "reasoning_content": ""},
+            {"role": "user", "content": "again"},
+        ],
+        model="fake",
+        reasoning=ReasoningConfig(enabled=True),
+        stream=False,
+    )
+
+    assistant_msgs = [
+        msg for msg in captured["messages"] if msg.get("role") == "assistant"
+    ]
+    assert "reasoning_content" not in assistant_msgs[0]
+    assert "reasoning_content" not in assistant_msgs[1]
+    assert captured["extra_body"] == {"thinking": {"type": "enabled"}}
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_reasoning_replay_can_be_enabled_temporarily(monkeypatch):
+    monkeypatch.setenv("DIANA_OPENAI_COMPAT_REPLAY_REASONING_CONTENT", "1")
+    provider = OpenAICompatProvider(
+        "deepseek_test",
+        base_url="https://example.com/v1",
+        api_key="sk-test",
+        reasoning_style="thinking_extra_body",
+    )
+    captured = {}
+
+    async def fake_create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="ok", tool_calls=None),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+            model="fake",
+        )
+
+    monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+
+    await provider.chat_completion(
+        [
             {"role": "assistant", "content": "ok"},
             {"role": "assistant", "content": "", "reasoning_content": ""},
             {"role": "user", "content": "again"},

@@ -382,13 +382,14 @@ async def test_main_reply_persists_task_context_snapshot_for_kv_prefix(build_pip
 
     records = await history.records()
     roles = [r.get("role") for r in records[:4]]
-    assert roles == ["user", "system", "assistant", "tool"]
+    assert roles == ["user", "user", "assistant", "tool"]
     assert records[1].get("metadata", {}).get("kind") == "task_context_snapshot"
     assert "<task_context" in records[1]["content"]
+    assert "不是用户新发言" in records[1]["content"]
 
     first_call = provider.calls[0]["messages"]
     assert first_call[1]["role"] == "user"
-    assert first_call[2]["role"] == "system"
+    assert first_call[2]["role"] == "user"
     assert first_call[2]["content"] == records[1]["content"]
 
 
@@ -1304,7 +1305,7 @@ async def test_same_conversation_interrupt_flushes_async_send_queue(build_pipeli
     receipt_turn_context = "\n".join(
         str(m.get("content", ""))
         for m in provider.calls[-1]["messages"]
-        if m.get("role") == "system" and "<send_receipt_task" in str(m.get("content", ""))
+        if m.get("role") == "user" and "<send_receipt_task" in str(m.get("content", ""))
     )
     assert "<send_receipt>" in receipt_turn_context
     assert '"interrupted": true' in receipt_turn_context

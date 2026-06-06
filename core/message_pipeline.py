@@ -750,7 +750,7 @@ def _make_task_context_record(
     if not content:
         return None
     record: dict[str, Any] = {
-        "role": "system",
+        "role": "user",
         "content": content,
         "metadata": {"kind": "task_context_snapshot"},
     }
@@ -1459,7 +1459,7 @@ class MessagePipeline:
         for receipt in receipts:
             records.append(
                 {
-                    "role": "system",
+                    "role": "user",
                     "content": self._format_send_receipt(receipt),
                     "conversation_id": conversation_id,
                 }
@@ -1501,7 +1501,7 @@ class MessagePipeline:
             receipt_block = "\n".join(
                 r.get("content", "")
                 for r in receipt_records
-                if r.get("role") == "system" and r.get("content")
+                if "<send_receipt>" in str(r.get("content") or "")
             )
             task_context = (
                 "<send_receipt_task priority=\"high\">\n"

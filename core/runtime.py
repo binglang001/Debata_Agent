@@ -876,6 +876,11 @@ class Runtime:
             model=str(metadata.get("model") or ""),
             agent=str(metadata.get("agent") or ""),
             operation=str(metadata.get("operation") or ""),
+            extra={
+                k: v
+                for k, v in metadata.items()
+                if k.startswith("kv_") or k in {"task_phase", "loop"}
+            },
         )
 
     def _update_model_activity(self, payload: dict[str, Any]) -> None:

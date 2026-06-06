@@ -71,6 +71,7 @@ class UsageStatsStore:
         model: str = "",
         agent: str = "",
         operation: str = "",
+        extra: dict[str, Any] | None = None,
     ) -> None:
         if usage.total_tokens <= 0 and usage.prompt_tokens <= 0 and usage.completion_tokens <= 0:
             return
@@ -90,6 +91,8 @@ class UsageStatsStore:
                 or (usage.prompt_tokens + usage.completion_tokens)
             ),
         }
+        if extra:
+            record.update(extra)
         async with self._lock:
             if self._records is None:
                 self._load_unlocked()

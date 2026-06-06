@@ -320,15 +320,16 @@ def test_build_messages_structure():
         current_context="时间：2026/05/23",
     )
 
-    # 顺序：system(combined) → system(admin) → user → assistant → system(task_context)
+    # 顺序：system(combined) → system(admin) → user → assistant → user(task_context)
     assert msgs[0]["role"] == "system"
     assert "<persona" in msgs[0]["content"]
     assert msgs[1]["role"] == "system"
     assert "<admin_info" in msgs[1]["content"]
     assert msgs[2]["role"] == "user"
     assert msgs[3]["role"] == "assistant"
-    assert msgs[4]["role"] == "system"
+    assert msgs[4]["role"] == "user"
     assert "<task_context" in msgs[4]["content"]
+    assert "不是用户新发言" in msgs[4]["content"]
     assert "2026/05/23" in msgs[4]["content"]
 
 
@@ -383,17 +384,19 @@ def test_build_messages_rag_memory_is_tail_context_for_cache_stability():
     assert first[0]["content"] == second[0]["content"]
     assert "RAG 片段 A" not in first[0]["content"]
     assert "RAG 片段 B" not in second[0]["content"]
-    assert [m["role"] for m in first] == ["system", "user", "system", "system"]
+    assert [m["role"] for m in first] == ["system", "user", "user", "user"]
     assert "旧消息" in first[1]["content"]
     assert "task_context" in first[2]["content"]
+    assert "不是用户新发言" in first[2]["content"]
     assert "RAG 片段 A" in first[3]["content"]
+    assert "不是用户新发言" in first[3]["content"]
 
 
 def test_build_messages_can_reuse_persisted_task_context_record_for_prefix_stability():
     p = _persona()
     history = [{"role": "user", "content": "本轮用户消息"}]
     task_record = {
-        "role": "system",
+        "role": "user",
         "content": "<task_context priority=\"medium\">\n现在是 10:00。\n</task_context>",
         "metadata": {"kind": "task_context_snapshot"},
         "conversation_id": "private:1",
@@ -409,7 +412,7 @@ def test_build_messages_can_reuse_persisted_task_context_record_for_prefix_stabi
         p,
         [*history, task_record, {"role": "assistant", "content": ""}],
         current_context_record={
-            "role": "system",
+            "role": "user",
             "content": "<task_context priority=\"medium\">\n现在是 10:01。\n</task_context>",
         },
         memory_mode="rag",
@@ -430,7 +433,7 @@ def test_build_messages_user_event_is_final_user_message():
 
     assert msgs[-1]["role"] == "user"
     assert "系统事件" in msgs[-1]["content"]
-    assert msgs[-2]["role"] == "system"
+    assert msgs[-2]["role"] == "user"
     assert "task_context" in msgs[-2]["content"]
 
 

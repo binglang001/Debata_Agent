@@ -17,7 +17,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -37,6 +42,11 @@ from providers.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+_RAW_PROMPT_DUMP_ENV = "DIANA_KV_RAW_PROMPT_DUMP"
+_RAW_PROMPT_DUMP_DIR_ENV = "DIANA_KV_RAW_PROMPT_DUMP_DIR"
+_RAW_PROMPT_DUMP_DEFAULT_DIR = Path("data/logs/kv_raw_prompts")
+_REPLAY_REASONING_ENV = "DIANA_OPENAI_COMPAT_REPLAY_REASONING_CONTENT"
 
 
 class OpenAICompatProvider(IProvider):
@@ -128,6 +138,8 @@ class OpenAICompatProvider(IProvider):
             extra_body.update(extra)
         if extra_body:
             kwargs["extra_body"] = extra_body
+
+        _dump_raw_prompt_request(provider=self.name, kwargs=kwargs)
 
         try:
             if stream:
@@ -276,12 +288,9 @@ class OpenAICompatProvider(IProvider):
     def _should_replay_reasoning_content(
         self, reasoning: ReasoningConfig | None, *, model: str = ""
     ) -> bool:
-        return bool(
-            reasoning
-            and reasoning.enabled
-            and self.reasoning_style in {"thinking_extra_body", "qwen_enable_thinking"}
-            and self._model_allows_reasoning_controls(model, reasoning)
-        )
+        if not _replay_reasoning_content_enabled():
+            return False
+        return bool(reasoning and reasoning.enabled)
 
     def _model_allows_reasoning_controls(
         self,
@@ -358,3 +367,87 @@ class OpenAICompatProvider(IProvider):
             cache_creation_tokens=int(cache_creation),
             total_tokens=int(total),
         )
+
+
+def _dump_raw_prompt_request(*, provider: str, kwargs: dict[str, Any]) -> Path | None:
+    """临时保存 OpenAI-compatible 最终请求体，用于 KV 缓存排障。"""
+    if not _raw_prompt_dump_enabled():
+        return None
+
+    try:
+        payload = _raw_prompt_dump_payload(provider=provider, kwargs=kwargs)
+        text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        root = _raw_prompt_dump_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(payload["ts"]))
+        model = _safe_filename(str(payload.get("model") or "model"))
+        req_hash = _short_hash(
+            json.dumps(
+                payload.get("request") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        )
+        path = root / f"{ts}-{_safe_filename(provider)}-{model}-{req_hash}.json"
+        path.write_text(text, encoding="utf-8")
+        (root / "latest.json").write_text(text, encoding="utf-8")
+        return path
+    except Exception:
+        logger.debug("写入原始提示词 KV 诊断失败", exc_info=True)
+        return None
+
+
+def _raw_prompt_dump_payload(*, provider: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    request_keys = {
+        "model",
+        "messages",
+        "tools",
+        "tool_choice",
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "stream",
+        "stream_options",
+        "extra_body",
+    }
+    request = {key: value for key, value in kwargs.items() if key in request_keys}
+    request_text = json.dumps(request, ensure_ascii=False, sort_keys=True, default=str)
+    messages = request.get("messages") or []
+    tools = request.get("tools") or []
+    return {
+        "ts": time.time(),
+        "provider": provider,
+        "model": str(kwargs.get("model") or ""),
+        "request_hash": _short_hash(request_text),
+        "request_chars": len(request_text),
+        "message_count": len(messages) if isinstance(messages, list) else 0,
+        "tool_count": len(tools) if isinstance(tools, list) else 0,
+        "request": request,
+    }
+
+
+def _raw_prompt_dump_enabled() -> bool:
+    value = os.getenv(_RAW_PROMPT_DUMP_ENV)
+    return bool(value and value.strip().lower() not in {"0", "false", "no", "off"})
+
+
+def _replay_reasoning_content_enabled() -> bool:
+    value = os.getenv(_REPLAY_REASONING_ENV)
+    return bool(value and value.strip().lower() not in {"0", "false", "no", "off"})
+
+
+def _raw_prompt_dump_dir() -> Path:
+    value = os.getenv(_RAW_PROMPT_DUMP_DIR_ENV)
+    return Path(value).expanduser() if value else _RAW_PROMPT_DUMP_DEFAULT_DIR
+
+
+def _safe_filename(value: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value.strip())
+    return safe[:80] or "unknown"
+
+
+def _short_hash(text: str) -> str:
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
