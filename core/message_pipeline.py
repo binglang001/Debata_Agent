@@ -658,6 +658,7 @@ _RATE_LIMIT_REPLY_TEMPLATE = "已超出速率限制（{window_seconds} 秒内最
 _PREFIX_ESTIMATE_TOKENS = 12_000
 _CURRENT_CONVERSATION_MIN_RECORDS = 8
 _PROACTIVE_ROUTER_HISTORY_BUDGET = 16_384
+_SLOW_BATCH_STAGE_SECONDS = 1.0
 _OUT_OF_BAND_DENIED_TOOLS = frozenset(
     {
         "start_agent_task",
@@ -685,6 +686,26 @@ def _recommended_context_budget(model: str, context_length: int | None = None) -
     if "claude" in name:
         return 150_000
     return 96_000
+
+
+def _log_slow_batch_stage(
+    stage: str,
+    started_at: float,
+    *,
+    conversation_id: str,
+    extra: str = "",
+) -> None:
+    elapsed = time.monotonic() - started_at
+    if elapsed < _SLOW_BATCH_STAGE_SECONDS:
+        return
+    suffix = f" {extra}" if extra else ""
+    logger.warning(
+        "批处理阶段耗时过长 stage=%s conversation_id=%s elapsed=%.3fs%s",
+        stage,
+        conversation_id,
+        elapsed,
+        suffix,
+    )
 
 
 def _record_timestamp(record: dict[str, Any]) -> Any:
@@ -1131,8 +1152,12 @@ class MessagePipeline:
                     )
                     return
 
-        # 速率限制
-        if self.rate_limiter and await self.rate_limiter.check_and_log(event.user_id):
+        # 速率限制只针对私聊陌生人。群聊本身由群白名单/审核控制，不按群成员逐个限速。
+        if (
+            self.rate_limiter
+            and not event.is_group()
+            and await self.rate_limiter.check_and_log(event.user_id)
+        ):
             await self._send_rate_limit_reply(event)
             return
 
@@ -1309,23 +1334,46 @@ class MessagePipeline:
         now = get_time()
         user_record = self._build_user_record(items, now)
         conversation_id = user_record.get("conversation_id") or "legacy:unknown"
+        stage_t0 = time.monotonic()
         await self.history.add_records([user_record], conversation_id=conversation_id)
+        _log_slow_batch_stage("history_add_user", stage_t0, conversation_id=conversation_id)
         logger.info(f"合并处理 {len(items)} 条消息")
 
         # 构造给 LLM 的 messages（emoji_hint / pending_requests 已在 _build_task_context 内拼装）
+        stage_t0 = time.monotonic()
         task_context = self._build_task_context(now, conversation_id)
         task_context_record = _make_task_context_record(
             task_context,
             conversation_id=conversation_id,
         )
+        _log_slow_batch_stage(
+            "build_task_context",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"context_len={len(task_context)}",
+        )
 
+        stage_t0 = time.monotonic()
         history_window = await self._select_working_history(conversation_id)
+        _log_slow_batch_stage(
+            "select_working_history",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"records={len(history_window)}",
+        )
         estimator = self._token_estimator()
 
+        stage_t0 = time.monotonic()
         important_text = await self._important_memory_text(
             conversation_id,
             query=items[-1].text if items else None,
             before_ts=_earliest_record_ts(history_window),
+        )
+        _log_slow_batch_stage(
+            "important_memory_text",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"memory_len={len(important_text)}",
         )
         logger.debug(
             "批处理记忆准备完成 conversation_id=%s memory_len=%s elapsed=%.3fs",
@@ -1334,16 +1382,33 @@ class MessagePipeline:
             time.monotonic() - batch_t0,
         )
 
+        stage_t0 = time.monotonic()
+        rolling_summary_text = self._rolling_summary_text(estimator)
+        _log_slow_batch_stage(
+            "rolling_summary_text",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"summary_len={len(rolling_summary_text)}",
+        )
+
+        stage_t0 = time.monotonic()
         messages = build_messages(
             persona=self.persona,
             history=history_window,
             important_memory_text=important_text,
-            rolling_summary_text=self._rolling_summary_text(estimator),
+            rolling_summary_text=rolling_summary_text,
             current_context_record=task_context_record,
             memory_mode=self.features_cfg.long_term_memory.mode,
         )
+        _log_slow_batch_stage(
+            "build_messages",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"messages={len(messages)}",
+        )
 
         # 构造 ToolContext
+        stage_t0 = time.monotonic()
         default_target = items[-1].raw_event.source_target if items else None
         latest_user_text = "\n".join(item.text for item in items)
         ctx = self._build_tool_context(
@@ -1356,12 +1421,32 @@ class MessagePipeline:
         )
         executor = self.tool_registry.get_executor(ctx)
         tools_schema = self.tool_registry.get_schemas()
+        _log_slow_batch_stage(
+            "build_tool_context_schema",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"tools={len(tools_schema)}",
+        )
+
+        stage_t0 = time.monotonic()
         estimated_prompt_tokens = estimator.estimate_messages(messages)
         if tools_schema:
             estimated_prompt_tokens += estimator.estimate_text(str(tools_schema))
+        _log_slow_batch_stage(
+            "estimate_prompt_tokens",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"estimated={estimated_prompt_tokens}",
+        )
 
         # 只串行模型轮；Phase 0 后台发送不占 reply_lock。
+        stage_t0 = time.monotonic()
         async with self.reply_lock:
+            _log_slow_batch_stage(
+                "reply_lock_wait",
+                stage_t0,
+                conversation_id=conversation_id,
+            )
             self._send_manager.begin_model_turn(conversation_id)
             model_t0 = time.monotonic()
             try:

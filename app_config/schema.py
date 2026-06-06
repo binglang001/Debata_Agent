@@ -85,6 +85,19 @@ class NapCatAdapterConfig(StrictModel):
     """WebSocket 路径。client 模式（NapCat 正向 WS）默认 "/"；
     server 模式时与 NapCat 那边配的目标地址保持一致即可。"""
 
+    @field_validator("path", mode="before")
+    @classmethod
+    def normalize_ws_path(cls, v) -> str:
+        """兼容旧配置/UI 把 path 写成 null 或空串，并保证以 / 开头。"""
+        if v is None:
+            return "/"
+        raw = str(v).strip()
+        if not raw:
+            return "/"
+        if not raw.startswith("/"):
+            return "/" + raw
+        return raw
+
     # 鉴权：填 SecretsManager 中的【密钥 ID】，不是 token 本身。
     # 例如 "napcat_default_token" 这种短标识，对应 secrets 中保存的实际 token。
     access_token_id: str | None = None

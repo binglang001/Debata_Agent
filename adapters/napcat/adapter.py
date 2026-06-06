@@ -112,6 +112,7 @@ class NapCatAdapter(IAdapter):
         if cfg.mode == "client":
             # 程序作为 WS 客户端，连 ws://{host}:{port}{path}（NapCat = 正向 WS 服务端）
             ws_url = f"ws://{cfg.host}:{cfg.port}{cfg.path}"
+            logger.info("NapCat 配置：client 模式，连接 %s", ws_url)
             connection: NapCatConnection = ReverseWSConnection(
                 ws_url=ws_url,
                 access_token=access_token,
@@ -127,6 +128,12 @@ class NapCatAdapter(IAdapter):
             )
         else:  # mode == "server"
             # 程序作为 WS 服务端，监听 {host}:{port}{path} 等 NapCat 反向连入
+            logger.info(
+                "NapCat 配置：server 模式，监听 ws://%s:%s%s",
+                cfg.host,
+                cfg.port,
+                cfg.path,
+            )
             connection = ForwardWSConnection(
                 host=cfg.host,
                 port=cfg.port,

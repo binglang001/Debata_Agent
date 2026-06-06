@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 
@@ -56,16 +57,26 @@ def _estimate_text_raw(text: str, model: str = "") -> int:
     if not text:
         return 1
     try:
-        import tiktoken
-
-        try:
-            enc = tiktoken.encoding_for_model(model) if model else tiktoken.get_encoding("o200k_base")
-        except Exception:
-            try:
-                enc = tiktoken.get_encoding("o200k_base")
-            except Exception:
-                enc = tiktoken.get_encoding("cl100k_base")
+        enc = _encoding_for_model(model)
         return len(enc.encode(text))
     except Exception:
         # 中文约 1.5 字/token，英文约 4 chars/token；用保守混合估算。
         return max(1, len(text) // 2)
+
+
+def warm_token_estimator(model: str = "") -> None:
+    """预热并缓存 tokenizer，避免首条真实消息触发同步加载。"""
+    _encoding_for_model(model)
+
+
+@lru_cache(maxsize=32)
+def _encoding_for_model(model: str = ""):
+    import tiktoken
+
+    try:
+        return tiktoken.encoding_for_model(model) if model else tiktoken.get_encoding("o200k_base")
+    except Exception:
+        try:
+            return tiktoken.get_encoding("o200k_base")
+        except Exception:
+            return tiktoken.get_encoding("cl100k_base")

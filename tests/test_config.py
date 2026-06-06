@@ -44,6 +44,13 @@ def test_minimal_valid_config():
     assert budgets["get_recent_chat_messages"].artifact_threshold_tokens == 3000
 
 
+def test_napcat_adapter_path_normalizes_legacy_values():
+    assert NapCatAdapterConfig(path=None).path == "/"  # type: ignore[arg-type]
+    assert NapCatAdapterConfig(path="").path == "/"
+    assert NapCatAdapterConfig(path="onebot").path == "/onebot"
+    assert NapCatAdapterConfig(path="/onebot").path == "/onebot"
+
+
 def test_tool_result_budget_config_accepts_custom_values():
     cfg = _minimal_config()
     cfg.behavior.context.tool_result_budgets["read_file"] = ToolResultBudgetConfig(
