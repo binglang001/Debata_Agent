@@ -55,10 +55,12 @@ from .keyword_save import try_save_from_user
 from .message_builder import (
     FORBIDDEN_TAGS,
     build_emoji_hint,
-    build_image_cq,
-    build_message,
+    build_message_action,
     contains_forbidden,
     list_emoji_files,
+    list_emoji_names,
+    resolve_emoji_path,
+    resolve_send_image_ref,
     typing_delay,
 )
 
@@ -82,10 +84,12 @@ __all__ = [
     # message_builder
     "FORBIDDEN_TAGS",
     "build_emoji_hint",
-    "build_image_cq",
-    "build_message",
+    "build_message_action",
     "contains_forbidden",
     "list_emoji_files",
+    "list_emoji_names",
+    "resolve_emoji_path",
+    "resolve_send_image_ref",
     "typing_delay",
     # keyword_save
     "try_save_from_user",

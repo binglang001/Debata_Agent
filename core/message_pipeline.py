@@ -256,12 +256,10 @@ class _AsyncSendManager:
             return {
                 "ok": True,
                 "status": "sent",
-                "brief": "没有可发送的有效消息。",
                 "qq_visible": False,
                 "send_id": send_id,
                 "count": 0,
                 "sent": [],
-                "sent_messages": [],
             }
 
         groups: dict[str, list[dict[str, Any]]] = {}
@@ -279,7 +277,6 @@ class _AsyncSendManager:
             result = {
                 "ok": False,
                 "status": "stale",
-                "brief": "发送未执行：会话状态已变化。",
                 "qq_visible": False,
                 "send_id": send_id,
                 "stale_conversations": stale_convs,
@@ -288,7 +285,6 @@ class _AsyncSendManager:
                 "next": "重新判断；不要自动补发 attempted_messages。必要时调用 get_recent_chat_messages。",
             }
             if recalled_messages:
-                result["brief"] = "发送未执行：会话有消息被撤回。"
                 result["recalled_messages"] = recalled_messages
             return result
 
@@ -369,6 +365,8 @@ class _AsyncSendManager:
             "label": str(action.get("label") or action.get("content") or ""),
             "delay": float(action.get("delay") or 0.0),
             "audio_path": str(action.get("audio_path") or ""),
+            "image_path": str(action.get("image_path") or ""),
+            "image_url": str(action.get("image_url") or ""),
         }
 
     def _can_sync_send(self, conversation_id: str, actions: list[dict[str, Any]]) -> bool:
@@ -410,16 +408,10 @@ class _AsyncSendManager:
         result: dict[str, Any] = {
             "ok": bool(sent) or not errors,
             "status": "sent",
-            "brief": (
-                f"已发送 {len(sent)} 条消息，QQ 可见。"
-                if sent
-                else "发送尝试完成，但没有消息发出。"
-            ),
             "qq_visible": bool(sent),
             "send_id": send_id,
             "count": len(sent),
             "sent": sent,
-            "sent_messages": sent,
         }
         if errors:
             result["errors"] = errors
@@ -518,6 +510,16 @@ class _AsyncSendManager:
             if send_voice is None:
                 raise RuntimeError("当前适配器不支持发送语音")
             msg_id = await send_voice(target, Path(action.get("audio_path") or ""))
+        elif kind in {"emoji", "image"}:
+            msg_id = await self.pipeline.adapter.send_image(
+                target,
+                image_path=(
+                    Path(str(action.get("image_path")))
+                    if action.get("image_path")
+                    else None
+                ),
+                image_url=str(action.get("image_url") or "") or None,
+            )
         else:
             content = action.get("content") or ""
             msg_id = await self.pipeline.adapter.send_text(target, content)

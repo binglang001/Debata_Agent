@@ -36,17 +36,32 @@ class PrivateMessageTarget(_ToolArgs):
     target_qq: int = Field(..., description="接收者 QQ 号")
     content: str | None = Field(
         default=None,
-        description="消息正文；可在开头加 [CQ:reply,id=msg_id] 引用回复。content 与 image 二选一。",
+        description="消息正文；可在开头加 [CQ:reply,id=msg_id] 引用回复。content、emoji、image 三选一。",
+    )
+    emoji: str | None = Field(
+        default=None,
+        description="表情包名称，不带文件后缀；必须从 task_context 的可用表情包列表中选择。content、emoji、image 三选一。",
     )
     image: str | None = Field(
         default=None,
-        description="表情包文件名（emoji 目录下的文件名）。content 与 image 二选一。",
+        description="要发送的图片 URL 或 workspace 相对路径；不是表情包。content、emoji、image 三选一。",
     )
     order: int = Field(..., description="发送顺序，从小到大")
     delay: float | None = Field(
         default=None,
         description="本条发出后的等待秒数。不填时按消息长度自动估算。",
     )
+
+    @model_validator(mode="after")
+    def validate_payload_choice(self) -> PrivateMessageTarget:
+        values = [
+            value
+            for value in (self.content, self.emoji, self.image)
+            if str(value or "").strip()
+        ]
+        if len(values) != 1:
+            raise ValueError("content、emoji、image 必须且只能填写一个")
+        return self
 
 
 class SendPrivateArgs(_ToolArgs):
@@ -68,13 +83,29 @@ class GroupMessageTarget(_ToolArgs):
         default=None,
         description="消息正文；@人用 [CQ:at,qq=QQ号]；引用用 [CQ:reply,id=msg_id]。",
     )
+    emoji: str | None = Field(
+        default=None,
+        description="表情包名称，不带文件后缀；必须从 task_context 的可用表情包列表中选择。content、emoji、image 三选一。",
+    )
     image: str | None = Field(
-        default=None, description="表情包文件名。content 与 image 二选一。"
+        default=None,
+        description="要发送的图片 URL 或 workspace 相对路径；不是表情包。content、emoji、image 三选一。",
     )
     order: int = Field(..., description="发送顺序，从小到大")
     delay: float | None = Field(
         default=None, description="本条发出后的等待秒数。不填时按长度估算。"
     )
+
+    @model_validator(mode="after")
+    def validate_payload_choice(self) -> GroupMessageTarget:
+        values = [
+            value
+            for value in (self.content, self.emoji, self.image)
+            if str(value or "").strip()
+        ]
+        if len(values) != 1:
+            raise ValueError("content、emoji、image 必须且只能填写一个")
+        return self
 
 
 class SendGroupArgs(_ToolArgs):

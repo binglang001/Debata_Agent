@@ -163,6 +163,7 @@ class FakeAdapter(IAdapter):
     def __init__(self, name: str = "fake") -> None:
         super().__init__(name)
         self.sent: list[tuple[Target, str]] = []
+        self.image_sent: list[tuple[Target, dict[str, Any]]] = []
         self.voice_sent: list[tuple[Target, Any]] = []
         self.uploaded: list[tuple[Target, Any, str | None]] = []
         self.recalled: list[str] = []
@@ -193,6 +194,16 @@ class FakeAdapter(IAdapter):
     async def send_image(self, target, *, image_path=None, image_url=None, image_b64=None):
         mid = str(self._next_msg_id)
         self._next_msg_id += 1
+        self.image_sent.append(
+            (
+                target,
+                {
+                    "image_path": image_path,
+                    "image_url": image_url,
+                    "image_b64": image_b64,
+                },
+            )
+        )
         return mid
 
     async def recall(self, message_id: str) -> bool:
@@ -234,7 +245,7 @@ class FakeAdapter(IAdapter):
 def build_pipeline(tmp_path):
     """返回 async 工厂。调用 build(script) 得到 (pipeline, provider, adapter, history, important)。"""
 
-    async def _build(script: list[CompletionResult]):
+    async def _build(script: list[CompletionResult], *, emoji_dir=None, workspace_dir=None):
         cfg = _make_root_config()
         provider = ScriptedProvider(script)
         chat_agent = ChatAgent(provider, cfg.agents.chat)
@@ -266,8 +277,8 @@ def build_pipeline(tmp_path):
             pending_requests=PendingRequestStore(),
             behavior_cfg=cfg.behavior,
             features_cfg=cfg.features,
-            emoji_dir=None,
-            workspace_dir=None,
+            emoji_dir=emoji_dir,
+            workspace_dir=workspace_dir,
             rate_limiter=None,
             summary_agent=None,
         )
@@ -1228,6 +1239,42 @@ async def test_send_private_immediate_path_reaches_adapter(build_pipeline):
     await _drain_pipeline(pipeline)
 
     assert any(c == "键名一致性测试" for _, c in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_send_private_emoji_reaches_image_adapter_and_timeline(build_pipeline, tmp_path):
+    emoji_dir = tmp_path / "emoji"
+    emoji_dir.mkdir()
+    emoji_path = emoji_dir / "无语.png"
+    emoji_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    args = {
+        "targets": [{"target_qq": 456, "emoji": "无语", "order": 1}],
+        "send_only": True,
+    }
+    pipeline, _, adapter, _, _ = await build_pipeline(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-emoji",
+                        name="send_private_messages",
+                        arguments=json.dumps(args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        ],
+        emoji_dir=emoji_dir,
+    )
+
+    await pipeline.enqueue(_msg(user_id="456", text="发个表情"))
+    await _drain_pipeline(pipeline)
+
+    assert adapter.sent == []
+    assert adapter.image_sent[0][1]["image_path"] == emoji_path
+    messages = pipeline.chat_timeline.recent("private:456", 10)
+    markdown = pipeline.chat_timeline.to_markdown(messages)
+    assert "我(999)：[表情包: 无语] [msg_id=1000]" in markdown
 
 
 @pytest.mark.asyncio

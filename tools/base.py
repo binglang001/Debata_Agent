@@ -162,7 +162,7 @@ class ToolContext:
     None 表示禁用文件类工具（read/write/edit/list/delete/upload_file/run_python）。"""
 
     emoji_dir: Path | None = None
-    """表情包目录（send_* 工具通过 image 参数引用文件名时用）。"""
+    """表情包目录（send_* 工具通过 emoji 参数按名称引用时用）。"""
 
     default_history_fetch_count: int = 100
     """summarize_chat_history 工具拉取群历史的默认 count 参数。"""

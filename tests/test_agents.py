@@ -153,7 +153,8 @@ def test_emoji_hint_in_protocol():
     """关于发图片表情包的明确提示必须在协议里。"""
     s = build_tool_use_protocol("file")
     assert "表情包" in s
-    assert "image" in s
+    assert "emoji" in s
+    assert "image` 字段用于发送普通图片" in s
     assert "正常短回复" in s
 
 

@@ -44,7 +44,7 @@ def _timeline_message(message_id: str, text: str) -> ChatTimelineMessage:
     )
 
 
-def test_inbound_markdown_preserves_image_url_and_forward_id():
+def test_inbound_markdown_compacts_image_url_and_preserves_forward_id():
     store = ChatTimelineStore()
     raw = (
         "[CQ:image,summary=[图片],file=abc.jpg,url=https://example.com/a.png]"
@@ -73,7 +73,7 @@ def test_inbound_markdown_preserves_image_url_and_forward_id():
 
     assert "用户(123)" in markdown
     assert "[图片]" in markdown
-    assert "https://example.com/a.png" in markdown
+    assert "https://example.com/a.png" not in markdown
     assert "forward-1" in markdown
     assert "msg_id=m1" in markdown
 
@@ -108,7 +108,7 @@ def test_raw_cq_parser_preserves_url_after_unescaped_summary():
         timestamp=1_780_000_000.0,
     )
 
-    markdown = store.to_markdown(store.recent("private:123", 10))
+    markdown = store.to_markdown(store.recent("private:123", 10), compact=False)
 
     assert "summary=[图片]" in markdown
     assert "file=abc.jpg" in markdown

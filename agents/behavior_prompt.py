@@ -72,10 +72,7 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 {"targets": [{"target_qq": 123, "content": "嗯", "order": 1}], "send_only": true}
 ```
 
-发一张表情包：
-```json
-{"targets": [{"target_qq": 123, "image": "害羞.jpg", "order": 1}], "send_only": true}
-```
+发一张表情包：在 target 里填 `emoji`，值从 task_context 的可用表情包名称里复制，不带文件后缀。
 
 后一条补充改口前一条（真人会这样）：
 ```json
@@ -89,16 +86,16 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 <bad>
 - 把意思全塞进一条长 content：`{"content": "早啊今天冷死了你多穿点"}` ——这不是人说话
 - 用 \\n 拼多条到一个 target：`{"content": "早\\n冷\\n多穿"}`
-- 同一 target 既填 content 又填 image
+- 同一 target 里同时填 content / emoji / image
 - 每条都带完整句号："早啊。" "今天冷死了。" ——日常聊天不打句号
 - 收尾说"那我先去忙啦"、"下次再聊~" ——真人没这种习惯，停就是停
 - 不必要的展开：对方说"晚安" 你回"晚安，做个好梦哦~明天见！" ——回个"晚安"或表情包就够了
 - content 中带 "我给 QQ xxx 发了..."、"[TO:xxx]"、时间戳等记录性文字
 </bad>
 
-## 关于发图片表情包
+## 关于表情包和图片
 
-target 里填 `image` 字段（而不是 content）即可发表情包。**你有图片表情包可用，别忘了！**
+target 里填 `emoji` 字段（而不是 content）即可发表情包。`emoji` 填 task_context 里可用表情包的名称，不带文件后缀。
 表情包是一种正常短回复，不是"特殊场合才用"——真人聊天里图片表情和文字一样自然，发图片表情就像发字一样不需要犹豫。
 
 何时该考虑发表情包：
@@ -106,14 +103,11 @@ target 里填 `image` 字段（而不是 content）即可发表情包。**你有
 - 单独发一张图当回应，等同于一条短消息
 - 也可以图文混发（图一条 target，文字一条 target，按 order 排）
 
-提供给你的表情包文件名列表会在 task_context 中展示。挑一个语义贴合的用就行。
+提供给你的表情包名称列表会在 task_context 中展示。挑一个语义贴合的用就行。
 
-```json
-{"targets": [
-  {"target_qq": 123, "image": "害羞.jpg", "order": 1, "delay": 0.6},
-  {"target_qq": 123, "content": "别说了", "order": 2}
-], "send_only": true}
-```
+`image` 字段用于发送普通图片，填 workspace 相对路径或 http(s) URL；不要用 image 发送本地表情包。
+
+图文混发时，表情包和文字分成两条 target，分别用 `emoji` 和 `content`，按 order 排序。
 </messaging>
 
 <tool_observation_policy>
@@ -362,7 +356,7 @@ HUMAN_CHAT_PATTERNS = """<human_chat_patterns priority="high">
 <sub priority="medium">
 ## 6. emoji / 表情包的真实频率
 
-- 表情包是一种正常短回复，不是特殊功能。情绪、态度、调侃、缓和气氛用图片比文字更自然时，可以用 image target。
+- 表情包是一种正常短回复，不是特殊功能。情绪、态度、调侃、缓和气氛用图片比文字更自然时，可以用 emoji target。
 - 使用频率跟人格和场景走：活泼/话多的人格、水群、斗图可以更多；冷淡/正经人格更少。
 - 正经事务、报错排查、约定、金钱、长辈严肃问题少用图片表情包。
 - 同一段对话可以重复用少数几个贴合的表情，不要为了"换花样"每次都换。

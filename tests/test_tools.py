@@ -17,7 +17,7 @@ from tools import (
     ToolContext,
     ToolRegistry,
     build_default_registry,
-    build_message,
+    build_message_action,
     contains_forbidden,
     get_default_specs,
     try_save_from_user,
@@ -25,6 +25,7 @@ from tools import (
 )
 from tools.base import _inline_refs, _strip_pydantic_metadata, tool
 from tools.feature_tools import send_voice_message
+from tools.message_builder import MessageBuildError, resolve_emoji_path
 from tools.result_shrink import tool_budget
 from tools.schemas import (
     SendVoiceMessageArgs,
@@ -87,6 +88,7 @@ class FakeSendAdapter:
 
     def __init__(self) -> None:
         self.sent: list[tuple[object, str]] = []
+        self.sent_images: list[dict[str, object]] = []
         self.voice_sent: list[tuple[object, Path]] = []
         self._next_msg_id = 100
 
@@ -100,6 +102,19 @@ class FakeSendAdapter:
         msg_id = str(self._next_msg_id)
         self._next_msg_id += 1
         self.voice_sent.append((target, audio_path))
+        return msg_id
+
+    async def send_image(self, target, *, image_path=None, image_url=None, image_b64=None) -> str:
+        msg_id = str(self._next_msg_id)
+        self._next_msg_id += 1
+        self.sent_images.append(
+            {
+                "target": target,
+                "image_path": image_path,
+                "image_url": image_url,
+                "image_b64": image_b64,
+            }
+        )
         return msg_id
 
 
@@ -214,6 +229,10 @@ def test_send_private_schema_derivation():
     assert "send_only" in fn["parameters"]["properties"]
     assert "targets" in fn["parameters"]["properties"]
     assert "targets" in fn["parameters"]["required"]
+    target_props = fn["parameters"]["properties"]["targets"]["items"]["properties"]
+    assert "emoji" in target_props
+    assert "image" in target_props
+    assert "不是表情包" in target_props["image"]["description"]
 
 
 def test_schema_no_refs_in_output():
@@ -489,7 +508,6 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         return {
             "ok": True,
             "status": "sent",
-            "brief": f"模拟发送 {len(actions)} 条消息，QQ 可见。",
             "qq_visible": True,
             "send_id": "send-test",
             "count": len(actions),
@@ -501,14 +519,6 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
                     "qq_visible": True,
                 }
                 for idx, a in enumerate(actions, start=1)
-            ],
-            "sent_messages": [
-                {
-                    "conversation_id": f"{a['target_scope']}:{a['target_id']}",
-                    "content": a.get("label") or a.get("content") or "",
-                    "qq_visible": True,
-                }
-                for a in actions
             ],
         }
 
@@ -1013,15 +1023,15 @@ async def test_send_private_sends_immediately(tmp_path):
     )
     assert result["ok"] is True
     assert result["count"] == 2
-    assert result["sent"] == [
-        {"order": 1, "target_qq": "12345", "msg_id": "100"},
-        {"order": 2, "target_qq": "12345", "msg_id": "101"},
-    ]
+    assert [item["order"] for item in result["sent"]] == [1, 2]
+    assert [item["target_qq"] for item in result["sent"]] == ["12345", "12345"]
+    assert [item["msg_id"] for item in result["sent"]] == ["100", "101"]
     assert result["status"] == "sent"
     assert result["qq_visible"] is True
-    assert result["sent_messages"][0]["conversation_id"] == "private:12345"
-    assert result["sent_messages"][0]["content"] == "你好"
-    assert result["sent_messages"][0]["qq_visible"] is True
+    assert result["sent"][0]["conversation_id"] == "private:12345"
+    assert result["sent"][0]["content"] == "你好"
+    assert result["sent"][0]["qq_visible"] is True
+    assert "sent_messages" not in result
     assert ctx.collected == []
     assert [content for _, content in adapter.sent] == ["你好", "在吗"]
 
@@ -1070,12 +1080,65 @@ async def test_send_group_order_sorted(tmp_path):
     assert contents == ["first", "second", "third"]
     assert [item["msg_id"] for item in result["sent"]] == ["100", "101", "102"]
     assert result["qq_visible"] is True
-    assert result["sent_messages"][0]["conversation_id"] == "group:100"
-    assert [item["content"] for item in result["sent_messages"]] == [
+    assert result["sent"][0]["conversation_id"] == "group:100"
+    assert [item["content"] for item in result["sent"]] == [
         "first",
         "second",
         "third",
     ]
+    assert "sent_messages" not in result
+
+
+@pytest.mark.asyncio
+async def test_send_group_emoji_uses_emoji_name_without_suffix(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    emoji_dir = tmp_path / "emoji"
+    emoji_dir.mkdir()
+    (emoji_dir / "无语.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    adapter = FakeSendAdapter()
+    ctx = ToolContext(emoji_dir=emoji_dir, adapter=adapter)
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "send_group_message",
+        {
+            "group_id": 100,
+            "targets": [{"emoji": "无语", "order": 1, "delay": 0}],
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["sent"][0]["content"] == "[表情包: 无语]"
+    assert adapter.sent == []
+    assert adapter.sent_images[0]["image_path"] == emoji_dir / "无语.png"
+
+
+@pytest.mark.asyncio
+async def test_send_group_image_is_workspace_or_url_not_emoji(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    image_path = workspace / "incoming" / "a.png"
+    image_path.parent.mkdir()
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    adapter = FakeSendAdapter()
+    ctx = ToolContext(workspace_dir=workspace, adapter=adapter)
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "send_group_message",
+        {
+            "group_id": 100,
+            "targets": [{"image": "incoming/a.png", "order": 1, "delay": 0}],
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["sent"][0]["content"] == "[图片: incoming/a.png]"
+    assert adapter.sent == []
+    assert adapter.sent_images[0]["image_path"] == image_path
 
 
 # ============================================================
@@ -1107,43 +1170,41 @@ def test_contains_forbidden_negative():
     assert not contains_forbidden("普通消息")
 
 
-@pytest.mark.asyncio
-async def test_build_message_text(tmp_path):
-    msg, label = await build_message("你好", None, tmp_path / "emoji")
-    assert msg == "你好"
-    assert label == "你好"
+def test_build_message_action_text(tmp_path):
+    action = build_message_action("你好", None, None, tmp_path / "emoji", tmp_path)
+    assert action["kind"] == "text"
+    assert action["content"] == "你好"
+    assert action["label"] == "你好"
 
 
-@pytest.mark.asyncio
-async def test_build_message_missing_image(tmp_path):
-    """图片不存在时返回 (None, None)。"""
+def test_resolve_emoji_path_by_name_without_suffix(tmp_path):
     emoji_dir = tmp_path / "emoji"
     emoji_dir.mkdir()
-    msg, label = await build_message(None, "nonexistent.png", emoji_dir)
-    assert msg is None
-    assert label is None
+    expected = emoji_dir / "hi.png"
+    expected.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    assert resolve_emoji_path("hi", emoji_dir) == expected
 
 
-@pytest.mark.asyncio
-async def test_build_message_rejects_path_traversal(tmp_path):
-    """图片名含 .. 或 / 时拒绝。"""
+def test_build_message_action_missing_emoji(tmp_path):
     emoji_dir = tmp_path / "emoji"
     emoji_dir.mkdir()
-    msg, _ = await build_message(None, "../etc/passwd", emoji_dir)
-    assert msg is None
+    with pytest.raises(MessageBuildError, match="表情包不存在"):
+        build_message_action(None, "missing", None, emoji_dir, tmp_path)
 
 
-@pytest.mark.asyncio
-async def test_build_message_real_image(tmp_path):
-    """存在的表情包应被读取并 base64 编码。"""
+def test_build_message_action_rejects_emoji_path_traversal(tmp_path):
     emoji_dir = tmp_path / "emoji"
     emoji_dir.mkdir()
-    (emoji_dir / "hi.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    with pytest.raises(MessageBuildError, match="不能包含路径"):
+        build_message_action(None, "../etc/passwd", None, emoji_dir, tmp_path)
 
-    msg, label = await build_message(None, "hi.png", emoji_dir)
-    assert msg is not None
-    assert msg.startswith("[CQ:image,file=base64://")
-    assert label == "[表情包: hi.png]"
+
+def test_build_message_action_image_url():
+    action = build_message_action(None, None, "https://example.com/a.png", None, None)
+    assert action["kind"] == "image"
+    assert action["image_url"] == "https://example.com/a.png"
+    assert action["label"] == "[图片]"
 
 
 # ============================================================
