@@ -11,6 +11,7 @@ def _incoming(
     raw_message: str | None = None,
     media: list[MediaSegment] | None = None,
     timestamp: float = 1_780_000_000.0,
+    reply_to: str | None = None,
 ) -> IncomingMessage:
     return IncomingMessage(
         adapter="fake",
@@ -23,6 +24,7 @@ def _incoming(
         text=text,
         raw_message=raw_message if raw_message is not None else text,
         media=media or [],
+        reply_to=reply_to,
     )
 
 
@@ -74,6 +76,21 @@ def test_inbound_markdown_preserves_image_url_and_forward_id():
     assert "https://example.com/a.png" in markdown
     assert "forward-1" in markdown
     assert "msg_id=m1" in markdown
+
+
+def test_inbound_markdown_includes_reply_to():
+    store = ChatTimelineStore()
+    store.append_inbound_event(
+        _incoming(message_id="m2", text="回复", reply_to="m1"),
+        conversation_id="private:123",
+        text="回复",
+        timestamp=1_780_000_000.0,
+    )
+
+    markdown = store.to_markdown(store.recent("private:123", 10))
+
+    assert "reply_to=m1" in markdown
+    assert "msg_id=m2" in markdown
 
 
 def test_raw_cq_parser_preserves_url_after_unescaped_summary():

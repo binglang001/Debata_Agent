@@ -28,7 +28,7 @@ from agents.persona_loader import (
     validate_persona_name,
 )
 from agents.proactive_agent import ProactiveRouterAgent, _is_action_decision
-from agents.runner import AgentRunner
+from agents.runner import AgentRunner, _kv_prompt_diagnostics
 from app_config.schema import AgentConfig
 from providers.base import CompletionResult, IProvider, ToolCall, Usage, normalize_messages
 
@@ -154,7 +154,90 @@ def test_emoji_hint_in_protocol():
     s = build_tool_use_protocol("file")
     assert "表情包" in s
     assert "image" in s
-    assert "别忘了" in s or "不需要犹豫" in s  # 鼓励性表述
+    assert "正常短回复" in s
+
+
+def test_tool_trigger_policy_in_protocol():
+    s = build_tool_use_protocol("file")
+    assert "工具是内部观察" in s
+    assert "看完不代表必须回复" in s
+    assert "get_recent_chat_messages" in s
+    assert "describe_image" in s
+    assert "get_forward_msg" in s
+    assert "read_file" in s
+    assert "stale" in s
+    assert "interrupted=true" in s
+
+
+def test_group_relevance_uses_clear_addressee_rules():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "最近几条消息实际在对谁说" in sys
+    assert "不要自动理解成自己" in sys
+    assert "最近聊天里的发言对象" in sys
+    assert "当前小线程" not in sys
+
+
+def test_direct_address_should_not_disappear_silently():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "被递话后沉默不是收尾" in sys
+    assert "想结束也要给一个可见短回应" in sys
+    assert "短收尾或贴合的表情包" in sys
+
+
+def test_group_claims_and_banter_keep_independent_judgment():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "只是\"这个人的说法\"" in sys
+    assert "不自动等于事实" in sys
+    assert "管理员也可能只是在拱火或逗你" in sys
+    assert "字面义、谐音义、玩梗义" in sys
+    assert "不必判成\"完全信 A / 完全信 B\"" in sys
+
+
+def test_kv_prompt_diagnostics_do_not_emit_temp_fields():
+    diag = _kv_prompt_diagnostics(
+        [{"role": "user", "content": "<task_context>ctx</task_context>"}],
+        [{"type": "function", "function": {"name": "no_action"}}],
+        loop=1,
+        model="deepseek-v4-pro",
+    )
+
+    assert "kv_message_count" in diag
+    assert "kv_prefix_8k_hash" in diag
+    assert not any(key.startswith("kv_temp") for key in diag)
+
+
+def test_kv_prompt_diagnostics_scan_runtime_user_context():
+    diag = _kv_prompt_diagnostics(
+        [
+            {"role": "system", "content": "<core_rules>x</core_rules>"},
+            {
+                "role": "user",
+                "content": (
+                    "<task_context><recent_group_messages>x</recent_group_messages>"
+                    "<send_receipt>x</send_receipt>"
+                    "<retrieved_conversation_context>x</retrieved_conversation_context>"
+                    "</task_context>"
+                ),
+            },
+        ],
+        [],
+        loop=1,
+    )
+
+    assert diag["kv_has_send_receipt"] is True
+    assert diag["kv_has_recent_group_messages"] is True
+    assert diag["kv_has_rag"] is True
+
+
+def test_behavior_prompt_does_not_hardcode_persona_replies():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "行为规则不提供固定口癖" in sys
+    for phrase in ["草", "绷不住", "这什么"]:
+        assert phrase not in sys
 
 
 # ============================================================

@@ -34,6 +34,7 @@ class ChatTimelineMessage:
     msg_id: str | None
     text: str
     raw_message: str
+    reply_to: str | None = None
     cq_segments: list[dict[str, Any]] = field(default_factory=list)
     attachments: list[dict[str, Any]] = field(default_factory=list)
     source: Literal["qq"] = "qq"
@@ -74,6 +75,7 @@ class ChatTimelineStore:
                 target_id=event.group_id if event.is_group() else event.user_id,
                 group_id=event.group_id,
                 msg_id=event.message_id,
+                reply_to=event.reply_to,
                 text=text,
                 raw_message=raw_message,
                 cq_segments=_parse_cq_segments(raw_message),
@@ -108,6 +110,7 @@ class ChatTimelineStore:
                 target_id=target_id,
                 group_id=target_id if target_scope == "group" else None,
                 msg_id=str(msg_id) if msg_id is not None else None,
+                reply_to=None,
                 text=label,
                 raw_message=raw_message,
                 cq_segments=_parse_cq_segments(raw_message),
@@ -140,7 +143,12 @@ class ChatTimelineStore:
         lines: list[str] = []
         for message in messages:
             content = _timeline_content(message)
-            suffix = f" [msg_id={message.msg_id}]" if message.msg_id else ""
+            refs: list[str] = []
+            if message.reply_to:
+                refs.append(f"reply_to={message.reply_to}")
+            if message.msg_id:
+                refs.append(f"msg_id={message.msg_id}")
+            suffix = f" [{' '.join(refs)}]" if refs else ""
             lines.append(
                 f"{message.time_text} {message.sender_name}({message.sender_id})："
                 f"{content}{suffix}"

@@ -385,6 +385,7 @@ def test_settings_page_uses_navigation_sections(qapp, tmp_paths):
     assert "软件行为" in labels
     assert "Token预算" in labels
     assert "日志与诊断" in labels
+    assert "表情包" not in labels
     assert "角色" not in labels
     assert "外观" not in labels
 
@@ -458,6 +459,58 @@ def test_settings_page_scrolls_only_right_content(qapp, tmp_paths):
         assert page._settings_scroll.isAncestorOf(page._settings_stack)
         assert not page._settings_scroll.isAncestorOf(page._settings_nav)
         assert not page._settings_scroll.isAncestorOf(page._status)
+    finally:
+        page.deleteLater()
+
+
+def test_settings_page_features_contains_emoji_without_extra_nav(qapp, tmp_paths):
+    cfg = _minimal_root_config()
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "paths": tmp_paths,
+            "secrets": type("Secrets", (), {"get": lambda self, _key: ""})(),
+            "provider_registry": type("Registry", (), {"presets": {}})(),
+            "providers": {},
+            "provider_health": {},
+        },
+    )()
+    page = SettingsPage(runtime)
+    try:
+        labels = [page._settings_nav.item(i).text() for i in range(page._settings_nav.count())]
+        features_row = labels.index("功能")
+        page._settings_nav.setCurrentRow(features_row)
+        text = "\n".join(label.text() for label in page._settings_stack.currentWidget().findChildren(QtWidgets.QLabel))
+        assert "表情包" in text
+        assert "管理 Debata 在聊天中可用的表情包图片" in text
+    finally:
+        page.deleteLater()
+
+
+def test_settings_page_page_wrappers_do_not_add_trailing_stretch(qapp, tmp_paths):
+    cfg = _minimal_root_config()
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "paths": tmp_paths,
+            "secrets": type("Secrets", (), {"get": lambda self, _key: ""})(),
+            "provider_registry": type("Registry", (), {"presets": {}})(),
+            "providers": {},
+            "provider_health": {},
+        },
+    )()
+    page = SettingsPage(runtime)
+    try:
+        for idx in range(page._settings_stack.count()):
+            wrapper = page._settings_stack.widget(idx)
+            layout = wrapper.layout()
+            assert layout is not None
+            assert layout.count() == 1
+            assert layout.itemAt(0).widget() is not None
     finally:
         page.deleteLater()
 

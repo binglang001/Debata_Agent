@@ -158,11 +158,12 @@ class SettingsPage(QWidget):
         self._settings_nav.addItem(item)
 
         page = QWidget()
+        page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(Spacing.MD)
+        content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         lay.addWidget(content)
-        lay.addStretch(1)
         self._settings_stack.addWidget(page)
 
     def _on_settings_section_changed(self, row: int) -> None:
@@ -889,7 +890,12 @@ class SettingsPage(QWidget):
     # 功能节：features 全部可改
     # ============================================================
 
-    def _build_features_section(self) -> SectionCard:
+    def _build_features_section(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(Spacing.MD)
+
         card = SectionCard(
             title=DASHBOARD_COPY["settings.section_features"],
             subtitle="每项功能独立配置。开关即时保存，密钥/配置修改后需重启。",
@@ -898,7 +904,9 @@ class SettingsPage(QWidget):
         card.add_content(self._build_weather_card())
         card.add_content(self._build_websearch_card())
         card.add_content(self._build_tts_card())
-        return card
+        layout.addWidget(card)
+        layout.addWidget(self._build_emoji_section())
+        return page
 
     def _build_vision_card(self) -> QWidget:
         wrap = QFrame()

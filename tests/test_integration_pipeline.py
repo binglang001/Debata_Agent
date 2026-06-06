@@ -394,6 +394,44 @@ async def test_main_reply_persists_task_context_snapshot_for_kv_prefix(build_pip
 
 
 @pytest.mark.asyncio
+async def test_group_task_context_includes_recent_real_chat_window(build_pipeline):
+    pipeline, provider, _, _, _ = await build_pipeline([_ai_no_action()])
+
+    await pipeline.enqueue(_msg(user_id="a", group_id="5555", text="前一句", message_id="g1"))
+    await _drain_pipeline(pipeline)
+    await pipeline.enqueue(_msg(user_id="b", group_id="5555", text="接一句", message_id="g2"))
+    await _drain_pipeline(pipeline)
+
+    second_call = provider.calls[1]["messages"]
+    task_context = "\n".join(
+        str(m.get("content") or "")
+        for m in second_call
+        if m.get("role") == "user" and "<task_context" in str(m.get("content") or "")
+    )
+    assert "<recent_group_messages" in task_context
+    assert "前一句" in task_context
+    assert "接一句" in task_context
+    assert "msg_id=g1" in task_context
+    assert "msg_id=g2" in task_context
+
+
+@pytest.mark.asyncio
+async def test_private_task_context_does_not_include_group_window(build_pipeline):
+    pipeline, provider, _, _, _ = await build_pipeline([_ai_no_action()])
+
+    await pipeline.enqueue(_msg(user_id="123", text="私聊", message_id="p1"))
+    await _drain_pipeline(pipeline)
+
+    first_call = provider.calls[0]["messages"]
+    task_context = "\n".join(
+        str(m.get("content") or "")
+        for m in first_call
+        if m.get("role") == "user" and "<task_context" in str(m.get("content") or "")
+    )
+    assert "<recent_group_messages" not in task_context
+
+
+@pytest.mark.asyncio
 async def test_basic_private_message_flow(build_pipeline):
     """私聊：enqueue → batch → chat_agent → tool → adapter.send_text。
 
