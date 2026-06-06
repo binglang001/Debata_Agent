@@ -1364,6 +1364,7 @@ class SettingsPage(QWidget):
         if not dlg.exec() or not dlg.result_data:
             return
         data = dlg.result_data
+        emb.enabled = True
         emb.type = data["type"]
         if data["type"] == "api":
             emb.provider = data["provider"]

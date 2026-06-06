@@ -296,8 +296,8 @@ async def _probe_openai_compat_embedding(
         data = resp.json()
     except ValueError:
         return ProviderHealth("error", "响应不是合法 JSON")
-    items = data.get("data") if isinstance(data, dict) else None
-    if not items or not isinstance(items, list):
+    items = _normalize_embedding_data(data.get("data") if isinstance(data, dict) else None)
+    if not items:
         return ProviderHealth("error", "Embedding 响应格式异常")
     first = items[0]
     if not isinstance(first, dict) or not isinstance(first.get("embedding"), list):
@@ -307,6 +307,14 @@ async def _probe_openai_compat_embedding(
 
 def _is_volcengine_multimodal_embedding(model: str) -> bool:
     return model.startswith("doubao-embedding-vision-")
+
+
+def _normalize_embedding_data(data) -> list[dict]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    return []
 
 
 async def _probe_anthropic(

@@ -104,7 +104,7 @@ class OpenAICompatEmbeddingService(IEmbeddingService):
                 json=payload,
             )
             resp.raise_for_status()
-            data = resp.json().get("data")
+            data = _normalize_embedding_data(resp.json().get("data"))
             if not data:
                 raise EmbeddingError(f"embedding 响应缺少 data 字段：{resp.text[:200]}")
             # 缓存维度
@@ -126,6 +126,8 @@ class OpenAICompatEmbeddingService(IEmbeddingService):
         return data[0]["embedding"]
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if _is_volcengine_multimodal_embedding(self.model):
+            return [await self.embed_one(text) for text in texts]
         data = await self._request(texts)
         return [item["embedding"] for item in data]
 
@@ -141,6 +143,14 @@ class OpenAICompatEmbeddingService(IEmbeddingService):
 
 def _is_volcengine_multimodal_embedding(model: str) -> bool:
     return model.startswith("doubao-embedding-vision-")
+
+
+def _normalize_embedding_data(data) -> list[dict]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    return []
 
 
 __all__ = ["EmbeddingError", "IEmbeddingService", "OpenAICompatEmbeddingService"]

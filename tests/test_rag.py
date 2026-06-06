@@ -122,6 +122,59 @@ async def test_volcengine_vision_embedding_uses_multimodal_endpoint():
 
 
 @pytest.mark.asyncio
+async def test_volcengine_vision_embedding_accepts_object_data():
+    from features.embedding import OpenAICompatEmbeddingService
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"embedding": [0.3, 0.4]}})
+
+    service = OpenAICompatEmbeddingService(
+        base_url="https://ark.cn-beijing.volces.com/api/v3",
+        api_key="key",
+        model="doubao-embedding-vision-251215",
+    )
+    service._client = httpx.AsyncClient(
+        base_url=service.base_url,
+        transport=httpx.MockTransport(handler),
+    )
+
+    vector = await service.embed_one("test")
+
+    assert vector == [0.3, 0.4]
+    assert service.dimension == 2
+
+
+@pytest.mark.asyncio
+async def test_volcengine_vision_embedding_batch_requests_each_text():
+    from features.embedding import OpenAICompatEmbeddingService
+
+    seen: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        seen.append(body)
+        value = float(len(seen))
+        return httpx.Response(200, json={"data": {"embedding": [value]}})
+
+    service = OpenAICompatEmbeddingService(
+        base_url="https://ark.cn-beijing.volces.com/api/v3",
+        api_key="key",
+        model="doubao-embedding-vision-251215",
+    )
+    service._client = httpx.AsyncClient(
+        base_url=service.base_url,
+        transport=httpx.MockTransport(handler),
+    )
+
+    vectors = await service.embed_batch(["第一条", "第二条"])
+
+    assert vectors == [[1.0], [2.0]]
+    assert len(seen) == 2
+    assert "第一条".encode() in seen[0]
+    assert "第二条".encode() in seen[1]
+
+
+@pytest.mark.asyncio
 async def test_rag_store_crud(tmp_path: Path):
     store = RagStore(tmp_path / "r.jsonl")
     await store.load()

@@ -17,12 +17,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 QtWidgets = pytest.importorskip("PySide6.QtWidgets", exc_type=ImportError)
 QtCore = pytest.importorskip("PySide6.QtCore", exc_type=ImportError)
 QApplication = QtWidgets.QApplication
+QLabel = QtWidgets.QLabel
 QWidget = QtWidgets.QWidget
 Qt = QtCore.Qt
 
 from app_config.schema import (
     AgentConfig,
     AgentsConfig,
+    EmbeddingFeatureConfig,
     FeaturesConfig,
     LongTermMemoryConfig,
     NapCatAdapterConfig,
@@ -916,6 +918,48 @@ def test_memory_page_rag_mode_shows_index_view(qapp):
         assert page._add_row_widget.isHidden()
         assert page._action_row_widget.isHidden()
         assert page._metadata_row_widget.isHidden()
+    finally:
+        page.deleteLater()
+
+
+def test_settings_embedding_dialog_enables_embedding(qapp, tmp_paths, monkeypatch):
+    cfg = _minimal_root_config()
+    cfg.features = FeaturesConfig(
+        embedding=EmbeddingFeatureConfig(
+            enabled=False,
+            type="api",
+            provider="ds",
+            api_model="old-model",
+        ),
+        long_term_memory=LongTermMemoryConfig(mode="rag"),
+    )
+    runtime = _dashboard_runtime(tmp_paths, cfg)
+    page = SettingsPage(runtime)
+
+    class FakeEmbeddingDialog:
+        def __init__(self, *_args, **_kwargs):
+            self.result_data = {
+                "type": "api",
+                "provider": "ds",
+                "model": "new-model",
+                "api_key": "",
+            }
+
+        def exec(self):
+            return True
+
+    monkeypatch.setattr(
+        "ui.dashboard.settings_page._EmbeddingEditDialog",
+        FakeEmbeddingDialog,
+    )
+    monkeypatch.setattr(page, "_save_now", lambda **_kwargs: None)
+    label = QLabel()
+    try:
+        page._open_embedding_dialog(label)
+
+        assert cfg.features.embedding.enabled is True
+        assert cfg.features.embedding.provider == "ds"
+        assert cfg.features.embedding.api_model == "new-model"
     finally:
         page.deleteLater()
 
