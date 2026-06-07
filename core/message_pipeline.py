@@ -1263,6 +1263,8 @@ _PREFIX_ESTIMATE_TOKENS = 12_000
 _CURRENT_CONVERSATION_MIN_RECORDS = 8
 _PROACTIVE_ROUTER_HISTORY_BUDGET = 16_384
 _SLOW_BATCH_STAGE_SECONDS = 1.0
+_WORKING_HISTORY_RECENT_RUNTIME_RECORDS = 12
+_WORKING_HISTORY_SEND_RECEIPT_KEEP = 4
 _OUT_OF_BAND_DENIED_TOOLS = frozenset(
     {
         "start_agent_task",
@@ -1362,6 +1364,27 @@ def _record_conversation_id(record: dict[str, Any]) -> str | None:
         return f"group:{group_id}"
     if user_id:
         return f"private:{user_id}"
+    return None
+
+
+def _runtime_context_kind(record: dict[str, Any]) -> str | None:
+    """Return the runtime-context category for records that are not real chat."""
+    if record.get("role") != "user":
+        return None
+
+    meta = record.get("metadata")
+    if isinstance(meta, dict):
+        kind = str(meta.get("kind") or "")
+        if kind in {"task_context_snapshot", "send_done_snapshot"}:
+            return kind
+
+    content = str(record.get("content") or "")
+    if "<task_context" in content:
+        return "task_context_snapshot"
+    if "<send_status" in content:
+        return "send_done_snapshot"
+    if "<send_receipt" in content:
+        return "send_receipt"
     return None
 
 
@@ -2547,7 +2570,78 @@ class MessagePipeline:
                 working_budget,
                 used,
             )
-        return selected
+        return self._filter_working_history_runtime_noise(
+            selected,
+            conversation_id=conversation_id,
+            ensure_current_records=ensure_current_records,
+            log_context=log_context,
+            log_level=log_level,
+        )
+
+    def _filter_working_history_runtime_noise(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        conversation_id: str | None,
+        ensure_current_records: int,
+        log_context: str | None,
+        log_level: int,
+    ) -> list[dict[str, Any]]:
+        """Drop old runtime-only records from the prompt view, not from history.
+
+        The working window remains a unified cross-conversation timeline. This filter only
+        prevents old task snapshots and clean send-status records from being replayed
+        into every model call after they are no longer useful for immediate
+        decision-making. Assistant/tool pairs are left intact in this slice.
+        """
+        if not records:
+            return records
+
+        force_keep: set[int] = set()
+        if conversation_id and ensure_current_records > 0:
+            kept = 0
+            for idx in range(len(records) - 1, -1, -1):
+                if _record_conversation_id(records[idx]) != conversation_id:
+                    continue
+                force_keep.add(idx)
+                kept += 1
+                if kept >= ensure_current_records:
+                    break
+
+        runtime_indices = [
+            idx for idx, record in enumerate(records)
+            if _runtime_context_kind(record) is not None
+        ]
+        keep_runtime = set(runtime_indices[-_WORKING_HISTORY_RECENT_RUNTIME_RECORDS:])
+        send_receipt_indices = [
+            idx for idx in runtime_indices
+            if _runtime_context_kind(records[idx]) == "send_receipt"
+        ]
+        keep_runtime.update(send_receipt_indices[-_WORKING_HISTORY_SEND_RECEIPT_KEEP:])
+
+        drop_indices: set[int] = set()
+        for idx in runtime_indices:
+            if idx not in force_keep and idx not in keep_runtime:
+                drop_indices.add(idx)
+
+        if not drop_indices:
+            return records
+
+        filtered = [
+            record for idx, record in enumerate(records)
+            if idx not in drop_indices
+        ]
+        logger.log(
+            log_level,
+            "上下文运行时瘦身：view=%s 移除旧运行时记录 %s 条 "
+            "(保留当前会话最近 %s 条、全局近期 runtime %s 条、近期 send_receipt %s 条)",
+            log_context,
+            len(drop_indices),
+            ensure_current_records,
+            _WORKING_HISTORY_RECENT_RUNTIME_RECORDS,
+            _WORKING_HISTORY_SEND_RECEIPT_KEEP,
+        )
+        return filtered
 
     async def _do_send(self, action: dict) -> str | None:
         """把单个 collected action 真实发送出去。

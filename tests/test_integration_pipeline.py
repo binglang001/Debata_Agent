@@ -619,6 +619,121 @@ async def test_working_history_without_conversation_uses_normal_budget(build_pip
 
 
 @pytest.mark.asyncio
+async def test_working_history_trims_old_runtime_context_records(build_pipeline):
+    pipeline, _, _, history, _ = await build_pipeline([])
+    await history.add_user_message("群聊真实旧消息仍属于统一时间线", conversation_id="group:1")
+    await history.add_user_message("私聊真实旧消息仍应保留", conversation_id="private:123")
+    runtime_records = []
+    for idx in range(20):
+        runtime_records.extend(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "<task_context priority=\"medium\">\n"
+                        f"旧运行时上下文 {idx}\n"
+                        "</task_context>"
+                    ),
+                    "metadata": {"kind": "task_context_snapshot"},
+                    "conversation_id": "group:runtime",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "<send_status>\n"
+                        f"旧清洁发送状态 {idx}\n"
+                        "</send_status>"
+                    ),
+                    "metadata": {"kind": "send_done_snapshot"},
+                    "conversation_id": "group:runtime",
+                },
+            ]
+        )
+    await history.add_records(runtime_records)
+    await history.add_user_message("当前触发消息", conversation_id="private:123")
+
+    selected = await pipeline._select_working_history("private:123")
+    joined = "\n".join(str(r.get("content", "")) for r in selected)
+
+    assert "群聊真实旧消息仍属于统一时间线" in joined
+    assert "私聊真实旧消息仍应保留" in joined
+    assert "当前触发消息" in joined
+    assert "旧运行时上下文 0" not in joined
+    assert "旧清洁发送状态 0" not in joined
+    assert "旧运行时上下文 19" in joined
+    assert "旧清洁发送状态 19" in joined
+
+
+@pytest.mark.asyncio
+async def test_working_history_keeps_recent_current_conversation_runtime(build_pipeline):
+    pipeline, _, _, history, _ = await build_pipeline([])
+    for idx in range(16):
+        await history.add_records(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "<task_context priority=\"medium\">\n"
+                        f"当前会话近期运行时 {idx}\n"
+                        "</task_context>"
+                    ),
+                    "metadata": {"kind": "task_context_snapshot"},
+                    "conversation_id": "private:123",
+                }
+            ]
+        )
+
+    selected = await pipeline._select_working_history("private:123")
+    joined = "\n".join(str(r.get("content", "")) for r in selected)
+
+    assert "当前会话近期运行时 0" not in joined
+    assert "当前会话近期运行时 15" in joined
+
+
+@pytest.mark.asyncio
+async def test_working_history_keeps_recent_send_receipt_fields(build_pipeline):
+    pipeline, _, _, history, _ = await build_pipeline([])
+    for idx in range(16):
+        await history.add_records(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "<send_receipt>\n"
+                        f'{{"interrupted": true, "unsent": [], "new_messages": [], "old": {idx}}}\n'
+                        "</send_receipt>"
+                    ),
+                    "conversation_id": "group:5555",
+                }
+            ]
+        )
+    await history.add_records(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "<send_receipt>\n"
+                    '{"interrupted": true, "unsent": [{"content": "未发"}], '
+                    '"new_messages": [{"text": "新消息"}], '
+                    '"recalled_messages": [{"msg_id": "m1"}]}\n'
+                    "</send_receipt>"
+                ),
+                "conversation_id": "group:5555",
+            }
+        ]
+    )
+
+    selected = await pipeline._select_working_history("group:5555")
+    joined = "\n".join(str(r.get("content", "")) for r in selected)
+
+    assert '"old": 0' not in joined
+    assert '"interrupted": true' in joined
+    assert '"content": "未发"' in joined
+    assert '"text": "新消息"' in joined
+    assert '"recalled_messages": [{"msg_id": "m1"}]' in joined
+
+
+@pytest.mark.asyncio
 async def test_proactive_router_history_uses_small_window(build_pipeline):
     pipeline, _, _, history, _ = await build_pipeline([])
     for idx in range(40):
