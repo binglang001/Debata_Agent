@@ -124,7 +124,7 @@ class ChatsPage(QWidget):
 
         async def _load() -> None:
             try:
-                records = await rt.history.records()
+                records = await _load_chat_page_records(rt)
             except Exception as e:
                 logger.warning(f"加载 history 失败: {e}")
                 return
@@ -455,6 +455,24 @@ def _runtime_persona_name(runtime: Any) -> str:
     if isinstance(name, str) and name.strip():
         return name.strip()
     return "助手"
+
+
+async def _load_chat_page_records(runtime: Any) -> list[dict]:
+    history = getattr(runtime, "history", None)
+    if history is None:
+        return []
+
+    history_records = await history.records()
+    archive = getattr(runtime, "archive", None)
+    if archive is None:
+        return list(history_records or [])
+
+    try:
+        archive_records = await archive.records()
+    except Exception as e:
+        logger.warning(f"加载 archive 失败，仅显示活跃 history: {e}")
+        return list(history_records or [])
+    return [*list(archive_records or []), *list(history_records or [])]
 
 
 def _render_record_html(rec: dict, *, persona_name: str) -> str:

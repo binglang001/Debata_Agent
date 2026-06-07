@@ -42,6 +42,7 @@ from ui.dashboard.chats_page import (
     _format_send_receipt_summary,
     _format_tool_call_for_display,
     _group_records_by_conversation,
+    _load_chat_page_records,
     _render_record_bubbles,
     _render_record_html,
     _scrollbar_near_bottom,
@@ -78,6 +79,19 @@ def _minimal_root_config() -> RootConfig:
 class _EmptyHistory:
     async def records(self):
         return []
+
+
+class _StaticRecordStore:
+    def __init__(self, records):
+        self._records = records
+
+    async def records(self):
+        return list(self._records)
+
+
+class _FailingRecordStore:
+    async def records(self):
+        raise RuntimeError("boom")
 
 
 class _EmptyImportant:
@@ -194,6 +208,38 @@ def test_chats_unknown_assistant_without_context_does_not_attach_to_previous_cha
 
     assert by_key["unknown:history"]["records"][0]["content"] == "后台旧记录"
     assert by_key["private:10001"]["records"][0]["content"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_chats_loads_archive_before_active_history(tmp_paths):
+    rt = _dashboard_runtime(tmp_paths)
+    rt.archive = _StaticRecordStore([{"role": "user", "content": "归档旧消息"}])
+    rt.history = _StaticRecordStore([{"role": "assistant", "content": "活跃新消息"}])
+
+    records = await _load_chat_page_records(rt)
+
+    assert [item["content"] for item in records] == ["归档旧消息", "活跃新消息"]
+
+
+@pytest.mark.asyncio
+async def test_chats_load_records_without_archive(tmp_paths):
+    rt = _dashboard_runtime(tmp_paths)
+    rt.history = _StaticRecordStore([{"role": "user", "content": "活跃消息"}])
+
+    records = await _load_chat_page_records(rt)
+
+    assert [item["content"] for item in records] == ["活跃消息"]
+
+
+@pytest.mark.asyncio
+async def test_chats_falls_back_to_history_when_archive_fails(tmp_paths):
+    rt = _dashboard_runtime(tmp_paths)
+    rt.archive = _FailingRecordStore()
+    rt.history = _StaticRecordStore([{"role": "user", "content": "活跃消息"}])
+
+    records = await _load_chat_page_records(rt)
+
+    assert [item["content"] for item in records] == ["活跃消息"]
 
 
 def test_chats_conversation_signature_tracks_visible_list_changes():
