@@ -318,13 +318,14 @@ def test_build_combined_system_prompt_memory_mode_default():
     assert "必须主动保存" in sys  # 文件模式默认
 
 
-def test_build_combined_system_prompt_rag_mode_no_active_save():
+def test_build_combined_system_prompt_rag_mode_keeps_important_memory():
     p = _persona()
     sys = build_combined_system_prompt(p, important_memory_text="历史片段", memory_mode="rag")
     assert "RAG 会话向量检索" in sys
     assert "<retrieved_conversation_context" in sys
+    assert "</retrieved_conversation_context>" not in sys
     assert "历史片段" in sys
-    assert "<long_term_memory" not in sys
+    assert "<long_term_memory" in sys
     assert "save_important_memory" in sys
     assert "update_important_memory" in sys
     assert "没有 save_important_memory" not in sys
@@ -476,14 +477,16 @@ def test_build_messages_rag_memory_is_tail_context_for_cache_stability():
     first = build_messages(
         p,
         history,
-        important_memory_text="RAG 片段 A",
+        important_memory_text="重要记忆",
+        rag_context_text="RAG 片段 A",
         current_context="现在是 10:00",
         memory_mode="rag",
     )
     second = build_messages(
         p,
         history,
-        important_memory_text="RAG 片段 B",
+        important_memory_text="重要记忆",
+        rag_context_text="RAG 片段 B",
         current_context="现在是 10:00",
         memory_mode="rag",
     )
@@ -491,6 +494,8 @@ def test_build_messages_rag_memory_is_tail_context_for_cache_stability():
     assert first[0]["content"] == second[0]["content"]
     assert "RAG 片段 A" not in first[0]["content"]
     assert "RAG 片段 B" not in second[0]["content"]
+    assert "重要记忆" in first[0]["content"]
+    assert "<long_term_memory" in first[0]["content"]
     assert [m["role"] for m in first] == ["system", "user", "user", "user"]
     assert "旧消息" in first[1]["content"]
     assert "task_context" in first[2]["content"]

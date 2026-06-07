@@ -4,7 +4,7 @@
     1. 接收 IncomingMessage（来自 EventBus）
     2. 速率限制（非好友）
     3. 重建可读文本（CQ 码解析 + 附加媒体 URL）
-    4. 文件记忆模式下的关键词强制保存（RAG 模式不写 important.json）
+    4. 关键词强制保存重要记忆（RAG 只影响历史召回，不关闭 important.json）
     5. 合并窗口暂存
     6. 批处理触发：合并窗口到时，组装 messages → 调 ChatAgent
     7. 发送类工具走同步快路径或每会话异步发送队列
@@ -1181,7 +1181,7 @@ class MessagePipeline:
 
         # 关键词强制保存（命中即写入重要记忆）
         keyword_saved = False
-        if event.text and self.features_cfg.long_term_memory.mode != "rag":
+        if event.text:
             keyword_result = await try_save_from_user(
                 event.text,
                 self.important,
@@ -1402,8 +1402,6 @@ class MessagePipeline:
         stage_t0 = time.monotonic()
         important_text = await self._important_memory_text(
             conversation_id,
-            query=items[-1].text if items else None,
-            before_ts=_earliest_record_ts(history_window),
         )
         _log_slow_batch_stage(
             "important_memory_text",
@@ -1411,10 +1409,24 @@ class MessagePipeline:
             conversation_id=conversation_id,
             extra=f"memory_len={len(important_text)}",
         )
+
+        stage_t0 = time.monotonic()
+        rag_context_text = await self._rag_context_text(
+            conversation_id,
+            query=items[-1].text if items else None,
+            before_ts=_earliest_record_ts(history_window),
+        )
+        _log_slow_batch_stage(
+            "rag_context_text",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"rag_len={len(rag_context_text)}",
+        )
         logger.debug(
-            "批处理记忆准备完成 conversation_id=%s memory_len=%s elapsed=%.3fs",
+            "批处理上下文准备完成 conversation_id=%s memory_len=%s rag_len=%s elapsed=%.3fs",
             conversation_id,
             len(important_text),
+            len(rag_context_text),
             time.monotonic() - batch_t0,
         )
 
@@ -1432,6 +1444,7 @@ class MessagePipeline:
             persona=self.persona,
             history=history_window,
             important_memory_text=important_text,
+            rag_context_text=rag_context_text,
             rolling_summary_text=rolling_summary_text,
             current_context_record=task_context_record,
             memory_mode=self.features_cfg.long_term_memory.mode,
@@ -1735,26 +1748,39 @@ class MessagePipeline:
         self,
         conversation_id: str | None,
         *,
-        query: str | None = None,
+        token_budget: int | None = None,
+    ) -> str:
+        """按当前会话选择重要记忆注入文本，不受 RAG 开关影响。"""
+        estimator = self._token_estimator()
+        budget = token_budget or self._context_budget().memory_token_budget
+        return self.important.text_for_context(
+            conversation_id,
+            token_budget=budget,
+            estimator=estimator,
+        )
+
+    async def _rag_context_text(
+        self,
+        conversation_id: str | None,
+        *,
+        query: str | None,
         before_ts: str | None = None,
         token_budget: int | None = None,
     ) -> str:
-        """按当前会话选择长期记忆注入文本。"""
+        """按当前 query 检索历史对话片段。RAG 关闭或不可用时返回空。"""
+        if (
+            self.features_cfg.long_term_memory.mode != "rag"
+            or self.rag_memory is None
+            or not query
+        ):
+            return ""
         estimator = self._token_estimator()
         budget = token_budget or self._context_budget().memory_token_budget
-        if self.features_cfg.long_term_memory.mode == "rag":
-            if self.rag_memory is None or not query:
-                return ""
-            return await self.rag_memory.retrieve_for_query(
-                query,
-                conversation_id=conversation_id,
-                before_ts=before_ts,
-                top_k=self.features_cfg.long_term_memory.rag_top_k,
-                token_budget=budget,
-                estimator=estimator,
-            )
-        return self.important.text_for_context(
-            conversation_id,
+        return await self.rag_memory.retrieve_for_query(
+            query,
+            conversation_id=conversation_id,
+            before_ts=before_ts,
+            top_k=self.features_cfg.long_term_memory.rag_top_k,
             token_budget=budget,
             estimator=estimator,
         )
@@ -2126,14 +2152,17 @@ class MessagePipeline:
             )
 
         history_window = await self._select_working_history(conversation_id)
+        important_text = await self._important_memory_text(conversation_id)
+        rag_context_text = await self._rag_context_text(
+            conversation_id,
+            query=user_event or task_context,
+            before_ts=_earliest_record_ts(history_window),
+        )
         messages = build_messages(
             persona=self.persona,
             history=history_window,
-            important_memory_text=await self._important_memory_text(
-                conversation_id,
-                query=user_event or task_context,
-                before_ts=_earliest_record_ts(history_window),
-            ),
+            important_memory_text=important_text,
+            rag_context_text=rag_context_text,
             rolling_summary_text=self._rolling_summary_text(),
             current_context=task_context,
             memory_mode=self.features_cfg.long_term_memory.mode,
@@ -3159,11 +3188,7 @@ class MessagePipeline:
             logger.warning("compaction 未选出可归档切片，跳过")
             return
 
-        important_text = (
-            self.important.text()
-            if self.features_cfg.long_term_memory.mode != "rag"
-            else ""
-        )
+        important_text = self.important.text()
         result = await self.summary_agent.summarize_rolling(
             slice_records,
             self.rolling_summary.text(),
@@ -3192,11 +3217,7 @@ class MessagePipeline:
             },
             updated_at=get_time(),
         )
-        if (
-            self.features_cfg.long_term_memory.mode != "rag"
-            and isinstance(new_important_items, list)
-            and new_important_items
-        ):
+        if isinstance(new_important_items, list) and new_important_items:
             for item in new_important_items:
                 content = (item.get("content") or "").strip() if isinstance(item, dict) else ""
                 if content:
@@ -3207,10 +3228,7 @@ class MessagePipeline:
 
         important_count = (
             len(new_important_items)
-            if (
-                self.features_cfg.long_term_memory.mode != "rag"
-                and isinstance(new_important_items, list)
-            )
+            if isinstance(new_important_items, list)
             else 0
         )
         await self.history.add_system_note(

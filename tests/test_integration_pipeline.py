@@ -1792,12 +1792,16 @@ async def test_keyword_force_save_triggered(build_pipeline):
 @pytest.mark.asyncio
 async def test_token_compaction_archives_before_truncate(build_pipeline):
     class FakeSummaryAgent:
+        def __init__(self) -> None:
+            self.existing_important_text = ""
+
         async def summarize_rolling(
             self,
             history_slice,
             existing_summary_text,
             existing_important_text,
         ):
+            self.existing_important_text = existing_important_text
             return {
                 "summary_text": f"{existing_summary_text}\n已归档 {len(history_slice)} 条".strip(),
                 "new_important": [{"content": "归档中提到用户喜欢测试"}],
@@ -1823,6 +1827,47 @@ async def test_token_compaction_archives_before_truncate(build_pipeline):
     assert after < before
     assert "已归档" in pipeline.rolling_summary.text()
     assert any("喜欢测试" in item.get("content", "") for item in important.items())
+
+
+@pytest.mark.asyncio
+async def test_rag_mode_compaction_still_reads_and_writes_important_memory(build_pipeline):
+    class FakeSummaryAgent:
+        def __init__(self) -> None:
+            self.existing_important_text = ""
+
+        async def summarize_rolling(
+            self,
+            history_slice,
+            existing_summary_text,
+            existing_important_text,
+        ):
+            self.existing_important_text = existing_important_text
+            return {
+                "summary_text": f"RAG 模式归档 {len(history_slice)} 条",
+                "new_important": [{"content": "RAG 模式归档中提到用户喜欢测试"}],
+            }
+
+    pipeline, _, _, history, important = await build_pipeline([])
+    pipeline.features_cfg.long_term_memory.mode = "rag"
+    await important.save("已有重要记忆仍应参与摘要")
+    agent = FakeSummaryAgent()
+    pipeline.summary_agent = agent
+    pipeline.behavior_cfg.summarize.trigger_at_tokens = 50
+    pipeline.behavior_cfg.summarize.target_after_tokens = 20
+
+    for idx in range(6):
+        await history.add_user_message(
+            f"RAG 模式旧消息 {idx} " + ("很长的测试内容 " * 20),
+            conversation_id="private:123",
+        )
+
+    await pipeline._maybe_summarize()
+
+    assert "已有重要记忆仍应参与摘要" in agent.existing_important_text
+    assert any(
+        "RAG 模式归档中提到用户喜欢测试" in item.get("content", "")
+        for item in important.items()
+    )
 
 
 @pytest.mark.asyncio
@@ -1925,14 +1970,34 @@ async def test_pipeline_injects_scope_filtered_important_memory(build_pipeline):
 
 
 @pytest.mark.asyncio
-async def test_rag_mode_does_not_write_important_memory(build_pipeline):
+async def test_rag_mode_still_injects_scope_filtered_important_memory(build_pipeline):
+    pipeline, provider, _, _, important = await build_pipeline([_ai_no_action()])
+    pipeline.features_cfg.long_term_memory.mode = "rag"
+    await important.save("RAG 模式全局偏好", scope="global")
+    await important.save("RAG 模式群 42 约定", scope="group:42")
+    await important.save("RAG 模式群 99 约定", scope="group:99")
+
+    await pipeline.enqueue(_msg(text="触发 RAG 模式上下文", group_id="42"))
+    await _drain_pipeline(pipeline)
+
+    joined = "\n".join(
+        str(message.get("content", "")) for message in provider.calls[0]["messages"]
+    )
+    assert "RAG 模式全局偏好" in joined
+    assert "RAG 模式群 42 约定" in joined
+    assert "RAG 模式群 99 约定" not in joined
+    assert "<long_term_memory" in joined
+
+
+@pytest.mark.asyncio
+async def test_rag_mode_keyword_force_save_still_writes_important_memory(build_pipeline):
     pipeline, _, _, _, important = await build_pipeline([_ai_no_action()])
     pipeline.features_cfg.long_term_memory.mode = "rag"
 
     await pipeline.enqueue(_msg(text="记一下：我报名了某项长期活动，7月7日有选拔环节"))
     await _drain_pipeline(pipeline)
 
-    assert important.items() == []
+    assert any("长期活动" in item.get("content", "") for item in important.items())
 
 
 @pytest.mark.asyncio
