@@ -35,9 +35,14 @@ from app_config.schema import (
 from memory.important import ImportantMemoryManager
 from memory.rag_store import RagEntry
 from ui.dashboard.chats_page import (
+    DEFAULT_VISIBLE_RECORD_LIMIT,
+    ChatsPage,
+    _compact_inline_tokens,
     _conversation_list_signature,
+    _format_send_receipt_summary,
     _format_tool_call_for_display,
     _group_records_by_conversation,
+    _render_record_html,
     _scrollbar_near_bottom,
 )
 from ui.dashboard.layout import DEFAULT_LAYOUT
@@ -217,6 +222,82 @@ def test_chats_formats_send_tool_call_readably():
     )
 
     assert text == "在群 1039163467 发送消息：好好好 不说了（0.5s）；那我先待机（0.6s）"
+
+
+def test_chats_render_record_uses_speaker_names_not_ambiguous_pronouns():
+    user_html = _render_record_html(
+        {
+            "role": "user",
+            "content": "【2026-05-27 12:00:00 群聊 20002 Bob(30003) msg_id=9】群消息",
+        },
+        persona_name="玖",
+    )
+    assistant_html = _render_record_html(
+        {"role": "assistant", "content": "收到"},
+        persona_name="玖",
+    )
+
+    assert "Bob(30003)" in user_html
+    assert "群消息" in user_html
+    assert "玖" in assistant_html
+    assert ">你<" not in user_html + assistant_html
+    assert ">她<" not in user_html + assistant_html
+
+
+def test_chats_runtime_and_tool_results_are_readable_and_collapsed():
+    receipt = (
+        "<send_receipt>\n"
+        "系统说明：运行时发送状态。\n"
+        '{"status":"stale","sent":[],"attempted_messages":[{"content":"嗯"}],'
+        '"new_messages":[{"text":"新消息"}],"note":"模型思考期间当前会话来了新消息"}'
+        "\n</send_receipt>"
+    )
+    tool_html = _render_record_html(
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"ok":false,"status":"stale","attempted_messages":[{}],"new_visible_messages":[{}]}',
+        },
+        persona_name="玖",
+    )
+
+    assert _format_send_receipt_summary(receipt) == (
+        "状态 stale；待发送/尝试 1 条；新消息 1 条；模型思考期间当前会话来了新消息"
+    )
+    assert "工具结果 · call-1" in tool_html
+    assert "状态 stale" in tool_html
+    assert "展开原文" in tool_html
+
+
+def test_chats_compacts_long_links_and_paths():
+    long_url = "https://multimedia.nt.qq.com.cn/download?" + ("a" * 120)
+    long_path = "C:\\Users\\admin\\.qq-chat-exporter\\exports\\" + ("x" * 100) + ".txt"
+
+    compact = _compact_inline_tokens(f"{long_url} {long_path}")
+
+    assert "[URL multimedia.nt.qq.com.cn/" in compact
+    assert "[路径 " in compact
+    assert long_url not in compact
+    assert long_path not in compact
+
+
+def test_chats_render_conversation_paginates_without_dropping_history(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {"role": "user", "content": f"消息 {i}", "conversation_id": "group:1"}
+            for i in range(DEFAULT_VISIBLE_RECORD_LIMIT + 5)
+        ],
+    }
+
+    html = page._render_conversation(conv)
+
+    assert f"已显示 {DEFAULT_VISIBLE_RECORD_LIMIT} / 共 {DEFAULT_VISIBLE_RECORD_LIMIT + 5} 条" in html
+    assert "还有 5 条更早记录未显示" in html
+    assert "消息 0" not in html
+    assert f"消息 {DEFAULT_VISIBLE_RECORD_LIMIT + 4}" in html
 
 
 def test_chats_scrollbar_bottom_threshold():
