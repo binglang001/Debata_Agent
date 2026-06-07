@@ -73,6 +73,12 @@ class ChatsPage(QWidget):
         self._load_more_btn.clicked.connect(self._load_more_current)
         self._load_more_btn.setEnabled(False)
         head.addWidget(self._load_more_btn)
+
+        self._show_all_btn = QPushButton("显示全部")
+        self._show_all_btn.setProperty("role", "text")
+        self._show_all_btn.clicked.connect(self._show_all_current)
+        self._show_all_btn.setEnabled(False)
+        head.addWidget(self._show_all_btn)
         outer.addLayout(head)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -143,6 +149,7 @@ class ChatsPage(QWidget):
             self._list_signature = []
             self._list.clear()
             self._load_more_btn.setEnabled(False)
+            self._show_all_btn.setEnabled(False)
             self._show_empty(True)
             return
 
@@ -234,12 +241,24 @@ class ChatsPage(QWidget):
         self._current_detail_html = ""
         self._refresh_current_detail()
 
+    def _show_all_current(self) -> None:
+        if not self._current_key:
+            return
+        conv = next((c for c in self._conversations if c["key"] == self._current_key), None)
+        if conv is None:
+            return
+        total = len(conv.get("records") or [])
+        self._visible_record_limits[self._current_key] = total
+        self._current_detail_html = ""
+        self._refresh_current_detail()
+
     def _update_load_more_state(self, conv: dict | None = None) -> None:
         if conv is None and self._current_key:
             conv = next((c for c in self._conversations if c["key"] == self._current_key), None)
         if conv is None:
             self._load_more_btn.setEnabled(False)
             self._load_more_btn.setText("加载更早")
+            self._show_all_btn.setEnabled(False)
             return
         total = len(conv.get("records") or [])
         limit = self._visible_record_limits.get(
@@ -248,6 +267,7 @@ class ChatsPage(QWidget):
         )
         hidden = max(0, total - limit)
         self._load_more_btn.setEnabled(hidden > 0)
+        self._show_all_btn.setEnabled(hidden > 0)
         self._load_more_btn.setText(
             f"加载更早（{hidden}）" if hidden > 0 else "已显示全部"
         )
@@ -287,12 +307,13 @@ class ChatsPage(QWidget):
         if hidden:
             parts.append(
                 "<div class='chat-record chat-system'>"
-                f"还有 {hidden} 条更早记录未显示。点击上方“加载更早”继续展开。"
+                f"还有 {hidden} 条更早记录未显示。点击上方“加载更早”逐步展开，或“显示全部”查看完整记录。"
                 "</div>"
             )
         for rec in visible:
-            parts.append(_render_record_html(rec, persona_name=persona_name))
-            parts.append("<hr/>")
+            for bubble in _render_record_bubbles(rec, persona_name=persona_name):
+                parts.append(bubble)
+                parts.append("<hr/>")
         return "".join(parts)
 
     def _render_record(self, rec: dict) -> str:
@@ -434,6 +455,11 @@ def _runtime_persona_name(runtime: Any) -> str:
 
 
 def _render_record_html(rec: dict, *, persona_name: str) -> str:
+    bubbles = _render_record_bubbles(rec, persona_name=persona_name)
+    return "".join(bubbles)
+
+
+def _render_record_bubbles(rec: dict, *, persona_name: str) -> list[str]:
     role = rec.get("role", "?")
     content = str(rec.get("content") or "")
     reasoning = str(rec.get("reasoning_content") or "")
@@ -475,18 +501,28 @@ def _render_record_html(rec: dict, *, persona_name: str) -> str:
         )
     if body:
         parts.append(body)
+    parts.append("</div>")
+    bubbles = ["".join(parts)]
     if tool_calls:
-        parts.append(f"<div class='chat-head'>{_escape(persona_name)} · 工具调用</div>")
-        parts.append("<ul class='chat-tool-list'>")
-        for tc in tool_calls:
-            label = _format_tool_call_for_display(tc)
-            parts.append(f"<li>{_escape(label)}</li>")
-        parts.append("</ul>")
-        parts.append(
-            "<details><summary class='chat-summary'>展开原始工具参数</summary>"
-            f"<pre class='chat-pre'>{_escape(json.dumps(tool_calls, ensure_ascii=False, indent=2))}</pre>"
-            "</details>"
-        )
+        bubbles.append(_render_tool_call_bubble(tool_calls, persona_name=persona_name))
+    return bubbles
+
+
+def _render_tool_call_bubble(tool_calls: list, *, persona_name: str) -> str:
+    parts = [
+        "<div class='chat-record chat-tool'>",
+        f"<div class='chat-head'>{_escape(persona_name)} · 工具调用</div>",
+        "<ul class='chat-tool-list'>",
+    ]
+    for tc in tool_calls:
+        label = _format_tool_call_for_display(tc)
+        parts.append(f"<li>{_escape(label)}</li>")
+    parts.append("</ul>")
+    parts.append(
+        "<details><summary class='chat-summary'>展开原始工具参数</summary>"
+        f"<pre class='chat-pre'>{_escape(json.dumps(tool_calls, ensure_ascii=False, indent=2))}</pre>"
+        "</details>"
+    )
     parts.append("</div>")
     return "".join(parts)
 

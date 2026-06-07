@@ -42,6 +42,7 @@ from ui.dashboard.chats_page import (
     _format_send_receipt_summary,
     _format_tool_call_for_display,
     _group_records_by_conversation,
+    _render_record_bubbles,
     _render_record_html,
     _scrollbar_near_bottom,
 )
@@ -269,6 +270,31 @@ def test_chats_runtime_and_tool_results_are_readable_and_collapsed():
     assert "展开原文" in tool_html
 
 
+def test_chats_renders_assistant_tool_calls_as_separate_bubble():
+    bubbles = _render_record_bubbles(
+        {
+            "role": "assistant",
+            "content": "准备发",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "send_private_messages",
+                        "arguments": '{"targets":[{"target_qq":123,"content":"你好"}]}',
+                    }
+                }
+            ],
+        },
+        persona_name="玖",
+    )
+
+    assert len(bubbles) == 2
+    assert "准备发" in bubbles[0]
+    assert "chat-assistant" in bubbles[0]
+    assert "工具调用" not in bubbles[0]
+    assert "chat-tool" in bubbles[1]
+    assert "向 123 发送消息：你好" in bubbles[1]
+
+
 def test_chats_compacts_long_links_and_paths():
     long_url = "https://multimedia.nt.qq.com.cn/download?" + ("a" * 120)
     long_path = "C:\\Users\\admin\\.qq-chat-exporter\\exports\\" + ("x" * 100) + ".txt"
@@ -296,8 +322,30 @@ def test_chats_render_conversation_paginates_without_dropping_history(qapp, tmp_
 
     assert f"已显示 {DEFAULT_VISIBLE_RECORD_LIMIT} / 共 {DEFAULT_VISIBLE_RECORD_LIMIT + 5} 条" in html
     assert "还有 5 条更早记录未显示" in html
+    assert "显示全部" in html
     assert "消息 0" not in html
     assert f"消息 {DEFAULT_VISIBLE_RECORD_LIMIT + 4}" in html
+
+
+def test_chats_show_all_current_displays_full_conversation(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {"role": "user", "content": f"消息 {i}", "conversation_id": "group:1"}
+            for i in range(DEFAULT_VISIBLE_RECORD_LIMIT + 5)
+        ],
+    }
+    page._conversations = [conv]
+    page._current_key = "group:1"
+
+    page._show_all_current()
+    html = page._render_conversation(conv)
+
+    assert f"已显示 {DEFAULT_VISIBLE_RECORD_LIMIT + 5} / 共 {DEFAULT_VISIBLE_RECORD_LIMIT + 5} 条" in html
+    assert "消息 0" in html
+    assert "还有 5 条更早记录未显示" not in html
 
 
 def test_chats_scrollbar_bottom_threshold():
