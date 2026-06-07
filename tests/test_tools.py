@@ -228,7 +228,7 @@ def test_send_private_schema_derivation():
     assert schema["type"] == "function"
     fn = schema["function"]
     assert fn["name"] == "send_private_messages"
-    assert "send_only" in fn["parameters"]["properties"]
+    assert "send_only" not in fn["parameters"]["properties"]
     assert "targets" in fn["parameters"]["properties"]
     assert "targets" in fn["parameters"]["required"]
     target_props = fn["parameters"]["properties"]["targets"]["items"]["properties"]
@@ -583,12 +583,10 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         "delete_important_memory": {"keyword": "红茶"},
         "send_private_messages": {
             "targets": [{"target_qq": 123, "content": "你好", "order": 1}],
-            "send_only": True,
         },
         "send_group_message": {
             "group_id": 456,
             "targets": [{"content": "群消息", "order": 1}],
-            "send_only": True,
         },
         "recall_message": {"message_id": 100},
         "upload_file": {

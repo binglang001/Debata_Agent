@@ -190,7 +190,7 @@ class ToolContext:
     collected: list[dict[str, Any]] = field(default_factory=list)
     """遗留发送动作兜底队列。
     每条结构：{"action": "private"|"group", "target": str, "content": str,
-    "label": str, "delay": float, "send_only": bool}；语音动作额外带
+    "label": str, "delay": float}；语音动作额外带
     {"kind": "voice", "audio_path": str}。常规 send_* 工具不再写入该队列。"""
 
     extras: dict[str, Any] = field(default_factory=dict)

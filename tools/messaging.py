@@ -105,7 +105,7 @@ async def _send_action_direct(ctx: ToolContext, target: Target, action: dict) ->
     description=(
         "向 QQ 用户发送私聊消息。可混合文字/表情包/图片，按 order 排序，delay 控制间隔。"
         "可在 content 开头加 [CQ:reply,id=消息ID] 引用回复。"
-        "send_only=true 则正常发送后直接结束。"
+        "发送后如本轮已结束，继续调用 no_action 收尾。"
     ),
     args_model=SendPrivateArgs,
     category="messaging",
@@ -213,7 +213,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
     description=(
         "向 QQ 群发送消息。可混合文字/表情包/图片，按 order 排序，delay 控制间隔。"
         "可在 content 开头加 [CQ:reply,id=msg_id] 引用；@人用 [CQ:at,qq=QQ号]。"
-        "send_only=true 则正常发送后直接结束。"
+        "发送后如本轮已结束，继续调用 no_action 收尾。"
     ),
     args_model=SendGroupArgs,
     category="messaging",

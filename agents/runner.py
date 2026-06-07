@@ -8,10 +8,9 @@
 
 循环退出条件（保留 V1 语义）：
     1. AI 调用了 no_action → finish_reason='no_action'
-    2. AI 全部调用 send_* 且 send_only=True 且全部成功 → 'send_only_complete'
-    3. AI 调用的全是 no_feedback 类工具且全部成功 → 'all_no_feedback'
-    4. AI 未调用工具，提示重试后仍不调用 → 'no_tool_after_retry'
-    5. 达到 max_loops → 'max_loops'，随后追加一次无工具收尾，让模型说明部分结果
+    2. AI 调用的全是 no_feedback 类工具且全部成功 → 'all_no_feedback'
+    3. AI 未调用工具，提示重试后仍不调用 → 'no_tool_after_retry'
+    4. 达到 max_loops → 'max_loops'，随后追加一次无工具收尾，让模型说明部分结果
 """
 
 from __future__ import annotations
@@ -51,7 +50,7 @@ DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "schedule_wakeup",
 }
 
-# 发送类工具：send_only=True 时同样算作终止信号
+# 发送类工具需要把结果回填给模型；发送成功不等于本轮结束。
 SEND_TOOL_NAMES: set[str] = {
     "send_private_messages",
     "send_group_message",
@@ -103,7 +102,6 @@ class AgentRunner:
         prompt_tokens_total = 0
         effective_max_loops = max(1, int(max_loops or self.cfg.max_loops))
         refocus_interval = self.cfg.refocus_interval
-        has_pending_send_actions = False
 
         reasoning = self._to_provider_reasoning(self.cfg.reasoning)
         tool_names_dbg = [t["function"]["name"] for t in tools] if tools else []
@@ -145,7 +143,7 @@ class AgentRunner:
                     "content": (
                         f"[本轮焦点提醒] {task_contract}\n"
                         f"已执行 {loop_count - 1} 轮。检查当前操作是否仍在为这个目标服务，"
-                        f"若已完成请用 send_only=true 或 no_action 收尾。"
+                        f"若已完成请用 no_action 收尾。"
                     ),
                 }
                 msgs.append(refocus)
@@ -251,11 +249,6 @@ class AgentRunner:
             if not result.tool_calls:
                 if await append_pending_context() and loop_count < effective_max_loops:
                     continue
-                content = (result.content or "").strip()
-                if has_pending_send_actions:
-                    final_content = content
-                    finish_reason = "send_only_complete"
-                    break
                 if loop_count < effective_max_loops:
                     # 还有下一轮：丢弃纯文本草稿，只插入系统纠正后继续。
                     # 不能把无效 assistant 文本放回上下文，否则下一轮可能把
@@ -289,11 +282,6 @@ class AgentRunner:
                 tool_names=[tc.name for tc in result.tool_calls],
             )
             tc_results = await self._execute_tools(result.tool_calls, tool_executor)
-            if any(
-                r["name"] in SEND_TOOL_NAMES and r["result"].get("ok", True)
-                for r in tc_results
-            ):
-                has_pending_send_actions = True
             for tcr in tc_results:
                 tool_record = {
                     "role": "tool",
@@ -536,12 +524,8 @@ class AgentRunner:
             name = r["name"]
             ok = r["result"].get("ok", True)
             if name in SEND_TOOL_NAMES:
-                if name == "send_voice_message":
-                    if not ok:
-                        return False
-                elif not r["args"].get("send_only", False) or not ok:
-                    return False
-            elif name in self.no_feedback_tools:
+                return False
+            if name in self.no_feedback_tools:
                 if not ok:
                     return False
             else:
@@ -550,9 +534,6 @@ class AgentRunner:
 
     @staticmethod
     def _classify_no_feedback(tc_results: list[dict[str, Any]]) -> FinishReason:
-        for r in tc_results:
-            if r["name"] in SEND_TOOL_NAMES:
-                return "send_only_complete"
         return "all_no_feedback"
 
 

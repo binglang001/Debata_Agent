@@ -897,15 +897,21 @@ async def test_runner_failed_no_action_does_not_finish_tool_loop():
                     finish_reason="tool_calls",
                     usage=Usage(prompt_tokens=5),
                 )
-            assert "policy_rejected" in messages[-1]["content"]
+            if len(self.calls) == 2:
+                assert "policy_rejected" in messages[-1]["content"]
+                return CompletionResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="tc-send",
+                            name="send_private_messages",
+                            arguments='{"targets": [{"target_qq": 123, "content": "已处理"}]}',
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                    usage=Usage(prompt_tokens=6),
+                )
             return CompletionResult(
-                tool_calls=[
-                    ToolCall(
-                        id="tc-send",
-                        name="send_private_messages",
-                        arguments='{"send_only": true, "targets": [{"target_qq": 123, "content": "已处理"}]}',
-                    )
-                ],
+                tool_calls=[ToolCall(id="tc-na-ok", name="no_action", arguments="{}")],
                 finish_reason="tool_calls",
                 usage=Usage(prompt_tokens=6),
             )
@@ -913,8 +919,14 @@ async def test_runner_failed_no_action_does_not_finish_tool_loop():
         async def aclose(self) -> None:
             pass
 
+    no_action_calls = 0
+
     async def executor(name, _args):
+        nonlocal no_action_calls
         if name == "no_action":
+            no_action_calls += 1
+            if no_action_calls > 1:
+                return {"ok": True, "status": "done"}
             return {"ok": False, "status": "policy_rejected"}
         if name == "send_private_messages":
             return {"ok": True, "status": "sent"}
@@ -949,8 +961,8 @@ async def test_runner_failed_no_action_does_not_finish_tool_loop():
         tool_executor=executor,
     )
 
-    assert result.finish_reason == "send_only_complete"
-    assert len(provider.calls) == 2
+    assert result.finish_reason == "no_action"
+    assert len(provider.calls) == 3
 
 
 @pytest.mark.asyncio

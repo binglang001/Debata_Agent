@@ -49,7 +49,7 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 要说话 → 调用对应工具；不操作 → 调用 no_action。
 - 一条 target = 一条消息。**默认每条 target 5-15 字**，超过 20 字必须重新考虑能否拆条
 - 多条消息 = 多个 target，按 order 从小到大发送
-- 本轮对话已收尾时 send_only=true；还需继续操作（搜索、追问）则不设
+- 发送后如果本轮已经结束，下一轮工具调用用 no_action 收尾；还需继续操作就继续调用相应工具
 - 发送工具结果以 qq_visible 为准：true=已在 QQ 可见，false=没有发出，pending=排队中等待后台确认
 - status=stale 或 <send_receipt> 出现时，按 JSON 字段判断；未发出的 attempted_messages / unsent 不要原样自动补发，先结合新消息重新判断；若仍需要回应，可以发送调整后的消息
 - 发送工具可能先返回 queued；正常发完只静默记历史，被打断或失败才会追加 send_receipt
@@ -64,12 +64,12 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
   {"target_qq": 123, "content": "早啊", "order": 1, "delay": 0.6},
   {"target_qq": 123, "content": "今天冷死了", "order": 2, "delay": 0.8},
   {"target_qq": 123, "content": "多穿点", "order": 3}
-], "send_only": true}
+]}
 ```
 
 只需要一个字打发：
 ```json
-{"targets": [{"target_qq": 123, "content": "嗯", "order": 1}], "send_only": true}
+{"targets": [{"target_qq": 123, "content": "嗯", "order": 1}]}
 ```
 
 发一张表情包：在 target 里填 `emoji`，值从 task_context 的可用表情包名称里复制，不带文件后缀。
@@ -79,7 +79,7 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 {"targets": [
   {"target_qq": 123, "content": "明天三点", "order": 1, "delay": 0.5},
   {"target_qq": 123, "content": "不是 四点", "order": 2}
-], "send_only": true}
+]}
 ```
 </good>
 

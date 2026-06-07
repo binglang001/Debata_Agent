@@ -214,7 +214,6 @@ async def test_private_message_napcat_json_to_send(tmp_path):
                     name="send_private_messages",
                     arguments=json.dumps({
                         "targets": [{"target_qq": "123456", "content": "收到，回复中", "order": 1}],
-                        "send_only": True,
                     }),
                 ),
             ],
@@ -289,7 +288,6 @@ async def test_group_message_napcat_json_to_send(tmp_path):
                     arguments=json.dumps({
                         "group_id": 5555,
                         "targets": [{"content": "收到群聊", "order": 1}],
-                        "send_only": True,
                     }),
                 ),
             ],

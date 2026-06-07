@@ -70,10 +70,6 @@ class SendPrivateArgs(_ToolArgs):
     targets: list[PrivateMessageTarget] = Field(
         ..., description="要发送的目标列表，至少 1 项"
     )
-    send_only: bool = Field(
-        default=False,
-        description="True 则正常发送后直接结束本轮（不等待 LLM 反思）。",
-    )
 
 
 class GroupMessageTarget(_ToolArgs):
@@ -114,9 +110,6 @@ class SendGroupArgs(_ToolArgs):
     group_id: int = Field(..., description="群号")
     targets: list[GroupMessageTarget] = Field(
         ..., description="要发送的消息列表，至少 1 项"
-    )
-    send_only: bool = Field(
-        default=False, description="True 则正常发送后直接结束本轮。"
     )
 
 
