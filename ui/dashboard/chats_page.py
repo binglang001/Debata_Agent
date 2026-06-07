@@ -17,8 +17,10 @@ from urllib.parse import urlsplit
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -52,6 +54,7 @@ class ChatsPage(QWidget):
         self._current_key: str | None = None
         self._current_detail_html = ""
         self._visible_record_limits: dict[str, int] = {}
+        self._search_text = ""
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -80,6 +83,28 @@ class ChatsPage(QWidget):
         self._show_all_btn.setEnabled(False)
         head.addWidget(self._show_all_btn)
         outer.addLayout(head)
+
+        filters = QHBoxLayout()
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("搜索当前会话")
+        self._search_input.textChanged.connect(self._on_filter_changed)
+        filters.addWidget(self._search_input, 1)
+
+        self._show_chat_cb = QCheckBox("聊天")
+        self._show_chat_cb.setChecked(True)
+        self._show_chat_cb.stateChanged.connect(self._on_filter_changed)
+        filters.addWidget(self._show_chat_cb)
+
+        self._show_system_cb = QCheckBox("系统")
+        self._show_system_cb.setChecked(True)
+        self._show_system_cb.stateChanged.connect(self._on_filter_changed)
+        filters.addWidget(self._show_system_cb)
+
+        self._show_tools_cb = QCheckBox("工具")
+        self._show_tools_cb.setChecked(True)
+        self._show_tools_cb.stateChanged.connect(self._on_filter_changed)
+        filters.addWidget(self._show_tools_cb)
+        outer.addLayout(filters)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -252,6 +277,11 @@ class ChatsPage(QWidget):
         self._current_detail_html = ""
         self._refresh_current_detail()
 
+    def _on_filter_changed(self, *_args: Any) -> None:
+        self._search_text = self._search_input.text().strip()
+        self._current_detail_html = ""
+        self._refresh_current_detail()
+
     def _update_load_more_state(self, conv: dict | None = None) -> None:
         if conv is None and self._current_key:
             conv = next((c for c in self._conversations if c["key"] == self._current_key), None)
@@ -287,6 +317,13 @@ class ChatsPage(QWidget):
         )
         visible = records[-limit:] if limit > 0 else records
         hidden = max(0, len(records) - len(visible))
+        filtered_visible = _filter_visible_records(
+            visible,
+            search_text=self._search_text,
+            show_chat=self._show_chat_cb.isChecked(),
+            show_system=self._show_system_cb.isChecked(),
+            show_tools=self._show_tools_cb.isChecked(),
+        )
         persona_name = _runtime_persona_name(self._runtime)
         parts = [
             "<style>"
@@ -305,7 +342,8 @@ class ChatsPage(QWidget):
             ".chat-tool-list{margin:6px 0 0 18px;}"
             "</style>"
             f"<h3 style='margin:0 0 4px 0'>{_escape(conv['label'])}</h3>"
-            f"<div class='chat-meta'>已显示 {len(visible)} / 共 {len(records)} 条</div>"
+            f"<div class='chat-meta'>已显示 {len(visible)} / 共 {len(records)} 条"
+            f"；当前过滤后 {len(filtered_visible)} 条</div>"
         ]
         if hidden:
             parts.append(
@@ -313,8 +351,20 @@ class ChatsPage(QWidget):
                 f"还有 {hidden} 条更早记录未显示。点击上方“加载更早”逐步展开，或“显示全部”查看完整记录。"
                 "</div>"
             )
-        for rec in visible:
-            for bubble in _render_record_bubbles(rec, persona_name=persona_name):
+        if not filtered_visible:
+            parts.append(
+                "<div class='chat-record chat-event chat-event-system'>"
+                "当前搜索或过滤条件下没有可显示记录。"
+                "</div>"
+            )
+        for rec in filtered_visible:
+            for bubble in _render_record_bubbles(
+                rec,
+                persona_name=persona_name,
+                show_chat=self._show_chat_cb.isChecked(),
+                show_system=self._show_system_cb.isChecked(),
+                show_tools=self._show_tools_cb.isChecked(),
+            ):
                 parts.append(bubble)
                 parts.append("<hr/>")
         return "".join(parts)
@@ -449,6 +499,64 @@ def _conversation_list_signature(conversations: list[dict]) -> list[tuple[str, i
     return signature
 
 
+def _filter_visible_records(
+    records: list[dict],
+    *,
+    search_text: str,
+    show_chat: bool,
+    show_system: bool,
+    show_tools: bool,
+) -> list[dict]:
+    query = search_text.strip().casefold()
+    result: list[dict] = []
+    for record in records:
+        categories = _record_display_categories(record)
+        if not show_chat and "chat" in categories:
+            categories.discard("chat")
+        if not show_system and "system" in categories:
+            categories.discard("system")
+        if not show_tools and "tool" in categories:
+            categories.discard("tool")
+        if not categories:
+            continue
+        if query and query not in _record_search_text(record).casefold():
+            continue
+        result.append(record)
+    return result
+
+
+def _record_display_categories(record: dict) -> set[str]:
+    role = str(record.get("role") or "")
+    content = str(record.get("content") or "")
+    categories: set[str] = set()
+    if role == "tool":
+        categories.add("tool")
+    elif _runtime_event_summary(content) is not None or role == "system":
+        categories.add("system")
+    elif role in {"user", "assistant"}:
+        if content.strip():
+            categories.add("chat")
+        if record.get("tool_calls"):
+            categories.add("tool")
+    else:
+        categories.add("system")
+    return categories
+
+
+def _record_search_text(record: dict) -> str:
+    parts = [str(record.get("role") or ""), str(record.get("content") or "")]
+    tool_call_id = record.get("tool_call_id")
+    if tool_call_id:
+        parts.append(str(tool_call_id))
+    tool_calls = record.get("tool_calls") or []
+    if tool_calls:
+        parts.append(json.dumps(tool_calls, ensure_ascii=False))
+    meta = record.get("metadata")
+    if isinstance(meta, dict):
+        parts.append(json.dumps(meta, ensure_ascii=False))
+    return "\n".join(parts)
+
+
 def _runtime_persona_name(runtime: Any) -> str:
     persona = getattr(runtime, "persona", None)
     name = getattr(persona, "name", None)
@@ -475,12 +583,32 @@ async def _load_chat_page_records(runtime: Any) -> list[dict]:
     return [*list(archive_records or []), *list(history_records or [])]
 
 
-def _render_record_html(rec: dict, *, persona_name: str) -> str:
-    bubbles = _render_record_bubbles(rec, persona_name=persona_name)
+def _render_record_html(
+    rec: dict,
+    *,
+    persona_name: str,
+    show_chat: bool = True,
+    show_system: bool = True,
+    show_tools: bool = True,
+) -> str:
+    bubbles = _render_record_bubbles(
+        rec,
+        persona_name=persona_name,
+        show_chat=show_chat,
+        show_system=show_system,
+        show_tools=show_tools,
+    )
     return "".join(bubbles)
 
 
-def _render_record_bubbles(rec: dict, *, persona_name: str) -> list[str]:
+def _render_record_bubbles(
+    rec: dict,
+    *,
+    persona_name: str,
+    show_chat: bool = True,
+    show_system: bool = True,
+    show_tools: bool = True,
+) -> list[str]:
     role = rec.get("role", "?")
     content = str(rec.get("content") or "")
     reasoning = str(rec.get("reasoning_content") or "")
@@ -489,27 +617,53 @@ def _render_record_bubbles(rec: dict, *, persona_name: str) -> list[str]:
     runtime = _runtime_event_summary(content)
 
     if role == "tool":
+        if not show_tools:
+            return []
         head = f"工具结果 · {tool_call_id}" if tool_call_id else "工具结果"
         body = _render_tool_result_content(content)
         return [_render_event_record(head, body, event_class="chat-event-tool")]
     elif runtime is not None:
+        if not show_system:
+            return []
         title, summary = runtime
         head = f"系统 · {title}"
         body = _render_collapsed_content(summary, content)
         return [_render_event_record(head, body, event_class="chat-event-system")]
     elif role == "user":
+        if not show_chat:
+            return []
         head = _user_record_label(rec)
         css = "chat-user"
         body = _render_text_block(_strip_legacy_header(content))
     elif role == "assistant":
-        head = persona_name
-        css = "chat-assistant"
+        bubbles: list[str] = []
         body = _render_text_block(content) if content else ""
+        if show_chat and (body or reasoning):
+            parts = [
+                "<div class='chat-record chat-bubble chat-assistant'>",
+                f"<div class='chat-head'>{_escape(persona_name)}</div>",
+            ]
+            if reasoning:
+                parts.append(
+                    "<details><summary class='chat-summary'>思考过程</summary>"
+                    f"<pre class='chat-pre'>{_escape(reasoning)}</pre></details>"
+                )
+            if body:
+                parts.append(body)
+            parts.append("</div>")
+            bubbles.append("".join(parts))
+        if show_tools and tool_calls:
+            bubbles.append(_render_tool_call_bubble(tool_calls, persona_name=persona_name))
+        return bubbles
     elif role == "system":
+        if not show_system:
+            return []
         head = "系统"
         body = _render_text_block(content)
         return [_render_event_record(head, body, event_class="chat-event-system")]
     else:
+        if not show_system:
+            return []
         head = str(role or "记录")
         body = _render_text_block(content)
         return [_render_event_record(head, body, event_class="chat-event-system")]

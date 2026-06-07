@@ -39,6 +39,7 @@ from ui.dashboard.chats_page import (
     ChatsPage,
     _compact_inline_tokens,
     _conversation_list_signature,
+    _filter_visible_records,
     _format_send_receipt_summary,
     _format_tool_call_for_display,
     _group_records_by_conversation,
@@ -373,6 +374,79 @@ def test_chats_renders_assistant_tool_calls_as_separate_bubble():
     assert "向 123 发送消息：你好" in bubbles[1]
 
 
+def test_chats_filters_assistant_text_and_tool_bubbles_independently():
+    record = {
+        "role": "assistant",
+        "content": "准备发",
+        "tool_calls": [
+            {
+                "function": {
+                    "name": "send_private_messages",
+                    "arguments": '{"targets":[{"target_qq":123,"content":"你好"}]}',
+                }
+            }
+        ],
+    }
+
+    text_only = _render_record_bubbles(
+        record,
+        persona_name="玖",
+        show_chat=True,
+        show_tools=False,
+    )
+    tool_only = _render_record_bubbles(
+        record,
+        persona_name="玖",
+        show_chat=False,
+        show_tools=True,
+    )
+
+    assert len(text_only) == 1
+    assert "准备发" in text_only[0]
+    assert "工具调用" not in text_only[0]
+    assert len(tool_only) == 1
+    assert "准备发" not in tool_only[0]
+    assert "向 123 发送消息：你好" in tool_only[0]
+
+
+def test_chats_filter_visible_records_searches_metadata_and_categories():
+    records = [
+        {
+            "role": "user",
+            "content": "普通聊天",
+            "metadata": {"messages": [{"nickname": "Alice"}]},
+        },
+        {"role": "system", "content": "系统事件"},
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"status":"accepted"}',
+        },
+    ]
+
+    assert _filter_visible_records(
+        records,
+        search_text="Alice",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+    ) == [records[0]]
+    assert _filter_visible_records(
+        records,
+        search_text="",
+        show_chat=True,
+        show_system=False,
+        show_tools=False,
+    ) == [records[0]]
+    assert _filter_visible_records(
+        records,
+        search_text="accepted",
+        show_chat=False,
+        show_system=False,
+        show_tools=True,
+    ) == [records[2]]
+
+
 def test_chats_compacts_long_links_and_paths():
     long_url = "https://multimedia.nt.qq.com.cn/download?" + ("a" * 120)
     long_path = "C:\\Users\\admin\\.qq-chat-exporter\\exports\\" + ("x" * 100) + ".txt"
@@ -424,6 +498,34 @@ def test_chats_show_all_current_displays_full_conversation(qapp, tmp_paths):
     assert f"已显示 {DEFAULT_VISIBLE_RECORD_LIMIT + 5} / 共 {DEFAULT_VISIBLE_RECORD_LIMIT + 5} 条" in html
     assert "消息 0" in html
     assert "还有 5 条更早记录未显示" not in html
+
+
+def test_chats_render_conversation_applies_search_and_filters(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {"role": "user", "content": "alpha 聊天", "conversation_id": "group:1"},
+            {"role": "system", "content": "alpha 系统", "conversation_id": "group:1"},
+            {
+                "role": "tool",
+                "tool_call_id": "call-alpha",
+                "content": '{"status":"accepted","detail":"alpha 工具"}',
+                "conversation_id": "group:1",
+            },
+        ],
+    }
+    page._search_input.setText("alpha")
+    page._show_system_cb.setChecked(False)
+    page._show_tools_cb.setChecked(False)
+
+    html = page._render_conversation(conv)
+
+    assert "alpha 聊天" in html
+    assert "alpha 系统" not in html
+    assert "alpha 工具" not in html
+    assert "当前过滤后 1 条" in html
 
 
 def test_chats_scrollbar_bottom_threshold():
