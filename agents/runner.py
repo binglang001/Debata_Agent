@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 # 调用完直接结束循环
 DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "save_important_memory",
+    "update_important_memory",
     "delete_important_memory",
     "no_action",
     "set_friend_add_request",

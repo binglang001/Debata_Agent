@@ -185,6 +185,36 @@ class DeleteMemoryArgs(_ToolArgs):
     )
 
 
+class UpdateMemoryArgs(_ToolArgs):
+    """update_important_memory 工具参数。"""
+
+    memory_id: str = Field(
+        ...,
+        min_length=1,
+        description="要更新的重要记忆 ID。通常来自 long_term_memory 中的记忆标识或工具返回的 existing_id。",
+    )
+    memory_text: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "覆写后的完整记忆正文。必须客观、完整、有明确主语；不要只写补丁片段。"
+            "例如写“张三的生日是7月8日”，不要写“你生日七月八号”。"
+        ),
+    )
+    scope: str | None = Field(
+        default=None,
+        description="可选：同时更新记忆适用范围。可填 global、user:QQ号 或 group:群号；不填则保留原 scope。",
+    )
+    pinned: bool | None = Field(
+        default=None,
+        description="可选：同时更新是否置顶。不填则保留原 pinned。",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么更新旧记忆，而不是新增一条。只用于日志和自检。",
+    )
+
+
 # ============================================================
 # Platform（联系人/群信息/请求处理）
 # ============================================================

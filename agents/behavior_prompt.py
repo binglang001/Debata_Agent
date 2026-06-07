@@ -37,8 +37,8 @@ CORE_RULES = """<core_rules priority="critical">
 # 2) TOOL_USE_PROTOCOL —— priority="high"，工具使用规范
 #
 #    拆成 _HEADER + _MEMORY_BLOCK_* + _FOOTER 三段，便于按
-#    long_term_memory.mode 动态注入对应的记忆工具说明
-#    RAG 模式不暴露 save/delete，长期记忆由会话向量检索自动完成。
+#    long_term_memory.mode 动态注入对应的记忆说明。
+#    RAG 只是历史召回；重要记忆工具始终可用。
 # ============================================================
 
 _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
@@ -178,10 +178,10 @@ target 里填 `emoji` 字段（而不是 content）即可发表情包。`emoji` 
 </search_weather_tools>
 """
 
-# === 长期记忆工具说明：按模式二选一注入 ===
+# === 长期记忆工具说明：按模式注入 ===
 
 _MEMORY_BLOCK_FILE_MODE = """<memory>
-## save_important_memory / delete_important_memory
+## save_important_memory / update_important_memory / delete_important_memory
 
 对话重启后普通记忆会丢失。只有 save_important_memory 的内容才持久。
 
@@ -192,20 +192,27 @@ _MEMORY_BLOCK_FILE_MODE = """<memory>
 - 你做了自我反思，发现要改进的地方
 - 管理员给了反馈或指示
 
-保存时用一句话概括核心信息，不存日常闲聊。scope 通常留空由系统按当前私聊/群聊推断；只有跨会话稳定事实才用 global，需要任何场景都常驻时才 pinned=true。系统会自动去重。
+保存时用一句话概括核心信息，不存日常闲聊。必须客观、完整、有明确主语，不要保存“你生日七月八号”这种离开上下文就不知道是谁的片段。
+
+如果已有同一主体的相关记忆，且新信息是在修正、补充、合并旧事实，优先调用 update_important_memory 覆写旧记忆，而不是另存一条。
+
+scope 通常留空由系统按当前私聊/群聊推断；只有跨会话稳定事实才用 global，需要任何场景都常驻时才 pinned=true。程序只拦截完全相同文本，不做语义去重。
 
 记忆过时或不再需要 → delete_important_memory（关键词模糊匹配）。
 </memory>
 """
 
 _MEMORY_BLOCK_RAG_MODE = """<memory>
-## RAG 会话向量检索
+## 重要记忆 + RAG 会话向量检索
 
 系统会自动把历史对话建立向量索引。与你当前话题相关的旧消息会在 <retrieved_conversation_context source="rag"> 中召回。
-这些内容只是相关历史片段，不是 save_important_memory 保存的重要记忆，也不是新的用户消息。
+这些内容只是相关历史片段，不是 save_important_memory 保存的重要记忆，也不是新的用户消息。RAG 只是可选历史召回，不替代重要记忆。
 
-RAG 模式下不要主动保存或删除重要记忆；没有 save_important_memory / delete_important_memory 工具。
-用户说“记住 / 记一下 / 帮我记 / 约定”时，把它当作当前对话内容正常回应即可，后续会由历史向量检索召回。
+save_important_memory / update_important_memory / delete_important_memory 仍然可用。长期稳定事实必须主动维护重要记忆，不能指望 RAG 一定召回。
+
+保存时必须客观、完整、有明确主语；不要保存“你生日七月八号”这种无头聊天片段。
+
+如果已有同一主体的相关记忆，且新信息是在修正、补充、合并旧事实，优先调用 update_important_memory 覆写旧记忆，而不是另存一条。程序只拦截完全相同文本，不做语义去重。
 </memory>
 """
 
@@ -240,8 +247,8 @@ def build_tool_use_protocol(memory_mode: str = "file") -> str:
     """按长期记忆模式拼装工具使用协议。
 
     Args:
-        memory_mode: "file" = 文件模式（AI 主动调用 save_important_memory）
-                     "rag"  = RAG 模式（自动会话向量检索，不暴露重要记忆工具）
+        memory_mode: "file" = 文件模式（AI 主动维护重要记忆）
+                     "rag"  = RAG 模式（历史向量检索 + AI 主动维护重要记忆）
 
     Returns:
         完整的 <tool_use_protocol>...</tool_use_protocol> 字符串

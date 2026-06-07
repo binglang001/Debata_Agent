@@ -300,7 +300,7 @@ def test_all_expected_tools_registered():
     """检查核心工具都已通过装饰器注册到全局列表。"""
     expected = {
         "send_private_messages", "send_group_message", "recall_message", "upload_file",
-        "save_important_memory", "delete_important_memory",
+        "save_important_memory", "update_important_memory", "delete_important_memory",
         "list_contacts", "get_user_info", "get_forward_msg", "get_recent_chat_messages",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
         "summarize_conversation", "recall_history", "start_agent_task",
@@ -397,14 +397,15 @@ def test_registry_file_mode_includes_memory_tools():
     cfg = _make_config(memory_mode="file")
     reg = build_default_registry(cfg)
     assert "save_important_memory" in reg
+    assert "update_important_memory" in reg
     assert "delete_important_memory" in reg
 
 
-def test_registry_rag_mode_excludes_memory_tools():
+def test_registry_rag_mode_includes_memory_tools():
     cfg = _make_config(memory_mode="rag")
     reg = build_default_registry(cfg)
     for name in MEMORY_FILE_TOOLS:
-        assert name not in reg, f"RAG 模式下不应注册 {name}"
+        assert name in reg, f"RAG 模式下也应注册 {name}"
 
 
 def test_registry_feature_disabled_excludes_tool():
@@ -475,6 +476,9 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     )
     important = ImportantMemoryManager(tmp_path / "important.json")
     await important.load()
+    await important.replace_all(
+        [{"timestamp": "mem-existing", "content": "用户喜欢绿茶"}]
+    )
 
     timeline = ChatTimelineStore()
     timeline.append(_timeline_message("m1", "最近消息"))
@@ -572,6 +576,10 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "prompt": "年轻女性，自然口语",
         },
         "save_important_memory": {"memory_text": "用户喜欢红茶"},
+        "update_important_memory": {
+            "memory_id": "mem-existing",
+            "memory_text": "用户喜欢红茶和乌龙茶",
+        },
         "delete_important_memory": {"keyword": "红茶"},
         "send_private_messages": {
             "targets": [{"target_qq": 123, "content": "你好", "order": 1}],
@@ -680,7 +688,8 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
 
     assert results["save_important_memory"]["saved"] is True
     assert results["save_important_memory"]["scope"] == "user:123"
-    assert results["delete_important_memory"]["deleted"] == 1
+    assert results["update_important_memory"]["updated"] is True
+    assert results["delete_important_memory"]["deleted"] == 2
     assert important.items() == []
 
     assert results["recall_message"]["data"]["message_id"] == "100"
@@ -731,13 +740,14 @@ def test_registry_no_feedback_names_includes_known():
     assert "schedule_wakeup" in names
 
 
-def test_registry_rag_no_feedback_names_excludes_memory_tools():
+def test_registry_rag_no_feedback_names_includes_memory_tools():
     cfg = _make_config(memory_mode="rag")
     reg = build_default_registry(cfg)
     names = reg.get_no_feedback_names()
     assert "no_action" in names
-    assert "save_important_memory" not in names
-    assert "delete_important_memory" not in names
+    assert "save_important_memory" in names
+    assert "update_important_memory" in names
+    assert "delete_important_memory" in names
 
 
 def test_registry_duplicate_spec_raises():
@@ -2248,6 +2258,61 @@ async def test_save_memory_explicit_scope_and_pinned(tmp_path):
     assert result["pinned"] is True
     assert im.items()[0]["scope"] == "global"
     assert im.items()[0]["pinned"] is True
+
+
+@pytest.mark.asyncio
+async def test_update_memory_with_manager(tmp_path):
+    from memory import ImportantMemoryManager
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+    await im.replace_all([{"timestamp": "mem-1", "content": "张三是朋友"}])
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(important=im)
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "update_important_memory",
+        {
+            "memory_id": "mem-1",
+            "memory_text": "张三是朋友，生日是7月8日",
+            "reason": "补充生日",
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["updated"] is True
+    assert im.items()[0]["content"] == "张三是朋友，生日是7月8日"
+
+
+@pytest.mark.asyncio
+async def test_update_memory_exact_duplicate_returns_existing_id(tmp_path):
+    from memory import ImportantMemoryManager
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+    await im.replace_all(
+        [
+            {"timestamp": "mem-1", "content": "张三是朋友"},
+            {"timestamp": "mem-2", "content": "李四是朋友"},
+        ]
+    )
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(important=im)
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "update_important_memory",
+        {"memory_id": "mem-2", "memory_text": "张三是朋友"},
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "exact_duplicate"
+    assert result["updated"] is False
+    assert result["existing_id"] == "mem-1"
+    assert im.items()[1]["content"] == "李四是朋友"
 
 
 @pytest.mark.asyncio

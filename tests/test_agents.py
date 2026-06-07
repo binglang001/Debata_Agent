@@ -126,6 +126,7 @@ def test_list_available_personas(tmp_paths):
 def test_tool_use_protocol_file_mode():
     s = build_tool_use_protocol("file")
     assert "save_important_memory" in s
+    assert "update_important_memory" in s
     assert "必须主动保存" in s
     assert "自动管理" not in s
 
@@ -135,8 +136,9 @@ def test_tool_use_protocol_rag_mode():
     assert "RAG 会话向量检索" in s
     assert "retrieved_conversation_context" in s
     assert "save_important_memory" in s
-    assert "没有 save_important_memory" in s
-    assert "必须主动保存" not in s
+    assert "update_important_memory" in s
+    assert "没有 save_important_memory" not in s
+    assert "不能指望 RAG 一定召回" in s
 
 
 def test_tool_use_protocol_default_is_file():
@@ -324,8 +326,9 @@ def test_build_combined_system_prompt_rag_mode_no_active_save():
     assert "历史片段" in sys
     assert "<long_term_memory" not in sys
     assert "save_important_memory" in sys
-    assert "没有 save_important_memory" in sys
-    assert "必须主动保存" not in sys
+    assert "update_important_memory" in sys
+    assert "没有 save_important_memory" not in sys
+    assert "不能指望 RAG 一定召回" in sys
 
 
 def test_build_combined_system_prompt_with_important_memory():
@@ -654,19 +657,21 @@ async def test_important_force_save_custom_keywords(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_important_force_save_bypasses_dedup(tmp_path):
-    """强制保存不应被去重检查阻止（直接写入）。"""
+async def test_important_force_save_blocks_exact_duplicate(tmp_path):
+    """关键词强制保存也只拦截完全相同文本。"""
     from memory import ImportantMemoryManager
 
     im = ImportantMemoryManager(tmp_path / "imp.json")
     await im.load()
-    await im.force_save_from_keyword("记住第一条")
-    await im.force_save_from_keyword("记住第一条")  # 相同内容
-    # 两条都被保存
-    assert len(im.items()) == 2
-    # 都标记了来源
-    for item in im.items():
-        assert item.get("source", "").startswith("keyword:")
+    first = await im.force_save_from_keyword("记住第一条")
+    second = await im.force_save_from_keyword("记住第一条")
+
+    assert first["saved"] is True
+    assert second["saved"] is False
+    assert second["duplicate"] is True
+    assert second["duplicate_type"] == "exact"
+    assert len(im.items()) == 1
+    assert im.items()[0].get("source", "").startswith("keyword:")
 
 
 # ============================================================

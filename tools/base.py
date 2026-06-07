@@ -473,6 +473,7 @@ def _strip_pydantic_metadata(schema: dict[str, Any]) -> dict[str, Any]:
 
 DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "save_important_memory",
+    "update_important_memory",
     "delete_important_memory",
     "no_action",
     "set_friend_add_request",

@@ -5,7 +5,7 @@
     schemas             —— 全部 Pydantic args 模型
     message_builder     —— 表情包/CQ 码/打字延迟等消息辅助
     messaging           —— send_private / send_group / recall / upload_file
-    memory_tools        —— save / delete_important_memory（仅 file 模式）
+    memory_tools        —— save / update / delete_important_memory
     platform_tools      —— list_contacts / get_user_info / get_forward_msg /
                            set_*_add_request / summarize_chat_history /
                            summarize_conversation / recall_history
@@ -109,9 +109,10 @@ __all__ = [
 
 MEMORY_TOOLS: set[str] = {
     "save_important_memory",
+    "update_important_memory",
     "delete_important_memory",
 }
-"""文件长期记忆工具。RAG 模式改用会话向量检索，不暴露这些工具。"""
+"""长期重要记忆工具。RAG 只是历史召回，不再替代 important.json。"""
 
 # 兼容旧测试/旧导入名。
 MEMORY_FILE_TOOLS = MEMORY_TOOLS
@@ -144,7 +145,7 @@ def build_default_registry(
     规则：
         - messaging 工具（send_*/recall）：始终启用
         - upload_file：默认启用（受 ctx.workspace_dir 进一步限制）
-        - memory 工具：仅 file 模式启用；RAG 模式不再使用 important.json
+        - memory 工具：始终启用；RAG 是历史召回，不替代 important.json
         - platform 工具：始终启用（按需）
         - control 工具：始终启用
         - feature 工具：按 features.{vision,web_search,weather}.enabled
@@ -171,10 +172,6 @@ def build_default_registry(
 
         # 2. upload_file 按调用方意愿
         if spec.name == "upload_file" and not include_upload_file:
-            continue
-
-        # 3. RAG 模式使用自动会话向量检索，不暴露重要记忆写入/删除工具
-        if memory_mode == "rag" and spec.name in MEMORY_TOOLS:
             continue
 
         enabled.append(spec)
