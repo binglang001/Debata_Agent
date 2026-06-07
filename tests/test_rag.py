@@ -370,6 +370,72 @@ async def test_rag_memory_indexes_history_in_background(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_rag_memory_strips_media_urls_and_workspace_noise(tmp_path: Path):
+    embedding = _FakeEmbedding()
+    store = SqliteVectorStore(tmp_path / "rag.sqlite3")
+    await store.load()
+    service = RagMemoryService(embedding=embedding, store=store, top_k=5)
+    await service.load()
+
+    await service.enqueue_records(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "【2026-06-01 群聊 Alice(1) msg_id=img】"
+                    "猫猫截图 [图片 workspace=incoming/img_1.jpg "
+                    "url=https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=x&rkey=y]"
+                ),
+                "conversation_id": "group:1",
+                "metadata": {"timestamp": "2026-06-01 10:00:00"},
+            },
+            {
+                "role": "user",
+                "content": (
+                    "【2026-06-01 私聊 Alice(1) msg_id=file】"
+                    "猫相关文件 [文件 url=D:\\QQ_data\\Tencent Files\\NapCat\\temp\\猫.txt "
+                    "workspace=incoming/猫.txt]"
+                ),
+                "conversation_id": "private:1",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "【2026-06-01 私聊 Alice(1) msg_id=voice】"
+                    "[音频消息: 猫叫转录文本 url=https://example.com/voice.amr "
+                    "workspace=incoming/voice.amr]"
+                ),
+                "conversation_id": "private:1",
+            },
+            {
+                "role": "assistant",
+                "content": "猫资料链接 https://example.com/cat?a=1",
+                "conversation_id": "private:1",
+            },
+        ]
+    )
+
+    await asyncio.wait_for(service._queue.join(), timeout=1.0)
+
+    indexed = "\n".join(entry.text for entry in store.all_entries())
+    assert "猫猫截图 [图片]" in indexed
+    assert "猫相关文件 [文件]" in indexed
+    assert "[音频消息: 猫叫转录文本]" in indexed
+    assert "猫资料链接 [链接]" in indexed
+    assert "https://" not in indexed
+    assert "multimedia.nt.qq.com.cn" not in indexed
+    assert "workspace=" not in indexed
+    assert "url=" not in indexed
+    assert "D:\\QQ_data" not in indexed
+
+    out = await service.retrieve_for_query("猫", conversation_id="private:1")
+    assert "猫叫转录文本" in out
+    assert "https://" not in out
+    assert "workspace=" not in out
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_rag_memory_load_removes_existing_runtime_context_entries(tmp_path: Path):
     embedding = _FakeEmbedding()
     store = SqliteVectorStore(tmp_path / "rag.sqlite3")
