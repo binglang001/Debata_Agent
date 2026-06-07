@@ -37,6 +37,7 @@ from memory.rag_store import RagEntry
 from ui.dashboard.chats_page import (
     DEFAULT_VISIBLE_RECORD_LIMIT,
     ChatsPage,
+    _build_render_items,
     _compact_inline_tokens,
     _conversation_list_signature,
     _filter_visible_records,
@@ -449,6 +450,98 @@ def test_chats_filters_assistant_text_and_tool_bubbles_independently():
     assert len(tool_only) == 1
     assert "准备发" not in tool_only[0]
     assert "向 123 发送消息：你好" in tool_only[0]
+
+
+def test_chats_attaches_tool_results_to_matching_tool_calls():
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {
+                        "name": "send_private_messages",
+                        "arguments": '{"targets":[{"target_qq":123,"content":"你好"}]}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"status":"accepted","send_id":"send-1"}',
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "orphan",
+            "content": '{"status":"done"}',
+        },
+    ]
+
+    items = _build_render_items(
+        records,
+        search_text="",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+    )
+
+    assert len(items) == 2
+    assert items[0][0] is records[0]
+    assert items[0][1] == {"call-1": [records[1]]}
+    assert items[1][0] is records[2]
+
+    html = "".join(
+        bubble
+        for record, attached in items
+        for bubble in _render_record_bubbles(
+            record,
+            persona_name="玖",
+            attached_tool_results=attached,
+        )
+    )
+
+    assert "向 123 发送消息：你好" in html
+    assert "工具结果 · call-1" in html
+    assert "send_id=send-1" in html
+    assert "工具结果 · orphan" in html
+    assert html.count("工具结果 · call-1") == 1
+
+
+def test_chats_tool_result_search_keeps_parent_tool_call_visible():
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {
+                        "name": "send_group_message",
+                        "arguments": '{"group_id":1,"targets":[{"content":"普通"}]}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"status":"accepted","send_id":"needle-send"}',
+        },
+    ]
+
+    items = _build_render_items(
+        records,
+        search_text="needle-send",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+    )
+
+    assert len(items) == 1
+    assert items[0][0] is records[0]
+    assert items[0][1] == {"call-1": [records[1]]}
 
 
 def test_chats_filter_visible_records_searches_metadata_and_categories():

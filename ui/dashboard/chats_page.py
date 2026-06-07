@@ -317,7 +317,7 @@ class ChatsPage(QWidget):
         )
         visible = records[-limit:] if limit > 0 else records
         hidden = max(0, len(records) - len(visible))
-        filtered_visible = _filter_visible_records(
+        render_items = _build_render_items(
             visible,
             search_text=self._search_text,
             show_chat=self._show_chat_cb.isChecked(),
@@ -340,10 +340,11 @@ class ChatsPage(QWidget):
             ".chat-pre{white-space:pre-wrap;margin:6px 0 0 0;}"
             ".chat-summary{color:#6B635A;}"
             ".chat-tool-list{margin:6px 0 0 18px;}"
+            ".chat-tool-result{margin:8px 0 0 0;padding:8px 10px;border-left:3px solid #9DB9D3;background:#F8FBFD;}"
             "</style>"
             f"<h3 style='margin:0 0 4px 0'>{_escape(conv['label'])}</h3>"
             f"<div class='chat-meta'>已显示 {len(visible)} / 共 {len(records)} 条"
-            f"；当前过滤后 {len(filtered_visible)} 条</div>"
+            f"；当前过滤后 {len(render_items)} 条</div>"
         ]
         if hidden:
             parts.append(
@@ -351,19 +352,20 @@ class ChatsPage(QWidget):
                 f"还有 {hidden} 条更早记录未显示。点击上方“加载更早”逐步展开，或“显示全部”查看完整记录。"
                 "</div>"
             )
-        if not filtered_visible:
+        if not render_items:
             parts.append(
                 "<div class='chat-record chat-event chat-event-system'>"
                 "当前搜索或过滤条件下没有可显示记录。"
                 "</div>"
             )
-        for rec in filtered_visible:
+        for rec, attached_tool_results in render_items:
             for bubble in _render_record_bubbles(
                 rec,
                 persona_name=persona_name,
                 show_chat=self._show_chat_cb.isChecked(),
                 show_system=self._show_system_cb.isChecked(),
                 show_tools=self._show_tools_cb.isChecked(),
+                attached_tool_results=attached_tool_results,
             ):
                 parts.append(bubble)
                 parts.append("<hr/>")
@@ -525,6 +527,113 @@ def _filter_visible_records(
     return result
 
 
+def _build_render_items(
+    records: list[dict],
+    *,
+    search_text: str,
+    show_chat: bool,
+    show_system: bool,
+    show_tools: bool,
+) -> list[tuple[dict, dict[str, list[dict]]]]:
+    """Build display records and attach tool results to their tool calls.
+
+    History stores assistant tool calls and tool results as separate raw records.
+    The chat page should show the result under the corresponding call when the
+    `tool_call_id` matches, while orphan results stay visible as standalone
+    tool events.
+    """
+    tool_results, attached_tool_result_indexes = _collect_attached_tool_results(records)
+    query = search_text.strip().casefold()
+    items: list[tuple[dict, dict[str, list[dict]]]] = []
+
+    for index, record in enumerate(records):
+        if index in attached_tool_result_indexes:
+            continue
+        attached = _attached_results_for_record(record, tool_results) if show_tools else {}
+        record_matches = _record_matches_display_filters(
+            record,
+            query=query,
+            show_chat=show_chat,
+            show_system=show_system,
+            show_tools=show_tools,
+        )
+        attached_matches = bool(attached) and (
+            not query
+            or any(
+                query in _record_search_text(result).casefold()
+                for results in attached.values()
+                for result in results
+            )
+        )
+        if record_matches or attached_matches:
+            items.append((record, attached))
+    return items
+
+
+def _collect_attached_tool_results(records: list[dict]) -> tuple[dict[str, list[dict]], set[int]]:
+    call_ids: set[str] = set()
+    for record in records:
+        call_ids.update(_record_tool_call_ids(record))
+
+    results: dict[str, list[dict]] = {}
+    attached_indexes: set[int] = set()
+    if not call_ids:
+        return results, attached_indexes
+
+    for index, record in enumerate(records):
+        if record.get("role") != "tool":
+            continue
+        tool_call_id = str(record.get("tool_call_id") or "").strip()
+        if not tool_call_id or tool_call_id not in call_ids:
+            continue
+        results.setdefault(tool_call_id, []).append(record)
+        attached_indexes.add(index)
+    return results, attached_indexes
+
+
+def _record_tool_call_ids(record: dict) -> list[str]:
+    ids: list[str] = []
+    for tool_call in record.get("tool_calls") or []:
+        if not isinstance(tool_call, dict):
+            continue
+        tool_call_id = str(tool_call.get("id") or "").strip()
+        if tool_call_id:
+            ids.append(tool_call_id)
+    return ids
+
+
+def _attached_results_for_record(
+    record: dict,
+    tool_results: dict[str, list[dict]],
+) -> dict[str, list[dict]]:
+    attached: dict[str, list[dict]] = {}
+    for tool_call_id in _record_tool_call_ids(record):
+        results = tool_results.get(tool_call_id)
+        if results:
+            attached[tool_call_id] = results
+    return attached
+
+
+def _record_matches_display_filters(
+    record: dict,
+    *,
+    query: str,
+    show_chat: bool,
+    show_system: bool,
+    show_tools: bool,
+) -> bool:
+    categories = _record_display_categories(record)
+    if not show_chat and "chat" in categories:
+        categories.discard("chat")
+    if not show_system and "system" in categories:
+        categories.discard("system")
+    if not show_tools and "tool" in categories:
+        categories.discard("tool")
+    if not categories:
+        return False
+    return not query or query in _record_search_text(record).casefold()
+
+
 def _record_display_categories(record: dict) -> set[str]:
     role = str(record.get("role") or "")
     content = str(record.get("content") or "")
@@ -608,6 +717,7 @@ def _render_record_bubbles(
     show_chat: bool = True,
     show_system: bool = True,
     show_tools: bool = True,
+    attached_tool_results: dict[str, list[dict]] | None = None,
 ) -> list[str]:
     role = rec.get("role", "?")
     content = str(rec.get("content") or "")
@@ -661,7 +771,13 @@ def _render_record_bubbles(
             parts.append("</div>")
             bubbles.append("".join(parts))
         if show_tools and tool_calls:
-            bubbles.append(_render_tool_call_bubble(tool_calls, persona_name=persona_name))
+            bubbles.append(
+                _render_tool_call_bubble(
+                    tool_calls,
+                    persona_name=persona_name,
+                    attached_tool_results=attached_tool_results,
+                )
+            )
         return bubbles
     elif role == "system":
         if not show_system:
@@ -689,8 +805,14 @@ def _render_record_bubbles(
         parts.append(body)
     parts.append("</div>")
     bubbles = ["".join(parts)]
-    if tool_calls:
-        bubbles.append(_render_tool_call_bubble(tool_calls, persona_name=persona_name))
+    if show_tools and tool_calls:
+        bubbles.append(
+            _render_tool_call_bubble(
+                tool_calls,
+                persona_name=persona_name,
+                attached_tool_results=attached_tool_results,
+            )
+        )
     return bubbles
 
 
@@ -705,7 +827,12 @@ def _render_event_record(head: str, body: str, *, event_class: str) -> str:
     return "".join(parts)
 
 
-def _render_tool_call_bubble(tool_calls: list, *, persona_name: str) -> str:
+def _render_tool_call_bubble(
+    tool_calls: list,
+    *,
+    persona_name: str,
+    attached_tool_results: dict[str, list[dict]] | None = None,
+) -> str:
     parts = [
         "<div class='chat-record chat-bubble chat-tool'>",
         f"<div class='chat-head'>{_escape(persona_name)} · 工具调用</div>",
@@ -713,7 +840,17 @@ def _render_tool_call_bubble(tool_calls: list, *, persona_name: str) -> str:
     ]
     for tc in tool_calls:
         label = _format_tool_call_for_display(tc)
-        parts.append(f"<li>{_escape(label)}</li>")
+        tool_call_id = str(tc.get("id") or "").strip() if isinstance(tc, dict) else ""
+        parts.append(f"<li>{_escape(label)}")
+        for result in (attached_tool_results or {}).get(tool_call_id, []):
+            result_id = str(result.get("tool_call_id") or tool_call_id)
+            parts.append(
+                "<div class='chat-tool-result'>"
+                f"<div class='chat-head'>工具结果 · {_escape(result_id)}</div>"
+                f"{_render_tool_result_content(str(result.get('content') or ''))}"
+                "</div>"
+            )
+        parts.append("</li>")
     parts.append("</ul>")
     parts.append(
         "<details><summary class='chat-summary'>展开原始工具参数</summary>"
