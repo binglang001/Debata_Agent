@@ -19,6 +19,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -559,6 +560,12 @@ def _kv_prompt_diagnostics(
     )
     roles = [str(m.get("role") or "") for m in normalized]
     joined_content = "\n".join(str(m.get("content") or "") for m in normalized)
+    role_char_counts: dict[str, int] = {}
+    for message in normalized:
+        role = str(message.get("role") or "")
+        role_char_counts[role] = role_char_counts.get(role, 0) + len(
+            str(message.get("content") or "")
+        )
     tools_text = json.dumps(
         tools or [],
         ensure_ascii=False,
@@ -566,6 +573,7 @@ def _kv_prompt_diagnostics(
         separators=(",", ":"),
         default=str,
     )
+    tool_schema_modes = _tool_schema_mode_counts(tools or [])
     diag: dict[str, Any] = {
         "kv_loop": int(loop),
         "kv_message_count": len(normalized),
@@ -573,14 +581,40 @@ def _kv_prompt_diagnostics(
         "kv_system_count": sum(1 for role in roles if role == "system"),
         "kv_assistant_count": sum(1 for role in roles if role == "assistant"),
         "kv_tool_count": sum(1 for role in roles if role == "tool"),
+        "kv_user_count": sum(1 for role in roles if role == "user"),
+        "kv_content_char_count": len(joined_content),
+        "kv_serialized_char_count": len(serialized),
+        "kv_system_char_count": role_char_counts.get("system", 0),
+        "kv_user_char_count": role_char_counts.get("user", 0),
+        "kv_assistant_char_count": role_char_counts.get("assistant", 0),
+        "kv_tool_char_count": role_char_counts.get("tool", 0),
         "kv_tools_count": len(tools or []),
         "kv_tools_hash": _short_hash(tools_text),
+        "kv_tools_char_count": len(tools_text),
+        "kv_tools_full_count": tool_schema_modes["full"],
+        "kv_tools_stub_count": tool_schema_modes["stub"],
         "kv_prefix_8k_hash": _short_hash(serialized[:8192]),
         "kv_prefix_16k_hash": _short_hash(serialized[:16384]),
         "kv_prefix_24k_hash": _short_hash(serialized[:24576]),
         "kv_has_send_receipt": "<send_receipt" in joined_content,
+        "kv_send_receipt_block_count": joined_content.count("<send_receipt"),
+        "kv_send_receipt_char_count": _tagged_block_char_count(
+            joined_content,
+            "send_receipt",
+        ),
+        "kv_task_context_block_count": joined_content.count("<task_context"),
+        "kv_task_context_char_count": _tagged_block_char_count(
+            joined_content,
+            "task_context",
+        ),
         "kv_has_recent_group_messages": "<recent_group_messages" in joined_content,
+        "kv_recent_group_message_line_count": joined_content.count(" msg_id="),
         "kv_has_rag": "<retrieved_conversation_context" in joined_content,
+        "kv_rag_block_count": joined_content.count("<retrieved_conversation_context"),
+        "kv_rag_char_count": _tagged_block_char_count(
+            joined_content,
+            "retrieved_conversation_context",
+        ),
     }
     return diag
 
@@ -589,6 +623,27 @@ def _short_hash(text: str) -> str:
     if not text:
         return ""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _tool_schema_mode_counts(tools: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"full": 0, "stub": 0}
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        parameters = function.get("parameters") if isinstance(function, dict) else None
+        properties = parameters.get("properties") if isinstance(parameters, dict) else None
+        if isinstance(properties, dict) and "_tool_search_required" in properties:
+            counts["stub"] += 1
+        else:
+            counts["full"] += 1
+    return counts
+
+
+def _tagged_block_char_count(text: str, tag_name: str) -> int:
+    pattern = re.compile(
+        rf"<{re.escape(tag_name)}(?:\s[^>]*)?>.*?</{re.escape(tag_name)}>",
+        re.DOTALL,
+    )
+    return sum(len(match.group(0)) for match in pattern.finditer(text))
 
 
 def _executor_accepts_tool_call_id(executor: ToolExecutor) -> bool:

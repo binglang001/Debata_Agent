@@ -230,6 +230,9 @@ def test_kv_prompt_diagnostics_do_not_emit_temp_fields():
 
     assert "kv_message_count" in diag
     assert "kv_prefix_8k_hash" in diag
+    assert diag["kv_user_char_count"] == len("<task_context>ctx</task_context>")
+    assert diag["kv_task_context_block_count"] == 1
+    assert diag["kv_task_context_char_count"] == len("<task_context>ctx</task_context>")
     assert not any(key.startswith("kv_temp") for key in diag)
 
 
@@ -254,6 +257,39 @@ def test_kv_prompt_diagnostics_scan_runtime_user_context():
     assert diag["kv_has_send_receipt"] is True
     assert diag["kv_has_recent_group_messages"] is True
     assert diag["kv_has_rag"] is True
+    assert diag["kv_send_receipt_block_count"] == 1
+    assert diag["kv_rag_block_count"] == 1
+
+
+def test_kv_prompt_diagnostics_counts_stub_tools():
+    diag = _kv_prompt_diagnostics(
+        [{"role": "system", "content": "x"}],
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "stub_tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"_tool_search_required": {"type": "boolean"}},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "full_tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        loop=1,
+    )
+
+    assert diag["kv_tools_count"] == 2
+    assert diag["kv_tools_stub_count"] == 1
+    assert diag["kv_tools_full_count"] == 1
+    assert diag["kv_tools_char_count"] > 0
 
 
 def test_behavior_prompt_does_not_hardcode_persona_replies():
