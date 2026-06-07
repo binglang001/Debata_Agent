@@ -244,6 +244,57 @@ class UploadFileArgs(_ToolArgs):
     )
 
 
+class GetMsgArgs(_ToolArgs):
+    """get_msg 工具参数。"""
+
+    message_id: int = Field(
+        ...,
+        description="要读取的 QQ 消息 ID。只能使用上下文中真实出现过的 msg_id，不要猜。",
+    )
+
+
+class SendPokeArgs(_ToolArgs):
+    """send_poke 工具参数。"""
+
+    user_id: int = Field(..., description="要戳一戳的目标 QQ 号，必须明确。")
+    group_id: int | None = Field(
+        default=None,
+        description=(
+            "群号。群聊戳一戳时填写；私聊戳一戳不填。"
+            "不填且当前会话是群聊时，程序会自动使用当前群号。"
+        ),
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么戳一戳。用于日志和自检，不会发给 QQ。",
+    )
+
+
+class SetMsgEmojiLikeArgs(_ToolArgs):
+    """set_msg_emoji_like 工具参数。"""
+
+    message_id: int = Field(
+        ...,
+        description="要添加或取消表情回复的消息 ID。必须是真实消息 ID，不要猜。",
+    )
+    emoji_id: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "QQ 表情 ID。必须使用已知 ID；不确定时不要猜。"
+            "常见 ID 可来自上下文、文档或用户明确给出的表情。"
+        ),
+    )
+    set: bool = Field(
+        default=True,
+        description="true=添加表情回复，false=取消这个表情回复。",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么设置表情回复。用于日志和自检，不会发给 QQ。",
+    )
+
+
 class ToolSearchArgs(_ToolArgs):
     """tool_search 工具参数。"""
 

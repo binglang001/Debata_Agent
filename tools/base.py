@@ -592,6 +592,8 @@ DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "update_important_memory",
     "delete_important_memory",
     "no_action",
+    "send_poke",
+    "set_msg_emoji_like",
     "set_friend_add_request",
     "set_group_add_request",
     "schedule_wakeup",

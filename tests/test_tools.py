@@ -206,6 +206,13 @@ class FullFakeAdapter(FakeSendAdapter):
                 "user_id": params.get("user_id"),
                 "role": "admin",
             }
+        if action == "get_msg":
+            return {
+                "message_id": params.get("message_id"),
+                "group_id": 456,
+                "user_id": 1001,
+                "raw_message": "单条消息内容",
+            }
         return {"ok": True, "action": action}
 
 
@@ -322,6 +329,7 @@ def test_all_expected_tools_registered():
         "recall_message", "upload_file",
         "save_important_memory", "update_important_memory", "delete_important_memory",
         "list_contacts", "get_user_info", "get_forward_msg", "get_recent_chat_messages",
+        "get_msg", "send_poke", "set_msg_emoji_like",
         "get_group_self_role", "set_group_kick", "set_group_ban",
         "set_group_whole_ban", "set_group_leave",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
@@ -708,6 +716,18 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         "get_user_info": {"user_id": 1001},
         "get_forward_msg": {"forward_id": "root", "recursive": True, "max_depth": 2},
         "get_recent_chat_messages": {"conversation_id": "private:123", "limit": 10},
+        "get_msg": {"message_id": 321},
+        "send_poke": {
+            "user_id": 1001,
+            "group_id": 456,
+            "reason": "用户明确要求戳一戳",
+        },
+        "set_msg_emoji_like": {
+            "message_id": 321,
+            "emoji_id": "76",
+            "set": True,
+            "reason": "用表情轻量回应",
+        },
         "set_friend_add_request": {"flag": "friend-flag", "approve": True, "remark": "A"},
         "set_group_add_request": {
             "flag": "group-flag",
@@ -780,6 +800,8 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["get_recent_chat_messages"]["content"].count("最近消息") == 1
     assert results["get_recent_chat_messages"]["data"]["range"] == "continuous"
     assert results["get_recent_chat_messages"]["data"]["last_msg_id"] == "m1"
+    assert results["get_msg"]["content"] == "单条消息内容"
+    assert results["get_msg"]["data"]["conversation_id"] == "group:456"
 
     assert results["read_file"]["data"]["range"] == "continuous_page"
     assert "old line" in results["read_file"]["content"]
@@ -839,6 +861,10 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["list_contacts"]["friends"][0]["nickname"] == "Alice"
     assert results["get_user_info"]["data"]["user_id"] == "1001"
     assert results["get_user_info"]["info"]["nickname"] == "Alice"
+    assert results["send_poke"]["status"] == "done"
+    assert results["send_poke"]["data"]["group_id"] == "456"
+    assert results["set_msg_emoji_like"]["status"] == "done"
+    assert results["set_msg_emoji_like"]["data"]["emoji_id"] == "76"
     assert adapter.friend_request == {"flag": "friend-flag", "approve": True, "remark": "A"}
     assert adapter.group_request == {
         "flag": "group-flag",
@@ -852,6 +878,8 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["set_group_whole_ban"]["status"] == "done"
     assert results["set_group_leave"]["status"] == "done"
     assert [call[0] for call in adapter.api_calls].count("set_group_ban") == 1
+    assert [call[0] for call in adapter.api_calls].count("send_poke") == 1
+    assert [call[0] for call in adapter.api_calls].count("set_msg_emoji_like") == 1
 
     assert results["summarize_chat_history"]["task_id"] == "agent-test"
     assert agent_tasks[1]["output_name"] == "group_456_summary.md"
@@ -881,6 +909,8 @@ def test_registry_no_feedback_names_includes_known():
     assert "no_action" in names
     assert "save_important_memory" in names
     assert "schedule_wakeup" in names
+    assert "send_poke" in names
+    assert "set_msg_emoji_like" in names
 
 
 def test_registry_rag_no_feedback_names_includes_memory_tools():
@@ -2084,6 +2114,15 @@ class _FakeAdapter:
                 "user_id": params.get("user_id"),
                 "role": self.member_role,
             }
+        if action == "get_msg":
+            return {
+                "message_id": params.get("message_id"),
+                "user_id": 123,
+                "message": [
+                    {"type": "text", "data": {"text": "你好"}},
+                    {"type": "face", "data": {"id": "76"}},
+                ],
+            }
         return {"ok": True, "action": action}
 
 
@@ -2308,6 +2347,35 @@ async def test_group_whole_ban_calls_napcat_api_when_admin():
         "set_group_whole_ban",
         {"group_id": 42, "enable": True},
     )
+
+
+@pytest.mark.asyncio
+async def test_qq_action_tools_call_napcat_api():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(adapter=adapter, conversation_id="group:42")
+    executor = reg.get_executor(ctx)
+
+    msg = await executor("get_msg", {"message_id": 123})
+    poke = await executor("send_poke", {"user_id": 456})
+    emoji = await executor(
+        "set_msg_emoji_like",
+        {"message_id": 123, "emoji_id": "76", "set": False},
+    )
+
+    assert msg["ok"] is True
+    assert msg["content"] == "你好[face]"
+    assert msg["data"]["conversation_id"] == "private:123"
+    assert poke["ok"] is True
+    assert poke["data"]["group_id"] == "42"
+    assert emoji["ok"] is True
+    assert emoji["data"]["set"] is False
+    assert adapter.api_calls[-3:] == [
+        ("get_msg", {"message_id": 123}),
+        ("send_poke", {"user_id": 456, "group_id": 42}),
+        ("set_msg_emoji_like", {"message_id": 123, "emoji_id": "76", "set": False}),
+    ]
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ from . import (  # noqa: F401
     memory_tools,
     messaging,
     platform_tools,
+    qq_action_tools,
     tool_search_tools,
     workspace_tools,
 )
@@ -159,6 +160,9 @@ FULL_SCHEMA_TOOLS: set[str] = {
     "list_contacts",
     "get_user_info",
     "get_group_self_role",
+    "get_msg",
+    "send_poke",
+    "set_msg_emoji_like",
     "set_friend_add_request",
     "set_group_add_request",
     "read_file",
