@@ -54,7 +54,7 @@ from typing import Any
 
 from adapters.base import IAdapter
 from adapters.types import IncomingMessage, MediaSegment, MediaType, Target
-from agents import ChatAgent, Persona, SummaryAgent, build_messages, build_task_context
+from agents import ChatAgent, Persona, SummaryAgent, build_messages
 from agents.base import AgentRunResult
 from app_config.schema import BehaviorConfig, FeaturesConfig, WhitelistConfig
 from memory import (
@@ -75,6 +75,21 @@ from utils import get_time, parse_raw_cq
 from utils.token_budget import TokenBudget, TokenEstimator
 
 from .chat_timeline import ChatTimelineStore
+from .pipeline_context import (
+    _earliest_record_ts as _earliest_record_ts,
+)
+from .pipeline_context import (
+    _filter_tool_schemas as _filter_tool_schemas,
+)
+from .pipeline_context import (
+    _make_runtime_context_record as _make_runtime_context_record,
+)
+from .pipeline_context import (
+    _make_task_context_record as _make_task_context_record,
+)
+from .pipeline_context import (
+    _recommended_context_budget as _recommended_context_budget,
+)
 from .pipeline_history import (
     _WORKING_HISTORY_NO_ACTION_KEEP as _WORKING_HISTORY_NO_ACTION_KEEP,
 )
@@ -1308,26 +1323,6 @@ _OUT_OF_BAND_DENIED_TOOLS = frozenset(
 )
 
 
-def _recommended_context_budget(model: str, context_length: int | None = None) -> int:
-    """按模型名推导工作上下文预算，不等于模型硬上限。"""
-    name = (model or "").lower()
-    if "deepseek-v4-pro" in name:
-        return 350_000
-    if "deepseek-v4" in name:
-        return 300_000
-    if context_length and context_length > 0:
-        if context_length >= 1_000_000:
-            return 300_000
-        if context_length >= 200_000:
-            return 150_000
-        if context_length >= 128_000:
-            return 96_000
-        return max(4096, int(context_length * 0.75))
-    if "claude" in name:
-        return 150_000
-    return 96_000
-
-
 def _log_slow_batch_stage(
     stage: str,
     started_at: float,
@@ -1361,67 +1356,6 @@ def _text_mentions_self_or_role(text: str, self_id: str, role_name: str) -> bool
             return True
     cleaned_role = str(role_name or "").strip()
     return bool(cleaned_role and f"@{cleaned_role}" in content)
-
-
-def _make_task_context_record(
-    task_context: str,
-    *,
-    conversation_id: str | None = None,
-) -> dict[str, Any] | None:
-    content = build_task_context(task_context)
-    if not content:
-        return None
-    record: dict[str, Any] = {
-        "role": "user",
-        "content": content,
-        "metadata": {"kind": "task_context_snapshot"},
-    }
-    if conversation_id:
-        record["conversation_id"] = conversation_id
-    return record
-
-
-def _make_runtime_context_record(
-    content: str,
-    *,
-    kind: str,
-    tag: str,
-    conversation_id: str | None = None,
-) -> dict[str, Any] | None:
-    content = content.strip()
-    if not content:
-        return None
-    record: dict[str, Any] = {
-        "role": "user",
-        "content": (
-            f"<{tag}>\n"
-            "系统说明：以下内容由运行时系统提供，不是用户新发言。\n"
-            f"{content}\n"
-            f"</{tag}>"
-        ),
-        "metadata": {"kind": kind},
-    }
-    if conversation_id:
-        record["conversation_id"] = conversation_id
-    return record
-
-
-def _earliest_record_ts(records: list[dict[str, Any]]) -> str | None:
-    timestamps: list[str] = []
-    for record in records:
-        ts = _record_timestamp(record)
-        if isinstance(ts, str) and ts:
-            timestamps.append(ts)
-    return min(timestamps) if timestamps else None
-
-
-def _filter_tool_schemas(
-    schemas: list[dict[str, Any]],
-    denied_tools: set[str] | frozenset[str],
-) -> list[dict[str, Any]]:
-    # 保持工具 schema 名称集合稳定，避免不同系统事件触发时破坏 provider KV 缓存。
-    # denied_tools 只在 executor 层拦截执行。
-    return schemas
 
 
 def _safe_agent_task_filename(name: str, *, default: str, suffix: str) -> str:
