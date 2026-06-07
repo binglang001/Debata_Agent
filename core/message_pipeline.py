@@ -1438,6 +1438,110 @@ def _no_action_pair_indices(records: list[dict[str, Any]], start: int) -> set[in
     return set(range(start, end + 1))
 
 
+def _working_history_noise_indices(
+    records: list[dict[str, Any]],
+    *,
+    conversation_id: str | None,
+    ensure_current_records: int,
+) -> set[int]:
+    """Indices of stale runtime records that can be skipped while filling budget."""
+    if not records:
+        return set()
+
+    force_keep = _working_history_force_keep_indices(
+        records,
+        conversation_id=conversation_id,
+        ensure_current_records=ensure_current_records,
+    )
+    runtime_indices = [
+        idx for idx, record in enumerate(records)
+        if _runtime_context_kind(record) is not None
+    ]
+    keep_runtime = set(runtime_indices[-_WORKING_HISTORY_RECENT_RUNTIME_RECORDS:])
+    send_receipt_indices = [
+        idx for idx in runtime_indices
+        if _runtime_context_kind(records[idx]) == "send_receipt"
+    ]
+    keep_runtime.update(send_receipt_indices[-_WORKING_HISTORY_SEND_RECEIPT_KEEP:])
+
+    drop_indices: set[int] = set()
+    for idx in runtime_indices:
+        if idx not in force_keep and idx not in keep_runtime:
+            drop_indices.add(idx)
+
+    no_action_pairs: list[set[int]] = []
+    idx = 0
+    while idx < len(records):
+        pair = _no_action_pair_indices(records, idx)
+        if not pair:
+            idx += 1
+            continue
+        no_action_pairs.append(pair)
+        idx = max(pair) + 1
+
+    kept_no_action_indices: set[int] = set()
+    for pair in no_action_pairs[-_WORKING_HISTORY_NO_ACTION_KEEP:]:
+        kept_no_action_indices.update(pair)
+    for pair in no_action_pairs:
+        if pair & force_keep:
+            continue
+        if pair & kept_no_action_indices:
+            continue
+        drop_indices.update(pair)
+
+    return drop_indices
+
+
+def _working_history_force_keep_indices(
+    records: list[dict[str, Any]],
+    *,
+    conversation_id: str | None,
+    ensure_current_records: int,
+) -> set[int]:
+    force_keep: set[int] = set()
+    if not conversation_id or ensure_current_records <= 0:
+        return force_keep
+    for idx in range(len(records) - 1, -1, -1):
+        if _record_conversation_id(records[idx]) != conversation_id:
+            continue
+        force_keep.add(idx)
+        if len(force_keep) >= ensure_current_records:
+            break
+    return force_keep
+
+
+def _working_history_optional_runtime_indices(
+    records: list[dict[str, Any]],
+    *,
+    conversation_id: str | None,
+    ensure_current_records: int,
+) -> set[int]:
+    """Recent runtime/no_action records that may use leftover budget."""
+    drop_indices = _working_history_noise_indices(
+        records,
+        conversation_id=conversation_id,
+        ensure_current_records=ensure_current_records,
+    )
+    force_keep = _working_history_force_keep_indices(
+        records,
+        conversation_id=conversation_id,
+        ensure_current_records=ensure_current_records,
+    )
+    optional = {
+        idx for idx, record in enumerate(records)
+        if _runtime_context_kind(record) is not None
+    }
+    idx = 0
+    while idx < len(records):
+        pair = _no_action_pair_indices(records, idx)
+        if not pair:
+            idx += 1
+            continue
+        optional.update(pair)
+        idx = max(pair) + 1
+    return optional - drop_indices - force_keep
+
+
 def _text_mentions_self_or_role(text: str, self_id: str, role_name: str) -> bool:
     content = str(text or "")
     cleaned_self_id = str(self_id or "").strip()
@@ -2579,11 +2683,23 @@ class MessagePipeline:
     ) -> list[dict[str, Any]]:
         estimator = self._token_estimator()
         selected_indices: set[int] = set()
+        noise_indices = _working_history_noise_indices(
+            records,
+            conversation_id=conversation_id,
+            ensure_current_records=ensure_current_records,
+        )
+        optional_runtime_indices = _working_history_optional_runtime_indices(
+            records,
+            conversation_id=conversation_id,
+            ensure_current_records=ensure_current_records,
+        )
         used = 0
 
         def add_index(index: int, *, force: bool = False) -> bool:
             nonlocal used
             if index in selected_indices:
+                return True
+            if not force and index in noise_indices:
                 return True
             cost = estimator.estimate_messages([records[index]])
             if not force and selected_indices and used + cost > working_budget:
@@ -2604,6 +2720,16 @@ class MessagePipeline:
 
         for idx in range(len(records) - 1, -1, -1):
             if idx in selected_indices:
+                continue
+            if idx in optional_runtime_indices:
+                continue
+            if not add_index(idx):
+                break
+
+        for idx in range(len(records) - 1, -1, -1):
+            if idx in selected_indices:
+                continue
+            if idx not in optional_runtime_indices:
                 continue
             if not add_index(idx):
                 break
@@ -2648,52 +2774,11 @@ class MessagePipeline:
         if not records:
             return records
 
-        force_keep: set[int] = set()
-        if conversation_id and ensure_current_records > 0:
-            kept = 0
-            for idx in range(len(records) - 1, -1, -1):
-                if _record_conversation_id(records[idx]) != conversation_id:
-                    continue
-                force_keep.add(idx)
-                kept += 1
-                if kept >= ensure_current_records:
-                    break
-
-        runtime_indices = [
-            idx for idx, record in enumerate(records)
-            if _runtime_context_kind(record) is not None
-        ]
-        keep_runtime = set(runtime_indices[-_WORKING_HISTORY_RECENT_RUNTIME_RECORDS:])
-        send_receipt_indices = [
-            idx for idx in runtime_indices
-            if _runtime_context_kind(records[idx]) == "send_receipt"
-        ]
-        keep_runtime.update(send_receipt_indices[-_WORKING_HISTORY_SEND_RECEIPT_KEEP:])
-
-        drop_indices: set[int] = set()
-        for idx in runtime_indices:
-            if idx not in force_keep and idx not in keep_runtime:
-                drop_indices.add(idx)
-
-        no_action_pairs: list[set[int]] = []
-        idx = 0
-        while idx < len(records):
-            pair = _no_action_pair_indices(records, idx)
-            if not pair:
-                idx += 1
-                continue
-            no_action_pairs.append(pair)
-            idx = max(pair) + 1
-
-        kept_no_action_indices: set[int] = set()
-        for pair in no_action_pairs[-_WORKING_HISTORY_NO_ACTION_KEEP:]:
-            kept_no_action_indices.update(pair)
-        for pair in no_action_pairs:
-            if pair & force_keep:
-                continue
-            if pair & kept_no_action_indices:
-                continue
-            drop_indices.update(pair)
+        drop_indices = _working_history_noise_indices(
+            records,
+            conversation_id=conversation_id,
+            ensure_current_records=ensure_current_records,
+        )
 
         if not drop_indices:
             return records

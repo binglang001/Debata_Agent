@@ -665,6 +665,36 @@ async def test_working_history_trims_old_runtime_context_records(build_pipeline)
 
 
 @pytest.mark.asyncio
+async def test_working_history_skips_runtime_noise_before_budget_cutoff(build_pipeline):
+    pipeline, _, _, history, _ = await build_pipeline([])
+    pipeline.behavior_cfg.context.max_context_tokens = 18_000
+    await history.add_user_message("预算内应保留的真实旧聊天 KEEP-REAL", conversation_id="group:1")
+    for idx in range(80):
+        await history.add_records(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "<task_context priority=\"medium\">\n"
+                        f"巨大旧运行时噪声 {idx} " + ("填充 " * 120) + "\n"
+                        "</task_context>"
+                    ),
+                    "metadata": {"kind": "task_context_snapshot"},
+                    "conversation_id": "group:noise",
+                }
+            ]
+        )
+    await history.add_user_message("当前触发消息", conversation_id="private:123")
+
+    selected = await pipeline._select_working_history("private:123")
+    joined = "\n".join(str(r.get("content", "")) for r in selected)
+
+    assert "预算内应保留的真实旧聊天 KEEP-REAL" in joined
+    assert "巨大旧运行时噪声 0" not in joined
+    assert "当前触发消息" in joined
+
+
+@pytest.mark.asyncio
 async def test_working_history_keeps_recent_current_conversation_runtime(build_pipeline):
     pipeline, _, _, history, _ = await build_pipeline([])
     for idx in range(16):
