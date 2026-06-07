@@ -156,6 +156,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
                 "target_scope": "private",
                 "target_id": str(t.target_qq),
                 "delay": delay,
+                "interrupt_policy": args.interrupt_policy,
                 **message_action,
             }
         )
@@ -258,6 +259,7 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
                 "target_scope": "group",
                 "target_id": str(args.group_id),
                 "delay": delay,
+                "interrupt_policy": args.interrupt_policy,
                 **message_action,
             }
         )

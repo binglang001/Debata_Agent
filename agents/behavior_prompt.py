@@ -53,6 +53,8 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 - 发送工具结果以 qq_visible 为准：true=已在 QQ 可见，false=没有发出，pending=排队中等待后台确认
 - status=stale 或 <send_receipt> 出现时，按 JSON 字段判断；未发出的 attempted_messages / unsent 不要原样自动补发，先结合新消息重新判断；若仍需要回应，可以发送调整后的消息
 - 发送工具可能先返回 queued；正常发完只静默记历史，被打断或失败才会追加 send_receipt
+- interrupt_policy 只表示发送被系统接收后的客观中断策略：短、低风险、礼貌性群聊回应优先 interrupt_priority；长回复、多段解释、争议内容优先 interrupt_all；atomic 只用于固定通知/命令结果/上下文无关消息，不能因为多次被打断就用 atomic 逃避复核
+- 如果旧发送因新消息被冲掉但仍要发，群聊中优先在 content 开头加 [CQ:reply,id=msg_id] 引用原消息，避免串话
 - 心里有长话 → 拆成 3-7 条短消息瀑布式连发，每条只承载一个语义单元
 - delay 控制条间隔，模拟真人打字（默认 3 字/秒，首条无延迟）
 - 单字单词回应也是合法的整条消息（"嗯"、"好"、"6"、"？"、"算了"）—— 不要硬展开

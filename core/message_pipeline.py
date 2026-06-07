@@ -97,6 +97,7 @@ class _SendJob:
     conversation_id: str
     actions: list[dict[str, Any]]
     source_tool: str
+    interrupt_policy: str
     trigger_message_id: str | None
     trigger_inbound_seq: int
     trigger_user_id: str | None
@@ -113,6 +114,9 @@ class _SendConversationState:
     pending_receipts: list[dict[str, Any]] = field(default_factory=list)
     needs_resync: bool = False
     in_flight: bool = False
+    active_interrupt_policy: str = "interrupt_all"
+    active_trigger_user_id: str | None = None
+    active_trigger_message_id: str | None = None
 
 
 class _AsyncSendManager:
@@ -165,6 +169,8 @@ class _AsyncSendManager:
         msg = self._inbound_to_receipt_message(ref)
         state = self._state(item.conversation_id)
         if state.in_flight or state.queue:
+            if not self._inbound_should_interrupt(state, item, msg):
+                return
             state.needs_resync = True
             state.interrupt_messages.append(msg)
             state.interrupt_event.set()
@@ -173,6 +179,8 @@ class _AsyncSendManager:
         if not self.is_model_active(item.conversation_id):
             return
 
+        if not self._model_thinking_inbound_should_interrupt(item, msg):
+            return
         state.needs_resync = True
         state.interrupt_messages.append(msg)
 
@@ -310,6 +318,7 @@ class _AsyncSendManager:
                 conversation_id=conversation_id,
                 actions=group_actions,
                 source_tool=source_tool,
+                interrupt_policy=self._group_interrupt_policy(group_actions),
                 trigger_message_id=trigger_message_id,
                 trigger_inbound_seq=trigger_inbound_seq,
                 trigger_user_id=trigger_user_id,
@@ -379,6 +388,7 @@ class _AsyncSendManager:
             "audio_path": str(action.get("audio_path") or ""),
             "image_path": str(action.get("image_path") or ""),
             "image_url": str(action.get("image_url") or ""),
+            "interrupt_policy": str(action.get("interrupt_policy") or "interrupt_all"),
         }
 
     def _can_sync_send(self, conversation_id: str, actions: list[dict[str, Any]]) -> bool:
@@ -388,6 +398,74 @@ class _AsyncSendManager:
         if len(actions) == 1:
             return True
         return all(float(a.get("delay") or 0.0) <= 0 for a in actions)
+
+    @staticmethod
+    def _group_interrupt_policy(actions: list[dict[str, Any]]) -> str:
+        policies = {str(action.get("interrupt_policy") or "interrupt_all") for action in actions}
+        if "interrupt_all" in policies:
+            return "interrupt_all"
+        if "interrupt_priority" in policies:
+            return "interrupt_priority"
+        return "atomic"
+
+    def _inbound_should_interrupt(
+        self,
+        state: _SendConversationState,
+        item: PendingMessageItem,
+        msg: dict[str, Any],
+    ) -> bool:
+        policy = state.active_interrupt_policy
+        if policy == "interrupt_all":
+            return True
+        if policy == "atomic":
+            return False
+        return self._is_priority_inbound(
+            item,
+            msg,
+            trigger_user_id=state.active_trigger_user_id,
+            trigger_message_id=state.active_trigger_message_id,
+        )
+
+    def _model_thinking_inbound_should_interrupt(
+        self,
+        item: PendingMessageItem,
+        msg: dict[str, Any],
+    ) -> bool:
+        if item.raw_event.is_private():
+            msg["priority_reason"] = "private_message"
+            return True
+        return self._is_priority_inbound(
+            item,
+            msg,
+            trigger_user_id=None,
+            trigger_message_id=None,
+        )
+
+    def _is_priority_inbound(
+        self,
+        item: PendingMessageItem,
+        msg: dict[str, Any],
+        *,
+        trigger_user_id: str | None,
+        trigger_message_id: str | None,
+    ) -> bool:
+        if item.raw_event.is_private():
+            msg["priority_reason"] = "private_message"
+            return True
+        if trigger_user_id and item.user_id == trigger_user_id:
+            msg["priority_reason"] = "same_trigger_user"
+            return True
+        if trigger_message_id and item.raw_event.reply_to == trigger_message_id:
+            msg["priority_reason"] = "reply_to_trigger_message"
+            return True
+        if _text_mentions_self_or_role(
+            item.text,
+            item.raw_event.self_id,
+            self.pipeline.persona.name,
+        ):
+            msg["priority_reason"] = "mentions_bot_or_role"
+            return True
+        return False
 
     async def _send_sync(
         self,
@@ -434,6 +512,9 @@ class _AsyncSendManager:
             while state.queue:
                 job = state.queue.popleft()
                 state.in_flight = True
+                state.active_interrupt_policy = job.interrupt_policy
+                state.active_trigger_user_id = job.trigger_user_id
+                state.active_trigger_message_id = job.trigger_message_id
                 sent: list[dict[str, Any]] = []
                 errors: list[str] = []
                 interrupted = False
@@ -501,6 +582,9 @@ class _AsyncSendManager:
                     break
         finally:
             state.in_flight = False
+            state.active_interrupt_policy = "interrupt_all"
+            state.active_trigger_user_id = None
+            state.active_trigger_message_id = None
             state.worker = None
             if state.queue:
                 state.worker = asyncio.create_task(self._worker(conversation_id, state))
@@ -775,6 +859,21 @@ def _record_conversation_id(record: dict[str, Any]) -> str | None:
     if user_id:
         return f"private:{user_id}"
     return None
+
+
+def _text_mentions_self_or_role(text: str, self_id: str, role_name: str) -> bool:
+    content = str(text or "")
+    cleaned_self_id = str(self_id or "").strip()
+    if cleaned_self_id:
+        tokens = (
+            f"@{cleaned_self_id}",
+            f"@QQ{cleaned_self_id}",
+            f"[CQ:at,qq={cleaned_self_id}]",
+        )
+        if any(token in content for token in tokens):
+            return True
+    cleaned_role = str(role_name or "").strip()
+    return bool(cleaned_role and f"@{cleaned_role}" in content)
 
 
 def _make_task_context_record(

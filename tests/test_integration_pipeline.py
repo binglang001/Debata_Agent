@@ -54,7 +54,11 @@ from app_config.schema import (
     SummarizeConfig,
     TypingConfig,
 )
-from core.message_pipeline import MessagePipeline, _recommended_context_budget
+from core.message_pipeline import (
+    MessagePipeline,
+    _recommended_context_budget,
+    _text_mentions_self_or_role,
+)
 from core.proactive_loop import ProactiveLoop
 from core.recall_handler import RecallHandler
 from core.state import PendingMessageItem, PendingRequestStore, RateLimiter
@@ -305,6 +309,7 @@ def _msg(
     group_id: str | None = None,
     text: str = "你好",
     message_id: str = "m1",
+    reply_to: str | None = None,
 ) -> IncomingMessage:
     scope = "group" if group_id else "private"
     return IncomingMessage(
@@ -318,6 +323,7 @@ def _msg(
         group_id=group_id,
         text=text,
         raw_message=text,
+        reply_to=reply_to,
     )
 
 
@@ -342,6 +348,13 @@ def _ai_no_action(reason: str = "无需回复") -> CompletionResult:
     _ = reason
     tc = ToolCall(id="tc-na", name="no_action", arguments="{}")
     return CompletionResult(tool_calls=[tc], finish_reason="tool_calls")
+
+
+def test_text_mentions_self_or_role_uses_deterministic_tokens():
+    assert _text_mentions_self_or_role("@QQ999 在吗", "999", "测试机器人") is True
+    assert _text_mentions_self_or_role("[CQ:at,qq=999] 在吗", "999", "测试机器人") is True
+    assert _text_mentions_self_or_role("@测试机器人 在吗", "999", "测试机器人") is True
+    assert _text_mentions_self_or_role("普通插话", "999", "测试机器人") is False
 
 
 async def _drain_pipeline(pipeline: MessagePipeline, max_wait: float = 1.0) -> None:
@@ -1472,6 +1485,88 @@ async def test_same_conversation_interrupt_flushes_async_send_queue(build_pipeli
 
 
 @pytest.mark.asyncio
+async def test_group_priority_interrupt_allows_unrelated_async_chat(build_pipeline):
+    """群聊默认 interrupt_priority：其他人普通插话不冲掉已排队的短回应。"""
+    args = {
+        "group_id": 5555,
+        "targets": [
+            {"content": "一", "order": 1, "delay": 0.2},
+            {"content": "二", "order": 2, "delay": 0.2},
+        ],
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_group_message",
+                        arguments=json.dumps(args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            _ai_no_action("处理普通插话"),
+        ]
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", group_id="5555", text="开始", message_id="m-start"))
+    await _wait_until(lambda: len(adapter.sent) == 1, max_wait=1.0)
+    await pipeline.enqueue(_msg(user_id="456", group_id="5555", text="路过插话", message_id="m-other"))
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert [content for _, content in adapter.sent] == ["一", "二"]
+    assert not pipeline._send_manager.should_defer_batch("group:5555")
+    records = await history.records()
+    joined = "\n".join(str(r.get("content", "")) for r in records)
+    assert "路过插话" in joined
+    assert '"interrupted": true' not in joined
+    assert len(provider.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_group_priority_interrupt_stops_same_trigger_user_followup(build_pipeline):
+    """同触发用户追问是确定性高优先级事件，仍会阻断剩余发送。"""
+    args = {
+        "group_id": 5555,
+        "targets": [
+            {"content": "一", "order": 1, "delay": 0.2},
+            {"content": "二", "order": 2, "delay": 0.2},
+        ],
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_group_message",
+                        arguments=json.dumps(args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            _ai_no_action("看到追问后先不补发"),
+        ]
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", group_id="5555", text="开始", message_id="m-start"))
+    await _wait_until(lambda: len(adapter.sent) == 1, max_wait=1.0)
+    await pipeline.enqueue(_msg(user_id="123", group_id="5555", text="等下", message_id="m-follow"))
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert [content for _, content in adapter.sent] == ["一"]
+    assert len(provider.calls) == 3
+    records = await history.records()
+    joined = "\n".join(str(r.get("content", "")) for r in records)
+    assert "m-follow" in joined
+    assert "<send_receipt>" in joined
+    assert '"interrupted": true' in joined
+    assert '"priority_reason": "same_trigger_user"' in joined
+    assert '"content": "二"' in joined
+
+
+@pytest.mark.asyncio
 async def test_same_conversation_message_while_model_thinking_returns_stale(build_pipeline):
     """LLM 思考时当前会话来了新消息，旧发送应 stale，并把新消息并入同一轮。"""
     started = asyncio.Event()
@@ -1544,6 +1639,54 @@ async def test_same_conversation_message_while_model_thinking_returns_stale(buil
     assert "m-old" in timeline_markdown
     assert "m-new" in timeline_markdown
     assert "旧回复" not in timeline_markdown
+
+
+@pytest.mark.asyncio
+async def test_unrelated_group_message_while_model_thinking_does_not_stale_send(build_pipeline):
+    """模型思考时普通群聊插话不应让默认群短回应饿死。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    send_args = {
+        "group_id": 5555,
+        "targets": [{"content": "短回", "order": 1}],
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline([])
+    call_count = 0
+
+    async def blocking_chat_completion(messages, *, model, tools=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        provider.calls.append({"messages": messages, "model": model, "tools": tools})
+        if call_count == 1:
+            started.set()
+            await release.wait()
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_group_message",
+                        arguments=json.dumps(send_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return _ai_no_action()
+
+    provider.chat_completion = blocking_chat_completion  # type: ignore[method-assign]
+
+    await pipeline.enqueue(_msg(user_id="123", group_id="5555", text="先问", message_id="m-old"))
+    await started.wait()
+    await pipeline.enqueue(_msg(user_id="456", group_id="5555", text="路过", message_id="m-new"))
+    release.set()
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert [content for _, content in adapter.sent] == ["短回"]
+    records = await history.records()
+    joined = "\n".join(str(r.get("content", "")) for r in records)
+    assert "路过" in joined
+    assert '"status": "stale"' not in joined
+    assert "<send_receipt>" not in joined
+    assert call_count == 3
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+SendInterruptPolicy = Literal["interrupt_all", "interrupt_priority", "atomic"]
+
 
 class _ToolArgs(BaseModel):
     """所有工具 args 的基类。
@@ -70,6 +72,14 @@ class SendPrivateArgs(_ToolArgs):
     targets: list[PrivateMessageTarget] = Field(
         ..., description="要发送的目标列表，至少 1 项"
     )
+    interrupt_policy: SendInterruptPolicy = Field(
+        default="interrupt_all",
+        description=(
+            "发送被系统接收后的中断策略。interrupt_all=同会话新消息都会阻断发送或使旧回复 stale；"
+            "interrupt_priority=只被确定性高优先级事件阻断，如私聊新消息、同触发用户追问、撤回；"
+            "atomic=普通新消息不阻断，只适合固定通知/命令结果，不要用来逃避频繁打断。"
+        ),
+    )
 
 
 class GroupMessageTarget(_ToolArgs):
@@ -110,6 +120,15 @@ class SendGroupArgs(_ToolArgs):
     group_id: int = Field(..., description="群号")
     targets: list[GroupMessageTarget] = Field(
         ..., description="要发送的消息列表，至少 1 项"
+    )
+    interrupt_policy: SendInterruptPolicy = Field(
+        default="interrupt_priority",
+        description=(
+            "发送被系统接收后的中断策略。interrupt_priority=推荐，普通群聊插话不阻断，"
+            "但同触发用户追问、@机器人、撤回等确定性高优先级事件会阻断；"
+            "interrupt_all=长回复/多段解释时使用，任何同会话新消息都阻断；"
+            "atomic=普通新消息不阻断，只适合固定通知/命令结果，不要用来逃避频繁打断。"
+        ),
     )
 
 
