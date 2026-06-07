@@ -241,6 +241,8 @@ def test_chats_render_record_uses_speaker_names_not_ambiguous_pronouns():
     assert "Bob(30003)" in user_html
     assert "群消息" in user_html
     assert "玖" in assistant_html
+    assert "chat-bubble chat-user" in user_html
+    assert "chat-bubble chat-assistant" in assistant_html
     assert ">你<" not in user_html + assistant_html
     assert ">她<" not in user_html + assistant_html
 
@@ -266,8 +268,37 @@ def test_chats_runtime_and_tool_results_are_readable_and_collapsed():
         "状态 stale；待发送/尝试 1 条；新消息 1 条；模型思考期间当前会话来了新消息"
     )
     assert "工具结果 · call-1" in tool_html
+    assert "chat-event chat-event-tool" in tool_html
+    assert "chat-bubble" not in tool_html
     assert "状态 stale" in tool_html
     assert "展开原文" in tool_html
+
+
+def test_chats_runtime_and_system_records_are_events_not_bubbles():
+    runtime_html = _render_record_html(
+        {
+            "role": "user",
+            "content": (
+                "<task_context priority=\"medium\">\n"
+                "现在是2026-06-07 01:20:21。\n"
+                "当前会话：group:497686077。\n"
+                "<recent_group_messages></recent_group_messages>\n"
+                "</task_context>"
+            ),
+        },
+        persona_name="玖",
+    )
+    system_html = _render_record_html(
+        {"role": "system", "content": "主动思考：本次跳过"},
+        persona_name="玖",
+    )
+
+    assert "系统 · 运行时上下文" in runtime_html
+    assert "chat-event chat-event-system" in runtime_html
+    assert "chat-bubble" not in runtime_html
+    assert "系统" in system_html
+    assert "chat-event chat-event-system" in system_html
+    assert "chat-bubble" not in system_html
 
 
 def test_chats_renders_assistant_tool_calls_as_separate_bubble():
@@ -292,6 +323,7 @@ def test_chats_renders_assistant_tool_calls_as_separate_bubble():
     assert "chat-assistant" in bubbles[0]
     assert "工具调用" not in bubbles[0]
     assert "chat-tool" in bubbles[1]
+    assert "chat-bubble" in bubbles[1]
     assert "向 123 发送消息：你好" in bubbles[1]
 
 

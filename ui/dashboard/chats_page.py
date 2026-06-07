@@ -290,11 +290,14 @@ class ChatsPage(QWidget):
         persona_name = _runtime_persona_name(self._runtime)
         parts = [
             "<style>"
-            ".chat-record{margin:10px 0;padding:10px 12px;border-radius:8px;}"
+            ".chat-record{margin:10px 0;}"
+            ".chat-bubble{padding:10px 12px;border-radius:8px;}"
             ".chat-user{background:#F6F1E8;}"
             ".chat-assistant{background:#EAF4F0;}"
             ".chat-tool{background:#EEF4FA;}"
-            ".chat-system{background:#F3F2F0;color:#5F5952;}"
+            ".chat-event{padding:8px 10px;border-left:3px solid #C8C1BA;color:#5F5952;background:#F7F6F4;}"
+            ".chat-event-tool{border-color:#9DB9D3;background:#F5F8FB;}"
+            ".chat-event-system{border-color:#C8C1BA;background:#F7F6F4;}"
             ".chat-head{font-weight:600;margin-bottom:6px;}"
             ".chat-meta{color:#7A7168;font-size:12px;}"
             ".chat-pre{white-space:pre-wrap;margin:6px 0 0 0;}"
@@ -306,7 +309,7 @@ class ChatsPage(QWidget):
         ]
         if hidden:
             parts.append(
-                "<div class='chat-record chat-system'>"
+                "<div class='chat-record chat-event chat-event-system'>"
                 f"还有 {hidden} 条更早记录未显示。点击上方“加载更早”逐步展开，或“显示全部”查看完整记录。"
                 "</div>"
             )
@@ -469,13 +472,13 @@ def _render_record_bubbles(rec: dict, *, persona_name: str) -> list[str]:
 
     if role == "tool":
         head = f"工具结果 · {tool_call_id}" if tool_call_id else "工具结果"
-        css = "chat-tool"
         body = _render_tool_result_content(content)
+        return [_render_event_record(head, body, event_class="chat-event-tool")]
     elif runtime is not None:
         title, summary = runtime
         head = f"系统 · {title}"
-        css = "chat-system"
         body = _render_collapsed_content(summary, content)
+        return [_render_event_record(head, body, event_class="chat-event-system")]
     elif role == "user":
         head = _user_record_label(rec)
         css = "chat-user"
@@ -486,14 +489,17 @@ def _render_record_bubbles(rec: dict, *, persona_name: str) -> list[str]:
         body = _render_text_block(content) if content else ""
     elif role == "system":
         head = "系统"
-        css = "chat-system"
         body = _render_text_block(content)
+        return [_render_event_record(head, body, event_class="chat-event-system")]
     else:
         head = str(role or "记录")
-        css = "chat-system"
         body = _render_text_block(content)
+        return [_render_event_record(head, body, event_class="chat-event-system")]
 
-    parts = [f"<div class='chat-record {css}'>", f"<div class='chat-head'>{_escape(head)}</div>"]
+    parts = [
+        f"<div class='chat-record chat-bubble {css}'>",
+        f"<div class='chat-head'>{_escape(head)}</div>",
+    ]
     if reasoning:
         parts.append(
             "<details><summary class='chat-summary'>思考过程</summary>"
@@ -508,9 +514,20 @@ def _render_record_bubbles(rec: dict, *, persona_name: str) -> list[str]:
     return bubbles
 
 
+def _render_event_record(head: str, body: str, *, event_class: str) -> str:
+    parts = [
+        f"<div class='chat-record chat-event {event_class}'>",
+        f"<div class='chat-head'>{_escape(head)}</div>",
+    ]
+    if body:
+        parts.append(body)
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def _render_tool_call_bubble(tool_calls: list, *, persona_name: str) -> str:
     parts = [
-        "<div class='chat-record chat-tool'>",
+        "<div class='chat-record chat-bubble chat-tool'>",
         f"<div class='chat-head'>{_escape(persona_name)} · 工具调用</div>",
         "<ul class='chat-tool-list'>",
     ]
