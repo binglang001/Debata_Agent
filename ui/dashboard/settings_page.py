@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import socket
 from copy import deepcopy
 from typing import Any
 
@@ -63,6 +62,7 @@ from .settings import (
     _VisionEditDialog,
     _WeatherEditDialog,
 )
+from .settings.adapter import SettingsAdapterMixin
 from .settings.behavior import SettingsBehaviorMixin
 from .settings.helpers import (
     _format_tool_result_overrides,
@@ -79,7 +79,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 
-class SettingsPage(SettingsBehaviorMixin, SettingsStateMixin, QWidget):
+class SettingsPage(SettingsAdapterMixin, SettingsBehaviorMixin, SettingsStateMixin, QWidget):
     """设置页。每字段即时保存；改完按需重启。"""
 
     theme_changed = Signal(str)  # "auto" / "light" / "dark"
@@ -1782,43 +1782,6 @@ class SettingsPage(SettingsBehaviorMixin, SettingsStateMixin, QWidget):
                     button.setText("测试连接")
 
         loop.create_task(_do_test())
-
-    def _running_adapter_for_current_page(self):
-        adapter = getattr(self._runtime, "adapter", None)
-        if adapter is None:
-            return None
-        if getattr(adapter, "name", "") != getattr(self, "_adapter_name", ""):
-            return None
-        return adapter
-
-    @staticmethod
-    async def _probe_tcp_port(host: str, port: int, *, timeout: float = 2.0) -> bool:
-        writer = None
-        try:
-            _reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
-                timeout=timeout,
-            )
-            return True
-        except (OSError, asyncio.TimeoutError):
-            return False
-        finally:
-            if writer is not None:
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except OSError:
-                    pass
-
-    @staticmethod
-    def _can_bind_adapter_port(host: str, port: int) -> bool:
-        family = socket.AF_INET6 if ":" in host else socket.AF_INET
-        try:
-            with socket.socket(family, socket.SOCK_STREAM) as sock:
-                sock.bind((host, port))
-                return True
-        except OSError:
-            return False
 
     # ============================================================
     # 人格节
