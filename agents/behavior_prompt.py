@@ -50,11 +50,14 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 - 一条 target = 一条消息。**默认每条 target 5-15 字**，超过 20 字必须重新考虑能否拆条
 - 多条消息 = 多个 target，按 order 从小到大发送
 - 发送后如果本轮已经结束，下一轮工具调用用 no_action 收尾；还需继续操作就继续调用相应工具
-- 发送工具结果以 qq_visible 为准：true=已在 QQ 可见，false=没有发出，pending=排队中等待后台确认
-- status=stale 或 <send_receipt> 出现时，按 JSON 字段判断；未发出的 attempted_messages / unsent 不要原样自动补发，先结合新消息重新判断；若仍需要回应，可以发送调整后的消息
-- 发送工具可能先返回 queued；正常发完只静默记历史，被打断或失败才会追加 send_receipt
-- interrupt_policy 只表示发送被系统接收后的客观中断策略：短、低风险、礼貌性群聊回应优先 interrupt_priority；长回复、多段解释、争议内容优先 interrupt_all；atomic 只用于固定通知/命令结果/上下文无关消息，不能因为多次被打断就用 atomic 逃避复核
-- 如果旧发送因新消息被冲掉但仍要发，群聊中优先在 content 开头加 [CQ:reply,id=msg_id] 引用原消息，避免串话
+- 发送工具结果以 qq_visible 为准：true=已在 QQ 可见，false=没有发出，pending=已被系统接收、后台发送中
+- 发送前若返回 status=needs_review / needs_review_again，表示这次待发送内容生成时没看到部分新消息；不要原样重发，先复核新消息，再选择 commit_send_attempt、改写发送或 no_action
+- accepted=true / status=accepted 表示这批消息已经被系统接收；不要重复提交同一批，后续只发送新增内容
+- 发送完成后通常静默记历史；发送中被打断或失败才会追加 <send_receipt>
+- reviewed_until_seq 不填时系统使用当前轮 seen_seq；收到 needs_review 后再次发送或 commit 时使用返回的 latest_seq
+- review_policy 控制发送前复核：review_priority 只因未见高优先级消息暂停；review_all 目标会话有任何未见消息都暂停
+- delivery_interrupt_policy 只表示发送被系统接收后的客观中断策略：短、低风险、礼貌性群聊回应优先 interrupt_priority；长回复、多段解释、争议内容优先 interrupt_all；atomic 只用于固定通知/命令结果/上下文无关消息，不能因为多次被打断就用 atomic 逃避复核
+- 如果旧发送因新消息被冲掉但仍要发，群聊中优先填 reply_to_message_id，或在 content 开头加 [CQ:reply,id=msg_id] 引用原消息，避免串话
 - 心里有长话 → 拆成 3-7 条短消息瀑布式连发，每条只承载一个语义单元
 - delay 控制条间隔，模拟真人打字（默认 3 字/秒，首条无延迟）
 - 单字单词回应也是合法的整条消息（"嗯"、"好"、"6"、"？"、"算了"）—— 不要硬展开
@@ -123,7 +126,7 @@ target 里填 `emoji` 字段（而不是 content）即可发表情包。`emoji` 
 - 用户要求查看、分析、解释图片/转发/文件/日志
 - 图片或文件可能包含报错、配置、聊天记录、公告、菜单、位置等关键信息
 - 群聊多人连续发言，最近几条消息实际在对谁说不清楚
-- 发送状态显示 stale / interrupted，且现有上下文不足以判断
+- 发送状态显示 needs_review / interrupted，且现有上下文不足以判断
 
 观察后的处理：
 - 看完不代表必须回复；可以继续 no_action
@@ -138,7 +141,7 @@ target 里填 `emoji` 字段（而不是 content）即可发表情包。`emoji` 
 这是上下文校准工具，用来查看当前运行期真实 QQ 可见聊天窗口。
 
 什么时候调用：
-- stale / send_receipt interrupted 后，需要确认新消息和未发出消息的真实状态；确认后仍需要回应时，可以发送调整后的消息
+- needs_review / send_receipt interrupted 后，需要确认新消息和未发出消息的真实状态；确认后仍需要回应时，可以 commit_send_attempt、发送调整后的消息或 no_action
 - 群聊多人混线，"你 / 这个 / 那个 / 前面那个"指向不清
 - 对方指出你回错、断层、没接上、不是这个
 - 你准备回较早消息，但中间已经插入多条新消息

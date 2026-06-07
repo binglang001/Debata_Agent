@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -508,7 +509,10 @@ class AgentRunner:
                 continue
 
             try:
-                result = await executor(name, args)
+                if _executor_accepts_tool_call_id(executor):
+                    result = await executor(name, args, tool_call_id=tc.id)
+                else:
+                    result = await executor(name, args)
                 if not isinstance(result, dict):
                     result = {"ok": True, "value": result}
             except Exception as e:
@@ -585,3 +589,22 @@ def _short_hash(text: str) -> str:
     if not text:
         return ""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _executor_accepts_tool_call_id(executor: ToolExecutor) -> bool:
+    try:
+        signature = inspect.signature(executor)
+    except (TypeError, ValueError):
+        return False
+    positional_count = 0
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "tool_call_id":
+            return True
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_count += 1
+    return positional_count >= 3

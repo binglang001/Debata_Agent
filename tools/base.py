@@ -107,11 +107,8 @@ WakeupCallback = Callable[
 ]
 """schedule_wakeup 工具调用的回调：(delay_seconds, reminder, target, mode, message_text) -> None"""
 
-SendActionsCallback = Callable[
-    [list[dict[str, Any]], str],
-    Awaitable[dict[str, Any]],
-]
-"""发送类工具的 Phase 0 队列回调：(actions, source_tool) -> result。"""
+SendActionsCallback = Callable[..., Awaitable[dict[str, Any]]]
+"""发送类工具的 Phase 0 队列回调：(actions, source_tool, metadata=...) -> result。"""
 
 AgentTaskCallback = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 """子 Agent 任务回调：(payload) -> in-band tool result。"""
@@ -377,7 +374,12 @@ class ToolRegistry:
             - 参数校验失败 / 工具不存在 / 工具抛异常 → 返回 {"ok": False, "error": "..."}
         """
 
-        async def executor(tool_name: str, raw_args: dict[str, Any]) -> dict[str, Any]:
+        async def executor(
+            tool_name: str,
+            raw_args: dict[str, Any],
+            *,
+            tool_call_id: str | None = None,
+        ) -> dict[str, Any]:
             spec = self._specs.get(tool_name)
             if spec is None:
                 return {"ok": False, "error": f"unknown tool: {tool_name}"}
@@ -390,10 +392,19 @@ class ToolRegistry:
                 return {"ok": False, "error": f"参数无效: {e}"}
 
             try:
+                old_tool_call_id = ctx.extras.get("tool_call_id")
+                if tool_call_id:
+                    ctx.extras["tool_call_id"] = tool_call_id
                 result = await spec.func(args, ctx)
             except Exception as e:
                 logger.exception(f"工具 {tool_name} 执行异常: {e}")
                 return {"ok": False, "error": str(e)}
+            finally:
+                if tool_call_id:
+                    if old_tool_call_id is None:
+                        ctx.extras.pop("tool_call_id", None)
+                    else:
+                        ctx.extras["tool_call_id"] = old_tool_call_id
 
             if not isinstance(result, dict):
                 # 工具实现应统一返回 dict（含 ok 字段）；非 dict 兜底为成功，

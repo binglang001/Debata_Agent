@@ -42,6 +42,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -88,6 +89,8 @@ class _InboundRef:
     user_id: str
     nickname: str
     text: str
+    reply_to: str | None
+    self_id: str
     received_at: float
 
 
@@ -119,6 +122,26 @@ class _SendConversationState:
     active_trigger_message_id: str | None = None
 
 
+@dataclass(slots=True)
+class _SendAttempt:
+    send_attempt_id: str
+    conversation_ids: list[str]
+    actions: list[dict[str, Any]]
+    source_tool: str
+    trigger_message_id: str | None
+    trigger_inbound_seq: int
+    trigger_user_id: str | None
+    focus_user_ids: list[str]
+    trigger_message_ids: list[str]
+    reviewed_until_seq: int
+    review_policy: str
+    delivery_interrupt_policy: str
+    tool_call_id: str | None
+    reason: str | None
+    created_at: float
+    consumed: bool = False
+
+
 class _AsyncSendManager:
     """Phase 0 每会话 FIFO 发送队列。
 
@@ -130,7 +153,11 @@ class _AsyncSendManager:
         self.pipeline = pipeline
         self._states: dict[str, _SendConversationState] = {}
         self._recent_inbound: dict[str, list[_InboundRef]] = {}
+        self._recent_recalls: dict[str, list[dict[str, Any]]] = {}
         self._send_counter = 0
+        self._attempt_counter = 0
+        self._send_attempts: dict[str, _SendAttempt] = {}
+        self._tool_call_results: dict[str, dict[str, Any]] = {}
         self._active_model_conversation: str | None = None
 
     def begin_model_turn(self, conversation_id: str | None) -> None:
@@ -159,6 +186,8 @@ class _AsyncSendManager:
             user_id=item.user_id,
             nickname=item.nickname,
             text=item.text,
+            reply_to=item.raw_event.reply_to,
+            self_id=str(getattr(item.raw_event, "self_id", "") or ""),
             received_at=item.received_at,
         )
         recent = self._recent_inbound.setdefault(item.conversation_id, [])
@@ -199,6 +228,17 @@ class _AsyncSendManager:
         note: str,
     ) -> None:
         """记录撤回导致的会话状态变化，阻止模型继续发送旧判断。"""
+        recalled = {
+            "conversation_id": conversation_id,
+            "time": get_time(),
+            "msg_id": str(message_id),
+            "note": note,
+            "qq_visible": False,
+        }
+        recent = self._recent_recalls.setdefault(conversation_id, [])
+        recent.append(recalled)
+        if len(recent) > 200:
+            del recent[:-200]
         state = self._state(conversation_id)
         needs_interrupt = (
             state.in_flight
@@ -208,13 +248,6 @@ class _AsyncSendManager:
         )
         if not needs_interrupt:
             return
-        recalled = {
-            "conversation_id": conversation_id,
-            "time": get_time(),
-            "msg_id": str(message_id),
-            "note": note,
-            "qq_visible": False,
-        }
         state.recall_events.append(recalled)
         if len(state.recall_events) > 50:
             del state.recall_events[:-50]
@@ -257,11 +290,30 @@ class _AsyncSendManager:
         trigger_message_id: str | None = None,
         trigger_inbound_seq: int = 0,
         trigger_user_id: str | None = None,
+        default_reviewed_until_seq: int | None = None,
+        default_focus_user_ids: list[str] | None = None,
+        default_trigger_message_ids: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        metadata = dict(metadata or {})
+        tool_call_id = str(metadata.get("tool_call_id") or "").strip()
+        if tool_call_id and tool_call_id in self._tool_call_results:
+            return copy.deepcopy(self._tool_call_results[tool_call_id])
+
+        if source_tool == "commit_send_attempt" or metadata.get("commit_send_attempt_id"):
+            result = await self._commit_send_attempt(
+                metadata,
+                trigger_message_id=trigger_message_id,
+                trigger_inbound_seq=trigger_inbound_seq,
+                trigger_user_id=trigger_user_id,
+            )
+            self._remember_tool_call_result(tool_call_id, result)
+            return result
+
         send_id = self._next_send_id()
         normalized = [self._normalize_action(a) for a in actions]
         if not normalized:
-            return {
+            result = {
                 "ok": True,
                 "status": "sent",
                 "qq_visible": False,
@@ -269,37 +321,97 @@ class _AsyncSendManager:
                 "count": 0,
                 "sent": [],
             }
+            self._remember_tool_call_result(tool_call_id, result)
+            return result
+
+        delivery_interrupt_policy = str(
+            metadata.get("delivery_interrupt_policy")
+            or self._group_interrupt_policy(normalized)
+        )
+        for action in normalized:
+            action["interrupt_policy"] = delivery_interrupt_policy
 
         groups: dict[str, list[dict[str, Any]]] = {}
         for action in normalized:
             groups.setdefault(self._conversation_id(action), []).append(action)
 
-        stale_convs = [cid for cid in groups if self._state(cid).needs_resync]
-        if stale_convs:
-            new_visible_messages: list[dict[str, Any]] = []
-            recalled_messages: list[dict[str, Any]] = []
-            for cid in stale_convs:
-                state = self._state(cid)
-                new_visible_messages.extend(state.interrupt_messages)
-                recalled_messages.extend(state.recall_events)
-            result = {
-                "ok": False,
-                "status": "stale",
-                "qq_visible": False,
-                "send_id": send_id,
-                "stale_conversations": stale_convs,
-                "attempted_messages": self._attempted_items(normalized, send_id),
-                "new_visible_messages": new_visible_messages,
-                "next": (
-                    "重新判断；不要原样补发 attempted_messages。"
-                    "如果结合新消息后仍需要回应，可以发送调整后的消息。"
-                    "必要时调用 get_recent_chat_messages。"
-                ),
-            }
-            if recalled_messages:
-                result["recalled_messages"] = recalled_messages
+        reviewed_until_seq = self._reviewed_until_seq(
+            metadata.get("reviewed_until_seq"),
+            default_reviewed_until_seq
+            if default_reviewed_until_seq is not None
+            else trigger_inbound_seq,
+        )
+        review_policy = str(metadata.get("review_policy") or "review_priority")
+        responding_to_message_ids = self._message_id_list(
+            metadata.get("responding_to_message_ids")
+        )
+        reply_to_message_id = str(metadata.get("reply_to_message_id") or "").strip()
+        trigger_message_ids = self._trigger_message_ids(
+            trigger_message_id,
+            default_trigger_message_ids or [],
+            responding_to_message_ids,
+            reply_to_message_id,
+        )
+        focus_user_ids = self._focus_user_ids(
+            list(groups.keys()),
+            responding_to_message_ids=responding_to_message_ids,
+            default_focus_user_ids=default_focus_user_ids,
+            trigger_user_id=trigger_user_id,
+        )
+        preflight = self._preflight_send(
+            list(groups.keys()),
+            reviewed_until_seq=reviewed_until_seq,
+            review_policy=review_policy,
+            focus_user_ids=focus_user_ids,
+            trigger_message_ids=trigger_message_ids,
+        )
+        if preflight["needs_review"]:
+            attempt = self._create_send_attempt(
+                normalized,
+                source_tool=source_tool,
+                conversation_ids=list(groups.keys()),
+                trigger_message_id=trigger_message_id,
+                trigger_inbound_seq=trigger_inbound_seq,
+                trigger_user_id=trigger_user_id,
+                focus_user_ids=focus_user_ids,
+                trigger_message_ids=trigger_message_ids,
+                reviewed_until_seq=reviewed_until_seq,
+                review_policy=review_policy,
+                delivery_interrupt_policy=delivery_interrupt_policy,
+                tool_call_id=tool_call_id or None,
+                reason=str(metadata.get("reason") or "") or None,
+            )
+            result = self._needs_review_result(
+                attempt,
+                preflight,
+                status="needs_review",
+            )
+            self._remember_tool_call_result(tool_call_id, result)
             return result
 
+        result = await self._accept_send(
+            send_id,
+            normalized,
+            groups,
+            source_tool,
+            trigger_message_id=trigger_message_id,
+            trigger_inbound_seq=trigger_inbound_seq,
+            trigger_user_id=trigger_user_id,
+        )
+        self._remember_tool_call_result(tool_call_id, result)
+        return result
+
+    async def _accept_send(
+        self,
+        send_id: str,
+        normalized: list[dict[str, Any]],
+        groups: dict[str, list[dict[str, Any]]],
+        source_tool: str,
+        *,
+        trigger_message_id: str | None,
+        trigger_inbound_seq: int,
+        trigger_user_id: str | None,
+    ) -> dict[str, Any]:
         can_sync = all(self._can_sync_send(cid, acts) for cid, acts in groups.items())
         if can_sync:
             return await self._send_sync(
@@ -330,14 +442,100 @@ class _AsyncSendManager:
 
         return {
             "ok": True,
-            "status": "queued",
+            "status": "accepted",
+            "accepted": True,
+            "delivery": "pending",
             "qq_visible": "pending",
             "send_id": send_id,
+            "accepted_messages": self._accepted_items(normalized),
+            "next": "这批消息已经被系统接收，不要重复提交同一批；如需补充，只发送新增内容。",
             "data": {
                 "conversation_ids": list(groups.keys()),
                 "message_count": sum(len(items) for items in groups.values()),
             },
         }
+
+    async def _commit_send_attempt(
+        self,
+        metadata: dict[str, Any],
+        *,
+        trigger_message_id: str | None,
+        trigger_inbound_seq: int,
+        trigger_user_id: str | None,
+    ) -> dict[str, Any]:
+        _ = trigger_message_id, trigger_inbound_seq, trigger_user_id
+        attempt_id = str(metadata.get("commit_send_attempt_id") or "").strip()
+        attempt = self._send_attempts.get(attempt_id)
+        if attempt is None:
+            return {
+                "ok": False,
+                "status": "not_found",
+                "send_attempt_id": attempt_id,
+                "qq_visible": False,
+                "error": "send_attempt 不存在或已过期",
+            }
+        if attempt.consumed:
+            return {
+                "ok": False,
+                "status": "already_committed",
+                "send_attempt_id": attempt_id,
+                "qq_visible": False,
+                "next": "这个 send_attempt 已经提交过；不要重复发送同一批。如需补充，只发送新增内容。",
+            }
+        reviewed_until_seq = self._reviewed_until_seq(
+            metadata.get("reviewed_until_seq"),
+            attempt.reviewed_until_seq,
+        )
+        preflight = self._preflight_send(
+            attempt.conversation_ids,
+            reviewed_until_seq=reviewed_until_seq,
+            review_policy="review_priority",
+            focus_user_ids=attempt.focus_user_ids,
+            trigger_message_ids=attempt.trigger_message_ids,
+        )
+        if preflight["recalled_messages"]:
+            return {
+                "ok": False,
+                "status": "cannot_commit_recalled_trigger",
+                "send_attempt_id": attempt_id,
+                "qq_visible": False,
+                "recalled_messages": preflight["recalled_messages"],
+                "next": "相关消息已撤回，不能确认发送旧内容。请重新判断或 no_action。",
+            }
+        if preflight["priority_interrupts"]:
+            return self._needs_review_result(
+                attempt,
+                preflight,
+                status="needs_review_again",
+            )
+
+        normalized = [dict(action) for action in attempt.actions]
+        delivery_policy = str(
+            metadata.get("delivery_interrupt_policy")
+            or attempt.delivery_interrupt_policy
+            or self._group_interrupt_policy(normalized)
+        )
+        for action in normalized:
+            action["interrupt_policy"] = delivery_policy
+        self._apply_reply_to_first_text(normalized, metadata.get("reply_to_message_id"))
+
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for action in normalized:
+            groups.setdefault(self._conversation_id(action), []).append(action)
+
+        send_id = self._next_send_id()
+        result = await self._accept_send(
+            send_id,
+            normalized,
+            groups,
+            attempt.source_tool,
+            trigger_message_id=attempt.trigger_message_id,
+            trigger_inbound_seq=attempt.trigger_inbound_seq,
+            trigger_user_id=attempt.trigger_user_id,
+        )
+        attempt.consumed = True
+        result["send_attempt_id"] = attempt_id
+        return result
 
     def pop_pending_receipts(self, conversation_id: str) -> list[dict[str, Any]]:
         state = self._state(conversation_id)
@@ -371,6 +569,22 @@ class _AsyncSendManager:
         self._send_counter += 1
         return f"send-{int(time.time() * 1000)}-{self._send_counter}"
 
+    def _next_attempt_id(self) -> str:
+        self._attempt_counter += 1
+        return f"attempt-{int(time.time() * 1000)}-{self._attempt_counter}"
+
+    def _remember_tool_call_result(
+        self,
+        tool_call_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        if not tool_call_id:
+            return
+        self._tool_call_results[tool_call_id] = copy.deepcopy(result)
+        if len(self._tool_call_results) > 200:
+            for key in list(self._tool_call_results)[:50]:
+                self._tool_call_results.pop(key, None)
+
     @staticmethod
     def _conversation_id(action: dict[str, Any]) -> str:
         return f"{action['target_scope']}:{action['target_id']}"
@@ -390,6 +604,277 @@ class _AsyncSendManager:
             "image_url": str(action.get("image_url") or ""),
             "interrupt_policy": str(action.get("interrupt_policy") or "interrupt_all"),
         }
+
+    @staticmethod
+    def _reviewed_until_seq(value: Any, default: int | None) -> int:
+        if value is None or value == "":
+            return max(0, int(default or 0))
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return max(0, int(default or 0))
+
+    @staticmethod
+    def _message_id_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        raw_items = value if isinstance(value, list) else [value]
+        result: list[str] = []
+        for item in raw_items:
+            text = str(item or "").strip()
+            if text and text not in result:
+                result.append(text)
+        return result
+
+    def _trigger_message_ids(
+        self,
+        trigger_message_id: str | None,
+        default_trigger_message_ids: list[str],
+        responding_to_message_ids: list[str],
+        reply_to_message_id: str | None,
+    ) -> list[str]:
+        result: list[str] = []
+        for item in [
+            trigger_message_id,
+            *default_trigger_message_ids,
+            *responding_to_message_ids,
+            reply_to_message_id,
+        ]:
+            text = str(item or "").strip()
+            if text and text not in result:
+                result.append(text)
+        return result
+
+    def _focus_user_ids(
+        self,
+        conversation_ids: list[str],
+        *,
+        responding_to_message_ids: list[str],
+        default_focus_user_ids: list[str] | None,
+        trigger_user_id: str | None,
+    ) -> list[str]:
+        result: list[str] = []
+        for message_id in responding_to_message_ids:
+            user_id = self._user_id_for_message(conversation_ids, message_id)
+            if user_id and user_id not in result:
+                result.append(user_id)
+        if result:
+            return result
+        for user_id in default_focus_user_ids or []:
+            text = str(user_id or "").strip()
+            if text and text not in result:
+                result.append(text)
+        if result:
+            return result
+        text = str(trigger_user_id or "").strip()
+        return [text] if text else []
+
+    def _user_id_for_message(
+        self,
+        conversation_ids: list[str],
+        message_id: str,
+    ) -> str | None:
+        target = str(message_id or "").strip()
+        if not target:
+            return None
+        for conversation_id in conversation_ids:
+            for ref in reversed(self._recent_inbound.get(conversation_id) or []):
+                if str(ref.message_id) == target:
+                    return ref.user_id
+        return None
+
+    def _preflight_send(
+        self,
+        conversation_ids: list[str],
+        *,
+        reviewed_until_seq: int,
+        review_policy: str,
+        focus_user_ids: list[str],
+        trigger_message_ids: list[str],
+    ) -> dict[str, Any]:
+        unseen: list[dict[str, Any]] = []
+        priority_interrupts: list[dict[str, Any]] = []
+        recalled_messages: list[dict[str, Any]] = []
+        for conversation_id in conversation_ids:
+            for ref in self._recent_inbound.get(conversation_id) or []:
+                if ref.seq <= reviewed_until_seq:
+                    continue
+                item = self._preflight_message(ref)
+                reasons = self._priority_reasons_for_ref(
+                    ref,
+                    focus_user_ids=focus_user_ids,
+                    trigger_message_ids=trigger_message_ids,
+                )
+                item["priority"] = bool(reasons)
+                if reasons:
+                    item["priority_reasons"] = reasons
+                    priority_interrupts.append(item)
+                unseen.append(item)
+            state = self._state(conversation_id)
+            recall_events = [
+                *self._recent_recalls.get(conversation_id, []),
+                *state.recall_events,
+            ]
+            seen_recall_ids: set[str] = set()
+            for recalled in recall_events:
+                msg_id = str(recalled.get("msg_id") or "")
+                if not msg_id or msg_id in seen_recall_ids:
+                    continue
+                seen_recall_ids.add(msg_id)
+                if (
+                    msg_id in trigger_message_ids
+                    or msg_id in {str(item.get("msg_id") or "") for item in unseen}
+                ):
+                    recalled_messages.append(recalled)
+
+        needs_review = False
+        if recalled_messages:
+            needs_review = True
+        elif review_policy == "review_all" and unseen:
+            needs_review = True
+        elif priority_interrupts:
+            needs_review = True
+        latest_seq = reviewed_until_seq
+        for conversation_id in conversation_ids:
+            recent = self._recent_inbound.get(conversation_id) or []
+            if recent:
+                latest_seq = max(latest_seq, max(ref.seq for ref in recent))
+        return {
+            "needs_review": needs_review,
+            "unseen_messages": unseen,
+            "priority_interrupts": priority_interrupts,
+            "recalled_messages": recalled_messages,
+            "latest_seq": latest_seq,
+        }
+
+    def _priority_reasons_for_ref(
+        self,
+        ref: _InboundRef,
+        *,
+        focus_user_ids: list[str],
+        trigger_message_ids: list[str],
+    ) -> list[str]:
+        reasons: list[str] = []
+        if ref.conversation_id.startswith("private:"):
+            reasons.append("private_message")
+        if ref.user_id in focus_user_ids:
+            reasons.append("focus_user")
+        if ref.reply_to and ref.reply_to in trigger_message_ids:
+            reasons.append("reply_to_trigger_message")
+        if _text_mentions_self_or_role(ref.text, ref.self_id, self.pipeline.persona.name):
+            reasons.append("mentions_bot_or_role")
+        stripped = ref.text.strip()
+        if stripped.startswith(("/", "#")):
+            reasons.append("command_message")
+        for message in self.pipeline.chat_timeline.recent(ref.conversation_id, 20):
+            if message.direction != "outbound" or not message.msg_id:
+                continue
+            if ref.reply_to and str(ref.reply_to) == str(message.msg_id):
+                reasons.append("reply_to_recent_bot_message")
+            break
+        return list(dict.fromkeys(reasons))
+
+    @staticmethod
+    def _preflight_message(ref: _InboundRef) -> dict[str, Any]:
+        return {
+            "conversation_id": ref.conversation_id,
+            "seq": ref.seq,
+            "time": get_time(),
+            "nickname": ref.nickname,
+            "user_id": ref.user_id,
+            "text": ref.text,
+            "msg_id": ref.message_id,
+            "reply_to": ref.reply_to,
+            "qq_visible": True,
+        }
+
+    def _create_send_attempt(
+        self,
+        actions: list[dict[str, Any]],
+        *,
+        source_tool: str,
+        conversation_ids: list[str],
+        trigger_message_id: str | None,
+        trigger_inbound_seq: int,
+        trigger_user_id: str | None,
+        focus_user_ids: list[str],
+        trigger_message_ids: list[str],
+        reviewed_until_seq: int,
+        review_policy: str,
+        delivery_interrupt_policy: str,
+        tool_call_id: str | None,
+        reason: str | None,
+    ) -> _SendAttempt:
+        attempt = _SendAttempt(
+            send_attempt_id=self._next_attempt_id(),
+            conversation_ids=list(conversation_ids),
+            actions=[dict(action) for action in actions],
+            source_tool=source_tool,
+            trigger_message_id=trigger_message_id,
+            trigger_inbound_seq=trigger_inbound_seq,
+            trigger_user_id=trigger_user_id,
+            focus_user_ids=list(focus_user_ids),
+            trigger_message_ids=list(trigger_message_ids),
+            reviewed_until_seq=reviewed_until_seq,
+            review_policy=review_policy,
+            delivery_interrupt_policy=delivery_interrupt_policy,
+            tool_call_id=tool_call_id,
+            reason=reason,
+            created_at=time.monotonic(),
+        )
+        self._send_attempts[attempt.send_attempt_id] = attempt
+        if len(self._send_attempts) > 100:
+            for key in list(self._send_attempts)[:25]:
+                old = self._send_attempts.get(key)
+                if old and old.consumed:
+                    self._send_attempts.pop(key, None)
+        return attempt
+
+    def _needs_review_result(
+        self,
+        attempt: _SendAttempt,
+        preflight: dict[str, Any],
+        *,
+        status: str,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "ok": True,
+            "status": status,
+            "qq_visible": False,
+            "send_attempt_id": attempt.send_attempt_id,
+            "attempted_messages": self._attempted_items(
+                attempt.actions,
+                attempt.send_attempt_id,
+            ),
+            "unseen_messages": preflight["unseen_messages"],
+            "priority_interrupts": preflight["priority_interrupts"],
+            "latest_seq": preflight["latest_seq"],
+            "next": (
+                "这次发送内容是在未看到这些新消息时生成的。请复核："
+                "调用 commit_send_attempt 确认旧内容、重新调用发送工具改写，或 no_action 放弃。"
+            ),
+        }
+        if preflight["recalled_messages"]:
+            result["recalled_messages"] = preflight["recalled_messages"]
+        return result
+
+    @staticmethod
+    def _apply_reply_to_first_text(
+        actions: list[dict[str, Any]],
+        reply_to_message_id: Any,
+    ) -> None:
+        reply_to = str(reply_to_message_id or "").strip()
+        if not reply_to:
+            return
+        prefix = f"[CQ:reply,id={reply_to}]"
+        for action in actions:
+            if action.get("kind", "text") != "text":
+                continue
+            content = str(action.get("content") or "")
+            if content.startswith("[CQ:reply,"):
+                return
+            action["content"] = f"{prefix}{content}"
+            return
 
     def _can_sync_send(self, conversation_id: str, actions: list[dict[str, Any]]) -> bool:
         state = self._state(conversation_id)
@@ -498,10 +983,15 @@ class _AsyncSendManager:
         result: dict[str, Any] = {
             "ok": bool(sent) or not errors,
             "status": "sent",
+            "accepted": bool(sent) or not errors,
+            "delivery": "done" if sent else "none",
             "qq_visible": bool(sent),
             "send_id": send_id,
             "count": len(sent),
             "sent": sent,
+            "accepted_messages": self._accepted_items(
+                [action for actions in groups.values() for action in actions]
+            ),
         }
         if errors:
             result["errors"] = errors
@@ -693,6 +1183,20 @@ class _AsyncSendManager:
                 "content": action.get("label") or action.get("content") or "",
                 "delay": float(action.get("delay") or 0.0),
                 "qq_visible": False,
+            }
+            for action in actions
+        ]
+
+    @staticmethod
+    def _accepted_items(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "conversation_id": f"{action.get('target_scope')}:{action.get('target_id')}",
+                "target_type": action.get("target_scope"),
+                "target_id": action.get("target_id"),
+                "order": int(action.get("order", 0)),
+                "content": action.get("label") or action.get("content") or "",
+                "delay": float(action.get("delay") or 0.0),
             }
             for action in actions
         ]
@@ -1559,6 +2063,8 @@ class MessagePipeline:
         stage_t0 = time.monotonic()
         default_target = items[-1].raw_event.source_target if items else None
         latest_user_text = "\n".join(item.text for item in items)
+        batch_trigger_message_ids = self._batch_trigger_message_ids(items)
+        batch_focus_user_ids = self._batch_focus_user_ids(items, batch_trigger_message_ids)
         ctx = self._build_tool_context(
             default_target=default_target,
             latest_user_text=latest_user_text,
@@ -1566,6 +2072,9 @@ class MessagePipeline:
             trigger_message_id=items[-1].message_id if items else None,
             trigger_inbound_seq=items[-1].inbound_seq if items else 0,
             trigger_user_id=items[-1].user_id if items else None,
+            seen_inbound_seq=items[-1].inbound_seq if items else 0,
+            focus_user_ids=batch_focus_user_ids,
+            trigger_message_ids=batch_trigger_message_ids,
         )
         executor = self.tool_registry.get_executor(ctx)
         tools_schema = self.tool_registry.get_schemas()
@@ -2283,7 +2792,12 @@ class MessagePipeline:
         if denied_tools:
             base_executor = executor
 
-            async def _guarded_executor(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+            async def _guarded_executor(
+                tool_name: str,
+                args: dict[str, Any],
+                *,
+                tool_call_id: str | None = None,
+            ) -> dict[str, Any]:
                 if tool_name in denied_tools:
                     return {
                         "ok": False,
@@ -2291,7 +2805,7 @@ class MessagePipeline:
                         "error": f"本轮系统事件不允许调用工具 {tool_name}",
                         "next": "只处理当前系统事件；如无需行动请调用 no_action。",
                     }
-                return await base_executor(tool_name, args)
+                return await base_executor(tool_name, args, tool_call_id=tool_call_id)
 
             executor = _guarded_executor
 
@@ -2339,6 +2853,9 @@ class MessagePipeline:
         trigger_message_id: str | None = None,
         trigger_inbound_seq: int = 0,
         trigger_user_id: str | None = None,
+        seen_inbound_seq: int = 0,
+        focus_user_ids: list[str] | None = None,
+        trigger_message_ids: list[str] | None = None,
         task_phase: str = "normal",
         tool_policy: dict[str, Any] | None = None,
     ) -> ToolContext:
@@ -2357,12 +2874,17 @@ class MessagePipeline:
             extras["latest_user_message"] = latest_user_text
         extras["chat_timeline"] = self.chat_timeline
         extras["task_phase"] = task_phase
+        extras["seen_inbound_seq"] = int(seen_inbound_seq or trigger_inbound_seq or 0)
+        extras["focus_user_ids"] = list(focus_user_ids or [])
+        extras["trigger_message_ids"] = list(trigger_message_ids or [])
         if tool_policy:
             extras["tool_policy"] = tool_policy
 
         async def _send_actions(
             actions: list[dict[str, Any]],
             source_tool: str,
+            *,
+            metadata: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
             return await self._send_manager.submit(
                 actions,
@@ -2370,6 +2892,10 @@ class MessagePipeline:
                 trigger_message_id=trigger_message_id,
                 trigger_inbound_seq=trigger_inbound_seq,
                 trigger_user_id=trigger_user_id,
+                default_reviewed_until_seq=extras["seen_inbound_seq"],
+                default_focus_user_ids=extras["focus_user_ids"],
+                default_trigger_message_ids=extras["trigger_message_ids"],
+                metadata=metadata,
             )
 
         async def _agent_task(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2491,6 +3017,74 @@ class MessagePipeline:
             f"{markdown}\n"
             "</recent_group_messages>"
         )
+
+    def _batch_trigger_message_ids(
+        self,
+        items: list[PendingMessageItem],
+    ) -> list[str]:
+        explicit: list[str] = []
+        for item in items:
+            if self._is_explicit_batch_trigger(item):
+                message_id = str(item.message_id or "").strip()
+                if message_id and message_id not in explicit:
+                    explicit.append(message_id)
+        if explicit:
+            return explicit
+        if not items:
+            return []
+        last_id = str(items[-1].message_id or "").strip()
+        return [last_id] if last_id else []
+
+    def _batch_focus_user_ids(
+        self,
+        items: list[PendingMessageItem],
+        trigger_message_ids: list[str],
+    ) -> list[str]:
+        focus: list[str] = []
+        trigger_set = set(trigger_message_ids)
+        for item in items:
+            if str(item.message_id or "") not in trigger_set:
+                continue
+            user_id = str(item.user_id or "").strip()
+            if user_id and user_id not in focus:
+                focus.append(user_id)
+        if focus:
+            return focus
+        if not items:
+            return []
+        user_id = str(items[-1].user_id or "").strip()
+        return [user_id] if user_id else []
+
+    def _is_explicit_batch_trigger(self, item: PendingMessageItem) -> bool:
+        if item.raw_event.is_private():
+            return True
+        if _text_mentions_self_or_role(
+            item.text,
+            item.raw_event.self_id,
+            self.persona.name,
+        ):
+            return True
+        if item.text.strip().startswith(("/", "#")):
+            return True
+        if item.raw_event.reply_to and self._reply_targets_recent_outbound(
+            item.conversation_id,
+            item.raw_event.reply_to,
+        ):
+            return True
+        return False
+
+    def _reply_targets_recent_outbound(
+        self,
+        conversation_id: str,
+        reply_to: str,
+    ) -> bool:
+        target = str(reply_to or "").strip()
+        if not target:
+            return False
+        for message in self.chat_timeline.recent(conversation_id, 20):
+            if message.direction == "outbound" and str(message.msg_id or "") == target:
+                return True
+        return False
 
     # ============================================================
     # 后台子 Agent 任务

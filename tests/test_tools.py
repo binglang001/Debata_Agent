@@ -299,7 +299,8 @@ def test_strip_pydantic_metadata_removes_title():
 def test_all_expected_tools_registered():
     """检查核心工具都已通过装饰器注册到全局列表。"""
     expected = {
-        "send_private_messages", "send_group_message", "recall_message", "upload_file",
+        "send_private_messages", "send_group_message", "commit_send_attempt",
+        "recall_message", "upload_file",
         "save_important_memory", "update_important_memory", "delete_important_memory",
         "list_contacts", "get_user_info", "get_forward_msg", "get_recent_chat_messages",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
@@ -509,8 +510,15 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "summary": "子 Agent 结果",
         }
 
-    async def fake_send_actions(actions, source_tool):
-        sent_actions.append({"source_tool": source_tool, "actions": actions})
+    async def fake_send_actions(actions, source_tool, *, metadata=None):
+        sent_actions.append({"source_tool": source_tool, "actions": actions, "metadata": metadata})
+        if source_tool == "commit_send_attempt":
+            return {
+                "ok": True,
+                "status": "already_committed",
+                "send_attempt_id": (metadata or {}).get("commit_send_attempt_id"),
+                "qq_visible": False,
+            }
         return {
             "ok": True,
             "status": "sent",
@@ -587,6 +595,11 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         "send_group_message": {
             "group_id": 456,
             "targets": [{"content": "群消息", "order": 1}],
+        },
+        "commit_send_attempt": {
+            "send_attempt_id": "attempt-test",
+            "reviewed_until_seq": 1,
+            "delivery_interrupt_policy": "interrupt_priority",
         },
         "recall_message": {"message_id": 100},
         "upload_file": {
@@ -675,9 +688,13 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["send_voice_message"]["status"] == "sent"
     assert results["send_private_messages"]["status"] == "sent"
     assert results["send_group_message"]["status"] == "sent"
+    non_commit_sends = [
+        item for item in sent_actions if item["source_tool"] != "commit_send_attempt"
+    ]
     assert [
-        item["source_tool"] for item in sent_actions
+        item["source_tool"] for item in non_commit_sends
     ] == ["send_voice_message", "send_private_messages", "send_group_message"]
+    assert results["commit_send_attempt"]["status"] == "already_committed"
     assert sent_actions[0]["actions"][0]["kind"] == "voice"
     assert sent_actions[1]["actions"][0]["target_scope"] == "private"
     assert sent_actions[1]["actions"][0]["content"] == "你好"

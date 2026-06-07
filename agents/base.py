@@ -9,7 +9,7 @@ from typing import Any, Literal
 from providers.base import Usage
 
 # 工具执行器签名
-ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+ToolExecutor = Callable[..., Awaitable[dict[str, Any]]]
 UsageRecorder = Callable[[Usage, dict[str, Any]], Awaitable[None]]
 StatusCallback = Callable[[dict[str, Any]], None]
 

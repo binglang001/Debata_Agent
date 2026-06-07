@@ -16,6 +16,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SendInterruptPolicy = Literal["interrupt_all", "interrupt_priority", "atomic"]
+SendReviewPolicy = Literal["review_all", "review_priority"]
 
 
 class _ToolArgs(BaseModel):
@@ -72,13 +73,40 @@ class SendPrivateArgs(_ToolArgs):
     targets: list[PrivateMessageTarget] = Field(
         ..., description="要发送的目标列表，至少 1 项"
     )
-    interrupt_policy: SendInterruptPolicy = Field(
+    reviewed_until_seq: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "发送前复核锚点：表示这次待发送内容基于已看到的最新入站 seq。"
+            "不填时使用当前模型轮开始时的 seen_seq；收到 needs_review 后再次发送或 commit 应填返回的 latest_seq。"
+        ),
+    )
+    review_policy: SendReviewPolicy = Field(
+        default="review_priority",
+        description=(
+            "发送前复核策略。review_priority=只因未见高优先级消息暂停；"
+            "review_all=目标会话有任何未见新消息都暂停复核。"
+        ),
+    )
+    delivery_interrupt_policy: SendInterruptPolicy = Field(
         default="interrupt_all",
         description=(
             "发送被系统接收后的中断策略。interrupt_all=同会话新消息都会阻断发送或使旧回复 stale；"
             "interrupt_priority=只被确定性高优先级事件阻断，如私聊新消息、同触发用户追问、撤回；"
             "atomic=普通新消息不阻断，只适合固定通知/命令结果，不要用来逃避频繁打断。"
         ),
+    )
+    responding_to_message_ids: list[str] = Field(
+        default_factory=list,
+        description="可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；不确定不要编造。",
+    )
+    reply_to_message_id: str | None = Field(
+        default=None,
+        description="可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用。",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么这样发送以及为什么选择该复核/中断策略。用于日志和自检，不会发给 QQ。",
     )
 
 
@@ -121,7 +149,22 @@ class SendGroupArgs(_ToolArgs):
     targets: list[GroupMessageTarget] = Field(
         ..., description="要发送的消息列表，至少 1 项"
     )
-    interrupt_policy: SendInterruptPolicy = Field(
+    reviewed_until_seq: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "发送前复核锚点：表示这次待发送内容基于已看到的最新入站 seq。"
+            "不填时使用当前模型轮开始时的 seen_seq；收到 needs_review 后再次发送或 commit 应填返回的 latest_seq。"
+        ),
+    )
+    review_policy: SendReviewPolicy = Field(
+        default="review_priority",
+        description=(
+            "发送前复核策略。review_priority=只因未见高优先级消息暂停；"
+            "review_all=目标群有任何未见新消息都暂停复核。"
+        ),
+    )
+    delivery_interrupt_policy: SendInterruptPolicy = Field(
         default="interrupt_priority",
         description=(
             "发送被系统接收后的中断策略。interrupt_priority=推荐，普通群聊插话不阻断，"
@@ -129,6 +172,48 @@ class SendGroupArgs(_ToolArgs):
             "interrupt_all=长回复/多段解释时使用，任何同会话新消息都阻断；"
             "atomic=普通新消息不阻断，只适合固定通知/命令结果，不要用来逃避频繁打断。"
         ),
+    )
+    responding_to_message_ids: list[str] = Field(
+        default_factory=list,
+        description="可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；不确定不要编造。",
+    )
+    reply_to_message_id: str | None = Field(
+        default=None,
+        description="可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用，适合旧回复被新消息隔开后锚定上下文。",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么这样发送以及为什么选择该复核/中断策略。用于日志和自检，不会发给 QQ。",
+    )
+
+
+class CommitSendAttemptArgs(_ToolArgs):
+    """commit_send_attempt 工具参数。"""
+
+    send_attempt_id: str = Field(
+        ...,
+        min_length=1,
+        description="要确认提交的 send_attempt_id，来自发送工具返回的 needs_review。只能提交一次。",
+    )
+    reviewed_until_seq: int | None = Field(
+        default=None,
+        ge=0,
+        description="复核后已看到的最新入站 seq。通常填 needs_review 返回的 latest_seq。",
+    )
+    delivery_interrupt_policy: SendInterruptPolicy = Field(
+        default="interrupt_priority",
+        description=(
+            "确认发送被系统接收后的中断策略。短低风险回复用 interrupt_priority；"
+            "长回复/多段解释用 interrupt_all；atomic 只用于固定通知/命令结果。"
+        ),
+    )
+    reply_to_message_id: str | None = Field(
+        default=None,
+        description="可选：确认发送时给第一条文本消息补引用，避免被中间新消息隔开后串话。",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么复核后仍提交旧内容；用于日志和自检，不会发给 QQ。",
     )
 
 
