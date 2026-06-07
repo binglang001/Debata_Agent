@@ -68,7 +68,7 @@ from tools import (
     try_save_from_user,
 )
 from utils import get_time
-from utils.token_budget import TokenBudget, TokenEstimator
+from utils.token_budget import TokenEstimator
 
 from .agent_task_helpers import (
     _agent_record_matches as _agent_record_matches,
@@ -136,9 +136,6 @@ from .pipeline_history import (
     _WORKING_HISTORY_NO_ACTION_KEEP as _WORKING_HISTORY_NO_ACTION_KEEP,
 )
 from .pipeline_history import (
-    _WORKING_HISTORY_RECENT_RUNTIME_RECORDS as _WORKING_HISTORY_RECENT_RUNTIME_RECORDS,
-)
-from .pipeline_history import (
     _WORKING_HISTORY_SEND_RECEIPT_KEEP as _WORKING_HISTORY_SEND_RECEIPT_KEEP,
 )
 from .pipeline_history import (
@@ -146,9 +143,6 @@ from .pipeline_history import (
 )
 from .pipeline_history import (
     _no_action_pair_indices as _no_action_pair_indices,
-)
-from .pipeline_history import (
-    _record_conversation_id as _record_conversation_id,
 )
 from .pipeline_history import (
     _record_timestamp as _record_timestamp,
@@ -162,12 +156,7 @@ from .pipeline_history import (
 from .pipeline_history import (
     _working_history_force_keep_indices as _working_history_force_keep_indices,
 )
-from .pipeline_history import (
-    _working_history_noise_indices as _working_history_noise_indices,
-)
-from .pipeline_history import (
-    _working_history_optional_runtime_indices as _working_history_optional_runtime_indices,
-)
+from .pipeline_working_context import PipelineWorkingContextMixin
 from .send_manager import (
     _AsyncSendManager as _AsyncSendManager,
 )
@@ -197,9 +186,6 @@ logger = logging.getLogger(__name__)
 
 # 速率超限时的提示模板（占位符运行时替换）
 _RATE_LIMIT_REPLY_TEMPLATE = "已超出速率限制（{window_seconds} 秒内最多 {max_messages} 条），请添加机器人为好友后继续使用"
-_PREFIX_ESTIMATE_TOKENS = 12_000
-_CURRENT_CONVERSATION_MIN_RECORDS = 8
-_PROACTIVE_ROUTER_HISTORY_BUDGET = 16_384
 _SLOW_BATCH_STAGE_SECONDS = 1.0
 _OUT_OF_BAND_DENIED_TOOLS = frozenset(
     {
@@ -233,7 +219,7 @@ def _log_slow_batch_stage(
 
 
 
-class MessagePipeline(MediaPipelineMixin):
+class MessagePipeline(PipelineWorkingContextMixin, MediaPipelineMixin):
     """消息处理管道。
 
     生命周期：
@@ -890,328 +876,6 @@ class MessagePipeline(MediaPipelineMixin):
         if scope not in {"private", "group"}:
             return None
         return Target(adapter=self.adapter.name, scope=scope, target_id=target_id)  # type: ignore[arg-type]
-
-    def _context_budget(self) -> TokenBudget:
-        cfg = self.behavior_cfg.context
-        model = getattr(self.chat_agent.cfg, "model", "")
-        max_context = cfg.max_context_tokens or _recommended_context_budget(
-            model,
-            self.model_context_length,
-        )
-        return TokenBudget(
-            max_context_tokens=max_context,
-            reserve_output_tokens=cfg.reserve_output_tokens,
-            memory_token_budget=cfg.memory_token_budget,
-            summary_token_budget=cfg.summary_token_budget,
-        )
-
-    def _token_estimator(self) -> TokenEstimator:
-        return TokenEstimator(
-            model=getattr(self.chat_agent.cfg, "model", ""),
-            calib_ratio=self._token_calib_ratio,
-        )
-
-    def _calibrate_tokens(self, estimated: int, actual_prompt_tokens: int) -> None:
-        if estimated <= 0 or actual_prompt_tokens <= 0:
-            return
-        estimator = self._token_estimator()
-        estimator.update_calibration(estimated, actual_prompt_tokens)
-        self._token_calib_ratio = estimator.calib_ratio
-        logger.debug(
-            "token 估算校准：estimated=%s actual=%s ratio=%.3f",
-            estimated,
-            actual_prompt_tokens,
-            self._token_calib_ratio,
-        )
-
-    def _rolling_summary_text(self, estimator: TokenEstimator | None = None) -> str:
-        if self.rolling_summary is None:
-            return ""
-        text = self.rolling_summary.text()
-        if not text:
-            return ""
-        estimator = estimator or self._token_estimator()
-        return self._trim_text_to_token_budget(
-            text,
-            self._context_budget().summary_token_budget,
-            estimator,
-        )
-
-    async def _important_memory_text(
-        self,
-        conversation_id: str | None,
-        *,
-        token_budget: int | None = None,
-    ) -> str:
-        """按当前会话选择重要记忆注入文本，不受 RAG 开关影响。"""
-        estimator = self._token_estimator()
-        budget = token_budget or self._context_budget().memory_token_budget
-        return self.important.text_for_context(
-            conversation_id,
-            token_budget=budget,
-            estimator=estimator,
-        )
-
-    async def _rag_context_text(
-        self,
-        conversation_id: str | None,
-        *,
-        query: str | None,
-        before_ts: str | None = None,
-        token_budget: int | None = None,
-    ) -> str:
-        """按当前 query 检索历史对话片段。RAG 关闭或不可用时返回空。"""
-        if (
-            self.features_cfg.long_term_memory.mode != "rag"
-            or self.rag_memory is None
-            or not query
-        ):
-            return ""
-        estimator = self._token_estimator()
-        budget = token_budget or self._context_budget().memory_token_budget
-        return await self.rag_memory.retrieve_for_query(
-            query,
-            conversation_id=conversation_id,
-            before_ts=before_ts,
-            top_k=self.features_cfg.long_term_memory.rag_top_k,
-            token_budget=budget,
-            estimator=estimator,
-        )
-
-    @staticmethod
-    def _trim_text_to_token_budget(
-        text: str,
-        budget: int,
-        estimator: TokenEstimator,
-    ) -> str:
-        if not text or estimator.estimate_text(text) <= budget:
-            return text
-        marker = "\n...[滚动摘要因上下文预算截断]...\n"
-        marker_cost = estimator.estimate_text(marker)
-        if budget <= marker_cost + 16:
-            return text[: max(1, budget * 2)]
-
-        head_budget = max(1, (budget - marker_cost) // 2)
-        tail_budget = max(1, budget - marker_cost - head_budget)
-
-        def fit_prefix(limit: int) -> str:
-            lo, hi = 0, len(text)
-            best = ""
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                candidate = text[:mid]
-                if estimator.estimate_text(candidate) <= limit:
-                    best = candidate
-                    lo = mid + 1
-                else:
-                    hi = mid - 1
-            return best.rstrip()
-
-        def fit_suffix(limit: int) -> str:
-            lo, hi = 0, len(text)
-            best = ""
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                candidate = text[len(text) - mid :]
-                if estimator.estimate_text(candidate) <= limit:
-                    best = candidate
-                    lo = mid + 1
-                else:
-                    hi = mid - 1
-            return best.lstrip()
-
-        return f"{fit_prefix(head_budget)}{marker}{fit_suffix(tail_budget)}"
-
-    async def _select_working_history(
-        self,
-        conversation_id: str | None,
-    ) -> list[dict[str, Any]]:
-        """按 token 预算选择统一近期时间线。
-
-        conversation_id 只用于保证当前会话最近若干条不被高频群聊挤掉；
-        工作窗口本身仍来自同一条全局 history，不按会话过滤。
-        """
-        records = await self.history.records()
-        return self._select_history_records(
-            records,
-            working_budget=self._working_history_budget(),
-            conversation_id=conversation_id,
-            ensure_current_records=_CURRENT_CONVERSATION_MIN_RECORDS,
-            log_context=conversation_id,
-            log_level=logging.INFO,
-        )
-
-    async def _select_proactive_router_history(self) -> list[dict[str, Any]]:
-        """主动路由专用小窗口；真正行动轮仍使用正常工作窗口。"""
-        records = await self.history.records()
-        return self._select_history_records(
-            records,
-            working_budget=min(
-                self._working_history_budget(),
-                _PROACTIVE_ROUTER_HISTORY_BUDGET,
-            ),
-            conversation_id=None,
-            ensure_current_records=0,
-            log_context="proactive_router",
-            log_level=logging.DEBUG,
-        )
-
-    def _working_history_budget(self) -> int:
-        budget = self._context_budget()
-        return max(
-            4096,
-            budget.total_input_budget
-            - budget.memory_token_budget
-            - budget.summary_token_budget
-            - _PREFIX_ESTIMATE_TOKENS,
-        )
-
-    def _warn_context_compaction_invariants(self) -> None:
-        working_budget = self._working_history_budget()
-        summarize = self.behavior_cfg.summarize
-        if self.summary_agent is None or self.archive is None or self.rolling_summary is None:
-            logger.warning(
-                "未启用滚动摘要/归档压缩；长会话超过工作窗口后会逐条淘汰历史，KV 缓存命中率会下降"
-            )
-            return
-        trigger = summarize.trigger_at_tokens
-        if trigger is None:
-            trigger = int(self._context_budget().max_context_tokens * 0.75)
-        if trigger >= working_budget:
-            logger.warning(
-                "滚动摘要触发线高于工作窗口预算：trigger=%s working_budget=%s；"
-                "长会话可能先发生窗口淘汰，导致 KV 缓存前缀逐轮重建",
-                trigger,
-                working_budget,
-            )
-
-    def _select_history_records(
-        self,
-        records: list[dict[str, Any]],
-        *,
-        working_budget: int,
-        conversation_id: str | None,
-        ensure_current_records: int,
-        log_context: str | None,
-        log_level: int,
-    ) -> list[dict[str, Any]]:
-        estimator = self._token_estimator()
-        selected_indices: set[int] = set()
-        noise_indices = _working_history_noise_indices(
-            records,
-            conversation_id=conversation_id,
-            ensure_current_records=ensure_current_records,
-        )
-        optional_runtime_indices = _working_history_optional_runtime_indices(
-            records,
-            conversation_id=conversation_id,
-            ensure_current_records=ensure_current_records,
-        )
-        used = 0
-
-        def add_index(index: int, *, force: bool = False) -> bool:
-            nonlocal used
-            if index in selected_indices:
-                return True
-            if not force and index in noise_indices:
-                return True
-            cost = estimator.estimate_messages([records[index]])
-            if not force and selected_indices and used + cost > working_budget:
-                return False
-            selected_indices.add(index)
-            used += cost
-            return True
-
-        if conversation_id and ensure_current_records > 0:
-            current_indices: list[int] = []
-            for idx in range(len(records) - 1, -1, -1):
-                if _record_conversation_id(records[idx]) == conversation_id:
-                    current_indices.append(idx)
-                    if len(current_indices) >= ensure_current_records:
-                        break
-            for idx in reversed(current_indices):
-                add_index(idx, force=True)
-
-        for idx in range(len(records) - 1, -1, -1):
-            if idx in selected_indices:
-                continue
-            if idx in optional_runtime_indices:
-                continue
-            if not add_index(idx):
-                break
-
-        for idx in range(len(records) - 1, -1, -1):
-            if idx in selected_indices:
-                continue
-            if idx not in optional_runtime_indices:
-                continue
-            if not add_index(idx):
-                break
-
-        selected = [records[idx] for idx in sorted(selected_indices)]
-        dropped = len(records) - len(selected)
-        if dropped > 0:
-            logger.log(
-                log_level,
-                "上下文预算裁剪：view=%s 丢弃活跃区较早记录 %s 条 "
-                "(working_budget≈%s tokens, used≈%s tokens)",
-                log_context,
-                dropped,
-                working_budget,
-                used,
-            )
-        return self._filter_working_history_runtime_noise(
-            selected,
-            conversation_id=conversation_id,
-            ensure_current_records=ensure_current_records,
-            log_context=log_context,
-            log_level=log_level,
-        )
-
-    def _filter_working_history_runtime_noise(
-        self,
-        records: list[dict[str, Any]],
-        *,
-        conversation_id: str | None,
-        ensure_current_records: int,
-        log_context: str | None,
-        log_level: int,
-    ) -> list[dict[str, Any]]:
-        """Drop old runtime-only records from the prompt view, not from history.
-
-        The working window remains a unified cross-conversation timeline. This filter only
-        prevents old task snapshots, clean send-status records, and complete
-        no_action assistant/tool blocks from being replayed into every model call
-        after they are no longer useful for immediate decision-making. Tool
-        blocks are dropped only when the full assistant/tool pair is present.
-        """
-        if not records:
-            return records
-
-        drop_indices = _working_history_noise_indices(
-            records,
-            conversation_id=conversation_id,
-            ensure_current_records=ensure_current_records,
-        )
-
-        if not drop_indices:
-            return records
-
-        filtered = [
-            record for idx, record in enumerate(records)
-            if idx not in drop_indices
-        ]
-        logger.log(
-            log_level,
-            "上下文运行时瘦身：view=%s 移除旧运行时记录 %s 条 "
-            "(保留当前会话最近 %s 条、全局近期 runtime %s 条、近期 send_receipt %s 条)",
-            log_context,
-            len(drop_indices),
-            ensure_current_records,
-            _WORKING_HISTORY_RECENT_RUNTIME_RECORDS,
-            _WORKING_HISTORY_SEND_RECEIPT_KEEP,
-        )
-        return filtered
 
     async def _do_send(self, action: dict) -> str | None:
         """把单个 collected action 真实发送出去。
