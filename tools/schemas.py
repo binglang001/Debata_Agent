@@ -244,6 +244,20 @@ class UploadFileArgs(_ToolArgs):
     )
 
 
+class ToolSearchArgs(_ToolArgs):
+    """tool_search 工具参数。"""
+
+    tool_name: str = Field(
+        ...,
+        min_length=1,
+        description="要查询完整说明和真实参数 schema 的工具名。",
+    )
+    intent: str | None = Field(
+        default=None,
+        description="可选：你为什么需要这个工具。用于返回更贴合的风险提醒，不会发给 QQ。",
+    )
+
+
 # ============================================================
 # Memory（重要记忆）
 # ============================================================

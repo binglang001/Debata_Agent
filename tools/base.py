@@ -7,8 +7,8 @@
        从 `model_json_schema()` 派生 OpenAI tool 格式，避免手写 schema 漂移。
     3. 依赖注入：工具不再直接持有 Bot/Adapter，所有依赖通过 ToolContext 注入。
        这让工具脱离任何具体适配器，便于跨平台。
-    4. features 动态启用：ToolRegistry 按配置决定哪些工具实际暴露给 LLM。
-       未启用的工具默认不在 schema 里，避免误调用。
+    4. schema 稳定：常驻工具集合尽量不随 feature 开关变化；低频/高风险/大 schema
+       工具以 stub 暴露名称，模型需要时通过 tool_search 获取完整参数。
 
 OpenAI tool 格式参考：
     {
@@ -31,10 +31,12 @@ import inspect
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Literal,
     Protocol,
     TypeVar,
 )
@@ -46,6 +48,11 @@ if TYPE_CHECKING:
     from memory import ArchiveStore, HistoryManager, ImportantMemoryManager
 
 logger = logging.getLogger(__name__)
+
+
+class ToolSchemaMode(StrEnum):
+    FULL = "full"
+    STUB = "stub"
 
 
 def _default_tool_result_budgets() -> dict[str, Any]:
@@ -233,6 +240,21 @@ class ToolSpec:
     """工具是否属于"调用成功后无需 LLM 反馈"的类别。
     runner 据此判断是否提前终止循环。"""
 
+    schema_mode: ToolSchemaMode = ToolSchemaMode.FULL
+    """对模型暴露 full schema 还是 stub schema。"""
+
+    short_description: str | None = None
+    """stub schema 和 tool_search 列表里使用的短说明。"""
+
+    search_tags: list[str] = field(default_factory=list)
+    """tool_search 可用的检索标签。"""
+
+    risk_level: Literal["low", "medium", "high"] = "low"
+    """工具风险等级，用于 tool_search 返回风险提醒。"""
+
+    examples: list[dict[str, Any]] = field(default_factory=list)
+    """tool_search 返回的调用示例。"""
+
     def to_openai_schema(self) -> dict[str, Any]:
         """从 Pydantic 模型派生 OpenAI tool 格式 schema。
 
@@ -241,6 +263,8 @@ class ToolSpec:
             - 移除 'title' 字段（仅用于 Pydantic 内部）
             - description 用工具 description 而非模型 docstring
         """
+        if self.schema_mode == ToolSchemaMode.STUB:
+            return self.to_stub_openai_schema()
         raw_schema = self.args_model.model_json_schema()
         cleaned = _strip_pydantic_metadata(_inline_refs(raw_schema))
         return {
@@ -250,6 +274,51 @@ class ToolSpec:
                 "description": self.description,
                 "parameters": cleaned,
             },
+        }
+
+    def to_stub_openai_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": (
+                    self.short_description
+                    or f"{self.name} 是低频工具。调用前先用 tool_search 查询完整参数和约束。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "_tool_search_required": {
+                            "type": "boolean",
+                            "description": (
+                                "这是占位参数。真实调用前必须先用 tool_search 查询完整参数。"
+                            ),
+                        }
+                    },
+                    "additionalProperties": True,
+                },
+            },
+        }
+
+    def full_parameters_schema(self) -> dict[str, Any]:
+        raw_schema = self.args_model.model_json_schema()
+        return _strip_pydantic_metadata(_inline_refs(raw_schema))
+
+    def tool_search_result(self) -> dict[str, Any]:
+        parameters = self.full_parameters_schema()
+        return {
+            "ok": True,
+            "status": "found",
+            "tool_name": self.name,
+            "description": self.description,
+            "short_description": self.short_description or self.description,
+            "parameters_schema": parameters,
+            "required_fields": parameters.get("required", []),
+            "risk_level": self.risk_level,
+            "search_tags": list(self.search_tags),
+            "examples": list(self.examples),
+            "constraints": _tool_constraints(self),
+            "next": "已返回完整参数。若确认要使用该工具，请按 parameters_schema 调用原工具。",
         }
 
 
@@ -271,6 +340,11 @@ def tool(
     category: str = "misc",
     feature: str | None = None,
     no_feedback: bool = False,
+    schema_mode: ToolSchemaMode | str = ToolSchemaMode.FULL,
+    short_description: str | None = None,
+    search_tags: list[str] | None = None,
+    risk_level: Literal["low", "medium", "high"] = "low",
+    examples: list[dict[str, Any]] | None = None,
 ) -> Callable[[ToolFunc], ToolFunc]:
     """把函数注册成工具的装饰器。
 
@@ -299,6 +373,11 @@ def tool(
             category=category,
             feature=feature,
             no_feedback=no_feedback,
+            schema_mode=ToolSchemaMode(schema_mode),
+            short_description=short_description,
+            search_tags=list(search_tags or []),
+            risk_level=risk_level,
+            examples=list(examples or []),
         )
         _DEFAULT_REGISTRY.append(spec)
         # 保留原函数（便于直接测试调用），并把 spec 挂到属性上
@@ -331,7 +410,7 @@ class ToolRegistry:
 
     构造时传入要启用的 ToolSpec 列表（一般由 build_tool_registry() 按配置筛选）。
     对外提供：
-        - get_schemas(): 返回所有已启用工具的 OpenAI schema 列表
+        - get_schemas(): 返回稳定工具 schema 列表
         - get_executor(ctx): 返回可直接传给 AgentRunner.run() 的 executor
         - get_no_feedback_names(): 返回所有 no_feedback=True 的工具名集合
     """
@@ -373,6 +452,8 @@ class ToolRegistry:
             - 找到 spec → 用 args_model 校验入参 → 调用实现函数
             - 参数校验失败 / 工具不存在 / 工具抛异常 → 返回 {"ok": False, "error": "..."}
         """
+        ctx.extras.setdefault("tool_registry", self)
+        ctx.extras.setdefault("tool_search_approved_tools", set())
 
         async def executor(
             tool_name: str,
@@ -383,6 +464,17 @@ class ToolRegistry:
             spec = self._specs.get(tool_name)
             if spec is None:
                 return {"ok": False, "error": f"unknown tool: {tool_name}"}
+            if (
+                spec.schema_mode == ToolSchemaMode.STUB
+                and tool_name not in ctx.extras.get("tool_search_approved_tools", set())
+            ):
+                return {
+                    "ok": False,
+                    "status": "need_tool_search",
+                    "tool_name": tool_name,
+                    "brief": f"工具 {tool_name} 需要先查询完整说明。",
+                    "next": "请先调用 tool_search 获取完整参数和风险约束，再决定是否调用。",
+                }
 
             try:
                 args = spec.args_model.model_validate(raw_args)
@@ -420,6 +512,19 @@ class ToolRegistry:
             return shrink_tool_result(tool_name, result, ctx)
 
         return executor
+
+
+def _tool_constraints(spec: ToolSpec) -> list[str]:
+    constraints = ["按 parameters_schema 填写真实参数；不要编造 ID、路径或目标。"]
+    if spec.schema_mode == ToolSchemaMode.STUB:
+        constraints.append("这是 stub 工具，本轮已查询后才可调用。")
+    if spec.risk_level == "high":
+        constraints.append("高风险工具：只有用户明确要求、目标明确、上下文清楚时才可调用。")
+    elif spec.risk_level == "medium":
+        constraints.append("中等风险工具：调用前确认目标、范围和后果。")
+    if spec.category in {"messaging", "platform"}:
+        constraints.append("QQ 操作类工具只按明确上下文执行，不因玩笑或情绪话误触发。")
+    return constraints
 
 
 # ============================================================

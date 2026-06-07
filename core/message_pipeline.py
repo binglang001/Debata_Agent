@@ -1436,15 +1436,9 @@ def _filter_tool_schemas(
     schemas: list[dict[str, Any]],
     denied_tools: set[str] | frozenset[str],
 ) -> list[dict[str, Any]]:
-    if not denied_tools:
-        return schemas
-    result: list[dict[str, Any]] = []
-    for schema in schemas:
-        function = schema.get("function") if isinstance(schema, dict) else None
-        name = function.get("name") if isinstance(function, dict) else None
-        if name not in denied_tools:
-            result.append(schema)
-    return result
+    # 保持工具 schema 名称集合稳定，避免不同系统事件触发时破坏 provider KV 缓存。
+    # denied_tools 只在 executor 层拦截执行。
+    return schemas
 
 
 def _safe_agent_task_filename(name: str, *, default: str, suffix: str) -> str:
@@ -2749,7 +2743,7 @@ class MessagePipeline:
             task_contract: 本轮任务锚点，传给 AgentRunner 防止工具循环漂移。
             task_phase: 本轮运行阶段，保留给日志归类和未来策略扩展。
             tool_policy: 本轮工具策略所需的结构化上下文。
-            tool_denylist: 本轮不暴露也不允许调用的工具名集合。
+            tool_denylist: 本轮不允许调用的工具名集合。schema 仍保持暴露，调用时返回 denied。
         """
         self.mark_activity()
         record_conversation_id = history_conversation_id or conversation_id
@@ -2863,7 +2857,10 @@ class MessagePipeline:
 
         collected 是 per-call 的（绝不复用），所以每次新建实例。
         """
-        extras: dict[str, Any] = {}
+        extras: dict[str, Any] = {
+            "tool_registry": self.tool_registry,
+            "tool_search_approved_tools": set(),
+        }
         if default_target is not None:
             raw_target_id = str(default_target.target_id)
             extras["default_reply_target"] = {
@@ -3199,6 +3196,7 @@ class MessagePipeline:
 
             allowed = {
                 "no_action",
+                "tool_search",
                 "read_file",
                 "list_files",
                 "write_file",
@@ -3227,7 +3225,11 @@ class MessagePipeline:
                 tool_result_hard_cap_tokens=self.behavior_cfg.context.tool_result_hard_cap_tokens,
                 tool_result_soft_overrides=dict(self.behavior_cfg.context.tool_result_soft_overrides),
                 activity_cb=self.mark_activity,
-                extras={"chat_timeline": self.chat_timeline},
+                extras={
+                    "chat_timeline": self.chat_timeline,
+                    "tool_registry": sub_registry,
+                    "tool_search_approved_tools": set(),
+                },
             )
             output_rel = _workspace_rel(output_path, self.workspace_dir)
             manifest_rel = _workspace_rel(manifest_path, self.workspace_dir)

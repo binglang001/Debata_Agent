@@ -350,6 +350,21 @@ def _ai_no_action(reason: str = "无需回复") -> CompletionResult:
     return CompletionResult(tool_calls=[tc], finish_reason="tool_calls")
 
 
+def _ai_tool_search(tool_name: str) -> CompletionResult:
+    tc = ToolCall(
+        id=f"tc-search-{tool_name}",
+        name="tool_search",
+        arguments=json.dumps({"tool_name": tool_name}),
+    )
+    return CompletionResult(tool_calls=[tc], finish_reason="tool_calls")
+
+
+def _approve_stub_tools(ctx: ToolContext, *names: str) -> None:
+    approved = ctx.extras.setdefault("tool_search_approved_tools", set())
+    assert isinstance(approved, set)
+    approved.update(names)
+
+
 def test_text_mentions_self_or_role_uses_deterministic_tokens():
     assert _text_mentions_self_or_role("@QQ999 在吗", "999", "测试机器人") is True
     assert _text_mentions_self_or_role("[CQ:at,qq=999] 在吗", "999", "测试机器人") is True
@@ -889,9 +904,9 @@ async def test_proactive_action_runs_under_acquired_lock(build_pipeline):
     assert "触发理由：测试触发理由" in joined
     assert provider.calls[0]["messages"][-1]["role"] == "user"
     names = {schema["function"]["name"] for schema in provider.calls[0]["tools"]}
-    assert "start_agent_task" not in names
-    assert "summarize_conversation" not in names
-    assert "summarize_chat_history" not in names
+    assert "start_agent_task" in names
+    assert "summarize_conversation" in names
+    assert "summarize_chat_history" in names
 
 
 @pytest.mark.asyncio
@@ -1117,6 +1132,7 @@ async def test_start_agent_task_result_is_in_band_same_turn(build_pipeline, tmp_
     }
     pipeline, provider, adapter, history, _ = await build_pipeline(
         [
+            _ai_tool_search("start_agent_task"),
             CompletionResult(
                 tool_calls=[
                     ToolCall(
@@ -1155,8 +1171,8 @@ async def test_start_agent_task_result_is_in_band_same_turn(build_pipeline, tmp_
     await pipeline.enqueue(_msg(user_id="123", text="先把能做的完成", message_id="m-start"))
     await _drain_pipeline(pipeline, max_wait=3.0)
 
-    assert len(provider.calls) == 3
-    second_messages = provider.calls[1]["messages"]
+    assert len(provider.calls) == 4
+    second_messages = provider.calls[2]["messages"]
     tool_records = [m for m in second_messages if m.get("role") == "tool"]
     assert tool_records
     assert "agent_tasks/" in tool_records[-1]["content"]
@@ -1187,13 +1203,55 @@ async def test_wakeup_turn_uses_user_event_and_denies_long_running_tools(build_p
         for schema in provider.calls[0]["tools"]
     }
     assert "schedule_wakeup" in names
-    assert "start_agent_task" not in names
-    assert "summarize_chat_history" not in names
-    assert "summarize_conversation" not in names
+    assert "start_agent_task" in names
+    assert "summarize_chat_history" in names
+    assert "summarize_conversation" in names
     messages = provider.calls[0]["messages"]
     assert messages[-1]["role"] == "user"
     assert "[系统事件 · 非用户消息]" in messages[-1]["content"]
     assert "定时唤醒已到" in messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_wakeup_turn_denies_long_running_tool_execution(build_pipeline):
+    start_args = {
+        "prompt": "整理资料",
+        "sources": [{"type": "inline_text", "value": "资料"}],
+        "output_format": "markdown",
+    }
+    pipeline, provider, _, _, _ = await build_pipeline(
+        [
+            _ai_tool_search("start_agent_task"),
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-start-denied",
+                        name="start_agent_task",
+                        arguments=json.dumps(start_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            _ai_no_action(),
+        ]
+    )
+
+    await pipeline.run_wakeup_turn(
+        "30 秒到了，请处理提醒。",
+        target={"target_type": "private", "target_id": 123},
+        mode="wakeup",
+    )
+
+    assert len(provider.calls) == 3
+    third_messages = provider.calls[2]["messages"]
+    denied_records = [
+        json.loads(str(message.get("content") or "{}"))
+        for message in third_messages
+        if message.get("role") == "tool"
+        and "tc-start-denied" == message.get("tool_call_id")
+    ]
+    assert denied_records
+    assert denied_records[-1]["status"] == "denied"
 
 
 @pytest.mark.asyncio
@@ -2375,9 +2433,9 @@ async def test_recall_history_reads_archive(build_pipeline):
         conversation_id="group:42",
     )
     registry = build_default_registry(_make_root_config())
-    executor = registry.get_executor(
-        ToolContext(archive=pipeline.archive, history=history)
-    )
+    ctx = ToolContext(archive=pipeline.archive, history=history)
+    _approve_stub_tools(ctx, "recall_history")
+    executor = registry.get_executor(ctx)
 
     result = await executor(
         "recall_history",

@@ -18,7 +18,7 @@
     ToolContext         —— 给 AgentRunner 用的执行上下文
     ToolRegistry        —— 工具集合
     build_default_registry(config)
-                        —— 按 RootConfig 决定启用哪些工具的工厂
+                        —— 构造稳定工具集合的工厂
     get_default_specs() —— 全部已注册的工具规格
     try_save_from_user  —— 关键词强制保存
 """
@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 # 导入各模块的副作用：注册装饰器把工具加入全局列表
 from . import (  # noqa: F401
@@ -35,6 +36,7 @@ from . import (  # noqa: F401
     memory_tools,
     messaging,
     platform_tools,
+    tool_search_tools,
     workspace_tools,
 )
 from .base import (
@@ -45,6 +47,7 @@ from .base import (
     IWebSearchService,
     ToolContext,
     ToolRegistry,
+    ToolSchemaMode,
     ToolSpec,
     WakeupCallback,
     clear_default_registry,
@@ -72,6 +75,7 @@ __all__ = [
     "ToolContext",
     "ToolRegistry",
     "ToolSpec",
+    "ToolSchemaMode",
     "WakeupCallback",
     "IVisionService",
     "IWebSearchService",
@@ -99,6 +103,8 @@ __all__ = [
     "MEMORY_TOOLS",
     "PLATFORM_OPTIONAL_TOOLS",
     "FEATURE_TOOL_FEATURES",
+    "FULL_SCHEMA_TOOLS",
+    "STUB_SCHEMA_TOOLS",
 ]
 
 
@@ -135,24 +141,78 @@ FEATURE_TOOL_FEATURES: dict[str, str] = {
 """feature 工具名 → features 字典里的字段名。"""
 
 
-def build_default_registry(
-    config,
-    *,
-    include_upload_file: bool = True,
-) -> ToolRegistry:
-    """根据 RootConfig 构造启用工具的 Registry。
+FULL_SCHEMA_TOOLS: set[str] = {
+    "send_private_messages",
+    "send_group_message",
+    "commit_send_attempt",
+    "no_action",
+    "save_important_memory",
+    "update_important_memory",
+    "delete_important_memory",
+    "get_recent_chat_messages",
+    "get_forward_msg",
+    "recall_message",
+    "describe_image",
+    "tool_search",
+    "schedule_wakeup",
+    "list_contacts",
+    "get_user_info",
+    "set_friend_add_request",
+    "set_group_add_request",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_files",
+    "delete_file",
+    "run_python",
+    "web_search",
+    "get_weather",
+}
+"""常驻完整 schema 工具。"""
+
+
+STUB_SCHEMA_TOOLS: set[str] = {
+    "start_agent_task",
+    "summarize_chat_history",
+    "summarize_conversation",
+    "recall_history",
+    "upload_file",
+    "send_voice_message",
+}
+"""低频/高风险/大 schema 工具：常驻名称与简述，调用前通过 tool_search 查询。"""
+
+
+_STUB_SHORT_DESCRIPTIONS: dict[str, str] = {
+    "start_agent_task": "低频资料整理工具。调用前先用 tool_search 查询完整 sources 参数和约束。",
+    "summarize_chat_history": "低频群历史总结工具。调用前先用 tool_search 查询参数。",
+    "summarize_conversation": "低频本地会话总结工具。调用前先用 tool_search 查询参数。",
+    "recall_history": "低频归档检索工具。调用前先用 tool_search 查询参数。",
+    "upload_file": "文件发送工具。涉及本地文件和 QQ 上传，调用前先用 tool_search 查询约束。",
+    "send_voice_message": "语音发送工具。需要 TTS 与语气 prompt，调用前先用 tool_search 查询参数。",
+}
+
+
+_STUB_RISK_LEVELS: dict[str, str] = {
+    "upload_file": "medium",
+    "send_voice_message": "medium",
+    "start_agent_task": "medium",
+}
+
+
+def build_default_registry(config) -> ToolRegistry:
+    """根据 RootConfig 构造稳定工具 Registry。
 
     规则：
         - messaging 工具（send_*/recall）：始终启用
-        - upload_file：默认启用（受 ctx.workspace_dir 进一步限制）
+        - upload_file：始终注册为 stub，执行受 ctx.workspace_dir / adapter 进一步限制
         - memory 工具：始终启用；RAG 是历史召回，不替代 important.json
         - platform 工具：始终启用（按需）
         - control 工具：始终启用
-        - feature 工具：按 features.{vision,web_search,weather}.enabled
+        - feature 工具：始终注册；执行时按 ctx 是否注入 service 返回成功或未启用
+        - 低频/高风险/大 schema 工具：始终注册为 stub，通过 tool_search 查询完整参数
 
     Args:
         config: RootConfig 实例
-        include_upload_file: 是否包含 upload_file（如不需要可关掉）
 
     Returns:
         ToolRegistry 实例
@@ -163,18 +223,18 @@ def build_default_registry(
 
     enabled: list[ToolSpec] = []
     for spec in specs:
-        # 1. feature 工具按 enabled 开关
-        if spec.name in FEATURE_TOOL_FEATURES:
-            feat_name = FEATURE_TOOL_FEATURES[spec.name]
-            feat_cfg = getattr(features, feat_name, None)
-            if feat_cfg is None or not feat_cfg.enabled:
-                continue
-
-        # 2. upload_file 按调用方意愿
-        if spec.name == "upload_file" and not include_upload_file:
-            continue
-
-        enabled.append(spec)
+        configured = spec
+        if spec.name in STUB_SCHEMA_TOOLS:
+            configured = replace(
+                spec,
+                schema_mode=ToolSchemaMode.STUB,
+                short_description=_STUB_SHORT_DESCRIPTIONS.get(spec.name),
+                risk_level=_STUB_RISK_LEVELS.get(spec.name, "low"),
+                search_tags=[spec.category, spec.name],
+            )
+        elif spec.name in FULL_SCHEMA_TOOLS:
+            configured = replace(spec, schema_mode=ToolSchemaMode.FULL)
+        enabled.append(configured)
 
     registry = ToolRegistry(enabled)
     logger.info(

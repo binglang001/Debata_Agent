@@ -16,6 +16,7 @@ from tools import (
     DEFAULT_NO_FEEDBACK_TOOLS,
     FEATURE_TOOL_FEATURES,
     MEMORY_FILE_TOOLS,
+    STUB_SCHEMA_TOOLS,
     ToolContext,
     ToolRegistry,
     build_default_registry,
@@ -83,6 +84,12 @@ def _timeline_message(message_id: str, text: str) -> ChatTimelineMessage:
         text=text,
         raw_message=text,
     )
+
+
+def _approve_stub_tools(ctx: ToolContext, *names: str) -> None:
+    approved = ctx.extras.setdefault("tool_search_approved_tools", set())
+    assert isinstance(approved, set)
+    approved.update(names)
 
 
 class FakeSendAdapter:
@@ -306,6 +313,7 @@ def test_all_expected_tools_registered():
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
         "summarize_conversation", "recall_history", "start_agent_task",
         "no_action", "schedule_wakeup",
+        "tool_search",
         "describe_image", "web_search", "get_weather",
         "send_voice_message",
         # workspace tools
@@ -409,11 +417,11 @@ def test_registry_rag_mode_includes_memory_tools():
         assert name in reg, f"RAG 模式下也应注册 {name}"
 
 
-def test_registry_feature_disabled_excludes_tool():
+def test_registry_feature_disabled_keeps_schema_stable():
     cfg = _make_config(vision_enabled=False, weather_enabled=False)
     reg = build_default_registry(cfg)
     for name in ("describe_image", "get_weather"):
-        assert name not in reg
+        assert name in reg
 
 
 def test_registry_feature_enabled_includes_tool():
@@ -438,10 +446,84 @@ def test_registry_messaging_always_enabled():
     assert "recall_message" in reg
 
 
-def test_registry_upload_file_can_be_disabled():
+def test_registry_upload_file_is_stub_schema():
     cfg = _make_config()
-    reg = build_default_registry(cfg, include_upload_file=False)
-    assert "upload_file" not in reg
+    reg = build_default_registry(cfg)
+    schema_by_name = {
+        schema["function"]["name"]: schema["function"]
+        for schema in reg.get_schemas()
+    }
+    assert "upload_file" in reg
+    assert set(schema_by_name["upload_file"]["parameters"]["properties"]) == {
+        "_tool_search_required"
+    }
+
+
+def test_registry_stub_and_full_schema_modes_are_stable():
+    cfg = _make_config(vision_enabled=False, web_search_enabled=False, weather_enabled=False)
+    reg_disabled = build_default_registry(cfg)
+    cfg_enabled = _make_config(vision_enabled=True, web_search_enabled=True, weather_enabled=True)
+    reg_enabled = build_default_registry(cfg_enabled)
+
+    assert reg_disabled.names() == reg_enabled.names()
+    schema_by_name = {
+        schema["function"]["name"]: schema["function"]
+        for schema in reg_disabled.get_schemas()
+    }
+    for name in STUB_SCHEMA_TOOLS:
+        assert name in schema_by_name
+        props = schema_by_name[name]["parameters"]["properties"]
+        assert set(props) == {"_tool_search_required"}
+    assert "targets" in schema_by_name["send_private_messages"]["parameters"]["properties"]
+    assert "tool_name" in schema_by_name["tool_search"]["parameters"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_stub_tool_requires_tool_search_before_execution(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    file_path = workspace / "x.txt"
+    file_path.write_text("x", encoding="utf-8")
+    adapter = _FakeAdapter()
+    ctx = ToolContext(adapter=adapter, workspace_dir=workspace)
+    executor = reg.get_executor(ctx)
+
+    blocked = await executor(
+        "upload_file",
+        {"target_type": "group", "target_id": 1, "file_path": "x.txt"},
+    )
+    assert blocked["ok"] is False
+    assert blocked["status"] == "need_tool_search"
+
+    details = await executor("tool_search", {"tool_name": "upload_file", "intent": "发送文件"})
+    assert details["ok"] is True
+    assert details["status"] == "found"
+    assert details["tool_name"] == "upload_file"
+    assert "file_path" in details["parameters_schema"]["properties"]
+    assert "file_path" in details["required_fields"]
+
+    sent = await executor(
+        "upload_file",
+        {"target_type": "group", "target_id": 1, "file_path": "x.txt"},
+    )
+    assert sent["ok"] is True
+    assert sent["status"] == "done"
+    assert len(adapter.uploaded) == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_search_reports_unknown_tool_candidates():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext())
+
+    result = await executor("tool_search", {"tool_name": "send"})
+
+    assert result["ok"] is False
+    assert result["status"] == "not_found"
+    assert "send_private_messages" in result["candidates"]
 
 
 @pytest.mark.asyncio
@@ -631,6 +713,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         "list_files": {"path": ".", "pattern": "*.txt", "limit": 20},
         "delete_file": {"path": "delete-me.txt"},
         "run_python": {"code": "print('ok')", "timeout_seconds": 5},
+        "tool_search": {"tool_name": "upload_file", "intent": "测试工具详情查询"},
     }
     assert set(calls) == {spec.name for spec in get_default_specs()}
 
@@ -712,6 +795,9 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["upload_file"]["data"]["target_type"] == "private"
     assert adapter.uploaded["file_path"] == upload_path
     assert adapter.uploaded["display_name"] == "report.md"
+    assert results["tool_search"]["status"] == "found"
+    assert results["tool_search"]["tool_name"] == "upload_file"
+    assert "file_path" in results["tool_search"]["parameters_schema"]["properties"]
 
     assert results["list_contacts"]["data"]["scope"] == "friends"
     assert results["list_contacts"]["friends"][0]["nickname"] == "Alice"
@@ -1844,6 +1930,7 @@ async def test_recall_history_writes_complete_artifact(tmp_path):
             }
         },
     )
+    _approve_stub_tools(ctx, "recall_history")
     executor = reg.get_executor(ctx)
 
     result = await executor(
@@ -1956,6 +2043,7 @@ async def test_upload_file_outside_whitelist_rejected(tmp_path):
     outside.write_text("x")
 
     ctx = ToolContext(adapter=_FakeAdapter(), workspace_dir=allowed)
+    _approve_stub_tools(ctx, "upload_file")
     executor = reg.get_executor(ctx)
     result = await executor(
         "upload_file",
@@ -1978,6 +2066,7 @@ async def test_upload_file_inside_whitelist_ok(tmp_path):
 
     fake = _FakeAdapter()
     ctx = ToolContext(adapter=fake, workspace_dir=allowed)
+    _approve_stub_tools(ctx, "upload_file")
     executor = reg.get_executor(ctx)
     result = await executor(
         "upload_file",
@@ -1996,6 +2085,7 @@ async def test_upload_file_no_adapter():
     cfg = _make_config()
     reg = build_default_registry(cfg)
     ctx = ToolContext()  # 没 adapter
+    _approve_stub_tools(ctx, "upload_file")
     executor = reg.get_executor(ctx)
     result = await executor(
         "upload_file",
@@ -2386,6 +2476,7 @@ async def test_summarize_conversation_starts_agent_task(tmp_path):
         agent_task_cb=fake_agent_task,
         conversation_id="group:42",
     )
+    _approve_stub_tools(ctx, "summarize_conversation")
     executor = reg.get_executor(ctx)
 
     result = await executor(
@@ -2419,7 +2510,9 @@ async def test_start_agent_task_requires_prompt_and_calls_runtime():
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
-    executor = reg.get_executor(ToolContext(agent_task_cb=fake_agent_task))
+    ctx = ToolContext(agent_task_cb=fake_agent_task)
+    _approve_stub_tools(ctx, "start_agent_task")
+    executor = reg.get_executor(ctx)
 
     result = await executor(
         "start_agent_task",
@@ -2450,7 +2543,9 @@ async def test_start_agent_task_rejects_image_ref_without_vision_service():
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
-    executor = reg.get_executor(ToolContext(agent_task_cb=fake_agent_task))
+    ctx = ToolContext(agent_task_cb=fake_agent_task)
+    _approve_stub_tools(ctx, "start_agent_task")
+    executor = reg.get_executor(ctx)
 
     result = await executor(
         "start_agent_task",
@@ -2477,7 +2572,9 @@ async def test_start_agent_task_rejects_image_workspace_path_without_vision_serv
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
-    executor = reg.get_executor(ToolContext(agent_task_cb=fake_agent_task))
+    ctx = ToolContext(agent_task_cb=fake_agent_task)
+    _approve_stub_tools(ctx, "start_agent_task")
+    executor = reg.get_executor(ctx)
 
     result = await executor(
         "start_agent_task",
@@ -2509,6 +2606,7 @@ async def test_start_agent_task_rejects_image_retry_after_describe_image_failure
     cfg = _make_config(vision_enabled=True)
     reg = build_default_registry(cfg)
     ctx = ToolContext(vision=FailingVision(), agent_task_cb=fake_agent_task)
+    _approve_stub_tools(ctx, "start_agent_task")
     executor = reg.get_executor(ctx)
 
     image_result = await executor(
