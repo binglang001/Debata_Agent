@@ -321,6 +321,48 @@ def test_chats_runtime_and_tool_results_are_readable_and_collapsed():
     assert "展开原文" in tool_html
 
 
+def test_chats_send_receipt_renders_only_visible_sent_as_outbound_bubble():
+    receipt_html = _render_record_html(
+        {
+            "role": "user",
+            "content": (
+                "<send_receipt>\n"
+                '{"sent":[{"content":"真正发出","msg_id":"100","qq_visible":true}],'
+                '"attempted_messages":[{"content":"未确认草稿"}],'
+                '"unsent":[{"content":"未发"}]}\n'
+                "</send_receipt>"
+            ),
+        },
+        persona_name="玖",
+    )
+
+    assert "系统 · 发送回执" in receipt_html
+    assert "玖" in receipt_html
+    assert "真正发出" in receipt_html
+    assert "已发送 · msg_id=100" in receipt_html
+    assert "未确认草稿" not in receipt_html.split("chat-bubble chat-assistant")[-1]
+    assert "未发" not in receipt_html.split("chat-bubble chat-assistant")[-1]
+
+
+def test_chats_stale_attempted_receipt_does_not_render_outbound_bubble():
+    receipt_html = _render_record_html(
+        {
+            "role": "user",
+            "content": (
+                "<send_receipt>\n"
+                '{"status":"stale","attempted_messages":[{"content":"不要当成已发送"}],'
+                '"new_messages":[{"text":"新消息"}]}\n'
+                "</send_receipt>"
+            ),
+        },
+        persona_name="玖",
+    )
+
+    assert "系统 · 发送回执" in receipt_html
+    assert "待发送/尝试 1 条" in receipt_html
+    assert "chat-bubble chat-assistant" not in receipt_html
+
+
 def test_chats_runtime_and_system_records_are_events_not_bubbles():
     runtime_html = _render_record_html(
         {

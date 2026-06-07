@@ -623,12 +623,20 @@ def _render_record_bubbles(
         body = _render_tool_result_content(content)
         return [_render_event_record(head, body, event_class="chat-event-tool")]
     elif runtime is not None:
+        bubbles: list[str] = []
         if not show_system:
-            return []
-        title, summary = runtime
-        head = f"系统 · {title}"
-        body = _render_collapsed_content(summary, content)
-        return [_render_event_record(head, body, event_class="chat-event-system")]
+            bubbles = []
+        else:
+            title, summary = runtime
+            head = f"系统 · {title}"
+            body = _render_collapsed_content(summary, content)
+            bubbles.append(_render_event_record(head, body, event_class="chat-event-system"))
+        if show_chat:
+            bubbles.extend(
+                _render_outbound_bubble(item, persona_name=persona_name)
+                for item in _send_receipt_sent_items(content)
+            )
+        return bubbles
     elif role == "user":
         if not show_chat:
             return []
@@ -716,6 +724,24 @@ def _render_tool_call_bubble(tool_calls: list, *, persona_name: str) -> str:
     return "".join(parts)
 
 
+def _render_outbound_bubble(item: dict[str, Any], *, persona_name: str) -> str:
+    content = str(item.get("content") or item.get("label") or "").strip()
+    if not content:
+        content = "(空消息)"
+    msg_id = str(item.get("msg_id") or "").strip()
+    status = "已发送"
+    if msg_id:
+        status = f"{status} · msg_id={msg_id}"
+    parts = [
+        "<div class='chat-record chat-bubble chat-assistant'>",
+        f"<div class='chat-head'>{_escape(persona_name)}"
+        f" <span class='chat-meta'>{_escape(status)}</span></div>",
+        _render_text_block(content),
+        "</div>",
+    ]
+    return "".join(parts)
+
+
 def _user_record_label(rec: dict) -> str:
     meta_messages = (rec.get("metadata") or {}).get("messages") or []
     first = meta_messages[0] if meta_messages else None
@@ -785,6 +811,16 @@ def _format_send_receipt_summary(content: str) -> str:
     if note:
         parts.append(_compact_inline_tokens(note))
     return "；".join(parts) if parts else "发送回执"
+
+
+def _send_receipt_sent_items(content: str) -> list[dict[str, Any]]:
+    payload = _extract_tag_json(content, "send_receipt")
+    if not payload:
+        return []
+    sent = payload.get("sent")
+    if not isinstance(sent, list):
+        return []
+    return [item for item in sent if isinstance(item, dict) and item.get("qq_visible") is not False]
 
 
 def _format_task_context_summary(content: str) -> str:
