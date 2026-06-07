@@ -1265,6 +1265,7 @@ _PROACTIVE_ROUTER_HISTORY_BUDGET = 16_384
 _SLOW_BATCH_STAGE_SECONDS = 1.0
 _WORKING_HISTORY_RECENT_RUNTIME_RECORDS = 12
 _WORKING_HISTORY_SEND_RECEIPT_KEEP = 4
+_WORKING_HISTORY_NO_ACTION_KEEP = 8
 _OUT_OF_BAND_DENIED_TOOLS = frozenset(
     {
         "start_agent_task",
@@ -1386,6 +1387,55 @@ def _runtime_context_kind(record: dict[str, Any]) -> str | None:
     if "<send_receipt" in content:
         return "send_receipt"
     return None
+
+
+def _assistant_tool_call_names(record: dict[str, Any]) -> dict[str, str]:
+    if record.get("role") != "assistant":
+        return {}
+    result: dict[str, str] = {}
+    for tool_call in record.get("tool_calls") or []:
+        if not isinstance(tool_call, dict):
+            continue
+        call_id = str(tool_call.get("id") or "")
+        function = tool_call.get("function")
+        name = ""
+        if isinstance(function, dict):
+            name = str(function.get("name") or "")
+        if call_id and name:
+            result[call_id] = name
+    return result
+
+
+def _tool_result_is_no_action(record: dict[str, Any], tool_call_id: str) -> bool:
+    if record.get("role") != "tool":
+        return False
+    if str(record.get("tool_call_id") or "") != tool_call_id:
+        return False
+    try:
+        payload = json.loads(str(record.get("content") or "{}"))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict) and bool(payload.get("no_action"))
+
+
+def _no_action_pair_indices(records: list[dict[str, Any]], start: int) -> set[int]:
+    """Return a complete assistant/tool no_action block, or empty set."""
+    if start >= len(records):
+        return set()
+    assistant_record = records[start]
+    if str(assistant_record.get("content") or "").strip():
+        return set()
+    tool_names = _assistant_tool_call_names(assistant_record)
+    if not tool_names or any(name != "no_action" for name in tool_names.values()):
+        return set()
+    tool_call_ids = list(tool_names)
+    end = start + len(tool_call_ids)
+    if end >= len(records):
+        return set()
+    for offset, tool_call_id in enumerate(tool_call_ids, start=1):
+        if not _tool_result_is_no_action(records[start + offset], tool_call_id):
+            return set()
+    return set(range(start, end + 1))
 
 
 def _text_mentions_self_or_role(text: str, self_id: str, role_name: str) -> bool:
@@ -2590,9 +2640,10 @@ class MessagePipeline:
         """Drop old runtime-only records from the prompt view, not from history.
 
         The working window remains a unified cross-conversation timeline. This filter only
-        prevents old task snapshots and clean send-status records from being replayed
-        into every model call after they are no longer useful for immediate
-        decision-making. Assistant/tool pairs are left intact in this slice.
+        prevents old task snapshots, clean send-status records, and complete
+        no_action assistant/tool blocks from being replayed into every model call
+        after they are no longer useful for immediate decision-making. Tool
+        blocks are dropped only when the full assistant/tool pair is present.
         """
         if not records:
             return records
@@ -2623,6 +2674,26 @@ class MessagePipeline:
         for idx in runtime_indices:
             if idx not in force_keep and idx not in keep_runtime:
                 drop_indices.add(idx)
+
+        no_action_pairs: list[set[int]] = []
+        idx = 0
+        while idx < len(records):
+            pair = _no_action_pair_indices(records, idx)
+            if not pair:
+                idx += 1
+                continue
+            no_action_pairs.append(pair)
+            idx = max(pair) + 1
+
+        kept_no_action_indices: set[int] = set()
+        for pair in no_action_pairs[-_WORKING_HISTORY_NO_ACTION_KEEP:]:
+            kept_no_action_indices.update(pair)
+        for pair in no_action_pairs:
+            if pair & force_keep:
+                continue
+            if pair & kept_no_action_indices:
+                continue
+            drop_indices.update(pair)
 
         if not drop_indices:
             return records

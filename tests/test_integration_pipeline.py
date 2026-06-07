@@ -734,6 +734,112 @@ async def test_working_history_keeps_recent_send_receipt_fields(build_pipeline):
 
 
 @pytest.mark.asyncio
+async def test_working_history_trims_complete_old_no_action_pairs(build_pipeline):
+    pipeline, _, _, history, _ = await build_pipeline([])
+    for idx in range(14):
+        await history.add_records(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"tc-na-{idx}",
+                            "type": "function",
+                            "function": {"name": "no_action", "arguments": "{}"},
+                        }
+                    ],
+                    "conversation_id": "group:5555",
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"tc-na-{idx}",
+                    "content": '{"ok": true, "no_action": true}',
+                    "conversation_id": "group:5555",
+                },
+            ]
+        )
+    await history.add_user_message("真实聊天不能被 no_action 清理影响", conversation_id="group:5555")
+
+    selected = await pipeline._select_working_history("group:5555")
+    joined = "\n".join(json.dumps(r, ensure_ascii=False) for r in selected)
+
+    assert "真实聊天不能被 no_action 清理影响" in joined
+    assert "tc-na-0" not in joined
+    assert "tc-na-13" in joined
+
+
+@pytest.mark.asyncio
+async def test_working_history_keeps_incomplete_or_non_no_action_tool_pairs(build_pipeline):
+    pipeline, _, _, history, _ = await build_pipeline([])
+    await history.add_records(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc-send",
+                        "type": "function",
+                        "function": {"name": "send_group_message", "arguments": "{}"},
+                    }
+                ],
+                "conversation_id": "group:5555",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "tc-send",
+                "content": '{"ok": true, "status": "accepted"}',
+                "conversation_id": "group:5555",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc-na-incomplete",
+                        "type": "function",
+                        "function": {"name": "no_action", "arguments": "{}"},
+                    }
+                ],
+                "conversation_id": "group:5555",
+            },
+        ]
+    )
+    for idx in range(14):
+        await history.add_records(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"tc-old-na-{idx}",
+                            "type": "function",
+                            "function": {"name": "no_action", "arguments": "{}"},
+                        }
+                    ],
+                    "conversation_id": "group:old",
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"tc-old-na-{idx}",
+                    "content": '{"ok": true, "no_action": true}',
+                    "conversation_id": "group:old",
+                },
+            ]
+        )
+
+    selected = await pipeline._select_working_history("group:5555")
+    joined = "\n".join(json.dumps(r, ensure_ascii=False) for r in selected)
+
+    assert "tc-send" in joined
+    assert "accepted" in joined
+    assert "tc-na-incomplete" in joined
+    assert "tc-old-na-0" not in joined
+
+
+@pytest.mark.asyncio
 async def test_proactive_router_history_uses_small_window(build_pipeline):
     pipeline, _, _, history, _ = await build_pipeline([])
     for idx in range(40):
