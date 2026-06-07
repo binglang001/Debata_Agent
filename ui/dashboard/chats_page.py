@@ -104,6 +104,11 @@ class ChatsPage(QWidget):
         self._show_tools_cb.setChecked(True)
         self._show_tools_cb.stateChanged.connect(self._on_filter_changed)
         filters.addWidget(self._show_tools_cb)
+
+        self._media_only_cb = QCheckBox("只看图片/文件")
+        self._media_only_cb.setChecked(False)
+        self._media_only_cb.stateChanged.connect(self._on_filter_changed)
+        filters.addWidget(self._media_only_cb)
         outer.addLayout(filters)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -323,6 +328,7 @@ class ChatsPage(QWidget):
             show_chat=self._show_chat_cb.isChecked(),
             show_system=self._show_system_cb.isChecked(),
             show_tools=self._show_tools_cb.isChecked(),
+            media_only=self._media_only_cb.isChecked(),
         )
         persona_name = _runtime_persona_name(self._runtime)
         parts = [
@@ -386,6 +392,23 @@ _LEGACY_HEADER_RE = re.compile(
 _URL_RE = re.compile(r"https?://[^\s<>'\"]+")
 _WINDOWS_PATH_RE = re.compile(r"(?i)\b[A-Z]:\\[^\s<>'\"|?*]+")
 _WORKSPACE_PATH_RE = re.compile(r"\b(?:workspace=)?(?:incoming|workspace|outgoing)[/\\][^\s\]]+")
+_CQ_MEDIA_RE = re.compile(r"\[CQ:(?:image|file|record|video)\b", re.I)
+_MEDIA_OR_FILE_EXT_RE = re.compile(
+    r"(?i)(?:^|[\s\"'=:/\\])[\w.\-()[\]/\\]+"
+    r"\.(?:png|jpe?g|gif|webp|bmp|svg|mp4|mov|mkv|webm|mp3|wav|ogg|flac|"
+    r"pdf|docx?|xlsx?|pptx?|txt|md|zip|7z|rar|tar|gz|json|csv)\b"
+)
+_MEDIA_TOOL_NAMES = {
+    "describe_image",
+    "send_group_image",
+    "send_private_image",
+    "send_emoji",
+    "upload_file",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "get_forward_msg",
+}
 
 
 def _group_records_by_conversation(records: list[dict]) -> list[dict]:
@@ -508,20 +531,19 @@ def _filter_visible_records(
     show_chat: bool,
     show_system: bool,
     show_tools: bool,
+    media_only: bool = False,
 ) -> list[dict]:
     query = search_text.strip().casefold()
     result: list[dict] = []
     for record in records:
-        categories = _record_display_categories(record)
-        if not show_chat and "chat" in categories:
-            categories.discard("chat")
-        if not show_system and "system" in categories:
-            categories.discard("system")
-        if not show_tools and "tool" in categories:
-            categories.discard("tool")
-        if not categories:
-            continue
-        if query and query not in _record_search_text(record).casefold():
+        if not _record_matches_display_filters(
+            record,
+            query=query,
+            show_chat=show_chat,
+            show_system=show_system,
+            show_tools=show_tools,
+            media_only=media_only,
+        ):
             continue
         result.append(record)
     return result
@@ -534,6 +556,7 @@ def _build_render_items(
     show_chat: bool,
     show_system: bool,
     show_tools: bool,
+    media_only: bool = False,
 ) -> list[tuple[dict, dict[str, list[dict]]]]:
     """Build display records and attach tool results to their tool calls.
 
@@ -556,8 +579,12 @@ def _build_render_items(
             show_chat=show_chat,
             show_system=show_system,
             show_tools=show_tools,
+            media_only=media_only,
         )
         attached_matches = bool(attached) and (
+            not media_only
+            or any(_record_has_media_or_file(result) for results in attached.values() for result in results)
+        ) and (
             not query
             or any(
                 query in _record_search_text(result).casefold()
@@ -621,6 +648,7 @@ def _record_matches_display_filters(
     show_chat: bool,
     show_system: bool,
     show_tools: bool,
+    media_only: bool = False,
 ) -> bool:
     categories = _record_display_categories(record)
     if not show_chat and "chat" in categories:
@@ -631,7 +659,56 @@ def _record_matches_display_filters(
         categories.discard("tool")
     if not categories:
         return False
+    if media_only and not _record_has_media_or_file(record):
+        return False
     return not query or query in _record_search_text(record).casefold()
+
+
+def _record_has_media_or_file(record: dict) -> bool:
+    content = str(record.get("content") or "")
+    if _text_has_media_or_file(content):
+        return True
+
+    meta = record.get("metadata")
+    if isinstance(meta, dict) and _text_has_media_or_file(json.dumps(meta, ensure_ascii=False)):
+        return True
+
+    for tool_call in record.get("tool_calls") or []:
+        func = tool_call.get("function") if isinstance(tool_call, dict) else None
+        if not isinstance(func, dict):
+            continue
+        name = str(func.get("name") or "")
+        if name in _MEDIA_TOOL_NAMES:
+            return True
+        if _text_has_media_or_file(json.dumps(_parse_tool_arguments(func.get("arguments")), ensure_ascii=False)):
+            return True
+    return False
+
+
+def _text_has_media_or_file(text: str) -> bool:
+    if not text:
+        return False
+    if _CQ_MEDIA_RE.search(text):
+        return True
+    if "[图片" in text or "[文件" in text or "[视频" in text or "[语音" in text:
+        return True
+    if _MEDIA_OR_FILE_EXT_RE.search(text):
+        return True
+    lowered = text.casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "workspace=incoming/",
+            "workspace=incoming\\",
+            "image_ref",
+            "image_path",
+            "image_url",
+            "file_path",
+            "file_name",
+            "file_id",
+            "forward_id",
+        )
+    )
 
 
 def _record_display_categories(record: dict) -> set[str]:

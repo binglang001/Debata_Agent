@@ -544,6 +544,74 @@ def test_chats_tool_result_search_keeps_parent_tool_call_visible():
     assert items[0][1] == {"call-1": [records[1]]}
 
 
+def test_chats_media_filter_keeps_only_image_and_file_records():
+    records = [
+        {"role": "user", "content": "普通聊天"},
+        {"role": "user", "content": "[图片 workspace=incoming/img_1.jpg]"},
+        {"role": "user", "content": "报告在 C:\\Users\\admin\\Desktop\\report.pdf"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-upload",
+                    "function": {
+                        "name": "upload_file",
+                        "arguments": '{"file_path":"report.md"}',
+                    },
+                }
+            ],
+        },
+    ]
+
+    filtered = _filter_visible_records(
+        records,
+        search_text="",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+        media_only=True,
+    )
+
+    assert filtered == records[1:]
+
+
+def test_chats_media_filter_keeps_parent_for_media_tool_result():
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {
+                        "name": "get_recent_chat_messages",
+                        "arguments": '{"limit":5}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"ok":true,"content":"[CQ:image,file=a.png,url=https://example.com/a.png]"}',
+        },
+    ]
+
+    items = _build_render_items(
+        records,
+        search_text="",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+        media_only=True,
+    )
+
+    assert len(items) == 1
+    assert items[0][0] is records[0]
+    assert items[0][1] == {"call-1": [records[1]]}
+
+
 def test_chats_filter_visible_records_searches_metadata_and_categories():
     records = [
         {
