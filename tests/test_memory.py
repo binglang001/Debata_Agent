@@ -272,19 +272,6 @@ async def test_important_persists(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_important_duplicate_check_skip(tmp_path):
-    im = ImportantMemoryManager(tmp_path / "imp.json")
-    await im.load()
-    await im.save("张三的QQ是123")
-
-    async def checker(items, new_text):
-        return any("张三" in m["content"] for m in items)
-
-    result = await im.save("张三确实存在", check_dup=checker)
-    assert result == {"saved": False, "duplicate": True}
-
-
-@pytest.mark.asyncio
 async def test_important_update_rewrites_content_and_metadata(tmp_path):
     im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=lambda: "T2")
     await im.load()

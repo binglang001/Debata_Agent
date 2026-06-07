@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +32,6 @@ from utils.token_budget import TokenEstimator
 from .store import JsonStore
 
 logger = logging.getLogger(__name__)
-
-# 去重回调签名：(已存在的条目, 新内容) -> True 表示重复
-DuplicateChecker = Callable[[list[dict], str], Awaitable[bool]]
 
 GLOBAL_SCOPE = "global"
 _VALID_SCOPE_RE = re.compile(r"^(global|user:[^:\s]+|group:[^:\s]+)$")
@@ -229,7 +226,6 @@ class ImportantMemoryManager:
     async def save(
         self,
         content: str,
-        check_dup: DuplicateChecker | None = None,
         *,
         scope: str | None = None,
         pinned: bool = False,
@@ -238,7 +234,6 @@ class ImportantMemoryManager:
 
         Args:
             content: 记忆内容（一句话概括）
-            check_dup: 可选的去重检查器（async）
 
         Returns:
             {"saved": bool, "duplicate": bool}
@@ -259,15 +254,6 @@ class ImportantMemoryManager:
                 "duplicate_type": "exact",
                 "existing_id": duplicate_id,
             }
-
-        if check_dup and self._items:
-            try:
-                is_dup = await check_dup(self._items, content)
-                if is_dup:
-                    logger.info(f"重要记忆去重跳过: {content[:40]}")
-                    return {"saved": False, "duplicate": True}
-            except Exception as e:
-                logger.warning(f"去重检查失败，继续保存: {e}")
 
         item = self._normalize_item(
             {
