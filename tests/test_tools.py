@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -99,6 +100,7 @@ class FakeSendAdapter:
         self.sent: list[tuple[object, str]] = []
         self.sent_images: list[dict[str, object]] = []
         self.voice_sent: list[tuple[object, Path]] = []
+        self.api_calls: list[tuple[str, dict]] = []
         self._next_msg_id = 100
 
     async def send_text(self, target, content: str) -> str:
@@ -195,6 +197,16 @@ class FullFakeAdapter(FakeSendAdapter):
 
     async def upload_file(self, target, file_path: Path, *, display_name: str | None = None) -> None:
         self.uploaded = {"target": target, "file_path": file_path, "display_name": display_name}
+
+    async def call_api(self, action: str, **params: Any) -> dict:
+        self.api_calls.append((action, params))
+        if action == "get_group_member_info":
+            return {
+                "group_id": params.get("group_id"),
+                "user_id": params.get("user_id"),
+                "role": "admin",
+            }
+        return {"ok": True, "action": action}
 
 
 class FakeVision:
@@ -310,6 +322,8 @@ def test_all_expected_tools_registered():
         "recall_message", "upload_file",
         "save_important_memory", "update_important_memory", "delete_important_memory",
         "list_contacts", "get_user_info", "get_forward_msg", "get_recent_chat_messages",
+        "get_group_self_role", "set_group_kick", "set_group_ban",
+        "set_group_whole_ban", "set_group_leave",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
         "summarize_conversation", "recall_history", "start_agent_task",
         "no_action", "schedule_wakeup",
@@ -637,6 +651,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "chat_timeline": timeline,
             "default_reply_target": {"target_type": "private", "target_id": 123},
             "latest_user_message": "帮我测试工具",
+            "self_id": "999",
         },
     )
     reg = ToolRegistry(get_default_specs())
@@ -699,6 +714,27 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "sub_type": "add",
             "approve": False,
             "reason": "拒绝",
+        },
+        "get_group_self_role": {"group_id": 456},
+        "set_group_kick": {
+            "group_id": 456,
+            "user_id": 1002,
+            "reason": "管理员明确要求测试",
+        },
+        "set_group_ban": {
+            "group_id": 456,
+            "user_id": 1002,
+            "duration_seconds": 600,
+            "reason": "管理员明确要求测试",
+        },
+        "set_group_whole_ban": {
+            "group_id": 456,
+            "enable": True,
+            "reason": "管理员明确要求测试",
+        },
+        "set_group_leave": {
+            "group_id": 456,
+            "reason": "管理员明确要求测试",
         },
         "summarize_chat_history": {"group_id": 456, "custom_prompt": "总结"},
         "summarize_conversation": {
@@ -810,6 +846,12 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         "approve": False,
         "reason": "拒绝",
     }
+    assert results["get_group_self_role"]["role"] == "admin"
+    assert results["set_group_kick"]["status"] == "done"
+    assert results["set_group_ban"]["status"] == "done"
+    assert results["set_group_whole_ban"]["status"] == "done"
+    assert results["set_group_leave"]["status"] == "done"
+    assert [call[0] for call in adapter.api_calls].count("set_group_ban") == 1
 
     assert results["summarize_chat_history"]["task_id"] == "agent-test"
     assert agent_tasks[1]["output_name"] == "group_456_summary.md"
@@ -2018,6 +2060,8 @@ class _FakeAdapter:
         self.recalled: list[str] = []
         self.friend_requests: list[tuple[str, bool, str]] = []
         self.group_requests: list[tuple[str, str, bool, str]] = []
+        self.api_calls: list[tuple[str, dict]] = []
+        self.member_role = "admin"
 
     async def upload_file(self, target, file_path, *, display_name=None):
         self.uploaded.append((target, file_path, display_name))
@@ -2031,6 +2075,16 @@ class _FakeAdapter:
 
     async def handle_group_request(self, flag, sub_type, approve, reason=""):
         self.group_requests.append((flag, sub_type, approve, reason))
+
+    async def call_api(self, action, **params):
+        self.api_calls.append((action, params))
+        if action == "get_group_member_info":
+            return {
+                "group_id": params.get("group_id"),
+                "user_id": params.get("user_id"),
+                "role": self.member_role,
+            }
+        return {"ok": True, "action": action}
 
 
 @pytest.mark.asyncio
@@ -2094,6 +2148,166 @@ async def test_upload_file_no_adapter():
     assert result["ok"] is False
     assert result["status"] == "failed"
     assert "未连接适配器" in result["brief"]
+
+
+# ============================================================
+# QQ group admin tools
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_get_group_self_role_uses_current_group_and_self_id():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(
+        adapter=adapter,
+        conversation_id="group:42",
+        extras={"self_id": "999"},
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor("get_group_self_role", {})
+
+    assert result["ok"] is True
+    assert result["role"] == "admin"
+    assert result["group_id"] == "42"
+    assert adapter.api_calls == [
+        (
+            "get_group_member_info",
+            {"group_id": 42, "user_id": 999, "no_cache": True},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_group_admin_stub_requires_tool_search_before_execution():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(adapter=adapter, extras={"self_id": "999"})
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_group_ban",
+        {
+            "group_id": 42,
+            "user_id": 123,
+            "duration_seconds": 600,
+            "reason": "管理员明确要求测试",
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "need_tool_search"
+    assert adapter.api_calls == []
+
+    details = await executor("tool_search", {"tool_name": "set_group_ban"})
+    assert details["ok"] is True
+    assert details["risk_level"] == "high"
+    assert "duration_seconds" in details["parameters_schema"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_group_ban_requires_bot_admin_role():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    adapter.member_role = "member"
+    ctx = ToolContext(adapter=adapter, extras={"self_id": "999"})
+    _approve_stub_tools(ctx, "set_group_ban")
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_group_ban",
+        {
+            "group_id": 42,
+            "user_id": 123,
+            "duration_seconds": 600,
+            "reason": "管理员明确要求测试",
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "insufficient_permission"
+    assert [call[0] for call in adapter.api_calls] == ["get_group_member_info"]
+
+
+@pytest.mark.asyncio
+async def test_group_ban_calls_napcat_api_when_admin():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(adapter=adapter, extras={"self_id": "999"})
+    _approve_stub_tools(ctx, "set_group_ban")
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_group_ban",
+        {
+            "group_id": 42,
+            "user_id": 123,
+            "duration_seconds": 600,
+            "reason": "管理员明确要求测试",
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert adapter.api_calls == [
+        (
+            "get_group_member_info",
+            {"group_id": 42, "user_id": 999, "no_cache": True},
+        ),
+        (
+            "set_group_ban",
+            {"group_id": 42, "user_id": 123, "duration": 600},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_group_leave_only_allows_current_group():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(
+        adapter=adapter,
+        conversation_id="group:42",
+        extras={"self_id": "999"},
+    )
+    _approve_stub_tools(ctx, "set_group_leave")
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_group_leave",
+        {"group_id": 43, "reason": "用户明确要求退群"},
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "target_mismatch"
+    assert adapter.api_calls == []
+
+
+@pytest.mark.asyncio
+async def test_group_whole_ban_calls_napcat_api_when_admin():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(adapter=adapter, extras={"self_id": "999"})
+    _approve_stub_tools(ctx, "set_group_whole_ban")
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_group_whole_ban",
+        {"group_id": 42, "enable": True, "reason": "管理员明确要求全员禁言"},
+    )
+
+    assert result["ok"] is True
+    assert adapter.api_calls[-1] == (
+        "set_group_whole_ban",
+        {"group_id": 42, "enable": True},
+    )
 
 
 @pytest.mark.asyncio

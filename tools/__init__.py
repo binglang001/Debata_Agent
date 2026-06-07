@@ -33,6 +33,7 @@ from . import (  # noqa: F401
     agent_task_tools,
     control_tools,
     feature_tools,
+    group_admin_tools,
     memory_tools,
     messaging,
     platform_tools,
@@ -157,6 +158,7 @@ FULL_SCHEMA_TOOLS: set[str] = {
     "schedule_wakeup",
     "list_contacts",
     "get_user_info",
+    "get_group_self_role",
     "set_friend_add_request",
     "set_group_add_request",
     "read_file",
@@ -178,6 +180,10 @@ STUB_SCHEMA_TOOLS: set[str] = {
     "recall_history",
     "upload_file",
     "send_voice_message",
+    "set_group_kick",
+    "set_group_ban",
+    "set_group_whole_ban",
+    "set_group_leave",
 }
 """低频/高风险/大 schema 工具：常驻名称与简述，调用前通过 tool_search 查询。"""
 
@@ -189,6 +195,10 @@ _STUB_SHORT_DESCRIPTIONS: dict[str, str] = {
     "recall_history": "低频归档检索工具。调用前先用 tool_search 查询参数。",
     "upload_file": "文件发送工具。涉及本地文件和 QQ 上传，调用前先用 tool_search 查询约束。",
     "send_voice_message": "语音发送工具。需要 TTS 与语气 prompt，调用前先用 tool_search 查询参数。",
+    "set_group_kick": "高风险群管理工具。踢出群成员前必须 tool_search 查询约束和参数。",
+    "set_group_ban": "高风险群管理工具。禁言群成员前必须 tool_search 查询约束和参数。",
+    "set_group_whole_ban": "高风险群管理工具。全员禁言前必须 tool_search 查询约束和参数。",
+    "set_group_leave": "高风险群管理工具。机器人退群前必须 tool_search 查询约束和参数。",
 }
 
 
@@ -196,6 +206,10 @@ _STUB_RISK_LEVELS: dict[str, str] = {
     "upload_file": "medium",
     "send_voice_message": "medium",
     "start_agent_task": "medium",
+    "set_group_kick": "high",
+    "set_group_ban": "high",
+    "set_group_whole_ban": "high",
+    "set_group_leave": "high",
 }
 
 

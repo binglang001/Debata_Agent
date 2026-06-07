@@ -2860,7 +2860,12 @@ class MessagePipeline:
         extras: dict[str, Any] = {
             "tool_registry": self.tool_registry,
             "tool_search_approved_tools": set(),
+            "self_id_by_conversation": dict(self._self_id_by_conversation),
         }
+        if conversation_id:
+            self_id = self._self_id_by_conversation.get(conversation_id)
+            if self_id:
+                extras["self_id"] = self_id
         if default_target is not None:
             raw_target_id = str(default_target.target_id)
             extras["default_reply_target"] = {

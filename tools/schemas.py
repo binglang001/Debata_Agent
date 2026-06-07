@@ -259,6 +259,80 @@ class ToolSearchArgs(_ToolArgs):
 
 
 # ============================================================
+# QQ 群管理 / 权限查询
+# ============================================================
+
+
+class GetGroupSelfRoleArgs(_ToolArgs):
+    """get_group_self_role 工具参数。"""
+
+    group_id: int | None = Field(
+        default=None,
+        description="群号。不填时使用当前群聊；私聊或无法推断当前群时必须填写。",
+    )
+
+
+class SetGroupKickArgs(_ToolArgs):
+    """set_group_kick 工具参数。"""
+
+    group_id: int = Field(..., description="群号")
+    user_id: int = Field(..., description="要踢出的 QQ 号，必须明确，不要猜")
+    reject_add_request: bool = Field(
+        default=False,
+        description="是否拒绝该用户再次加群。默认 false；只有用户明确要求拉黑/拒绝再加时才设 true。",
+    )
+    reason: str = Field(
+        ...,
+        min_length=2,
+        description="为什么执行踢人。用于日志和自检，不会发给 QQ；必须来自明确用户请求。",
+    )
+
+
+class SetGroupBanArgs(_ToolArgs):
+    """set_group_ban 工具参数。"""
+
+    group_id: int = Field(..., description="群号")
+    user_id: int = Field(..., description="要禁言的 QQ 号，必须明确，不要猜")
+    duration_seconds: int = Field(
+        ...,
+        ge=1,
+        le=2_592_000,
+        description="禁言时长，单位秒。必须明确；例如 600=10分钟，1800=30分钟。",
+    )
+    reason: str = Field(
+        ...,
+        min_length=2,
+        description="为什么执行禁言。用于日志和自检，不会发给 QQ；必须来自明确用户请求。",
+    )
+
+
+class SetGroupWholeBanArgs(_ToolArgs):
+    """set_group_whole_ban 工具参数。"""
+
+    group_id: int = Field(..., description="群号")
+    enable: bool = Field(..., description="true=开启全员禁言，false=关闭全员禁言")
+    reason: str = Field(
+        ...,
+        min_length=2,
+        description="为什么执行全员禁言。用于日志和自检，不会发给 QQ；必须来自明确用户请求。",
+    )
+
+
+class SetGroupLeaveArgs(_ToolArgs):
+    """set_group_leave 工具参数。"""
+
+    group_id: int | None = Field(
+        default=None,
+        description="要退出的群号。不填时使用当前群聊；必须是当前群，不能让机器人跨群退群。",
+    )
+    reason: str = Field(
+        ...,
+        min_length=2,
+        description="为什么退群。用于日志和自检，不会发给 QQ；必须来自明确用户请求。",
+    )
+
+
+# ============================================================
 # Memory（重要记忆）
 # ============================================================
 
