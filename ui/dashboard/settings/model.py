@@ -89,6 +89,8 @@ class SettingsModelMixin:
             if agent_cfg is None:
                 continue
             card.add_content(self._build_agent_row(agent_name, agent_cfg))
+        if self._cfg().agents.chat is not None:
+            card.add_content(self._build_tool_loop_reminder_group())
         return card
 
     def _render_providers(self) -> None:
@@ -537,20 +539,6 @@ class SettingsModelMixin:
         model_wrap.setLayout(model_row)
         form.addRow(QLabel("模型 ID"), model_wrap)
 
-        if agent_name == "chat":
-            loops_spin = QSpinBox()
-            loops_spin.setRange(5, 60)
-            loops_spin.setValue(min(60, max(5, int(agent_cfg.max_loops or 25))))
-            loops_spin.setSuffix(" 轮")
-            install_wheel_freeze(loops_spin)
-            loops_spin.editingFinished.connect(
-                lambda *_, an=agent_name, s=loops_spin: self._on_agent_max_loops_changed(
-                    an,
-                    s.value(),
-                )
-            )
-            form.addRow(QLabel("工具轮数上限"), loops_spin)
-
         # 思考
         chk = QCheckBox("启用")
         is_on = bool(agent_cfg.reasoning and agent_cfg.reasoning.enabled)
@@ -584,6 +572,80 @@ class SettingsModelMixin:
         reasoning_wrap = QWidget()
         reasoning_wrap.setLayout(reasoning_row)
         form.addRow(QLabel("思考"), reasoning_wrap)
+
+        outer.addLayout(form)
+        return wrap
+
+    def _build_tool_loop_reminder_group(self) -> QWidget:
+        agent_cfg = self._cfg().agents.chat
+        wrap = QFrame()
+        wrap.setObjectName("Card")
+        outer = QVBoxLayout(wrap)
+        outer.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
+        outer.setSpacing(Spacing.SM)
+
+        title = QLabel("工具循环提醒")
+        title.setProperty("role", "title-3")
+        outer.addWidget(title)
+
+        hint = QLabel(
+            "连续多轮调用工具时先周期性提醒；达到最终警告后仍有宽限轮。"
+            "这不是达到某轮数就立即禁止工具的普通硬停止。"
+        )
+        hint.setProperty("role", "secondary")
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
+        form = QFormLayout()
+        form.setSpacing(Spacing.SM)
+
+        interval_spin = QSpinBox()
+        interval_spin.setObjectName("toolLoopReminderIntervalSpin")
+        interval_spin.setRange(1, 1000)
+        interval_spin.setValue(max(1, int(agent_cfg.tool_loop_reminder_interval or 8)))
+        interval_spin.setSuffix(" 轮")
+        interval_spin.setToolTip("连续多少个工具轮后触发一次普通提醒。")
+        install_wheel_freeze(interval_spin)
+        interval_spin.editingFinished.connect(
+            lambda: self._on_agent_tool_loop_field_changed(
+                "chat",
+                "tool_loop_reminder_interval",
+                interval_spin.value(),
+            )
+        )
+        form.addRow(QLabel("工具轮数提醒间隔"), interval_spin)
+
+        warning_spin = QSpinBox()
+        warning_spin.setObjectName("toolLoopFinalWarningCountSpin")
+        warning_spin.setRange(1, 1000)
+        warning_spin.setValue(max(1, int(agent_cfg.tool_loop_final_warning_count or 4)))
+        warning_spin.setSuffix(" 次")
+        warning_spin.setToolTip("普通提醒达到多少次后进入最终警告周期。")
+        install_wheel_freeze(warning_spin)
+        warning_spin.editingFinished.connect(
+            lambda: self._on_agent_tool_loop_field_changed(
+                "chat",
+                "tool_loop_final_warning_count",
+                warning_spin.value(),
+            )
+        )
+        form.addRow(QLabel("最终警告前提醒次数"), warning_spin)
+
+        grace_spin = QSpinBox()
+        grace_spin.setObjectName("toolLoopFinalGraceLoopsSpin")
+        grace_spin.setRange(0, 1000)
+        grace_spin.setValue(max(0, int(agent_cfg.tool_loop_final_grace_loops or 0)))
+        grace_spin.setSuffix(" 轮")
+        grace_spin.setToolTip("最终警告发出后还允许多少个工具轮。")
+        install_wheel_freeze(grace_spin)
+        grace_spin.editingFinished.connect(
+            lambda: self._on_agent_tool_loop_field_changed(
+                "chat",
+                "tool_loop_final_grace_loops",
+                grace_spin.value(),
+            )
+        )
+        form.addRow(QLabel("最终警告后宽限轮数"), grace_spin)
 
         outer.addLayout(form)
         return wrap
@@ -642,17 +704,33 @@ class SettingsModelMixin:
         a.model = model
         self._save_now(needs_restart=True, change_desc=f"agents.{agent_name}.model={model}")
 
-    def _on_agent_max_loops_changed(self, agent_name: str, value: int) -> None:
+    def _on_agent_tool_loop_field_changed(
+        self,
+        agent_name: str,
+        field_name: str,
+        value: int,
+    ) -> None:
         if self._suppress_signals:
             return
         a = getattr(self._cfg().agents, agent_name, None)
         if a is None:
             return
-        value = min(60, max(5, int(value)))
-        if a.max_loops == value:
+        minimums = {
+            "tool_loop_reminder_interval": 1,
+            "tool_loop_final_warning_count": 1,
+            "tool_loop_final_grace_loops": 0,
+        }
+        min_value = minimums.get(field_name)
+        if min_value is None:
             return
-        a.max_loops = value
-        self._save_now(needs_restart=False, change_desc=f"agents.{agent_name}.max_loops={value} (hot)")
+        value = max(min_value, int(value))
+        if getattr(a, field_name) == value:
+            return
+        setattr(a, field_name, value)
+        self._save_now(
+            needs_restart=False,
+            change_desc=f"agents.{agent_name}.{field_name}={value} (hot)",
+        )
 
     def _on_agent_reasoning_changed(self, agent_name: str, enabled: bool, budget) -> None:
         if self._suppress_signals:

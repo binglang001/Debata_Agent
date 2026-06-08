@@ -504,3 +504,62 @@ def test_settings_tool_result_budget_save_is_hot(tmp_paths):
     saved = load_config(tmp_paths)
     assert saved.behavior.context.tool_result_budgets["read_file"].inline_budget_tokens == 3200
     assert page._status.calls[-1] == (0, False)
+
+
+def test_settings_tool_loop_reminder_fields_save_hot(tmp_paths):
+    cfg = _minimal_root_config()
+
+    class FakeStatus:
+        def __init__(self):
+            self.calls = []
+            self.error = ""
+
+        def set_changes(self, count: int, *, needs_restart: bool) -> None:
+            self.calls.append((count, needs_restart))
+
+        def mark_error(self, msg: str) -> None:
+            self.error = msg
+
+    class Dummy:
+        def __init__(self):
+            self._suppress_signals = False
+            self._runtime = type("RuntimeStub", (), {"paths": tmp_paths, "config": cfg})()
+            self._baseline = cfg.model_copy(deep=True)
+            self._status = FakeStatus()
+
+        def _cfg(self):
+            return self._runtime.config
+
+        def _count_changes(self) -> int:
+            return SettingsPage._count_changes(self)
+
+        def _save_now(self, *, needs_restart: bool, change_desc: str = "") -> None:
+            SettingsPage._save_now(self, needs_restart=needs_restart, change_desc=change_desc)
+
+    page = Dummy()
+
+    SettingsPage._on_agent_tool_loop_field_changed(
+        page,
+        "chat",
+        "tool_loop_reminder_interval",
+        6,
+    )
+    SettingsPage._on_agent_tool_loop_field_changed(
+        page,
+        "chat",
+        "tool_loop_final_warning_count",
+        2,
+    )
+    SettingsPage._on_agent_tool_loop_field_changed(
+        page,
+        "chat",
+        "tool_loop_final_grace_loops",
+        0,
+    )
+
+    saved = load_config(tmp_paths)
+    assert saved.agents.chat.tool_loop_reminder_interval == 6
+    assert saved.agents.chat.tool_loop_final_warning_count == 2
+    assert saved.agents.chat.tool_loop_final_grace_loops == 0
+    assert saved.agents.chat.max_loops == 25
+    assert all(needs_restart is False for _count, needs_restart in page._status.calls)
