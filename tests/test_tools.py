@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from adapters.types import FriendInfo, GroupInfo, GroupMemberInfo, UserInfo
 from core.chat_timeline import ChatTimelineMessage, ChatTimelineStore
@@ -263,6 +263,22 @@ def test_send_private_schema_derivation():
     assert "不是表情包" in target_props["image"]["description"]
 
 
+def test_non_no_action_schemas_expose_finish_after_success():
+    specs = {s.name: s for s in get_default_specs()}
+
+    for spec in specs.values():
+        schema_props = spec.to_openai_schema()["function"]["parameters"].get(
+            "properties", {}
+        )
+        full_props = spec.full_parameters_schema().get("properties", {})
+        if spec.name == "no_action":
+            assert "finish_after_success" not in schema_props
+            assert "finish_after_success" not in full_props
+            continue
+        assert schema_props["finish_after_success"]["default"] is False
+        assert full_props["finish_after_success"]["default"] is False
+
+
 def test_schema_no_refs_in_output():
     """派生出的 schema 不应包含 $ref / $defs（OpenAI 不支持）。"""
     specs = {s.name: s for s in get_default_specs()}
@@ -477,7 +493,8 @@ def test_registry_upload_file_is_stub_schema():
     }
     assert "upload_file" in reg
     assert set(schema_by_name["upload_file"]["parameters"]["properties"]) == {
-        "_tool_search_required"
+        "_tool_search_required",
+        "finish_after_success",
     }
 
 
@@ -495,7 +512,7 @@ def test_registry_stub_and_full_schema_modes_are_stable():
     for name in STUB_SCHEMA_TOOLS:
         assert name in schema_by_name
         props = schema_by_name[name]["parameters"]["properties"]
-        assert set(props) == {"_tool_search_required"}
+        assert set(props) == {"_tool_search_required", "finish_after_success"}
     assert "targets" in schema_by_name["send_private_messages"]["parameters"]["properties"]
     assert "tool_name" in schema_by_name["tool_search"]["parameters"]["properties"]
 
@@ -964,6 +981,39 @@ async def test_executor_invalid_args():
     result = await executor("save_important_memory", {})
     assert result["ok"] is False
     assert "无效" in result["error"] or "memory_text" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_executor_finish_after_success_is_control_arg():
+    class _Args(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        value: int
+
+    @tool(name="_finish_after_success_test", description="finish", args_model=_Args)
+    async def _finish_after_success_test(args, ctx):
+        return {"ok": True, "status": "done", "value": args.value}
+
+    new_spec = next(
+        s for s in get_default_specs() if s.name == "_finish_after_success_test"
+    )
+    try:
+        reg = ToolRegistry([new_spec])
+        executor = reg.get_executor(ToolContext())
+        result = await executor(
+            "_finish_after_success_test",
+            {"value": 1, "finish_after_success": True},
+        )
+        assert result["ok"] is True
+        assert result["value"] == 1
+        assert result["turn_completion"]["allowed"] is True
+        assert result["turn_completion"]["reason"] == "finish_after_success"
+    finally:
+        from tools.base import _DEFAULT_REGISTRY
+
+        _DEFAULT_REGISTRY[:] = [
+            s for s in _DEFAULT_REGISTRY if s.name != "_finish_after_success_test"
+        ]
 
 
 @pytest.mark.asyncio

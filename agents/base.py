@@ -16,7 +16,7 @@ StatusCallback = Callable[[dict[str, Any]], None]
 
 FinishReason = Literal[
     "no_action",
-    "all_no_feedback",
+    "finish_after_success",
     "tool_stop",
     "no_tool_after_retry",
     "max_loops",

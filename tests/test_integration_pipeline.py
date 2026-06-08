@@ -2985,14 +2985,7 @@ async def test_voice_message_falls_back_to_adapter_when_asr_fails(
 
 @pytest.mark.asyncio
 async def test_multi_turn_tool_loop(build_pipeline):
-    """多轮：AI 第一次 save_important_memory（no_feedback），第二次 send_private（结束）。
-
-    验证 runner 不会在 save_important 后提前 finish——它属于 no_feedback，
-    单步 save 后应该继续等 send_private 或 no_action。
-
-    注意：当前 runner 的 _all_no_feedback 设计是「所有 tool_calls 都属于 no_feedback
-    才提前结束」，所以单个 save_important_memory 会让循环结束。这里实际验证的是
-    runner 的真实行为，不强求多轮。"""
+    """非 no_action 工具默认把结果回填给模型，不再因 no_feedback 隐式结束。"""
     # 工具参数字段名是 memory_text 不是 content（被集成测试抓出来的）
     save_args = {"memory_text": "用户喜欢咖啡"}
     save_tc = ToolCall(id="tc-s", name="save_important_memory", arguments=json.dumps(save_args))

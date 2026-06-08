@@ -8,7 +8,7 @@
 
 循环退出条件（保留 V1 语义）：
     1. AI 调用了 no_action → finish_reason='no_action'
-    2. AI 调用的全是 no_feedback 类工具且全部成功 → 'all_no_feedback'
+    2. 所有非 no_action 工具显式允许成功后结束 → 'finish_after_success'
     3. AI 未调用工具，提示重试后仍不调用 → 'no_tool_after_retry'
     4. 达到 max_loops → 'max_loops'，随后追加一次无工具收尾，让模型说明部分结果
 """
@@ -40,8 +40,7 @@ from .base import AgentRunResult, FinishReason, StatusCallback, ToolExecutor, Us
 logger = logging.getLogger(__name__)
 
 
-# 工具属于"调用成功后无需 LLM 反馈"的类别——它们的结果对后续没影响，
-# 调用完直接结束循环
+# 兼容旧导出；runner 不再根据这个集合提前结束。
 DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "save_important_memory",
     "update_important_memory",
@@ -308,16 +307,20 @@ class AgentRunner:
 
             # === 终止条件检查 ===
             if any(
-                r["name"] == "no_action" and r["result"].get("ok", True)
+                r["name"] == "no_action"
+                and not self._tool_result_blocks_completion(r["result"])
                 for r in tc_results
             ):
                 final_content = "NO_ACTIONS"
                 finish_reason = "no_action"
                 break
 
-            if self._all_no_feedback(tc_results):
+            if any(self._tool_result_blocks_completion(r["result"]) for r in tc_results):
+                continue
+
+            if self._all_non_no_action_results_allow_completion(tc_results):
                 final_content = result.content or ""
-                finish_reason = self._classify_no_feedback(tc_results)
+                finish_reason = "finish_after_success"
                 break
 
         if loop_count >= effective_max_loops and finish_reason == "max_loops":
@@ -522,26 +525,60 @@ class AgentRunner:
                 logger.exception(f"工具 {name} 执行失败: {e}")
                 result = {"ok": False, "error": str(e)}
 
+            result = self._maybe_mark_turn_completion(name, args, result)
             results.append({"id": tc.id, "name": name, "args": args, "result": result})
         return results
 
-    def _all_no_feedback(self, tc_results: list[dict[str, Any]]) -> bool:
-        """所有工具调用都不需要 LLM 反馈才能终止。"""
-        for r in tc_results:
-            name = r["name"]
-            ok = r["result"].get("ok", True)
-            if name in SEND_TOOL_NAMES:
-                return False
-            if name in self.no_feedback_tools:
-                if not ok:
-                    return False
-            else:
-                return False
-        return True
+    @staticmethod
+    def _maybe_mark_turn_completion(
+        name: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if name == "no_action" or args.get("finish_after_success") is not True:
+            return result
+        if AgentRunner._tool_result_blocks_completion(result):
+            return result
+        marked = dict(result)
+        completion = dict(marked.get("turn_completion") or {})
+        completion["allowed"] = True
+        completion.setdefault("reason", "finish_after_success")
+        marked["turn_completion"] = completion
+        return marked
 
     @staticmethod
-    def _classify_no_feedback(tc_results: list[dict[str, Any]]) -> FinishReason:
-        return "all_no_feedback"
+    def _tool_result_blocks_completion(result: dict[str, Any]) -> bool:
+        if result.get("ok") is False:
+            return True
+        if result.get("errors"):
+            return True
+        status = result.get("status")
+        pending_statuses = {
+            "needs_review",
+            "needs_review_again",
+            "stale",
+            "failed",
+            "partial",
+            "unsupported",
+            "need_tool_search",
+        }
+        if isinstance(status, str):
+            return status in pending_statuses
+        if isinstance(status, (list, tuple, set)):
+            return any(str(item) in pending_statuses for item in status)
+        return False
+
+    @staticmethod
+    def _all_non_no_action_results_allow_completion(
+        tc_results: list[dict[str, Any]],
+    ) -> bool:
+        non_no_action = [r for r in tc_results if r["name"] != "no_action"]
+        if not non_no_action:
+            return False
+        return all(
+            r["result"].get("turn_completion", {}).get("allowed") is True
+            for r in non_no_action
+        )
 
 
 def _kv_prompt_diagnostics(
