@@ -176,6 +176,26 @@ def test_tool_trigger_policy_in_protocol():
     assert "commit_send_attempt" in s
 
 
+def test_tool_use_protocol_documents_runtime_contracts_without_legacy_terms():
+    s = build_tool_use_protocol("rag")
+    lower = s.lower()
+
+    assert "finish_after_success" in s
+    assert "no_action 是唯一显式沉默终止工具" in s
+    assert "needs_review_again 仍属于同一个 send_attempt_id" in s
+    assert "atomic 不会绕过 needs_review / needs_review_again" in s
+    assert "ignore_review_interrupts 只用于 commit_send_attempt" in s
+    assert "update_important_memory" in s
+    assert "运行时噪声" in s
+    assert "tool_search 查询完整参数" in s
+    assert "status=need_tool_search" in s
+    assert "loop_reminder" in s
+    assert "<tool_loop_final_warning>" in s
+    assert "send_only" not in s
+    assert "no-feedback" not in lower
+    assert "no_feedback" not in lower
+
+
 def test_group_relevance_uses_clear_addressee_rules():
     p = _persona()
     sys = build_combined_system_prompt(p)

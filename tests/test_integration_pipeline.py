@@ -437,7 +437,9 @@ async def test_main_reply_persists_task_context_snapshot_for_kv_prefix(build_pip
 
 
 @pytest.mark.asyncio
-async def test_group_task_context_includes_recent_real_chat_window(build_pipeline):
+async def test_group_task_context_uses_lookup_hint_instead_of_recent_real_chat_window(
+    build_pipeline,
+):
     pipeline, provider, _, _, _ = await build_pipeline([_ai_no_action()])
 
     await pipeline.enqueue(_msg(user_id="a", group_id="5555", text="前一句", message_id="g1"))
@@ -451,12 +453,16 @@ async def test_group_task_context_includes_recent_real_chat_window(build_pipelin
         for m in second_call
         if m.get("role") == "user" and "<task_context" in str(m.get("content") or "")
     )
-    assert "<recent_group_messages" in task_context
-    assert 'limit="10"' in task_context
-    assert "前一句" in task_context
-    assert "接一句" in task_context
-    assert "msg_id=g1" in task_context
-    assert "msg_id=g2" in task_context
+    assert "<recent_group_messages" not in task_context
+    assert 'limit="10"' not in task_context
+    assert "前一句" not in task_context
+    assert "接一句" not in task_context
+    assert "msg_id=g1" not in task_context
+    assert "msg_id=g2" not in task_context
+    assert "<conversation_context_hint" in task_context
+    assert "get_recent_chat_messages" in task_context
+    assert "recall_history" in task_context
+    assert "当前会话：group:5555" in task_context
 
 
 @pytest.mark.asyncio
@@ -473,6 +479,28 @@ async def test_private_task_context_does_not_include_group_window(build_pipeline
         if m.get("role") == "user" and "<task_context" in str(m.get("content") or "")
     )
     assert "<recent_group_messages" not in task_context
+
+
+def test_tool_registry_stub_schema_reduces_exposed_tool_schema_size():
+    registry = build_default_registry(_make_root_config())
+    for name in ("upload_file", "start_agent_task"):
+        spec = registry.get_spec(name)
+        assert spec is not None
+        stub_text = json.dumps(spec.to_openai_schema(), ensure_ascii=False)
+        full_text = json.dumps(
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.full_parameters_schema(),
+                },
+            },
+            ensure_ascii=False,
+        )
+
+        assert "_tool_search_required" in stub_text
+        assert len(stub_text) < len(full_text)
 
 
 @pytest.mark.asyncio
