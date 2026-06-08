@@ -582,6 +582,32 @@ def test_chats_runtime_and_tool_results_are_readable_and_collapsed():
     assert "状态 stale" not in tool_html
 
 
+def test_chats_send_receipt_text_summary_is_readable():
+    receipt = (
+        "<send_receipt>\n"
+        "发送回执：send-1\n"
+        "会话：private:10001\n"
+        "状态：已完成（interrupted=false）。\n"
+        "已发送 1 条：\n"
+        "1. 收到；order=1；msg_id=900；conversation_id=private:10001\n"
+        "未发送 0 条：\n"
+        "- 无\n"
+        "新消息 2 条：\n"
+        "1. conversation_id=private:10001；user_id=10001；nickname=用户；count=2\n"
+        "撤回消息 0 条：\n"
+        "- 无\n"
+        "错误 0 条：\n"
+        "- 无\n"
+        "处理要求：不要重发已发送内容。\n"
+        "</send_receipt>"
+    )
+
+    summary = _format_send_receipt_summary(receipt)
+
+    assert "<send_receipt>" not in summary
+    assert summary == "状态 已完成（interrupted=false）；已发送 1 条；新消息 2 条"
+
+
 def test_chats_send_receipt_renders_only_visible_sent_as_outbound_bubble():
     receipt_html = _render_record_html(
         {
@@ -605,6 +631,48 @@ def test_chats_send_receipt_renders_only_visible_sent_as_outbound_bubble():
     assistant_bubble = receipt_html.split("chat-record chat-message-table chat-side-left chat-bot")[-1]
     assert "未确认草稿" not in assistant_bubble
     assert "未发" not in assistant_bubble
+
+
+def test_chats_text_send_receipt_sent_promotes_to_left_bubble_once(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "private:10001",
+        "label": "私聊 10001",
+        "records": [
+            {
+                "role": "user",
+                "conversation_id": "private:10001",
+                "content": (
+                    "<send_receipt>\n"
+                    "发送回执：send-r\n"
+                    "会话：private:10001\n"
+                    "状态：已完成（interrupted=false）。\n"
+                    "已发送 1 条：\n"
+                    "1. 收到；order=1；msg_id=900；conversation_id=private:10001；time=2026-06-08 19:43:55\n"
+                    "未发送 0 条：\n"
+                    "- 无\n"
+                    "新消息 0 条：\n"
+                    "- 无\n"
+                    "撤回消息 0 条：\n"
+                    "- 无\n"
+                    "错误 0 条：\n"
+                    "- 无\n"
+                    "处理要求：不要重发已发送内容。\n"
+                    "</send_receipt>"
+                ),
+            }
+        ],
+    }
+
+    html = page._render_conversation(conv)
+    body_html = html.split("</style>", 1)[1]
+
+    assert "chat-record chat-message-table chat-side-left chat-bot" in body_html
+    assert "收到" in body_html
+    assert "已发送 · msg_id=900" in body_html
+    assert body_html.count("收到") == 1
+    event_html = body_html.split("chat-record chat-message-table chat-side-left chat-bot", 1)[0]
+    assert "收到" not in event_html
 
 
 def test_chats_send_receipt_sent_promotes_to_left_bubble_without_flat_event_text(qapp, tmp_paths):
@@ -1461,6 +1529,96 @@ def test_chats_cross_conversation_send_receipt_sent_falls_back_only_in_target(qa
     assert "点击展开" not in target_body
     assert "不要用 accepted 成泡" not in target_body
     assert "不要用 attempted 成泡" not in target_body
+
+
+def test_chats_cross_conversation_text_send_receipt_sent_falls_back_only_in_target(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    receipt = (
+        "<send_receipt>\n"
+        "发送回执：send-receipt-ab\n"
+        "会话：private:10000\n"
+        "状态：已完成（interrupted=false）。\n"
+        "已发送 1 条：\n"
+        "1. 发给 B 的文本回执正文；order=1；msg_id=b-receipt-1；conversation_id=private:10001\n"
+        "未发送 1 条：\n"
+        "1. 不要用 unsent 成泡；order=2；send_id=send-receipt-ab；conversation_id=private:10001\n"
+        "新消息 0 条：\n"
+        "- 无\n"
+        "撤回消息 0 条：\n"
+        "- 无\n"
+        "错误 0 条：\n"
+        "- 无\n"
+        "处理要求：不要重发已发送内容。\n"
+        "</send_receipt>"
+    )
+    records = [
+        {
+            "role": "user",
+            "conversation_id": "private:10000",
+            "content": receipt,
+        }
+    ]
+
+    conversations = _group_records_by_conversation(records)
+    source_html = page._render_conversation(
+        next(item for item in conversations if item["key"] == "private:10000")
+    )
+    target_html = page._render_conversation(
+        next(item for item in conversations if item["key"] == "private:10001")
+    )
+    source_body = source_html.split("</style>", 1)[1]
+    target_body = target_html.split("</style>", 1)[1]
+
+    assert {item["key"] for item in conversations} == {"private:10000", "private:10001"}
+    assert "系统消息" in source_body
+    assert "chat-record chat-message-table chat-side-left chat-bot" not in source_body
+    assert "发给 B 的文本回执正文" not in source_body
+    assert "不要用 unsent 成泡" not in source_body
+    assert "chat-record chat-message-table chat-side-left chat-bot" in target_body
+    assert "发给 B 的文本回执正文" in target_body
+    assert "已发送 · msg_id=b-receipt-1" in target_body
+    assert target_body.count("发给 B 的文本回执正文") == 1
+    assert "chat-event" not in target_body
+    assert "发送回执" not in target_body
+    assert "不要用 unsent 成泡" not in target_body
+
+
+def test_chats_text_send_receipt_only_sent_section_promotes_to_bubble():
+    receipt_html = _render_record_html(
+        {
+            "role": "user",
+            "conversation_id": "private:10001",
+            "content": (
+                "<send_receipt>\n"
+                "发送回执：send-text-unsent\n"
+                "会话：private:10001\n"
+                "状态：有未发送内容（interrupted=false）。\n"
+                "已发送 0 条：\n"
+                "- 无\n"
+                "未发送 1 条：\n"
+                "1. 不要用 unsent 文本成泡；order=1；send_id=send-text-unsent；conversation_id=private:10001\n"
+                "attempted 1 条：\n"
+                "1. 不要用 attempted 文本成泡；conversation_id=private:10001\n"
+                "accepted 1 条：\n"
+                "1. 不要用 accepted 文本成泡；conversation_id=private:10001\n"
+                "新消息 0 条：\n"
+                "- 无\n"
+                "撤回消息 0 条：\n"
+                "- 无\n"
+                "错误 0 条：\n"
+                "- 无\n"
+                "处理要求：不要重发已发送内容。\n"
+                "</send_receipt>"
+            ),
+        },
+        persona_name="玖",
+    )
+
+    assert "系统消息" in receipt_html
+    assert "不要用 unsent 文本成泡" not in receipt_html
+    assert "不要用 attempted 文本成泡" not in receipt_html
+    assert "不要用 accepted 文本成泡" not in receipt_html
+    assert "chat-message-table chat-side-left chat-bot" not in receipt_html
 
 
 def test_chats_send_status_combines_accepted_messages_into_left_bubble(qapp, tmp_paths):

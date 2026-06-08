@@ -1291,6 +1291,7 @@ class _AsyncSendManager:
     def _inbound_to_receipt_message(ref: _InboundRef) -> dict[str, Any]:
         return {
             "conversation_id": ref.conversation_id,
+            "seq": ref.seq,
             "time": get_time(),
             "nickname": ref.nickname,
             "user_id": ref.user_id,

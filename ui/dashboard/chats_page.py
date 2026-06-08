@@ -2655,7 +2655,7 @@ def _send_status_text_completed(body: str, msg_ids: list[str]) -> bool:
 def _format_send_receipt_summary(content: str) -> str:
     payload = _extract_tag_json(content, "send_receipt")
     if not payload:
-        return _compact_inline_tokens(_first_nonempty_line(content))
+        return _format_send_receipt_text_summary(content)
     status = payload.get("status")
     ok = payload.get("ok")
     sent = payload.get("sent") or []
@@ -2692,10 +2692,37 @@ def _format_send_receipt_summary(content: str) -> str:
     return "；".join(parts) if parts else "发送回执"
 
 
+def _format_send_receipt_text_summary(content: str) -> str:
+    body = _extract_tag_text(content, "send_receipt") or content
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    parts: list[str] = []
+    for line in lines:
+        match = re.match(r"^状态[:：]\s*(.+?)\s*$", line)
+        if match:
+            status = match.group(1).strip().rstrip("。.")
+            if status:
+                parts.append(f"状态 {status}")
+            break
+    for source, label in (
+        ("已发送", "已发送"),
+        ("未发送", "未发送"),
+        ("新消息", "新消息"),
+        ("撤回消息", "撤回"),
+        ("错误", "错误"),
+    ):
+        count = _send_receipt_text_section_count(lines, source)
+        if count > 0:
+            parts.append(f"{label} {count} 条")
+    if parts:
+        return "；".join(parts)
+    first = _first_nonempty_line(body)
+    return _compact_inline_tokens(first) if first else "发送回执"
+
+
 def _send_receipt_sent_items(content: str) -> list[dict[str, Any]]:
     payload = _extract_tag_json(content, "send_receipt")
     if not payload:
-        return []
+        return _send_receipt_text_sent_items(content)
     sent = payload.get("sent")
     if not isinstance(sent, list):
         return []
@@ -2713,6 +2740,126 @@ def _send_receipt_sent_items(content: str) -> list[dict[str, Any]]:
             enriched["send_id"] = send_id
         result.append(enriched)
     return result
+
+
+def _send_receipt_text_sent_items(content: str) -> list[dict[str, Any]]:
+    body = _extract_tag_text(content, "send_receipt")
+    if not body:
+        return []
+    try:
+        return _parse_send_receipt_text_sent_items(body)
+    except (AttributeError, TypeError, ValueError):
+        return []
+
+
+def _parse_send_receipt_text_sent_items(body: str) -> list[dict[str, Any]]:
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    send_id = _send_receipt_text_send_id(lines)
+    start = -1
+    declared_count = 0
+    for index, line in enumerate(lines):
+        count = _send_receipt_text_section_count([line], "已发送")
+        if count >= 0:
+            start = index + 1
+            declared_count = count
+            break
+    if start < 0 or declared_count <= 0:
+        return []
+
+    result: list[dict[str, Any]] = []
+    for order, line in enumerate(_send_receipt_text_section_lines(lines, start)):
+        match = re.match(r"^\s*\d+[\.\)、]\s*(.+?)\s*$", line)
+        if not match:
+            continue
+        item = _parse_send_receipt_text_sent_line(
+            match.group(1),
+            fallback_send_id=send_id,
+            fallback_order=order,
+        )
+        if item:
+            result.append(item)
+    return result
+
+
+def _send_receipt_text_send_id(lines: list[str]) -> str:
+    for line in lines:
+        match = re.match(r"^发送回执[:：]\s*(\S+)\s*$", line)
+        if match:
+            value = match.group(1).strip()
+            return "" if value == "无" else value
+    return ""
+
+
+def _send_receipt_text_section_count(lines: list[str], title: str) -> int:
+    pattern = rf"^{re.escape(title)}\s*(\d+)\s*条[:：]?\s*$"
+    for line in lines:
+        match = re.match(pattern, line)
+        if match:
+            return int(match.group(1))
+    return -1
+
+
+def _send_receipt_text_section_lines(lines: list[str], start: int) -> list[str]:
+    result: list[str] = []
+    for line in lines[start:]:
+        if _send_receipt_text_is_section_heading(line) or line.startswith("处理要求"):
+            break
+        result.append(line)
+    return result
+
+
+def _send_receipt_text_is_section_heading(line: str) -> bool:
+    return bool(
+        re.match(
+            r"^(已发送|未发送|新消息|撤回消息|错误|attempted|accepted|待发送/尝试|排队/待确认|已接受消息)\s*\d+\s*条[:：]?\s*$",
+            line,
+        )
+    )
+
+
+def _parse_send_receipt_text_sent_line(
+    text: str,
+    *,
+    fallback_send_id: str,
+    fallback_order: int,
+) -> dict[str, Any] | None:
+    parts = [part.strip() for part in re.split(r"[；;](?=[A-Za-z_][\w-]*=)", text) if part.strip()]
+    if not parts:
+        return None
+    item: dict[str, Any] = {}
+    content_parts: list[str] = []
+    for part in parts:
+        match = re.match(r"^([A-Za-z_][\w-]*)=(.*)$", part)
+        if not match:
+            content_parts.append(part)
+            continue
+        key = match.group(1).strip()
+        value = match.group(2).strip()
+        if value and value != "无":
+            item[key] = _send_receipt_text_field_value(key, value)
+    content = str(item.get("content") or "；".join(content_parts)).strip()
+    if not content:
+        return None
+    if item.get("qq_visible") is False:
+        return None
+    item["content"] = content
+    item.setdefault("qq_visible", True)
+    item.setdefault("send_order", item.get("order", fallback_order))
+    if fallback_send_id:
+        item.setdefault("send_id", fallback_send_id)
+    item["_synthetic_source"] = "send_receipt"
+    return item
+
+
+def _send_receipt_text_field_value(key: str, value: str) -> Any:
+    lowered = value.casefold()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if key in {"order", "send_order", "message_index", "index"} and value.isdigit():
+        return int(value)
+    return value
 
 
 def _format_task_context_summary(content: str) -> str:

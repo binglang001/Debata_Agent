@@ -7,7 +7,9 @@ selection logic while moving methods.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any
 
 from utils.token_budget import TokenBudget, TokenEstimator
@@ -26,6 +28,23 @@ logger = logging.getLogger(__name__)
 _PREFIX_ESTIMATE_TOKENS = 12_000
 _CURRENT_CONVERSATION_MIN_RECORDS = 8
 _PROACTIVE_ROUTER_HISTORY_BUDGET = 16_384
+_SEND_RECEIPT_BLOCK_RE = re.compile(
+    r"<send_receipt>\s*(.*?)\s*</send_receipt>",
+    re.DOTALL,
+)
+_SEND_RECEIPT_JSON_KEYS = {
+    "type",
+    "send_id",
+    "conversation_id",
+    "status",
+    "interrupted",
+    "sent",
+    "unsent",
+    "new_messages",
+    "recalled_messages",
+    "errors",
+    "accepted_messages",
+}
 
 
 class PipelineWorkingContextMixin:
@@ -298,13 +317,14 @@ class PipelineWorkingContextMixin:
                 working_budget,
                 used,
             )
-        return self._filter_working_history_runtime_noise(
+        filtered = self._filter_working_history_runtime_noise(
             selected,
             conversation_id=conversation_id,
             ensure_current_records=ensure_current_records,
             log_context=log_context,
             log_level=log_level,
         )
+        return self._normalize_working_history_send_receipts(filtered)
 
     def _filter_working_history_runtime_noise(
         self,
@@ -350,3 +370,71 @@ class PipelineWorkingContextMixin:
             _WORKING_HISTORY_SEND_RECEIPT_KEEP,
         )
         return filtered
+
+    def _normalize_working_history_send_receipts(
+        self,
+        records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """只归一化 prompt view 中旧版 JSON 回执，不回写原始历史。"""
+        normalized: list[dict[str, Any]] = []
+        changed = False
+        for record in records:
+            content = record.get("content")
+            if not isinstance(content, str) or "<send_receipt" not in content:
+                normalized.append(record)
+                continue
+            new_content = self._normalize_send_receipt_content(content, record)
+            if new_content == content:
+                normalized.append(record)
+                continue
+            copied = dict(record)
+            copied["content"] = new_content
+            normalized.append(copied)
+            changed = True
+        return normalized if changed else records
+
+    def _normalize_send_receipt_content(
+        self,
+        content: str,
+        record: dict[str, Any],
+    ) -> str:
+        def replace(match: re.Match[str]) -> str:
+            receipt = self._parse_legacy_send_receipt_json(match.group(1))
+            if receipt is None:
+                return match.group(0)
+            if not receipt.get("conversation_id"):
+                conversation_id = _record_conversation_id(record)
+                if conversation_id:
+                    receipt = dict(receipt)
+                    receipt["conversation_id"] = conversation_id
+            return self._format_send_receipt(receipt)
+
+        return _SEND_RECEIPT_BLOCK_RE.sub(replace, content)
+
+    @staticmethod
+    def _parse_legacy_send_receipt_json(text: str) -> dict[str, Any] | None:
+        stripped = text.strip()
+        if not stripped:
+            return None
+
+        decoder = json.JSONDecoder()
+        candidates = [stripped]
+        first_brace = stripped.find("{")
+        if first_brace > 0:
+            candidates.append(stripped[first_brace:])
+
+        for candidate in candidates:
+            if not candidate.startswith("{"):
+                continue
+            try:
+                payload, end = decoder.raw_decode(candidate)
+            except json.JSONDecodeError:
+                continue
+            if candidate[end:].strip():
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if not (_SEND_RECEIPT_JSON_KEYS & payload.keys()):
+                continue
+            return payload
+        return None

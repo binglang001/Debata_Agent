@@ -788,13 +788,57 @@ async def test_working_history_keeps_recent_current_conversation_runtime(build_p
 async def test_working_history_keeps_recent_send_receipt_fields(build_pipeline):
     pipeline, _, _, history, _ = await build_pipeline([])
     for idx in range(16):
+        legacy_receipt = {
+            "interrupted": True,
+            "send_id": f"legacy-{idx}",
+            "sent": [{"content": f"已发-{idx}", "order": 1, "msg_id": f"s-{idx}"}],
+            "unsent": [
+                {
+                    "content": f"旧 JSON 未发-{idx}",
+                    "order": 2,
+                    "send_id": f"legacy-{idx}",
+                    "conversation_id": "group:5555",
+                }
+            ],
+            "new_messages": [
+                {
+                    "conversation_id": "group:5555",
+                    "user_id": "123",
+                    "nickname": f"用户{idx}",
+                    "text": f"旧 JSON 新消息 {idx}-1",
+                    "seq": idx * 10 + 1,
+                    "time": "10:00",
+                    "msg_id": f"legacy-new-{idx}-1",
+                },
+                {
+                    "conversation_id": "group:5555",
+                    "user_id": "123",
+                    "nickname": f"用户{idx}",
+                    "text": f"旧 JSON 新消息 {idx}-2",
+                    "seq": idx * 10 + 2,
+                    "time": "10:01",
+                    "msg_id": f"legacy-new-{idx}-2",
+                },
+            ],
+            "recalled_messages": [
+                {
+                    "msg_id": f"legacy-recall-{idx}",
+                    "conversation_id": "group:5555",
+                    "note": "旧 JSON 撤回",
+                }
+            ],
+            "errors": [{"order": 3, "error": "旧 JSON 错误"}],
+            "accepted_messages": [{"content": "不应进入 prompt 的 accepted"}],
+            "irrelevant_raw_payload": "不应进入 prompt 的无关字段",
+        }
         await history.add_records(
             [
                 {
                     "role": "user",
                     "content": (
                         "<send_receipt>\n"
-                        f'{{"interrupted": true, "unsent": [], "new_messages": [], "old": {idx}}}\n'
+                        "系统说明：运行时发送状态；按 JSON 字段判断。\n"
+                        f"{json.dumps(legacy_receipt, ensure_ascii=False)}\n"
                         "</send_receipt>"
                     ),
                     "conversation_id": "group:5555",
@@ -807,9 +851,16 @@ async def test_working_history_keeps_recent_send_receipt_fields(build_pipeline):
                 "role": "user",
                 "content": (
                     "<send_receipt>\n"
-                    '{"interrupted": true, "unsent": [{"content": "未发"}], '
-                    '"new_messages": [{"text": "新消息"}], '
-                    '"recalled_messages": [{"msg_id": "m1"}]}\n'
+                    "发送回执：send-latest\n"
+                    "会话：group:5555\n"
+                    "状态：部分发送；发送期间被新消息打断（interrupted=true）。\n"
+                    "未发送 1 条：\n"
+                    "1. 未发；order=2；send_id=send-latest；conversation_id=group:5555\n"
+                    "新消息 1 条：\n"
+                    "- 用户（group:5555；user_id=123）1 条；样例：\"新消息\"；"
+                    "最新 seq=8/time=10:00/msg_id=m-new\n"
+                    "撤回消息 1 条：\n"
+                    "1. msg_id=m1；conversation_id=group:5555；note=用户撤回\n"
                     "</send_receipt>"
                 ),
                 "conversation_id": "group:5555",
@@ -819,12 +870,167 @@ async def test_working_history_keeps_recent_send_receipt_fields(build_pipeline):
 
     selected = await pipeline._select_working_history("group:5555")
     joined = "\n".join(str(r.get("content", "")) for r in selected)
+    raw_joined = "\n".join(str(r.get("content", "")) for r in await history.records())
 
-    assert '"old": 0' not in joined
-    assert '"interrupted": true' in joined
-    assert '"content": "未发"' in joined
-    assert '"text": "新消息"' in joined
-    assert '"recalled_messages": [{"msg_id": "m1"}]' in joined
+    assert '"new_messages"' not in joined
+    assert "accepted_messages" not in joined
+    assert "irrelevant_raw_payload" not in joined
+    assert "不应进入 prompt 的 accepted" not in joined
+    assert "不应进入 prompt 的无关字段" not in joined
+    assert '"new_messages"' in raw_joined
+    assert "accepted_messages" in raw_joined
+    assert "发送回执：legacy-15" in joined
+    assert "会话：group:5555" in joined
+    assert "状态：部分发送；发送期间被新消息打断（interrupted=true）。" in joined
+    assert "旧 JSON 未发-15；order=2；send_id=legacy-15" in joined
+    assert "新消息 2 条" in joined
+    assert "用户15（group:5555；user_id=123）2 条" in joined
+    assert "样例：\"旧 JSON 新消息 15-1\"" in joined
+    assert "最新 seq=152/time=10:01/msg_id=legacy-new-15-2" in joined
+    assert "撤回消息 1 条" in joined
+    assert "msg_id=legacy-recall-15" in joined
+    assert "错误 1 条" in joined
+    assert "error=旧 JSON 错误；order=3" in joined
+    assert "发送回执：send-latest" in joined
+    assert "未发；order=2；send_id=send-latest" in joined
+    assert "样例：\"新消息\"" in joined
+    assert "msg_id=m1" in joined
+
+
+@pytest.mark.asyncio
+async def test_format_send_receipt_summarizes_spam_without_full_json(build_pipeline):
+    pipeline, _, _, _, _ = await build_pipeline([])
+    long_sent_content = "已发-" + "长" * 220
+    receipt = {
+        "type": "send_receipt",
+        "send_id": "send-token",
+        "conversation_id": "private:123",
+        "interrupted": True,
+        "sent": [
+            {
+                "content": long_sent_content if idx == 0 else f"已发-{idx}",
+                "order": idx + 1,
+                "msg_id": f"sent-{idx}",
+                "conversation_id": "private:123",
+            }
+            for idx in range(3)
+        ]
+        + [
+            {
+                "content": "已发-隐藏",
+                "order": 4,
+                "msg_id": "sent-hidden",
+                "conversation_id": "private:123",
+            }
+        ],
+        "unsent": [
+            {
+                "content": f"未发-{idx}",
+                "order": idx + 10,
+                "send_id": "send-token",
+                "conversation_id": "private:123",
+            }
+            for idx in range(5)
+        ]
+        + [
+            {
+                "content": "未发-隐藏",
+                "order": 99,
+                "send_id": "send-token",
+                "conversation_id": "private:123",
+            }
+        ],
+        "new_messages": [
+            {
+                "conversation_id": "private:123",
+                "user_id": "123",
+                "nickname": "用户",
+                "text": f"刷屏 {idx}",
+                "seq": idx + 1,
+                "time": f"10:{idx:02d}",
+                "msg_id": f"m-spam-{idx}",
+                "priority_reasons": ["private_message"] if idx == 0 else [],
+                "priority_reason": "focus_user" if idx == 1 else "",
+            }
+            for idx in range(20)
+        ],
+        "recalled_messages": [
+            {
+                "conversation_id": "private:123",
+                "time": "10:30",
+                "msg_id": "m-recall",
+                "note": "用户撤回",
+                "qq_visible": False,
+            }
+        ],
+        "errors": ["order=9: boom", {"order": 10, "error": "timeout"}],
+        "accepted_messages": [{"content": "不应重复出现的 accepted 内容"}],
+    }
+
+    summary = pipeline._format_send_receipt(receipt)
+
+    assert "<send_receipt>" in summary
+    assert "</send_receipt>" in summary
+    assert '"new_messages"' not in summary
+    assert '{"conversation_id"' not in summary
+    assert summary.count("msg_id=m-spam-") == 1
+    assert "新消息 20 条：" in summary
+    assert "用户（private:123；user_id=123）20 条" in summary
+    assert "样例：\"刷屏 0\"" in summary
+    assert "最新 seq=20/time=10:19/msg_id=m-spam-19" in summary
+    assert "priority_reasons=private_message,focus_user" in summary
+    assert "已发送 4 条：" in summary
+    expected_sent_content = f"{long_sent_content[:157]}..."
+    assert (
+        f"{expected_sent_content}；order=1；msg_id=sent-0；conversation_id=private:123"
+        in summary
+    )
+    assert long_sent_content not in summary
+    assert "已发-隐藏" not in summary
+    assert "... 另有 1 条未列出。" in summary
+    assert "未发送 6 条：" in summary
+    assert "未发-4；order=14；send_id=send-token；conversation_id=private:123" in summary
+    assert "未发-隐藏" not in summary
+    assert "撤回消息 1 条：" in summary
+    assert "msg_id=m-recall；conversation_id=private:123；time=10:30；note=用户撤回" in summary
+    assert "错误 2 条：" in summary
+    assert "order=9: boom" in summary
+    assert "error=timeout；order=10" in summary
+    assert "不应重复出现的 accepted 内容" not in summary
+
+
+@pytest.mark.asyncio
+async def test_format_send_receipt_limits_new_message_groups(build_pipeline):
+    pipeline, _, _, _, _ = await build_pipeline([])
+    receipt = {
+        "type": "send_receipt",
+        "send_id": "send-groups",
+        "conversation_id": "group:0",
+        "interrupted": True,
+        "sent": [],
+        "unsent": [],
+        "new_messages": [
+            {
+                "conversation_id": f"group:{idx}",
+                "user_id": str(idx),
+                "nickname": f"用户{idx}",
+                "text": f"消息 {idx}",
+                "seq": idx + 1,
+                "time": f"10:{idx:02d}",
+                "msg_id": f"m-group-{idx}",
+            }
+            for idx in range(8)
+        ],
+    }
+
+    summary = pipeline._format_send_receipt(receipt)
+
+    assert "新消息 8 条：" in summary
+    assert "用户0（group:0；user_id=0）1 条" in summary
+    assert "用户5（group:5；user_id=5）1 条" in summary
+    assert "用户6（group:6；user_id=6）1 条" not in summary
+    assert "... 另有 2 组未列出。" in summary
+    assert '"new_messages"' not in summary
 
 
 @pytest.mark.asyncio
@@ -1870,19 +2076,24 @@ async def test_same_conversation_interrupt_flushes_async_send_queue(build_pipeli
     joined = "\n".join(str(r.get("content", "")) for r in records)
     assert "m-interrupt" in joined
     assert "<send_receipt>" in joined
-    assert '"interrupted": true' in joined
-    assert '"content": "二"' in joined
-    assert '"content": "三"' in joined
-    assert '"qq_visible": false' in joined
-    assert '"qq_visible": true' in joined
+    assert "状态：部分发送；发送期间被新消息打断（interrupted=true）。" in joined
+    assert "未发送 2 条：" in joined
+    assert "二；order=2" in joined
+    assert "三；order=3" in joined
+    assert "新消息 1 条：" in joined
+    assert "最新 seq=2/" in joined
     receipt_turn_context = "\n".join(
         str(m.get("content", ""))
         for m in provider.calls[-1]["messages"]
         if m.get("role") == "user" and "<send_receipt_task" in str(m.get("content", ""))
     )
     assert "<send_receipt>" in receipt_turn_context
-    assert '"interrupted": true' in receipt_turn_context
-    assert "按 JSON 字段判断" in receipt_turn_context
+    assert "interrupted=true" in receipt_turn_context
+    assert "最新 seq=2/" in receipt_turn_context
+    assert "seq=无" not in receipt_turn_context
+    assert '"new_messages"' not in receipt_turn_context
+    assert "按回执摘要判断" in receipt_turn_context
+    assert "按 JSON 字段判断" not in receipt_turn_context
 
 
 @pytest.mark.asyncio
@@ -1962,9 +2173,9 @@ async def test_group_priority_interrupt_stops_same_trigger_user_followup(build_p
     joined = "\n".join(str(r.get("content", "")) for r in records)
     assert "m-follow" in joined
     assert "<send_receipt>" in joined
-    assert '"interrupted": true' in joined
-    assert '"priority_reason": "same_trigger_user"' in joined
-    assert '"content": "二"' in joined
+    assert "interrupted=true" in joined
+    assert "priority_reasons=same_trigger_user" in joined
+    assert "二；order=2" in joined
 
 
 @pytest.mark.asyncio
@@ -2653,9 +2864,9 @@ async def test_send_ignore_review_interrupts_does_not_hide_interrupt_from_queued
     joined = "\n".join(str(r.get("content", "")) for r in records)
     assert "发送期间的新消息" in joined
     assert "<send_receipt>" in joined
-    assert '"interrupted": true' in joined
-    assert '"content": "第二批"' in joined
-    assert '"send_id": "' in joined
+    assert "interrupted=true" in joined
+    assert "第二批；order=1" in joined
+    assert "send_id=send-" in joined
 
 
 @pytest.mark.asyncio
@@ -2709,10 +2920,10 @@ async def test_send_ignore_review_interrupts_does_not_ignore_recall_during_send(
     records = await history.records()
     joined = "\n".join(str(r.get("content", "")) for r in records)
     assert "<send_receipt>" in joined
-    assert '"interrupted": true' in joined
-    assert '"recalled_messages"' in joined
+    assert "interrupted=true" in joined
+    assert "撤回消息 1 条" in joined
     assert "m-old" in joined
-    assert '"content": "第二条"' in joined
+    assert "第二条；order=2" in joined
 
 
 @pytest.mark.asyncio
