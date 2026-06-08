@@ -172,7 +172,10 @@ class ToolContext:
     """summarize_chat_history 工具拉取群历史的默认 count 参数。"""
 
     typing_chars_per_second: float = 1.0
-    typing_max_delay_seconds: float = 2.0
+    typing_english_chars_per_second: float = 5.0
+    typing_min_delay_seconds: float = 1.0
+    typing_max_delay_seconds: float = 8.0
+    typing_clamp_model_delay: bool = True
 
     tool_result_soft_limit_tokens: int = 600
     tool_result_hard_cap_tokens: int = 1500

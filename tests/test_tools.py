@@ -1511,7 +1511,12 @@ async def test_send_private_sends_immediately(tmp_path):
     emoji_dir.mkdir()
 
     adapter = FakeSendAdapter()
-    ctx = ToolContext(emoji_dir=emoji_dir, adapter=adapter)
+    ctx = ToolContext(
+        emoji_dir=emoji_dir,
+        adapter=adapter,
+        typing_min_delay_seconds=0.0,
+        typing_max_delay_seconds=0.01,
+    )
     executor = reg.get_executor(ctx)
     result = await executor(
         "send_private_messages",
@@ -1535,6 +1540,44 @@ async def test_send_private_sends_immediately(tmp_path):
     assert "sent_messages" not in result
     assert ctx.collected == []
     assert [content for _, content in adapter.sent] == ["你好", "在吗"]
+
+
+@pytest.mark.asyncio
+async def test_send_private_single_message_positive_delay_does_not_sleep(
+    tmp_path, monkeypatch
+):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = FakeSendAdapter()
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr("tools.messaging.asyncio.sleep", fake_sleep)
+
+    ctx = ToolContext(
+        emoji_dir=tmp_path / "emoji",
+        adapter=adapter,
+        typing_min_delay_seconds=0.0,
+        typing_max_delay_seconds=10.0,
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "send_private_messages",
+        {
+            "targets": [
+                {"target_qq": 12345, "content": "稍等", "order": 1, "delay": 3.0},
+            ]
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["count"] == 1
+    assert result["sent"][0]["delay"] == pytest.approx(3.0)
+    assert [content for _, content in adapter.sent] == ["稍等"]
+    assert sleep_calls == []
 
 
 @pytest.mark.asyncio
@@ -1564,7 +1607,12 @@ async def test_send_group_order_sorted(tmp_path):
     cfg = _make_config()
     reg = build_default_registry(cfg)
     adapter = FakeSendAdapter()
-    ctx = ToolContext(emoji_dir=tmp_path / "emoji", adapter=adapter)
+    ctx = ToolContext(
+        emoji_dir=tmp_path / "emoji",
+        adapter=adapter,
+        typing_min_delay_seconds=0.0,
+        typing_max_delay_seconds=0.01,
+    )
     executor = reg.get_executor(ctx)
     result = await executor(
         "send_group_message",
@@ -1588,6 +1636,129 @@ async def test_send_group_order_sorted(tmp_path):
         "third",
     ]
     assert "sent_messages" not in result
+
+
+@pytest.mark.asyncio
+async def test_send_private_clamps_model_delay_in_actions(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    captured: list[list[dict[str, Any]]] = []
+
+    async def fake_send_actions(actions, source_tool, *, metadata=None):
+        captured.append(actions)
+        return {
+            "ok": True,
+            "status": "accepted",
+            "qq_visible": "pending",
+            "count": len(actions),
+        }
+
+    ctx = ToolContext(
+        emoji_dir=tmp_path / "emoji",
+        adapter=FakeSendAdapter(),
+        send_actions_cb=fake_send_actions,
+        typing_chars_per_second=1.0,
+        typing_english_chars_per_second=5.0,
+        typing_min_delay_seconds=1.0,
+        typing_max_delay_seconds=8.0,
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "send_private_messages",
+        {
+            "targets": [
+                {"target_qq": 12345, "content": "嗯", "order": 1, "delay": 0.4},
+                {"target_qq": 12345, "content": "确实", "order": 2, "delay": 0.4},
+            ]
+        },
+    )
+
+    assert result["ok"] is True
+    assert captured[0][0]["delay"] == pytest.approx(1.0)
+    assert captured[0][1]["delay"] == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_send_group_clamps_model_delay_in_actions(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    captured: list[list[dict[str, Any]]] = []
+
+    async def fake_send_actions(actions, source_tool, *, metadata=None):
+        captured.append(actions)
+        return {
+            "ok": True,
+            "status": "accepted",
+            "qq_visible": "pending",
+            "count": len(actions),
+        }
+
+    ctx = ToolContext(
+        emoji_dir=tmp_path / "emoji",
+        adapter=FakeSendAdapter(),
+        send_actions_cb=fake_send_actions,
+        typing_chars_per_second=1.0,
+        typing_english_chars_per_second=5.0,
+        typing_min_delay_seconds=1.0,
+        typing_max_delay_seconds=8.0,
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "send_group_message",
+        {
+            "group_id": 100,
+            "targets": [
+                {"content": "helloworld", "order": 1, "delay": 0.4},
+                {"content": "好", "order": 2, "delay": 0.4},
+            ],
+        },
+    )
+
+    assert result["ok"] is True
+    assert captured[0][0]["delay"] == pytest.approx(2.0)
+    assert captured[0][1]["delay"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_send_delay_fast_config_caps_clamped_model_delay(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    captured: list[list[dict[str, Any]]] = []
+
+    async def fake_send_actions(actions, source_tool, *, metadata=None):
+        captured.append(actions)
+        return {
+            "ok": True,
+            "status": "accepted",
+            "qq_visible": "pending",
+            "count": len(actions),
+        }
+
+    ctx = ToolContext(
+        emoji_dir=tmp_path / "emoji",
+        adapter=FakeSendAdapter(),
+        send_actions_cb=fake_send_actions,
+        typing_chars_per_second=999.0,
+        typing_english_chars_per_second=999.0,
+        typing_min_delay_seconds=0.0,
+        typing_max_delay_seconds=0.01,
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "send_private_messages",
+        {
+            "targets": [
+                {"target_qq": 12345, "content": "第一条", "order": 1, "delay": 0.4},
+                {"target_qq": 12345, "content": "第二条", "order": 2, "delay": 0.4},
+            ]
+        },
+    )
+
+    assert result["ok"] is True
+    assert [action["delay"] for action in captured[0]] == pytest.approx([0.01, 0.01])
 
 
 @pytest.mark.asyncio
@@ -1647,8 +1818,40 @@ async def test_send_group_image_is_workspace_or_url_not_emoji(tmp_path):
 # ============================================================
 
 
-def test_typing_delay_short():
-    assert typing_delay("a") < 1.0
+def test_typing_delay_chinese_short_uses_minimum():
+    assert typing_delay(
+        "嗯",
+        chars_per_second=2.0,
+        min_delay_seconds=1.0,
+        max_delay=8.0,
+    ) == pytest.approx(1.0)
+
+
+def test_typing_delay_long_chinese_not_capped_to_two_seconds():
+    assert typing_delay(
+        "一二三四五六",
+        chars_per_second=1.0,
+        min_delay_seconds=0.0,
+        max_delay=8.0,
+    ) == pytest.approx(6.0)
+
+
+def test_typing_delay_english_uses_english_letters_per_second():
+    assert typing_delay(
+        "helloworld",
+        min_delay_seconds=0.0,
+        max_delay=8.0,
+    ) == pytest.approx(2.0)
+
+
+def test_typing_delay_mixed_text_is_weighted():
+    assert typing_delay(
+        "你好abc12!",
+        chars_per_second=1.0,
+        english_chars_per_second=5.0,
+        min_delay_seconds=0.0,
+        max_delay=8.0,
+    ) == pytest.approx(3.2)
 
 
 def test_typing_delay_capped():

@@ -541,10 +541,19 @@ class TypingConfig(StrictModel):
     """模拟真人打字速度（决定多条消息之间的发送间隔）。"""
 
     chars_per_second: float = 1.0
-    """每秒打几个字。1 字/秒贴近真人正常聊天速度（含思考停顿）。"""
+    """每秒打几个中文字。1 字/秒贴近真人正常聊天速度（含思考停顿）。"""
 
-    max_delay_seconds: float = 2.0
+    english_chars_per_second: float = 5.0
+    """每秒打几个英文字母。默认约 5 letters/s。"""
+
+    min_delay_seconds: float = 1.0
+    """单条消息最小延迟（秒）。短句也保留基本输入/停顿时间。"""
+
+    max_delay_seconds: float = 8.0
     """单条消息最大延迟（秒）。再长的消息也不会等超过这个时间。"""
+
+    clamp_model_delay: bool = True
+    """是否校正模型手填 delay，避免绕过系统的人类化最小间隔。"""
 
 
 class RateLimitConfig(StrictModel):

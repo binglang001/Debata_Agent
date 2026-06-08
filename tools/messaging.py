@@ -30,6 +30,8 @@ from .schemas import (
 
 logger = logging.getLogger(__name__)
 
+_MEDIA_DELAY_SECONDS = 0.5
+
 
 def _mark_activity(ctx: ToolContext) -> None:
     if ctx.activity_cb is not None:
@@ -117,6 +119,40 @@ def _inject_context_tool_call_id(metadata: dict, ctx: ToolContext) -> dict:
     return result
 
 
+def _bounded_delay(value: float, ctx: ToolContext) -> float:
+    max_delay = max(0.0, float(ctx.typing_max_delay_seconds))
+    min_delay = min(max(0.0, float(ctx.typing_min_delay_seconds)), max_delay)
+    return min(max(0.0, float(value), min_delay), max_delay)
+
+
+def _estimate_send_delay(content: str | None, ctx: ToolContext) -> float:
+    if content:
+        return typing_delay(
+            content,
+            chars_per_second=ctx.typing_chars_per_second,
+            english_chars_per_second=ctx.typing_english_chars_per_second,
+            min_delay_seconds=ctx.typing_min_delay_seconds,
+            max_delay=ctx.typing_max_delay_seconds,
+        )
+    return _bounded_delay(_MEDIA_DELAY_SECONDS, ctx)
+
+
+def _normalize_send_delay(
+    *,
+    model_delay: float | None,
+    content: str | None,
+    ctx: ToolContext,
+    multi_message: bool,
+) -> float:
+    estimated_delay = _estimate_send_delay(content, ctx)
+    if model_delay is None:
+        return estimated_delay
+    delay = max(0.0, float(model_delay))
+    if not multi_message or not ctx.typing_clamp_model_delay:
+        return delay
+    return _bounded_delay(max(delay, estimated_delay), ctx)
+
+
 def _apply_reply_to_first_text(actions: list[dict], reply_to_message_id: str | None) -> None:
     reply_to = str(reply_to_message_id or "").strip()
     if not reply_to:
@@ -173,6 +209,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
 
     # 按 order 升序排序，保证逐条发送顺序与 LLM 意图一致
     sorted_targets = sorted(args.targets, key=lambda t: t.order)
+    multi_message = len(sorted_targets) > 1
 
     for t in sorted_targets:
         try:
@@ -194,14 +231,12 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
             )
             continue
 
-        delay = t.delay
-        if delay is None:
-            # 文本按长度估算延迟；表情包/图片走 0.5 秒
-            delay = typing_delay(
-                t.content or "",
-                chars_per_second=ctx.typing_chars_per_second,
-                max_delay=ctx.typing_max_delay_seconds,
-            ) if t.content else 0.5
+        delay = _normalize_send_delay(
+            model_delay=t.delay,
+            content=t.content,
+            ctx=ctx,
+            multi_message=multi_message,
+        )
 
         actions.append(
             {
@@ -290,6 +325,7 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
     errors: list[str] = []
 
     sorted_targets = sorted(args.targets, key=lambda t: t.order)
+    multi_message = len(sorted_targets) > 1
 
     for t in sorted_targets:
         try:
@@ -307,13 +343,12 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
             errors.append("内容含禁止标签")
             continue
 
-        delay = t.delay
-        if delay is None:
-            delay = typing_delay(
-                t.content or "",
-                chars_per_second=ctx.typing_chars_per_second,
-                max_delay=ctx.typing_max_delay_seconds,
-            ) if t.content else 0.5
+        delay = _normalize_send_delay(
+            model_delay=t.delay,
+            content=t.content,
+            ctx=ctx,
+            multi_message=multi_message,
+        )
 
         actions.append(
             {

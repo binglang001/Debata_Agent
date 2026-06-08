@@ -149,7 +149,11 @@ def _make_config() -> RootConfig:
             recall_merge_window_seconds=0.05,
             proactive_think_interval_seconds=600.0,
             default_history_fetch_count=100,
-            typing=TypingConfig(chars_per_second=999.0, max_delay_seconds=0.01),
+            typing=TypingConfig(
+                chars_per_second=999.0,
+                min_delay_seconds=0.0,
+                max_delay_seconds=0.01,
+            ),
             rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
             summarize=SummarizeConfig(
                 trigger_at_messages=99999,

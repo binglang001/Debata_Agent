@@ -119,7 +119,12 @@ def _make_root_config() -> RootConfig:
             recall_merge_window_seconds=0.05,
             proactive_think_interval_seconds=600.0,
             default_history_fetch_count=10000,
-            typing=TypingConfig(chars_per_second=999.0, max_delay_seconds=0.01),
+            typing=TypingConfig(
+                chars_per_second=999.0,
+                min_delay_seconds=0.0,
+                max_delay_seconds=0.01,
+                clamp_model_delay=False,
+            ),
             rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
             summarize=SummarizeConfig(
                 trigger_at_messages=99999, range_start_messages=9000, range_end_messages=11000,
@@ -1709,11 +1714,23 @@ async def test_pipeline_tool_context_injects_pending_requests_and_rate_limiter(
 ):
     limiter = RateLimiter(window_seconds=60, max_messages=1)
     pipeline, _, _, _, _ = await build_pipeline([], rate_limiter=limiter)
+    pipeline.behavior_cfg.typing = TypingConfig(
+        chars_per_second=2.0,
+        english_chars_per_second=6.0,
+        min_delay_seconds=1.5,
+        max_delay_seconds=7.0,
+        clamp_model_delay=True,
+    )
 
     ctx = pipeline._build_tool_context(conversation_id="private:456")
 
     assert ctx.extras["pending_requests"] is pipeline.pending_requests
     assert ctx.extras["rate_limiter"] is limiter
+    assert ctx.typing_chars_per_second == pytest.approx(2.0)
+    assert ctx.typing_english_chars_per_second == pytest.approx(6.0)
+    assert ctx.typing_min_delay_seconds == pytest.approx(1.5)
+    assert ctx.typing_max_delay_seconds == pytest.approx(7.0)
+    assert ctx.typing_clamp_model_delay is True
 
 
 @pytest.mark.asyncio

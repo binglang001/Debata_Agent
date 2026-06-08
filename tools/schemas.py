@@ -52,7 +52,10 @@ class PrivateMessageTarget(_ToolArgs):
     order: int = Field(..., description="发送顺序，从小到大")
     delay: float | None = Field(
         default=None,
-        description="本条发出后的等待秒数。不填时按消息长度自动估算。",
+        description=(
+            "本条发出后的等待秒数，表示节奏意图。不填时按消息长度自动估算；"
+            "手填过小值也会被系统按人类输入速度和最小间隔校正。"
+        ),
     )
 
     @model_validator(mode="after")
@@ -136,7 +139,11 @@ class GroupMessageTarget(_ToolArgs):
     )
     order: int = Field(..., description="发送顺序，从小到大")
     delay: float | None = Field(
-        default=None, description="本条发出后的等待秒数。不填时按长度估算。"
+        default=None,
+        description=(
+            "本条发出后的等待秒数，表示节奏意图。不填时按长度估算；"
+            "手填过小值也会被系统按人类输入速度和最小间隔校正。"
+        ),
     )
 
     @model_validator(mode="after")
