@@ -359,7 +359,8 @@ def test_all_expected_tools_registered():
         "get_group_self_role", "set_group_kick", "set_group_ban",
         "set_group_whole_ban", "set_group_leave",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
-        "summarize_conversation", "recall_history", "start_agent_task",
+        "summarize_conversation", "filter_archive_records", "recall_history",
+        "start_agent_task",
         "no_action", "schedule_wakeup",
         "tool_search",
         "describe_image", "web_search", "get_weather",
@@ -613,7 +614,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         metadata={"timestamp": "2026-06-01 12:00:00"},
         conversation_id="private:123",
     )
-    archive = ArchiveStore(tmp_path / "archive.jsonl")
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
     await archive.load()
     await archive.append_many(
         [
@@ -708,6 +709,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "self_id": "999",
         },
     )
+    _approve_stub_tools(ctx, "filter_archive_records")
     reg = ToolRegistry(get_default_specs())
     executor = reg.get_executor(ctx)
 
@@ -808,6 +810,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "range_hint": "2026-06-01",
             "goal": "总结",
         },
+        "filter_archive_records": {"keywords": ["keyword"], "limit": 5},
         "recall_history": {"conversation_id": "private:123", "keyword": "keyword", "limit": 5},
         "read_file": {"path": "note.txt", "max_lines": 10},
         "write_file": {"path": "created.txt", "content": "created"},
@@ -933,6 +936,8 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["summarize_conversation"]["task_id"] == "agent-test"
     assert agent_tasks[2]["output_name"] == "conversation_summary.md"
     assert agent_tasks[2]["sources"][0]["conversation_id"] == "private:123"
+    assert results["filter_archive_records"]["count"] == 1
+    assert results["filter_archive_records"]["results"][0]["id"] == "a1"
     assert results["recall_history"]["count"] == 1
     assert "归档消息 keyword" in results["recall_history"]["content"]
 
@@ -2056,7 +2061,7 @@ async def test_recall_history_writes_complete_artifact(tmp_path):
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    archive = ArchiveStore(tmp_path / "archive.jsonl")
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
     await archive.append_many(
         [
             {
@@ -2911,7 +2916,7 @@ async def test_rag_mode_memory_tools_execute_with_manager(tmp_path):
 async def test_summarize_conversation_starts_agent_task(tmp_path):
     from memory import ArchiveStore, HistoryManager
 
-    archive = ArchiveStore(tmp_path / "archive.jsonl")
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
     history = HistoryManager(tmp_path / "history.jsonl")
     await archive.append_many(
         [

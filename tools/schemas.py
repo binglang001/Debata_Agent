@@ -617,6 +617,22 @@ class SummarizeConversationArgs(_ToolArgs):
 class RecallHistoryArgs(_ToolArgs):
     """recall_history 工具参数。"""
 
+    archive_ids: list[str] = Field(
+        default_factory=list,
+        description="归档短 ID 列表；提供后优先按 ID 展开上下文。",
+    )
+    context_before: int = Field(
+        default=0,
+        ge=0,
+        le=20,
+        description="按 archive_ids 展开时，每个 ID 前取同会话多少条相邻记录。",
+    )
+    context_after: int = Field(
+        default=0,
+        ge=0,
+        le=20,
+        description="按 archive_ids 展开时，每个 ID 后取同会话多少条相邻记录。",
+    )
     conversation_id: str | None = Field(
         default=None,
         description=(
@@ -633,6 +649,83 @@ class RecallHistoryArgs(_ToolArgs):
         description="时间范围关键词，如 2026-05-30 / 凌晨 / 昨晚。Phase A 按原文和 metadata 做简单文本匹配。",
     )
     limit: int = Field(default=20, ge=1, le=100, description="最多返回多少条记录")
+
+
+class ArchiveTimeRange(_ToolArgs):
+    """归档筛选时间段。"""
+
+    start: str | None = Field(
+        default=None,
+        description="起始时间，如 2026-06-07 01:00；可只填 start。",
+    )
+    end: str | None = Field(
+        default=None,
+        description="结束时间，如 2026-06-07 02:00；可只填 end。",
+    )
+
+
+class FilterArchiveRecordsArgs(_ToolArgs):
+    """filter_archive_records 工具参数。"""
+
+    archive_ids: list[str] = Field(
+        default_factory=list,
+        description="可选：直接筛选这些归档短 ID。",
+    )
+    conversation_ids: list[str] = Field(
+        default_factory=list,
+        description="可选：会话范围，如 group:497686077 或 private:430666862。",
+    )
+    conversation_match: Literal["exact", "contains", "fuzzy"] = Field(
+        default="exact",
+        description="会话匹配方式。",
+    )
+    sender_ids: list[str] = Field(
+        default_factory=list,
+        description="可选：发送者 QQ/内部 ID 范围。",
+    )
+    sender_names: list[str] = Field(
+        default_factory=list,
+        description="可选：发送者昵称范围。",
+    )
+    sender_match: Literal["exact", "contains", "fuzzy"] = Field(
+        default="exact",
+        description="发送者昵称匹配方式。",
+    )
+    keywords: list[str] = Field(
+        default_factory=list,
+        description="可选：正文关键词列表。",
+    )
+    keyword_match: Literal["exact", "contains", "fuzzy"] = Field(
+        default="contains",
+        description="关键词匹配方式。",
+    )
+    keyword_operator: Literal["all", "any"] = Field(
+        default="all",
+        description="all=所有关键词都命中；any=任一关键词命中。",
+    )
+    time_ranges: list[ArchiveTimeRange] = Field(
+        default_factory=list,
+        description="可选：多个时间段，同字段内 OR。",
+    )
+    message_kinds: list[str] = Field(
+        default_factory=list,
+        description="可选：消息类型，如 text、image、file、audio、mixed。",
+    )
+    limit: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="最多返回多少条候选记录。",
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="分页偏移。",
+    )
+    order: Literal["asc", "desc"] = Field(
+        default="desc",
+        description="按时间/写入顺序升序或降序。",
+    )
 
 
 class AgentTaskSource(_ToolArgs):

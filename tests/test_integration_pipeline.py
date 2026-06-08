@@ -262,7 +262,7 @@ def build_pipeline(tmp_path):
         persona = _make_persona()
         history = HistoryManager(tmp_path / "history.jsonl")
         important = ImportantMemoryManager(tmp_path / "important.json")
-        archive = ArchiveStore(tmp_path / "archive.jsonl")
+        archive = ArchiveStore(tmp_path / "archive.sqlite3")
         rolling_summary = RollingSummaryStore(tmp_path / "rolling_summary.json")
         await history.load()
         await important.load()
