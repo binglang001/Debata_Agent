@@ -524,6 +524,9 @@ def test_registry_stub_and_full_schema_modes_are_stable():
         assert name in schema_by_name
         props = schema_by_name[name]["parameters"]["properties"]
         assert set(props) == {"_tool_search_required", "finish_after_success"}
+    filter_archive_spec = reg_disabled.get_spec("filter_archive_records")
+    assert filter_archive_spec is not None
+    assert {"archive", "history", "recall"}.issubset(filter_archive_spec.search_tags)
     assert "targets" in schema_by_name["send_private_messages"]["parameters"]["properties"]
     assert "tool_name" in schema_by_name["tool_search"]["parameters"]["properties"]
 
