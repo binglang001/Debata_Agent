@@ -9,7 +9,9 @@ Agent 工具参数、stale/unsent 草稿、system note 和模型思考不进入�
 
 from __future__ import annotations
 
+import copy
 import re
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -46,13 +48,16 @@ class ChatTimelineStore:
     def __init__(self, *, max_per_conversation: int = 1000) -> None:
         self.max_per_conversation = max(1, int(max_per_conversation))
         self._items: dict[str, deque[ChatTimelineMessage]] = {}
+        self._lock = threading.RLock()
 
     def append(self, message: ChatTimelineMessage) -> None:
-        bucket = self._items.get(message.conversation_id)
-        if bucket is None:
-            bucket = deque(maxlen=self.max_per_conversation)
-            self._items[message.conversation_id] = bucket
-        bucket.append(message)
+        stored = _copy_message(message)
+        with self._lock:
+            bucket = self._items.get(stored.conversation_id)
+            if bucket is None:
+                bucket = deque(maxlen=self.max_per_conversation)
+                self._items[stored.conversation_id] = bucket
+            bucket.append(stored)
 
     def append_inbound_event(
         self,
@@ -126,13 +131,27 @@ class ChatTimelineStore:
         since_msg_id: str | None = None,
         before_msg_id: str | None = None,
     ) -> list[ChatTimelineMessage]:
-        items = list(self._items.get(conversation_id) or [])
+        with self._lock:
+            items = [_copy_message(item) for item in self._items.get(conversation_id) or []]
         if before_msg_id:
             items = _items_before_msg_id(items, before_msg_id)
         if since_msg_id:
             items = _items_since_msg_id(items, since_msg_id)
         limit = max(1, min(self.max_per_conversation, int(limit)))
         return items[-limit:]
+
+    def conversation_ids(self) -> list[str]:
+        """返回当前有真实消息的会话 ID 拷贝。"""
+        with self._lock:
+            return list(self._items)
+
+    def snapshot(self) -> dict[str, list[ChatTimelineMessage]]:
+        """返回所有会话真实消息的安全快照。"""
+        with self._lock:
+            return {
+                conversation_id: [_copy_message(item) for item in items]
+                for conversation_id, items in self._items.items()
+            }
 
     def to_markdown(
         self,
@@ -164,6 +183,10 @@ def _format_time(timestamp: float) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
     except (OverflowError, OSError, ValueError):
         return get_time()
+
+
+def _copy_message(message: ChatTimelineMessage) -> ChatTimelineMessage:
+    return copy.deepcopy(message)
 
 
 def _items_before_msg_id(

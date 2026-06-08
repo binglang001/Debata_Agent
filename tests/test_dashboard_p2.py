@@ -34,6 +34,7 @@ from app_config.schema import (
     RootConfig,
     VisionFeatureConfig,
 )
+from core.chat_timeline import ChatTimelineMessage, ChatTimelineStore
 from memory.important import ImportantMemoryManager
 from memory.rag_store import RagEntry
 from ui.dashboard.chats_page import (
@@ -174,6 +175,32 @@ def _dashboard_runtime(tmp_paths, cfg: RootConfig | None = None) -> SimpleNamesp
     )
 
 
+def _timeline_record(
+    *,
+    conversation_id: str,
+    direction: str,
+    text: str,
+    msg_id: str,
+    timestamp: float,
+    time_text: str,
+    sender_name: str = "用户",
+    sender_id: str = "10001",
+) -> ChatTimelineMessage:
+    return ChatTimelineMessage(
+        conversation_id=conversation_id,
+        direction=direction,
+        timestamp=timestamp,
+        time_text=time_text,
+        sender_name=sender_name,
+        sender_id=sender_id,
+        target_id=conversation_id.split(":", 1)[1],
+        group_id=None,
+        msg_id=msg_id,
+        text=text,
+        raw_message=text,
+    )
+
+
 def test_chats_group_records_by_metadata_and_legacy_header():
     records = [
         {
@@ -225,6 +252,56 @@ def test_chats_group_records_prefers_explicit_conversation_id():
     assert len(by_key["private:10001"]["records"]) == 2
     assert by_key["system:global"]["records"][0]["content"] == "主动思考：本次跳过"
     assert by_key["group:20002"]["records"][0]["tool_call_id"] == "tc"
+
+
+def test_chats_keeps_send_tool_events_in_source_conversation():
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "conversation_id": "private:10000",
+            "tool_calls": [
+                {
+                    "id": "call-send",
+                    "function": {
+                        "name": "send_private_messages",
+                        "arguments": json.dumps(
+                            {
+                                "targets": [
+                                    {"target_qq": "10001", "content": "给一号"},
+                                    {"target_qq": "10002", "content": "给二号"},
+                                ]
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-send",
+            "conversation_id": "private:10000",
+            "content": json.dumps(
+                {
+                    "status": "accepted",
+                    "accepted_messages": [
+                        {"conversation_id": "private:10001", "content": "给一号"},
+                        {"conversation_id": "private:10002", "content": "给二号"},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    grouped = _group_records_by_conversation(records)
+    by_key = {item["key"]: item for item in grouped}
+
+    assert "private:10000" in by_key
+    assert "private:10001" not in by_key
+    assert "private:10002" not in by_key
+    assert [record.get("role") for record in by_key["private:10000"]["records"]] == ["assistant", "tool"]
 
 
 def test_chats_groups_proactive_records_as_system():
@@ -309,24 +386,68 @@ async def test_chats_loads_archive_through_filter_records_pages(tmp_paths):
 
 
 @pytest.mark.asyncio
-async def test_chats_load_records_without_archive(tmp_paths):
+async def test_chats_loads_timeline_without_archive(tmp_paths):
     rt = _dashboard_runtime(tmp_paths)
-    rt.history = _StaticRecordStore([{"role": "user", "content": "活跃消息"}])
+    timeline = ChatTimelineStore()
+    timeline.append(
+        _timeline_record(
+            conversation_id="private:10001",
+            direction="outbound",
+            text="实时发出",
+            msg_id="tl-1",
+            timestamp=1_780_000_001.0,
+            time_text="2026-06-08 23:07:19",
+            sender_name="我",
+            sender_id="999",
+        )
+    )
+    rt.pipeline = SimpleNamespace(chat_timeline=timeline)
+    rt.history = _StaticRecordStore([])
 
     records = await _load_chat_page_records(rt)
 
-    assert [item["content"] for item in records] == ["活跃消息"]
+    assert [item["content"] for item in records] == ["实时发出"]
+    assert records[0]["_source"] == "chat_timeline"
+
+
+@pytest.mark.asyncio
+async def test_chats_render_uses_timeline_outbound_when_history_has_not_flushed(qapp, tmp_paths):
+    rt = _dashboard_runtime(tmp_paths)
+    timeline = ChatTimelineStore()
+    timeline.append(
+        _timeline_record(
+            conversation_id="private:10001",
+            direction="outbound",
+            text="history 还没有的实时回复",
+            msg_id="tl-out-1",
+            timestamp=1_780_000_001.0,
+            time_text="2026-06-08 23:07:19",
+            sender_name="我",
+            sender_id="999",
+        )
+    )
+    rt.pipeline = SimpleNamespace(chat_timeline=timeline)
+    rt.history = _StaticRecordStore([{"role": "system", "content": "系统补充"}])
+    page = ChatsPage(rt)
+
+    records = await _load_chat_page_records(rt)
+    conv = next(item for item in _group_records_by_conversation(records) if item["key"] == "private:10001")
+    html = page._render_conversation(conv)
+
+    assert "chat-record chat-message-table chat-side-left chat-bot" in html
+    assert "history 还没有的实时回复" in html
+    assert "已发送 · msg_id=tl-out-1" in html
 
 
 @pytest.mark.asyncio
 async def test_chats_falls_back_to_history_when_archive_fails(tmp_paths):
     rt = _dashboard_runtime(tmp_paths)
     rt.archive = _FailingRecordStore()
-    rt.history = _StaticRecordStore([{"role": "user", "content": "活跃消息"}])
+    rt.history = _StaticRecordStore([{"role": "system", "content": "活跃系统事件"}])
 
     records = await _load_chat_page_records(rt)
 
-    assert [item["content"] for item in records] == ["活跃消息"]
+    assert [item["content"] for item in records] == ["活跃系统事件"]
 
 
 def test_chats_conversation_signature_tracks_visible_list_changes():
@@ -398,6 +519,8 @@ def test_chats_render_record_uses_speaker_names_not_ambiguous_pronouns():
     assert "class='chat-message-cell' width='78%' align='left'" in assistant_html
     assert "class='chat-bubble-frame' align='right'" in user_html
     assert "class='chat-bubble-frame' align='left'" in assistant_html
+    assert "border-radius:" in user_html
+    assert "data-rounded='qt-inline-radius'" in user_html
     assert "class='chat-name-line' align='right'>Bob(30003)" in user_html
     assert "class='chat-name-line' align='left'>玖" in assistant_html
     assert user_html.index("class='chat-spacer-cell'") < user_html.index("class='chat-message-cell'")
@@ -411,6 +534,25 @@ def test_chats_render_record_uses_speaker_names_not_ambiguous_pronouns():
     assert "chat-bubble" not in internal_html
     assert ">你<" not in user_html + assistant_html
     assert ">她<" not in user_html + assistant_html
+
+
+def test_chats_real_outbound_history_record_renders_as_left_bubble():
+    html = _render_record_html(
+        {
+            "role": "user",
+            "direction": "outbound",
+            "content": "真实发出的归档消息",
+            "conversation_id": "private:10001",
+            "qq_visible": True,
+            "msg_id": "200",
+        },
+        persona_name="玖",
+    )
+
+    assert "chat-record chat-message-table chat-side-left chat-bot" in html
+    assert "真实发出的归档消息" in html
+    assert "已发送 · msg_id=200" in html
+    assert "chat-event" not in html
 
 
 def test_chats_runtime_and_tool_results_are_readable_and_collapsed():
@@ -433,11 +575,11 @@ def test_chats_runtime_and_tool_results_are_readable_and_collapsed():
     assert _format_send_receipt_summary(receipt) == (
         "状态 stale；待发送/尝试 1 条；新消息 1 条；模型思考期间当前会话来了新消息"
     )
-    assert "工具结果 · call-1" in tool_html
+    assert "工具返回" in tool_html
+    assert "点击展开" in tool_html
     assert "chat-event chat-event-tool" in tool_html
     assert "chat-bubble" not in tool_html
-    assert "状态 stale" in tool_html
-    assert "展开原文" in tool_html
+    assert "状态 stale" not in tool_html
 
 
 def test_chats_send_receipt_renders_only_visible_sent_as_outbound_bubble():
@@ -455,13 +597,44 @@ def test_chats_send_receipt_renders_only_visible_sent_as_outbound_bubble():
         persona_name="玖",
     )
 
-    assert "系统 · 发送回执" in receipt_html
+    assert "系统消息" in receipt_html
+    assert "点击展开" in receipt_html
     assert "玖" in receipt_html
     assert "真正发出" in receipt_html
     assert "已发送 · msg_id=100" in receipt_html
     assistant_bubble = receipt_html.split("chat-record chat-message-table chat-side-left chat-bot")[-1]
     assert "未确认草稿" not in assistant_bubble
     assert "未发" not in assistant_bubble
+
+
+def test_chats_send_receipt_sent_promotes_to_left_bubble_without_flat_event_text(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "private:10001",
+        "label": "私聊 10001",
+        "records": [
+            {
+                "role": "user",
+                "conversation_id": "private:10001",
+                "content": (
+                    "<send_receipt>\n"
+                    '{"send_id":"send-r","sent":[{"content":"收到","msg_id":"900",'
+                    '"time":"2026-06-08 19:43:55","qq_visible":true}]}\n'
+                    "</send_receipt>"
+                ),
+            }
+        ],
+    }
+
+    html = page._render_conversation(conv)
+    body_html = html.split("</style>", 1)[1]
+
+    assert "chat-record chat-message-table chat-side-left chat-bot" in body_html
+    assert "收到" in body_html
+    assert "已发送 · msg_id=900" in body_html
+    assert body_html.count("收到") == 1
+    event_html = body_html.split("chat-record chat-message-table chat-side-left chat-bot", 1)[0]
+    assert "收到" not in event_html
 
 
 def test_chats_stale_attempted_receipt_does_not_render_outbound_bubble():
@@ -478,9 +651,11 @@ def test_chats_stale_attempted_receipt_does_not_render_outbound_bubble():
         persona_name="玖",
     )
 
-    assert "系统 · 发送回执" in receipt_html
-    assert "待发送/尝试 1 条" in receipt_html
-    assert "chat-bubble chat-assistant" not in receipt_html
+    assert "系统消息" in receipt_html
+    assert "点击展开" in receipt_html
+    assert "待发送/尝试 1 条" not in receipt_html
+    assert "不要当成已发送" not in receipt_html
+    assert "chat-message-table chat-side-left chat-bot" not in receipt_html
 
 
 def test_chats_runtime_and_system_records_are_events_not_bubbles():
@@ -514,14 +689,15 @@ def test_chats_runtime_and_system_records_are_events_not_bubbles():
         persona_name="玖",
     )
 
-    assert "系统 · 运行时上下文" in runtime_html
+    assert "系统消息" in runtime_html
+    assert "点击展开" in runtime_html
     assert "chat-event chat-event-system" in runtime_html
     assert "chat-bubble" not in runtime_html
     assert "系统" in system_html
     assert "chat-event chat-event-system" in system_html
     assert "chat-bubble" not in system_html
-    assert "系统 · 发送状态" in send_status_html
-    assert "send_id=send-1" in send_status_html
+    assert "系统消息" in send_status_html
+    assert "send_id=send-1" not in send_status_html
     assert "chat-bubble" not in send_status_html
 
 
@@ -548,12 +724,15 @@ def test_chats_event_records_do_not_use_qq_message_tables():
         persona_name="玖",
     )
 
-    for html in (tool_html, system_html, reasoning_html):
+    for html in (tool_html, system_html):
         assert "chat-event" in html
         assert "chat-message-table" not in html
         assert "chat-side-left" not in html
         assert "chat-side-right" not in html
         assert "chat-bubble" not in html
+    assert "chat-record chat-message-table chat-side-left chat-bot" in reasoning_html
+    assert "chat-bubble" in reasoning_html
+    assert "chat-event" not in reasoning_html
 
 
 def test_chats_renders_assistant_tool_calls_as_separate_event():
@@ -574,14 +753,15 @@ def test_chats_renders_assistant_tool_calls_as_separate_event():
     )
 
     assert len(bubbles) == 2
-    assert "准备发" in bubbles[0]
     assert "内部文本" in bubbles[0]
+    assert "点击展开" in bubbles[0]
+    assert "准备发" not in bubbles[0]
     assert "chat-event" in bubbles[0]
     assert "工具调用" not in bubbles[0]
     assert "chat-event-tool" in bubbles[1]
     assert "chat-bubble" not in bubbles[1]
-    assert "调用工具：send_private_messages" in bubbles[1]
-    assert "向 123 发送消息：你好" in bubbles[1]
+    assert "玖 · 发送私聊消息" in bubbles[1]
+    assert "向 123 发送消息：你好" not in bubbles[1]
 
 
 def test_chats_formats_commit_send_attempt_call_without_raw_json():
@@ -600,8 +780,8 @@ def test_chats_formats_commit_send_attempt_call_without_raw_json():
     )
 
     assert text == (
-        "提交发送尝试：send_attempt_id=attempt-1；已复核到 seq 8；"
-        "中断策略 interrupt_priority；忽略复核打断；原因：复核后确认旧回复仍适合"
+        "提交发送尝试：ID attempt-1；已阅读到编号 8；"
+        "忽略打断；原因：复核后确认旧回复仍适合"
     )
     assert "{" not in text
     assert "ignore_review_interrupts" not in text
@@ -630,9 +810,9 @@ def test_chats_tool_call_default_hides_raw_arguments():
         persona_name="玖",
     )
 
-    assert "调用工具：commit_send_attempt" in html
-    assert "提交发送尝试：send_attempt_id=attempt-1" in html
-    assert "展开原始参数" in html
+    assert "玖 · 提交被打断的消息" in html
+    assert "点击展开" in html
+    assert "提交发送尝试：send_attempt_id=attempt-1" not in html
     assert '"ignore_review_interrupts"' not in html
     assert "chat-bubble" not in html
 
@@ -651,6 +831,7 @@ def test_chats_tool_result_summarizes_long_unseen_lists_by_default(qapp, tmp_pat
         "ok": True,
         "status": "accepted",
         "send_id": "send-1",
+        "send_attempt_id": "attempt-1",
         "sent": [{"content": "第一条"}, {"content": "第二条"}],
         "ignored_review_interrupts": True,
         "forced_unseen_messages": forced,
@@ -671,12 +852,10 @@ def test_chats_tool_result_summarizes_long_unseen_lists_by_default(qapp, tmp_pat
 
     html = page._render_conversation(conv)
 
-    assert "状态 accepted" in html
-    assert "send_id=send-1" in html
-    assert "已发送 2 条" in html
-    assert "已忽略 11 条新打断" in html
-    assert "2026-06-08 10:00:00-2026-06-08 10:10:00" in html
-    assert "样例：Alice: 新消息 0" in html
+    assert "工具返回" in html
+    assert "点击展开" in html
+    assert "send_id=send-1" not in html
+    assert "已忽略 11 条复核打断" not in html
     assert "forced_unseen_messages" not in html
     assert "新消息 10" not in html
 
@@ -684,8 +863,13 @@ def test_chats_tool_result_summarizes_long_unseen_lists_by_default(qapp, tmp_pat
     expanded = page._render_conversation(conv)
 
     assert "收起" in expanded
-    assert "forced_unseen_messages" in expanded
-    assert "新消息 10" in expanded
+    assert "工具状态：已接受" in expanded
+    assert "发送 ID：send-1" in expanded
+    assert "打断消息 ID：attempt-1" in expanded
+    assert "已忽略 11 条复核打断" in expanded
+    assert "其中 11 条来自 Alice（群聊 1）" in expanded
+    assert "forced_unseen_messages" not in expanded
+    assert "新消息 10" not in expanded
 
 
 def test_chats_single_message_expand_is_per_item(qapp, tmp_paths):
@@ -789,6 +973,97 @@ def test_chats_render_conversation_separates_messages_without_hr(qapp, tmp_paths
     assert "<hr" not in html
 
 
+@pytest.mark.asyncio
+async def test_chats_real_messages_sort_by_timeline_qq_time_not_tool_order(qapp, tmp_paths):
+    rt = _dashboard_runtime(tmp_paths)
+    timeline = ChatTimelineStore()
+    for message in [
+        _timeline_record(
+            conversation_id="private:10001",
+            direction="inbound",
+            text="刷屏 23:07:18",
+            msg_id="in-1",
+            timestamp=1_780_000_018.0,
+            time_text="2026-06-08 23:07:18",
+        ),
+        _timeline_record(
+            conversation_id="private:10001",
+            direction="outbound",
+            text="行",
+            msg_id="out-1",
+            timestamp=1_780_000_019.0,
+            time_text="2026-06-08 23:07:19",
+            sender_name="我",
+            sender_id="999",
+        ),
+        _timeline_record(
+            conversation_id="private:10001",
+            direction="inbound",
+            text="刷屏 23:07:20",
+            msg_id="in-2",
+            timestamp=1_780_000_020.0,
+            time_text="2026-06-08 23:07:20",
+        ),
+        _timeline_record(
+            conversation_id="private:10001",
+            direction="outbound",
+            text="收到",
+            msg_id="out-2",
+            timestamp=1_780_000_045.0,
+            time_text="2026-06-08 23:07:45",
+            sender_name="我",
+            sender_id="999",
+        ),
+        _timeline_record(
+            conversation_id="private:10001",
+            direction="outbound",
+            text="试了",
+            msg_id="out-3",
+            timestamp=1_780_000_074.0,
+            time_text="2026-06-08 23:08:14",
+            sender_name="我",
+            sender_id="999",
+        ),
+    ]:
+        timeline.append(message)
+    rt.pipeline = SimpleNamespace(chat_timeline=timeline)
+    rt.history = _StaticRecordStore(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "conversation_id": "private:10001",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "send_private_messages",
+                            "arguments": '{"targets":[{"target_qq":"10001","content":"行"}]}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "conversation_id": "private:10001",
+                "content": '{"status":"accepted"}',
+            },
+        ]
+    )
+    page = ChatsPage(rt)
+
+    records = await _load_chat_page_records(rt)
+    conv = next(item for item in _group_records_by_conversation(records) if item["key"] == "private:10001")
+    html = page._render_conversation(conv)
+
+    assert html.index("刷屏 23:07:18") < html.index(">行<")
+    assert html.index(">行<") < html.index("刷屏 23:07:20")
+    assert html.index("刷屏 23:07:20") < html.index(">收到<")
+    assert html.index(">收到<") < html.index(">试了<")
+    assert html.index(">试了<") < html.index("Debata · 发送私聊消息")
+
+
 def test_chats_bubble_style_separates_light_and_dark_from_card_background():
     light = _chat_html_style("light")
     dark = _chat_html_style("dark")
@@ -805,7 +1080,20 @@ def test_chats_bubble_style_separates_light_and_dark_from_card_background():
     assert f"color:{dark_palette.text_primary};" in dark
 
 
-def test_chats_reasoning_is_collapsible_event(qapp, tmp_paths):
+def test_chats_expanded_event_detail_is_centered_and_low_key():
+    style = _chat_html_style("light")
+    detail_rule = style.split(".chat-event-detail{", 1)[1].split("}", 1)[0]
+
+    assert "text-align:center" in detail_rule
+    assert "font-size:13px" in detail_rule
+    assert "font-weight:400" in detail_rule
+    assert "color:" in detail_rule
+    assert "background:" not in detail_rule
+    assert "border:" not in detail_rule
+    assert "border-radius" not in detail_rule
+
+
+def test_chats_reasoning_is_collapsible_left_bubble(qapp, tmp_paths):
     page = ChatsPage(_dashboard_runtime(tmp_paths))
     conv = {
         "key": "group:1",
@@ -823,9 +1111,11 @@ def test_chats_reasoning_is_collapsible_event(qapp, tmp_paths):
 
     html = page._render_conversation(conv)
 
-    assert "思考过程" in html
-    assert "chat-event-reasoning" in html
-    assert "展开原文" in html
+    assert "Debata · 思考过程" in html
+    assert "chat-record chat-message-table chat-side-left chat-bot" in html
+    assert "chat-bubble" in html
+    assert "chat-event-reasoning" not in html
+    assert "点击展开" in html
     assert "内部推理 raw-only" not in html
 
     page._expanded_item_ids.add("group:1\nturn-1:reasoning")
@@ -833,6 +1123,497 @@ def test_chats_reasoning_is_collapsible_event(qapp, tmp_paths):
 
     assert "收起" in expanded
     assert "内部推理 raw-only" in expanded
+
+
+def test_chats_splits_multiple_legacy_header_messages_into_right_bubbles(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "private:430666862",
+        "label": "私聊 冰狼(430666862)",
+        "records": [
+            {
+                "role": "user",
+                "content": (
+                    "【2026-06-08 10:00:00 私聊 冰狼(430666862) msg_id=35】第一条\n"
+                    "【2026-06-08 10:00:02 私聊 冰狼(430666862) msg_id=36】第二条"
+                ),
+            }
+        ],
+    }
+
+    html = page._render_conversation(conv)
+
+    assert html.count("chat-record chat-message-table chat-side-right chat-peer") == 2
+    assert "第一条" in html
+    assert "第二条" in html
+    assert "msg_id=35" not in html
+    assert "msg_id=36" not in html
+    assert "【2026-06-08" not in html
+
+
+def test_chats_system_message_is_centered_plain_and_short_by_default(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "system:global",
+        "label": "系统记录",
+        "records": [
+            {
+                "role": "system",
+                "content": (
+                    "<task_context priority=\"medium\">\n"
+                    "现在是2026-06-08 10:00:00。\n"
+                    "当前会话：private:430666862。\n"
+                    "<recent_private_messages></recent_private_messages>\n"
+                    "</task_context>"
+                ),
+                "conversation_id": "system:global",
+            }
+        ],
+    }
+
+    html = page._render_conversation(conv)
+
+    assert "系统消息" in html
+    assert "点击展开" in html
+    assert "本轮系统上下文" not in html
+    assert "当前会话 private:430666862" not in html
+    assert "class='chat-record chat-event chat-event-system' align='center'" in html
+    assert "font-weight:600" not in html.split("chat-event-system", 1)[1].split("</style>", 1)[0]
+    body_html = html.split("</style>", 1)[1]
+    assert "chat-bubble" not in body_html
+
+
+def test_chats_default_expand_controls_are_separate_from_type_filters(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    labels = [cb.text() for cb in page.findChildren(QtWidgets.QCheckBox)]
+
+    assert "聊天" in labels
+    assert "系统" in labels
+    assert "工具" in labels
+    assert "展开思考" in labels
+    assert "展开系统" in labels
+    assert "展开工具调用" in labels
+    assert "展开工具返回/结果" in labels
+
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {
+                "id": "turn-1",
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "内部推理 raw-only",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "commit_send_attempt",
+                            "arguments": '{"send_attempt_id":"attempt-1","reason":"确认发送"}',
+                        },
+                    }
+                ],
+                "conversation_id": "group:1",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": '{"status":"accepted","send_id":"send-1","send_attempt_id":"attempt-1"}',
+                "conversation_id": "group:1",
+            },
+        ],
+    }
+
+    collapsed = page._render_conversation(conv)
+    assert "内部推理 raw-only" not in collapsed
+    assert "工具调用：提交发送尝试" not in collapsed
+    assert "工具状态：已接受" not in collapsed
+
+    page._expand_reasoning_cb.setChecked(True)
+    page._expand_tool_call_cb.setChecked(True)
+    page._expand_tool_result_cb.setChecked(True)
+    expanded = page._render_conversation(conv)
+    assert "内部推理 raw-only" in expanded
+    assert "工具调用：提交发送尝试" in expanded
+    assert "工具状态：已接受" in expanded
+
+    page._show_tools_cb.setChecked(False)
+    hidden_tools = page._render_conversation(conv)
+    assert "提交被打断的消息" not in hidden_tools
+    assert "工具状态：已接受" not in hidden_tools
+    assert "内部推理 raw-only" in hidden_tools
+
+
+def test_chats_target_conversation_does_not_render_copied_send_tool_events(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "conversation_id": "private:10000",
+            "tool_calls": [
+                {
+                    "id": "call-send",
+                    "function": {
+                        "name": "send_private_messages",
+                        "arguments": json.dumps(
+                            {
+                                "targets": [
+                                    {"target_qq": "10001", "content": "给一号"},
+                                    {"target_qq": "10002", "content": "给二号"},
+                                ]
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-send",
+            "conversation_id": "private:10000",
+            "content": json.dumps(
+                {
+                    "status": "accepted",
+                    "sent": [
+                        {"conversation_id": "private:10001", "content": "给一号"},
+                        {"conversation_id": "private:10002", "content": "给二号"},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    conversations = _group_records_by_conversation(records)
+
+    source = next(item for item in conversations if item["key"] == "private:10000")
+    source_html = page._render_conversation(source)
+
+    assert {item["key"] for item in conversations} == {"private:10000"}
+    assert "Debata · 发送私聊消息" in source_html
+    assert "工具返回" in source_html
+    assert "给一号" not in source_html
+    assert "给二号" not in source_html
+
+
+def test_chats_tool_result_does_not_duplicate_real_outbound_message(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "conversation_id": "system:request",
+            "tool_calls": [
+                {
+                    "id": "call-send",
+                    "function": {
+                        "name": "send_private_messages",
+                        "arguments": '{"targets":[{"target_qq":"10001","content":"已经真实发出"}]}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-send",
+            "conversation_id": "system:request",
+            "content": json.dumps(
+                {
+                    "status": "accepted",
+                    "sent": [{"conversation_id": "private:10001", "content": "已经真实发出"}],
+                },
+                ensure_ascii=False,
+            ),
+        },
+        {
+            "role": "assistant",
+            "direction": "outbound",
+            "content": "已经真实发出",
+            "conversation_id": "private:10001",
+            "qq_visible": True,
+            "msg_id": "300",
+        },
+    ]
+    conv = next(item for item in _group_records_by_conversation(records) if item["key"] == "private:10001")
+
+    html = page._render_conversation(conv)
+
+    assert html.count("已经真实发出") == 1
+    assert "chat-record chat-message-table chat-side-left chat-bot" in html
+    assert "工具返回" not in html
+
+
+def test_chats_cross_conversation_send_uses_timeline_for_target_bubble(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "conversation_id": "private:10000",
+            "tool_calls": [
+                {
+                    "id": "call-send",
+                    "function": {
+                        "name": "send_private_messages",
+                        "arguments": '{"targets":[{"target_qq":"10001","content":"发给 B 的正文"}]}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-send",
+            "conversation_id": "private:10000",
+            "content": json.dumps(
+                {
+                    "status": "accepted",
+                    "send_id": "send-ab",
+                    "accepted_messages": [
+                        {"conversation_id": "private:10001", "content": "发给 B 的正文"}
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+        {
+            "role": "assistant",
+            "direction": "outbound",
+            "content": "发给 B 的正文",
+            "conversation_id": "private:10001",
+            "qq_visible": True,
+            "msg_id": "b-1",
+            "timestamp": "2026-06-08 23:07:19",
+            "_source": "chat_timeline",
+        },
+    ]
+    conversations = _group_records_by_conversation(records)
+    source_html = page._render_conversation(
+        next(item for item in conversations if item["key"] == "private:10000")
+    )
+    target_html = page._render_conversation(
+        next(item for item in conversations if item["key"] == "private:10001")
+    )
+
+    assert "Debata · 发送私聊消息" in source_html
+    assert "工具返回" in source_html
+    assert "chat-record chat-message-table chat-side-left chat-bot" not in source_html
+    assert "发给 B 的正文" not in source_html
+    assert "chat-record chat-message-table chat-side-left chat-bot" in target_html
+    assert "发给 B 的正文" in target_html
+    assert "工具返回" not in target_html
+    assert "Debata · 发送私聊消息" not in target_html
+
+
+def test_chats_cross_conversation_send_receipt_sent_falls_back_only_in_target(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    receipt = json.dumps(
+        {
+            "status": "sent",
+            "send_id": "send-receipt-ab",
+            "sent": [
+                {
+                    "conversation_id": "private:10001",
+                    "content": "发给 B 的回执正文",
+                    "msg_id": "b-receipt-1",
+                    "qq_visible": True,
+                }
+            ],
+            "accepted_messages": [
+                {"conversation_id": "private:10001", "content": "不要用 accepted 成泡"}
+            ],
+            "attempted_messages": [
+                {"conversation_id": "private:10001", "content": "不要用 attempted 成泡"}
+            ],
+        },
+        ensure_ascii=False,
+    )
+    records = [
+        {
+            "role": "user",
+            "conversation_id": "private:10000",
+            "content": f"<send_receipt>\n{receipt}\n</send_receipt>",
+        }
+    ]
+
+    conversations = _group_records_by_conversation(records)
+    source_html = page._render_conversation(
+        next(item for item in conversations if item["key"] == "private:10000")
+    )
+    target_html = page._render_conversation(
+        next(item for item in conversations if item["key"] == "private:10001")
+    )
+    source_body = source_html.split("</style>", 1)[1]
+    target_body = target_html.split("</style>", 1)[1]
+
+    assert {item["key"] for item in conversations} == {"private:10000", "private:10001"}
+    assert "系统消息" in source_body
+    assert "点击展开" in source_body
+    assert "chat-record chat-message-table chat-side-left chat-bot" not in source_body
+    assert "发给 B 的回执正文" not in source_body
+    assert "chat-record chat-message-table chat-side-left chat-bot" in target_body
+    assert "发给 B 的回执正文" in target_body
+    assert "已发送 · msg_id=b-receipt-1" in target_body
+    assert target_body.count("发给 B 的回执正文") == 1
+    assert "chat-event" not in target_body
+    assert "系统消息" not in target_body
+    assert "发送回执" not in target_body
+    assert "点击展开" not in target_body
+    assert "不要用 accepted 成泡" not in target_body
+    assert "不要用 attempted 成泡" not in target_body
+
+
+def test_chats_send_status_combines_accepted_messages_into_left_bubble(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    records = [
+        {
+            "role": "tool",
+            "tool_call_id": "call-send",
+            "conversation_id": "system:request",
+            "content": json.dumps(
+                {
+                    "status": "accepted",
+                    "send_id": "send-77",
+                    "accepted_messages": [
+                        {"conversation_id": "private:10001", "content": "测试完了？"}
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+        {
+            "role": "user",
+            "conversation_id": "system:request",
+            "content": (
+                "<send_status>\n"
+                "系统说明：以下内容由运行时系统提供，不是用户新发言。\n"
+                "2026-06-08 19:44:00 发送完成 send_id=send-77 msg_ids=[901]\n"
+                "</send_status>"
+            ),
+        },
+    ]
+    conv = next(item for item in _group_records_by_conversation(records) if item["key"] == "private:10001")
+
+    html = page._render_conversation(conv)
+    body_html = html.split("</style>", 1)[1]
+
+    assert "chat-record chat-message-table chat-side-left chat-bot" in body_html
+    assert "测试完了？" in body_html
+    assert "已发送 · msg_id=901" in body_html
+    assert body_html.count("测试完了？") == 1
+    assert "send_id=send-77" not in body_html
+
+
+def test_chats_send_status_pending_does_not_promote_accepted_messages(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    records = [
+        {
+            "role": "tool",
+            "tool_call_id": "call-send",
+            "conversation_id": "system:request",
+            "content": json.dumps(
+                {
+                    "status": "accepted",
+                    "send_id": "send-pending",
+                    "accepted_messages": [
+                        {"conversation_id": "private:10001", "content": "还没确认发送"}
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+        {
+            "role": "user",
+            "conversation_id": "system:request",
+            "content": "<send_status>等待发送 send_id=send-pending msg_ids=[903]</send_status>",
+        },
+    ]
+    conversations = _group_records_by_conversation(records)
+
+    assert "private:10001" not in {item["key"] for item in conversations}
+    system_html = page._render_conversation(
+        next(item for item in conversations if item["key"] == "system:request")
+    )
+    assert "chat-record chat-message-table chat-side-left chat-bot" not in system_html
+    assert "还没确认发送" not in system_html
+
+
+def test_chats_send_status_does_not_duplicate_existing_real_outbound(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    records = [
+        {
+            "role": "tool",
+            "tool_call_id": "call-send",
+            "conversation_id": "system:request",
+            "content": json.dumps(
+                {
+                    "status": "accepted",
+                    "send_id": "send-88",
+                    "accepted_messages": [
+                        {"conversation_id": "private:10001", "content": "已经真实发出"}
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+        {
+            "role": "user",
+            "conversation_id": "system:request",
+            "content": "<send_status>发送完成 send_id=send-88 msg_ids=[902]</send_status>",
+        },
+        {
+            "role": "assistant",
+            "direction": "outbound",
+            "content": "已经真实发出",
+            "conversation_id": "private:10001",
+            "qq_visible": True,
+            "msg_id": "902",
+        },
+    ]
+    conv = next(item for item in _group_records_by_conversation(records) if item["key"] == "private:10001")
+
+    html = page._render_conversation(conv)
+
+    assert html.count("已经真实发出") == 1
+    assert html.count("msg_id=902") == 1
+
+
+def test_chats_cross_conversation_send_status_creates_each_target_bubble(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    records = [
+        {
+            "role": "tool",
+            "tool_call_id": "call-send",
+            "conversation_id": "system:request",
+            "content": json.dumps(
+                {
+                    "status": "accepted",
+                    "send_id": "send-99",
+                    "accepted_messages": [
+                        {"conversation_id": "private:10001", "content": "第一边"},
+                        {"conversation_id": "private:10002", "content": "第二边"},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+        {
+            "role": "user",
+            "conversation_id": "system:request",
+            "content": "<send_status>发送完成 send_id=send-99 msg_ids=[911,912]</send_status>",
+        },
+    ]
+    conversations = _group_records_by_conversation(records)
+
+    first_html = page._render_conversation(next(item for item in conversations if item["key"] == "private:10001"))
+    second_html = page._render_conversation(next(item for item in conversations if item["key"] == "private:10002"))
+
+    assert "第一边" in first_html
+    assert "msg_id=911" in first_html
+    assert "第二边" not in first_html
+    assert "第二边" in second_html
+    assert "msg_id=912" in second_html
+    assert "第一边" not in second_html
 
 
 def test_chats_normalizes_records_to_display_items():
@@ -956,11 +1737,13 @@ def test_chats_filters_assistant_text_and_tool_bubbles_independently():
     )
 
     assert len(text_only) == 1
-    assert "准备发" in text_only[0]
+    assert "内部文本" in text_only[0]
+    assert "准备发" not in text_only[0]
     assert "工具调用" not in text_only[0]
     assert len(tool_only) == 1
     assert "准备发" not in tool_only[0]
-    assert "向 123 发送消息：你好" in tool_only[0]
+    assert "玖 · 发送私聊消息" in tool_only[0]
+    assert "向 123 发送消息：你好" not in tool_only[0]
 
 
 def test_chats_attaches_tool_results_to_matching_tool_calls():
@@ -1013,11 +1796,10 @@ def test_chats_attaches_tool_results_to_matching_tool_calls():
         )
     )
 
-    assert "向 123 发送消息：你好" in html
-    assert "工具结果 · call-1" in html
-    assert "send_id=send-1" in html
-    assert "工具结果 · orphan" in html
-    assert html.count("工具结果 · call-1") == 1
+    assert "玖 · 发送私聊消息" in html
+    assert "向 123 发送消息：你好" not in html
+    assert "send_id=send-1" not in html
+    assert html.count("工具返回") == 2
 
 
 def test_chats_tool_result_search_keeps_parent_tool_call_visible():
@@ -1179,6 +1961,16 @@ def test_chats_compacts_long_links_and_paths():
 
 
 def test_chats_tool_result_summary_shows_pending_state():
+    items = normalize_history_records(
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "call-pending",
+                "content": '{"status":"accepted","delivery":"pending","qq_visible":"pending"}',
+            }
+        ],
+        persona_name="玖",
+    )
     html = _render_record_html(
         {
             "role": "tool",
@@ -1188,9 +1980,12 @@ def test_chats_tool_result_summary_shows_pending_state():
         persona_name="玖",
     )
 
-    assert "状态 accepted" in html
-    assert "投递 pending" in html
-    assert "QQ 可见性待确认" in html
+    assert "状态 accepted" in items[0].summary
+    assert "正在投递" in items[0].summary
+    assert "QQ 可见性待确认" in items[0].summary
+    assert "工具返回" in html
+    assert "点击展开" in html
+    assert "状态 accepted" not in html
 
 
 def test_chats_render_conversation_paginates_without_dropping_history(qapp, tmp_paths):

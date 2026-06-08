@@ -135,3 +135,37 @@ def test_recent_since_and_before_msg_id_return_continuous_windows():
 
     assert [item.msg_id for item in since] == ["m2", "m3", "m4"]
     assert [item.msg_id for item in before] == ["m0", "m1", "m2", "m3"]
+
+
+def test_snapshot_conversation_ids_and_recent_return_safe_copies():
+    store = ChatTimelineStore(max_per_conversation=3)
+    message = _timeline_message("m1", "原始")
+    message.attachments.append({"type": "image", "file": "before.jpg"})
+    store.append(message)
+
+    message.text = "外部改写"
+    message.attachments[0]["file"] = "after.jpg"
+    recent = store.recent("private:123", 10)
+    recent[0].text = "recent 改写"
+    recent[0].attachments[0]["file"] = "recent.jpg"
+    snapshot = store.snapshot()
+    snapshot["private:123"][0].text = "snapshot 改写"
+    snapshot["private:123"][0].attachments[0]["file"] = "snapshot.jpg"
+
+    assert store.conversation_ids() == ["private:123"]
+    assert store.recent("private:123", 10)[0].text == "原始"
+    assert store.recent("private:123", 10)[0].attachments[0]["file"] == "before.jpg"
+
+
+def test_snapshot_keeps_append_order_and_sliding_capacity():
+    store = ChatTimelineStore(max_per_conversation=3)
+    for idx in range(5):
+        msg = _timeline_message(f"m{idx}", f"消息{idx}")
+        msg.timestamp = float(idx)
+        store.append(msg)
+
+    snapshot = store.snapshot()
+
+    assert list(snapshot) == ["private:123"]
+    assert [item.msg_id for item in snapshot["private:123"]] == ["m2", "m3", "m4"]
+    assert [item.timestamp for item in snapshot["private:123"]] == [2.0, 3.0, 4.0]
