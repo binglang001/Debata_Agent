@@ -1961,6 +1961,60 @@ async def test_same_conversation_message_while_model_thinking_needs_review(build
 
 
 @pytest.mark.asyncio
+async def test_other_private_message_while_model_thinking_does_not_review_current_send(
+    build_pipeline,
+):
+    """A 私聊思考时 B 私聊来消息，不应让 A 私聊发送 needs_review。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    send_args = {
+        "targets": [{"target_qq": 123, "content": "A回复", "order": 1}],
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline([])
+    call_count = 0
+
+    async def blocking_chat_completion(messages, *, model, tools=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        provider.calls.append({"messages": messages, "model": model, "tools": tools})
+        if call_count == 1:
+            started.set()
+            await release.wait()
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_private_messages",
+                        arguments=json.dumps(send_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return _ai_no_action()
+
+    provider.chat_completion = blocking_chat_completion  # type: ignore[method-assign]
+
+    await pipeline.enqueue(_msg(user_id="123", text="A先问", message_id="a-old"))
+    await started.wait()
+    await pipeline.enqueue(_msg(user_id="456", text="B插话", message_id="b-new"))
+    release.set()
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert [content for _, content in adapter.sent] == ["A回复"]
+    records = await history.records()
+    joined = "\n".join(str(r.get("content", "")) for r in records)
+    assert "B插话" in joined
+    assert '"status": "needs_review"' not in joined
+    send_results = [
+        json.loads(r["content"])
+        for r in records
+        if r.get("role") == "tool" and r.get("tool_call_id") == "tc-send"
+    ]
+    assert send_results[-1]["status"] == "sent"
+    assert call_count == 3
+
+
+@pytest.mark.asyncio
 async def test_unrelated_group_message_while_model_thinking_does_not_stale_send(build_pipeline):
     """模型思考时普通群聊插话不应让默认群短回应饿死。"""
     started = asyncio.Event()
