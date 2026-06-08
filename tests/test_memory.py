@@ -240,9 +240,13 @@ async def test_important_save_and_read(tmp_path):
     await im.load()
 
     result = await im.save("张三是朋友")
-    assert result == {"saved": True, "duplicate": False}
+    assert result["saved"] is True
+    assert result["duplicate"] is False
+    assert result["id"].startswith("mem_")
+    assert im.items()[0]["id"] == result["id"]
 
     assert "张三是朋友" in im.text()
+    assert f"[{result['id']}]" in im.text()
     assert im.text().startswith("[重要记忆]")
 
 
@@ -257,6 +261,7 @@ async def test_important_save_exact_duplicate_skip(tmp_path):
     assert result["saved"] is False
     assert result["duplicate"] is True
     assert result["duplicate_type"] == "exact"
+    assert result["existing_id"] == im.items()[0]["id"]
     assert len(im.items()) == 1
 
 
@@ -278,10 +283,12 @@ async def test_important_persists(tmp_path):
     im1 = ImportantMemoryManager(tmp_path / "imp.json")
     await im1.load()
     await im1.save("永久")
+    item_id = im1.items()[0]["id"]
 
     im2 = ImportantMemoryManager(tmp_path / "imp.json")
     await im2.load()
     assert "永久" in im2.text()
+    assert im2.items()[0]["id"] == item_id
 
 
 @pytest.mark.asyncio
@@ -291,6 +298,7 @@ async def test_important_update_rewrites_content_and_metadata(tmp_path):
     await im.replace_all(
         [
             {
+                "id": "mem-1",
                 "timestamp": "T1",
                 "content": "张三是朋友",
                 "scope": "user:1",
@@ -300,13 +308,14 @@ async def test_important_update_rewrites_content_and_metadata(tmp_path):
     )
 
     result = await im.update(
-        "T1",
+        "mem-1",
         "张三是朋友，生日是7月8日",
         scope="group:42",
         pinned=True,
     )
 
     assert result["updated"] is True
+    assert result["id"] == "mem-1"
     item = im.items()[0]
     assert item["content"] == "张三是朋友，生日是7月8日"
     assert item["scope"] == "group:42"
@@ -320,16 +329,16 @@ async def test_important_update_exact_duplicate_skip_other_item(tmp_path):
     await im.load()
     await im.replace_all(
         [
-            {"timestamp": "T1", "content": "张三是朋友"},
-            {"timestamp": "T2", "content": "李四是朋友"},
+            {"id": "mem-1", "timestamp": "T1", "content": "张三是朋友"},
+            {"id": "mem-2", "timestamp": "T2", "content": "李四是朋友"},
         ]
     )
 
-    result = await im.update("T2", "张三是朋友")
+    result = await im.update("mem-2", "张三是朋友")
 
     assert result["updated"] is False
     assert result["duplicate"] is True
-    assert result["existing_id"] == "T1"
+    assert result["existing_id"] == "mem-1"
     assert im.items()[1]["content"] == "李四是朋友"
 
 
@@ -345,6 +354,33 @@ async def test_important_delete_by_keyword(tmp_path):
     assert deleted == 2
     assert "李四" in im.text()
     assert "张三" not in im.text()
+
+
+@pytest.mark.asyncio
+async def test_important_delete_by_id_is_exact(tmp_path):
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+    await im.save("张三是朋友")
+    await im.save("张三喜欢咖啡")
+    target_id = im.items()[0]["id"]
+
+    deleted = await im.delete_by_id(target_id)
+
+    assert deleted is True
+    assert "张三是朋友" not in im.text()
+    assert "张三喜欢咖啡" in im.text()
+
+
+@pytest.mark.asyncio
+async def test_important_delete_by_id_not_found(tmp_path):
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+    await im.save("张三是朋友")
+
+    deleted = await im.delete_by_id("mem_missing")
+
+    assert deleted is False
+    assert len(im.items()) == 1
 
 
 @pytest.mark.asyncio
@@ -376,6 +412,8 @@ async def test_important_requires_load(tmp_path):
     im = ImportantMemoryManager(tmp_path / "imp.json")
     with pytest.raises(RuntimeError):
         await im.save("x")
+    with pytest.raises(RuntimeError):
+        await im.delete_by_id("mem_x")
     with pytest.raises(RuntimeError):
         await im.delete_by_keyword("y")
 
@@ -413,8 +451,14 @@ async def test_important_loads_legacy_items_with_default_metadata(tmp_path):
     await im.load()
 
     item = im.items()[0]
+    assert item["id"].startswith("mem_")
+    assert item["id"] != "T1"
     assert item["scope"] == "global"
     assert item["pinned"] is False
+    import orjson
+
+    persisted = orjson.loads(path.read_bytes())
+    assert persisted[0]["id"] == item["id"]
 
 
 @pytest.mark.asyncio
@@ -454,8 +498,11 @@ async def test_important_text_for_context_includes_stable_ids(tmp_path):
     )
 
     out = im.text_for_context(None)
+    generated_id = im.items()[0]["id"]
 
-    assert "[T1]" in out
+    assert generated_id.startswith("mem_")
+    assert f"[{generated_id}]" in out
+    assert "[T1]" not in out
     assert "[mem-custom]" in out
 
 
@@ -481,7 +528,7 @@ async def test_important_update_metadata_persists(tmp_path):
     im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=lambda: "T1")
     await im.load()
     await im.save("可编辑记忆")
-    item_id = im.items()[0]["timestamp"]
+    item_id = im.items()[0]["id"]
 
     assert await im.update_metadata(item_id, scope="group:42", pinned=True) is True
 

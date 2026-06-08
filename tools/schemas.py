@@ -421,11 +421,30 @@ class SaveMemoryArgs(_ToolArgs):
 class DeleteMemoryArgs(_ToolArgs):
     """delete_important_memory 工具参数。"""
 
-    keyword: str = Field(
-        ...,
-        min_length=1,
-        description="要删除的记忆关键词，模糊匹配包含此关键词的条目",
+    memory_id: str | None = Field(
+        default=None,
+        description=(
+            "要删除的重要记忆 ID。推荐使用 memory_id；必须来自重要记忆上下文中展示的 ID、"
+            "save_important_memory 返回的 memory_id，或 existing_id。"
+        ),
     )
+    keyword: str | None = Field(
+        default=None,
+        description=(
+            "旧版兼容参数：按关键词模糊删除。新调用不要使用；能看到记忆 ID 时必须填 memory_id，"
+            "避免关键词误删多条记忆。"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_delete_target(self) -> DeleteMemoryArgs:
+        memory_id = (self.memory_id or "").strip()
+        keyword = (self.keyword or "").strip()
+        self.memory_id = memory_id or None
+        self.keyword = keyword or None
+        if self.memory_id is None and self.keyword is None:
+            raise ValueError("memory_id 或 keyword 至少填写一个；推荐使用 memory_id")
+        return self
 
 
 class UpdateMemoryArgs(_ToolArgs):

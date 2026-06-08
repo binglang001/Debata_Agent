@@ -401,6 +401,17 @@ def test_schedule_wakeup_schema_explains_delayed_wakeup():
     assert "target_id" in props
 
 
+def test_delete_memory_schema_prefers_memory_id():
+    specs = {s.name: s for s in get_default_specs()}
+    schema = specs["delete_important_memory"].to_openai_schema()["function"]
+    props = schema["parameters"]["properties"]
+
+    assert "memory_id" in props
+    assert "keyword" in props
+    assert "推荐使用 memory_id" in schema["description"]
+    assert "旧版兼容" in props["keyword"]["description"]
+
+
 # ============================================================
 # build_default_registry: 按配置筛选
 # ============================================================
@@ -632,7 +643,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     important = ImportantMemoryManager(tmp_path / "important.json")
     await important.load()
     await important.replace_all(
-        [{"timestamp": "mem-existing", "content": "用户喜欢绿茶"}]
+        [{"id": "mem-existing", "timestamp": "T0", "content": "用户喜欢绿茶"}]
     )
 
     timeline = ChatTimelineStore()
@@ -744,7 +755,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "memory_id": "mem-existing",
             "memory_text": "用户喜欢红茶和乌龙茶",
         },
-        "delete_important_memory": {"keyword": "红茶"},
+        "delete_important_memory": {"memory_id": "mem-existing"},
         "send_private_messages": {
             "targets": [{"target_qq": 123, "content": "你好", "order": 1}],
         },
@@ -895,10 +906,12 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert sent_actions[2]["actions"][0]["target_id"] == "456"
 
     assert results["save_important_memory"]["saved"] is True
+    assert results["save_important_memory"]["memory_id"].startswith("mem_")
     assert results["save_important_memory"]["scope"] == "user:123"
     assert results["update_important_memory"]["updated"] is True
-    assert results["delete_important_memory"]["deleted"] == 2
-    assert important.items() == []
+    assert results["delete_important_memory"]["deleted"] == 1
+    assert len(important.items()) == 1
+    assert important.items()[0]["id"] == results["save_important_memory"]["memory_id"]
 
     assert results["recall_message"]["data"]["message_id"] == "100"
     assert adapter.recalled == "100"
@@ -2770,8 +2783,11 @@ async def test_save_memory_with_manager(tmp_path):
     )
     assert result["ok"] is True
     assert result["saved"] is True
+    assert result["memory_id"].startswith("mem_")
+    assert result["data"]["memory_id"] == result["memory_id"]
     assert result["scope"] == "user:123"
     assert len(im.items()) == 1
+    assert im.items()[0]["id"] == result["memory_id"]
     assert im.items()[0]["scope"] == "user:123"
 
     duplicate = await executor(
@@ -2780,7 +2796,7 @@ async def test_save_memory_with_manager(tmp_path):
     assert duplicate["ok"] is True
     assert duplicate["status"] == "exact_duplicate"
     assert duplicate["saved"] is False
-    assert duplicate["existing_id"]
+    assert duplicate["existing_id"] == result["memory_id"]
 
 
 @pytest.mark.asyncio
@@ -2812,7 +2828,7 @@ async def test_update_memory_with_manager(tmp_path):
 
     im = ImportantMemoryManager(tmp_path / "imp.json")
     await im.load()
-    await im.replace_all([{"timestamp": "mem-1", "content": "张三是朋友"}])
+    await im.replace_all([{"id": "mem-1", "timestamp": "T1", "content": "张三是朋友"}])
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
@@ -2829,6 +2845,7 @@ async def test_update_memory_with_manager(tmp_path):
 
     assert result["ok"] is True
     assert result["updated"] is True
+    assert result["memory_id"] == "mem-1"
     assert im.items()[0]["content"] == "张三是朋友，生日是7月8日"
 
 
@@ -2840,8 +2857,8 @@ async def test_update_memory_exact_duplicate_returns_existing_id(tmp_path):
     await im.load()
     await im.replace_all(
         [
-            {"timestamp": "mem-1", "content": "张三是朋友"},
-            {"timestamp": "mem-2", "content": "李四是朋友"},
+            {"id": "mem-1", "timestamp": "T1", "content": "张三是朋友"},
+            {"id": "mem-2", "timestamp": "T2", "content": "李四是朋友"},
         ]
     )
 
@@ -2867,6 +2884,36 @@ async def test_delete_memory_with_manager(tmp_path):
 
     im = ImportantMemoryManager(tmp_path / "imp.json")
     await im.load()
+    saved = await im.save("张三是朋友")
+    await im.save("张三喜欢咖啡")
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(important=im)
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "delete_important_memory", {"memory_id": saved["id"], "keyword": ""}
+    )
+    assert result["ok"] is True
+    assert result["deleted"] == 1
+    assert result["memory_id"] == saved["id"]
+    assert "张三是朋友" not in im.text()
+    assert "张三喜欢咖啡" in im.text()
+
+    missing = await executor(
+        "delete_important_memory", {"memory_id": "mem_missing"}
+    )
+    assert missing["ok"] is False
+    assert missing["status"] == "not_found"
+    assert missing["deleted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_keyword_legacy_compat(tmp_path):
+    from memory import ImportantMemoryManager
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
     await im.save("张三是朋友")
     await im.save("李四是同事")
 
@@ -2875,9 +2922,11 @@ async def test_delete_memory_with_manager(tmp_path):
     ctx = ToolContext(important=im)
     executor = reg.get_executor(ctx)
     result = await executor(
-        "delete_important_memory", {"keyword": "张三"}
+        "delete_important_memory", {"memory_id": "", "keyword": "张三"}
     )
+
     assert result["ok"] is True
+    assert result["status"] == "legacy_keyword"
     assert result["deleted"] == 1
 
 
@@ -2897,7 +2946,7 @@ async def test_rag_mode_memory_tools_execute_with_manager(tmp_path):
         "save_important_memory",
         {"memory_text": "测试群42有固定茶会", "scope": "group:42"},
     )
-    item_id = im.items()[0]["timestamp"]
+    item_id = saved["memory_id"]
     updated = await executor(
         "update_important_memory",
         {
@@ -2906,7 +2955,7 @@ async def test_rag_mode_memory_tools_execute_with_manager(tmp_path):
             "reason": "补充时间",
         },
     )
-    deleted = await executor("delete_important_memory", {"keyword": "茶会"})
+    deleted = await executor("delete_important_memory", {"memory_id": item_id})
 
     assert saved["saved"] is True
     assert updated["updated"] is True

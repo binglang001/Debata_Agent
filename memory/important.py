@@ -3,6 +3,7 @@
 数据格式：
     [
         {
+            "id": "mem_...",
             "timestamp": "2026-03-05 10:00:00",
             "content": "...",
             "scope": "global",
@@ -16,7 +17,8 @@
     - 缓存为文本形式（"[重要记忆]\n- ...\n- ..."），便于直接嵌入 system prompt
     - scope / pinned 只影响注入选择，不拆分全局存储
     - 添加时只做完全相同文本拦截；语义更新由 AI 调 update 工具处理
-    - 删除支持关键词模糊匹配
+    - 模型可见的记忆 ID 是持久保存的专用 id；旧数据加载时自动补齐
+    - 删除优先使用专用 id；关键词删除仅保留给旧调用兼容
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from utils.token_budget import TokenEstimator
 
@@ -34,6 +37,7 @@ from .store import JsonStore
 logger = logging.getLogger(__name__)
 
 GLOBAL_SCOPE = "global"
+MEMORY_ID_PREFIX = "mem_"
 _VALID_SCOPE_RE = re.compile(r"^(global|user:[^:\s]+|group:[^:\s]+)$")
 
 
@@ -180,6 +184,7 @@ class ImportantMemoryManager:
                     text=item["content"],
                     vector=vec,
                     meta={
+                        "id": self._item_id(item),
                         "timestamp": item["timestamp"],
                         "scope": item.get("scope", GLOBAL_SCOPE),
                         "pinned": bool(item.get("pinned")),
@@ -195,9 +200,15 @@ class ImportantMemoryManager:
         if not isinstance(data, list):
             logger.warning("重要记忆文件格式不是 list，重置为空")
             data = []
-        self._items = [self._normalize_item(item) for item in data if isinstance(item, dict)]
+            should_persist = False
+        else:
+            should_persist = True
+        raw_items = [item for item in data if isinstance(item, dict)]
+        self._items, changed = self._normalize_items(raw_items)
         self._refresh_text_cache()
         self._loaded = True
+        if should_persist and (changed or len(raw_items) != len(data)):
+            await self._store.write(self._items)
 
     def text(self) -> str:
         """获取完整缓存文本。保留给管理界面/兼容调用；模型注入优先用 text_for_context。"""
@@ -236,7 +247,7 @@ class ImportantMemoryManager:
             content: 记忆内容（一句话概括）
 
         Returns:
-            {"saved": bool, "duplicate": bool}
+            {"saved": bool, "duplicate": bool, "id": str}
         """
         if not self._loaded:
             raise RuntimeError("ImportantMemoryManager 尚未调用 load()")
@@ -257,6 +268,7 @@ class ImportantMemoryManager:
 
         item = self._normalize_item(
             {
+                "id": self._new_item_id(),
                 "timestamp": self._now_fn(),
                 "content": content,
                 "scope": normalize_scope(scope),
@@ -268,7 +280,7 @@ class ImportantMemoryManager:
         self._refresh_text_cache()
         logger.info(f"重要记忆已保存: {content}")
         await self._index_in_rag(item)
-        return {"saved": True, "duplicate": False}
+        return {"saved": True, "duplicate": False, "id": self._item_id(item)}
 
     async def update(
         self,
@@ -301,9 +313,10 @@ class ImportantMemoryManager:
             }
 
         for item in self._items:
-            if self._item_id(item) != item_id:
+            if not self._matches_item_id(item, item_id):
                 continue
             old_content = str(item.get("content") or "")
+            actual_id = self._item_id(item)
             item["content"] = content
             if scope is not None:
                 item["scope"] = normalize_scope(scope)
@@ -313,10 +326,10 @@ class ImportantMemoryManager:
             await self._store.write(self._items)
             self._refresh_text_cache()
             await self._rebuild_rag_index()
-            logger.info(f"重要记忆已更新: id={item_id}")
+            logger.info(f"重要记忆已更新: id={actual_id}")
             return {
                 "updated": True,
-                "id": item_id,
+                "id": actual_id,
                 "old_content": old_content,
                 "content": content,
             }
@@ -353,7 +366,7 @@ class ImportantMemoryManager:
         return deleted
 
     async def delete_by_id(self, item_id: str) -> bool:
-        """按 timestamp/id 精确删除一条记忆，返回是否删除。"""
+        """按专用 id 精确删除一条记忆，返回是否删除。"""
         if not self._loaded:
             raise RuntimeError("ImportantMemoryManager 尚未调用 load()")
         item_id = (item_id or "").strip()
@@ -363,8 +376,7 @@ class ImportantMemoryManager:
         keep: list[dict] = []
         removed: dict | None = None
         for item in self._items:
-            current_id = self._item_id(item)
-            if removed is None and current_id == item_id:
+            if removed is None and self._matches_item_id(item, item_id):
                 removed = item
                 continue
             keep.append(item)
@@ -375,10 +387,13 @@ class ImportantMemoryManager:
         self._items = keep
         await self._store.write(self._items)
         self._refresh_text_cache()
-        logger.info(f"重要记忆删除 1 条 (id={item_id})")
+        removed_id = self._item_id(removed) or item_id
+        logger.info(f"重要记忆删除 1 条 (id={removed_id})")
         if self.rag_enabled:
             try:
-                await self._rag_store.remove_by_id(item_id)  # type: ignore[union-attr]
+                await self._rag_store.remove_by_id(removed_id)  # type: ignore[union-attr]
+                if removed_id != item_id:
+                    await self._rag_store.remove_by_id(item_id)  # type: ignore[union-attr]
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"RAG 索引移除失败：{e}")
         return True
@@ -428,6 +443,7 @@ class ImportantMemoryManager:
 
         item = self._normalize_item(
             {
+                "id": self._new_item_id(),
                 "timestamp": self._now_fn(),
                 "content": content,
                 "source": f"keyword:{matched}",
@@ -445,6 +461,7 @@ class ImportantMemoryManager:
             "matched_keyword": matched,
             "content": content,
             "duplicate": False,
+            "id": self._item_id(item),
         }
 
     async def update_metadata(
@@ -463,7 +480,7 @@ class ImportantMemoryManager:
 
         changed = False
         for item in self._items:
-            if self._item_id(item) != item_id:
+            if not self._matches_item_id(item, item_id):
                 continue
             if scope is not None:
                 item["scope"] = normalize_scope(scope)
@@ -485,13 +502,13 @@ class ImportantMemoryManager:
     async def replace_all(self, items: list[dict]) -> None:
         """整体替换（总结后用）。"""
         # 校验：每条至少应有 content
-        cleaned: list[dict] = []
+        raw_items: list[dict] = []
         for item in items:
             content = (item.get("content") or "").strip()
             if not content:
                 continue
-            normalized = self._normalize_item({**item, "content": content})
-            cleaned.append(normalized)
+            raw_items.append({**item, "content": content})
+        cleaned, _ = self._normalize_items(raw_items)
         self._items = cleaned
         await self._store.write(self._items)
         self._refresh_text_cache()
@@ -515,6 +532,7 @@ class ImportantMemoryManager:
                         text=item["content"],
                         vector=vec,
                         meta={
+                            "id": self._item_id(item),
                             "timestamp": item["timestamp"],
                             "scope": item.get("scope", GLOBAL_SCOPE),
                             "pinned": bool(item.get("pinned")),
@@ -534,6 +552,8 @@ class ImportantMemoryManager:
     def _normalize_item(self, item: dict[str, Any]) -> dict[str, Any]:
         content = str(item.get("content") or "").strip()
         normalized = dict(item)
+        item_id = str(item.get("id") or "").strip()
+        normalized["id"] = item_id or self._new_item_id()
         normalized["timestamp"] = str(item.get("timestamp") or self._now_fn())
         normalized["content"] = content
         normalized["scope"] = normalize_scope(str(item.get("scope") or GLOBAL_SCOPE))
@@ -541,7 +561,44 @@ class ImportantMemoryManager:
         return normalized
 
     def _item_id(self, item: dict[str, Any]) -> str:
-        return str(item.get("id") or item.get("timestamp") or "")
+        return str(item.get("id") or "").strip()
+
+    def _matches_item_id(self, item: dict[str, Any], item_id: str) -> bool:
+        requested_id = (item_id or "").strip()
+        if not requested_id:
+            return False
+        if self._item_id(item) == requested_id:
+            return True
+        # 兼容旧调用方曾把 timestamp 当作 id 传入；新上下文不再展示 timestamp。
+        legacy_id = str(item.get("timestamp") or "").strip()
+        return bool(legacy_id and legacy_id == requested_id)
+
+    def _new_item_id(self, existing_ids: set[str] | None = None) -> str:
+        if existing_ids is None:
+            existing_ids = {self._item_id(item) for item in self._items}
+        while True:
+            item_id = f"{MEMORY_ID_PREFIX}{uuid4().hex[:16]}"
+            if item_id not in existing_ids:
+                return item_id
+
+    def _normalize_items(
+        self,
+        raw_items: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        normalized_items: list[dict[str, Any]] = []
+        used_ids: set[str] = set()
+        changed = False
+        for item in raw_items:
+            normalized = self._normalize_item(item)
+            item_id = self._item_id(normalized)
+            if not item_id or item_id in used_ids:
+                normalized["id"] = self._new_item_id(used_ids)
+                changed = True
+            used_ids.add(self._item_id(normalized))
+            if normalized != item:
+                changed = True
+            normalized_items.append(normalized)
+        return normalized_items, changed
 
     def _find_exact_duplicate_id(
         self,
@@ -553,7 +610,7 @@ class ImportantMemoryManager:
         exclude_id = (exclude_id or "").strip()
         for item in self._items:
             item_id = self._item_id(item)
-            if exclude_id and item_id == exclude_id:
+            if exclude_id and self._matches_item_id(item, exclude_id):
                 continue
             if _normalize_memory_text_for_exact_match(str(item.get("content") or "")) == normalized_content:
                 return item_id
