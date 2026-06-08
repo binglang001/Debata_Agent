@@ -211,6 +211,13 @@ class CommitSendAttemptArgs(_ToolArgs):
         default=None,
         description="可选：确认发送时给第一条文本消息补引用，避免被中间新消息隔开后串话。",
     )
+    ignore_review_interrupts: bool = Field(
+        default=False,
+        description=(
+            "仅在确认旧 attempt 前忽略软复核打断并继续提交；"
+            "不能绕过撤回、权限变化、发送失败等硬错误。默认 false。"
+        ),
+    )
     reason: str | None = Field(
         default=None,
         description="简短说明为什么复核后仍提交旧内容；用于日志和自检，不会发给 QQ。",

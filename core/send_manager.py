@@ -100,6 +100,7 @@ class _SendAttempt:
     tool_call_id: str | None
     reason: str | None
     created_at: float
+    revision: int = 1
     consumed: bool = False
 
 
@@ -447,10 +448,11 @@ class _AsyncSendManager:
             metadata.get("reviewed_until_seq"),
             attempt.reviewed_until_seq,
         )
+        ignore_review_interrupts = bool(metadata.get("ignore_review_interrupts"))
         preflight = self._preflight_send(
             attempt.conversation_ids,
             reviewed_until_seq=reviewed_until_seq,
-            review_policy="review_priority",
+            review_policy=attempt.review_policy,
             focus_user_ids=attempt.focus_user_ids,
             trigger_message_ids=attempt.trigger_message_ids,
         )
@@ -463,12 +465,16 @@ class _AsyncSendManager:
                 "recalled_messages": preflight["recalled_messages"],
                 "next": "相关消息已撤回，不能确认发送旧内容。请重新判断或 no_action。",
             }
-        if preflight["priority_interrupts"]:
+        forced_unseen_messages: list[dict[str, Any]] = []
+        if preflight["needs_review"] and not ignore_review_interrupts:
+            attempt.revision += 1
             return self._needs_review_result(
                 attempt,
                 preflight,
                 status="needs_review_again",
             )
+        if preflight["needs_review"] and ignore_review_interrupts:
+            forced_unseen_messages = list(preflight["unseen_messages"])
 
         normalized = [dict(action) for action in attempt.actions]
         delivery_policy = str(
@@ -496,6 +502,10 @@ class _AsyncSendManager:
         )
         attempt.consumed = True
         result["send_attempt_id"] = attempt_id
+        if forced_unseen_messages:
+            result["ignored_review_interrupts"] = True
+            result["forced_unseen_messages"] = forced_unseen_messages
+            result["next"] = "已按 ignore_review_interrupts 提交旧 attempt。不要重复提交同一批。"
         return result
 
     def pop_pending_receipts(self, conversation_id: str) -> list[dict[str, Any]]:
@@ -724,9 +734,6 @@ class _AsyncSendManager:
             reasons.append("reply_to_trigger_message")
         if _text_mentions_self_or_role(ref.text, ref.self_id, self.pipeline.persona.name):
             reasons.append("mentions_bot_or_role")
-        stripped = ref.text.strip()
-        if stripped.startswith(("/", "#")):
-            reasons.append("command_message")
         for message in self.pipeline.chat_timeline.recent(ref.conversation_id, 20):
             if message.direction != "outbound" or not message.msg_id:
                 continue
@@ -803,6 +810,8 @@ class _AsyncSendManager:
             "status": status,
             "qq_visible": False,
             "send_attempt_id": attempt.send_attempt_id,
+            "attempt_revision": attempt.revision,
+            "revision": attempt.revision,
             "attempted_messages": self._attempted_items(
                 attempt.actions,
                 attempt.send_attempt_id,
@@ -953,6 +962,7 @@ class _AsyncSendManager:
             "accepted_messages": self._accepted_items(
                 [action for actions in groups.values() for action in actions]
             ),
+            "next": "这批消息已经发送完成，不要重复提交同一批；如需补充，只发送新增内容。",
         }
         if errors:
             result["errors"] = errors

@@ -289,6 +289,15 @@ def test_schema_no_refs_in_output():
         assert "$defs" not in text, f"{spec_name}: schema 含 $defs"
 
 
+def test_commit_send_attempt_schema_exposes_ignore_review_interrupts():
+    specs = {s.name: s for s in get_default_specs()}
+    schema = specs["commit_send_attempt"].to_openai_schema()
+    props = schema["function"]["parameters"]["properties"]
+
+    assert props["ignore_review_interrupts"]["default"] is False
+    assert "send_attempt_id" in props
+
+
 def test_schema_no_title_field():
     """派生 schema 不应含 Pydantic 的 title 字段。"""
     specs = {s.name: s for s in get_default_specs()}

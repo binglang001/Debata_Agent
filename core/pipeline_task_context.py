@@ -101,8 +101,6 @@ class PipelineTaskContextMixin:
             self.persona.name,
         ):
             return True
-        if item.text.strip().startswith(("/", "#")):
-            return True
         if item.raw_event.reply_to and self._reply_targets_recent_outbound(
             item.conversation_id,
             item.raw_event.reply_to,

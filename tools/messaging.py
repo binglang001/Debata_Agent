@@ -399,6 +399,7 @@ async def commit_send_attempt(args: CommitSendAttemptArgs, ctx: ToolContext) -> 
             "reviewed_until_seq": args.reviewed_until_seq,
             "delivery_interrupt_policy": args.delivery_interrupt_policy,
             "reply_to_message_id": args.reply_to_message_id,
+            "ignore_review_interrupts": args.ignore_review_interrupts,
             "reason": args.reason,
             "tool_call_id": str(ctx.extras.get("tool_call_id") or ""),
         },
