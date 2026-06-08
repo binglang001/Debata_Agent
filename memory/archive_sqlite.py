@@ -50,7 +50,10 @@ class SqliteArchiveStore:
     async def append_many(self, records: list[dict[str, Any]]) -> None:
         if not records:
             return
-        payload = [dict(record) for record in records if isinstance(record, dict)]
+        payload: list[dict[str, Any]] = []
+        for record in records:
+            if isinstance(record, dict):
+                payload.extend(real_chat_archive_records(record))
         if not payload:
             return
         async with self._lock:
@@ -275,7 +278,7 @@ class SqliteArchiveStore:
             rows = conn.execute(
                 "SELECT * FROM archive_messages ORDER BY rowid ASC"
             ).fetchall()
-        return [_row_to_record(row) for row in rows]
+        return [_row_to_record(row) for row in rows if _row_is_real_chat(row)]
 
     def _legacy_search_sync(
         self,
@@ -292,6 +295,8 @@ class SqliteArchiveStore:
                 "SELECT * FROM archive_messages ORDER BY rowid ASC"
             ).fetchall()
         for row in rows:
+            if not _row_is_real_chat(row):
+                continue
             if conversation_id and row["conversation_id"] != conversation_id:
                 continue
             text = _legacy_search_text(row)
@@ -309,7 +314,10 @@ class SqliteArchiveStore:
         reverse = order != "asc"
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM archive_messages").fetchall()
-        matched = [row for row in rows if _row_matches_filter(row, query)]
+        matched = [
+            row for row in rows
+            if _row_is_real_chat(row) and _row_matches_filter(row, query)
+        ]
         matched.sort(
             key=lambda row: (
                 row["timestamp_unix"] if row["timestamp_unix"] is not None else -1,
@@ -337,7 +345,11 @@ class SqliteArchiveStore:
                 f"SELECT * FROM archive_messages WHERE archive_id IN ({placeholders})",
                 archive_ids,
             ).fetchall()
-        by_id = {row["archive_id"]: _row_to_record(row) for row in rows}
+        by_id = {
+            row["archive_id"]: _row_to_record(row)
+            for row in rows
+            if _row_is_real_chat(row)
+        }
         return [by_id[archive_id] for archive_id in archive_ids if archive_id in by_id]
 
     def _context_around_sync(
@@ -351,7 +363,7 @@ class SqliteArchiveStore:
                 "SELECT * FROM archive_messages WHERE archive_id = ?",
                 (archive_id,),
             ).fetchone()
-            if target is None:
+            if target is None or not _row_is_real_chat(target):
                 return []
             conversation_id = target["conversation_id"]
             if conversation_id is None:
@@ -362,19 +374,21 @@ class SqliteArchiveStore:
                     """
                     SELECT * FROM archive_messages
                     WHERE conversation_id = ? AND rowid < ?
-                    ORDER BY rowid DESC LIMIT ?
+                    ORDER BY rowid DESC
                     """,
-                    (conversation_id, target["rowid"], before),
+                    (conversation_id, target["rowid"]),
                 ).fetchall()
                 next_rows = conn.execute(
                     """
                     SELECT * FROM archive_messages
                     WHERE conversation_id = ? AND rowid > ?
-                    ORDER BY rowid ASC LIMIT ?
+                    ORDER BY rowid ASC
                     """,
-                    (conversation_id, target["rowid"], after),
+                    (conversation_id, target["rowid"]),
                 ).fetchall()
-        rows = list(reversed(prev_rows)) + [target] + list(next_rows)
+        prev_real = [row for row in prev_rows if _row_is_real_chat(row)][:before]
+        next_real = [row for row in next_rows if _row_is_real_chat(row)][:after]
+        rows = list(reversed(prev_real)) + [target] + next_real
         return [_row_to_record(row) for row in rows]
 
     def _rag_records_sync(self) -> list[dict]:
@@ -389,6 +403,8 @@ class SqliteArchiveStore:
             ).fetchall()
         records: list[dict] = []
         for row in rows:
+            if not _row_is_real_chat(row):
+                continue
             record = _row_to_record(row)
             record["content"] = str(row["content_search"] or row["content"] or "")
             records.append(record)
@@ -432,6 +448,22 @@ def _normalize_archive_path(path: Path) -> Path:
     return path
 
 
+def real_chat_archive_records(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """把运行时记录转换成可入永久归档的真实 QQ 聊天记录。"""
+    outbound = _outbound_records_from_tool_result(record)
+    if outbound:
+        return outbound
+    copied = dict(record)
+    if is_real_chat_record(copied):
+        return [copied]
+    return []
+
+
+def is_real_chat_record(record: dict[str, Any]) -> bool:
+    normalized = _normalize_record(record)
+    return _normalized_is_real_chat(normalized)
+
+
 def _normalize_record(record: dict[str, Any]) -> _NormalizedRecord:
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     metadata = dict(metadata or {})
@@ -473,6 +505,132 @@ def _normalize_record(record: dict[str, Any]) -> _NormalizedRecord:
         or _clean_optional(metadata.get("reply_to_message_id")),
         metadata=metadata,
         record=normalized_record,
+    )
+
+
+def _normalized_is_real_chat(record: _NormalizedRecord) -> bool:
+    if record.role not in _REAL_CHAT_ROLES:
+        return False
+    if record.direction not in _REAL_CHAT_DIRECTIONS:
+        return False
+    if record.message_kind not in _REAL_CHAT_MESSAGE_KINDS:
+        return False
+    if not record.content:
+        return False
+    if _conversation_is_runtime(record.conversation_id):
+        return False
+    if _metadata_is_runtime(record.metadata) or _text_is_runtime(record.content):
+        return False
+    raw = record.record
+    if raw.get("tool_calls"):
+        return False
+    if raw.get("reasoning_content") or raw.get("reasoning_blocks"):
+        return False
+    if record.role == "assistant" and not _assistant_has_outbound_proof(
+        raw,
+        record.metadata,
+    ):
+        return False
+    return True
+
+
+def _row_is_real_chat(row: sqlite3.Row) -> bool:
+    if str(row["sender_role"] or "") not in _REAL_CHAT_ROLES:
+        return False
+    if str(row["direction"] or "") not in _REAL_CHAT_DIRECTIONS:
+        return False
+    if str(row["message_kind"] or "") not in _REAL_CHAT_MESSAGE_KINDS:
+        return False
+    if not str(row["content"] or "").strip():
+        return False
+    if _conversation_is_runtime(_clean_optional(row["conversation_id"])):
+        return False
+    if _text_is_runtime(str(row["content"] or "")):
+        return False
+    metadata = _json_loads(row["metadata_json"], default={})
+    if isinstance(metadata, dict) and _metadata_is_runtime(metadata):
+        return False
+    record = _json_loads(row["record_json"], default={})
+    if isinstance(record, dict):
+        role = str(record.get("role") or row["sender_role"] or "")
+        if role not in _REAL_CHAT_ROLES:
+            return False
+        if record.get("tool_calls"):
+            return False
+        if record.get("reasoning_content") or record.get("reasoning_blocks"):
+            return False
+        if role == "assistant" and not _assistant_has_outbound_proof(record, metadata):
+            return False
+    elif str(row["sender_role"] or "") == "assistant":
+        if not _assistant_has_outbound_proof({}, metadata):
+            return False
+    return True
+
+
+def _outbound_records_from_tool_result(record: dict[str, Any]) -> list[dict[str, Any]]:
+    if record.get("role") != "tool":
+        return []
+    try:
+        payload = json.loads(str(record.get("content") or "{}"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    sent_items = payload.get("sent")
+    if not isinstance(sent_items, list):
+        return []
+
+    result: list[dict[str, Any]] = []
+    for item in sent_items:
+        if not isinstance(item, dict) or item.get("qq_visible") is not True:
+            continue
+        content = _clean_optional(item.get("content"))
+        if not content:
+            continue
+        conversation_id = _clean_optional(item.get("conversation_id"))
+        if conversation_id is None:
+            target_type = _clean_optional(item.get("target_type"))
+            target_id = _clean_optional(item.get("target_id"))
+            if target_type and target_id:
+                conversation_id = f"{target_type}:{target_id}"
+        if _conversation_is_runtime(conversation_id):
+            continue
+        msg_id = _clean_optional(item.get("msg_id"))
+        metadata = {
+            "timestamp": _clean_optional(item.get("time")),
+            "qq_visible": True,
+            "source": "send_result",
+            "tool_call_id": _clean_optional(record.get("tool_call_id")),
+            "send_id": _clean_optional(payload.get("send_id")),
+        }
+        result.append(
+            {
+                "role": "assistant",
+                "content": content,
+                "conversation_id": conversation_id,
+                "original_msg_id": msg_id,
+                "metadata": {
+                    key: value for key, value in metadata.items() if value is not None
+                },
+            }
+        )
+    return result
+
+
+def _assistant_has_outbound_proof(
+    record: dict[str, Any],
+    metadata: Any,
+) -> bool:
+    if not isinstance(metadata, dict):
+        metadata = {}
+    record_source = _clean_optional(record.get("source"))
+    metadata_source = _clean_optional(metadata.get("source"))
+    record_visible = record.get("qq_visible") is True
+    metadata_visible = metadata.get("qq_visible") is True
+    return (
+        record_visible and record_source == "send_result"
+    ) or (
+        metadata_visible and metadata_source == "send_result"
     )
 
 
@@ -852,7 +1010,11 @@ def _direction_for(record: dict[str, Any], metadata: dict[str, Any], role: str) 
         return "runtime"
     if role == "user":
         return "inbound"
-    if role == "assistant" and not record.get("tool_calls"):
+    if (
+        role == "assistant"
+        and not record.get("tool_calls")
+        and _assistant_has_outbound_proof(record, metadata)
+    ):
         return "outbound"
     if role in {"assistant", "system", "tool"}:
         return "runtime"
@@ -902,11 +1064,16 @@ def _first_meta_message(metadata: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _metadata_is_runtime(metadata: dict[str, Any]) -> bool:
-    return metadata.get("kind") in {"task_context_snapshot", "send_done_snapshot"}
+    return metadata.get("kind") in _RUNTIME_METADATA_KINDS
 
 
 def _text_is_runtime(text: str) -> bool:
     return any(marker in text for marker in _RUNTIME_CONTEXT_MARKERS)
+
+
+def _conversation_is_runtime(conversation_id: str | None) -> bool:
+    value = str(conversation_id or "").strip().lower()
+    return value.startswith(("system:", "runtime:", "internal:"))
 
 
 def _query_to_dict(query: Any) -> dict[str, Any]:
@@ -1006,6 +1173,19 @@ _MEDIA_RUNTIME_ATTR_PATTERN = re.compile(r"\s(?:url|workspace)=(?:[^\]\s]+)")
 _URL_PATTERN = re.compile(r"https?://[^\s\]）)>\"']+")
 _WINDOWS_PATH_PATTERN = re.compile(r"(?<![\w/\\])[A-Za-z]:[\\/][^\s\]）)>\"']+")
 _SECRET_QUERY_PATTERN = re.compile(r"(?i)(?:rkey|clientkey|skey|token)=[^&\s\]]+")
+_REAL_CHAT_ROLES = frozenset({"user", "assistant"})
+_REAL_CHAT_DIRECTIONS = frozenset({"inbound", "outbound"})
+_REAL_CHAT_MESSAGE_KINDS = frozenset(
+    {"text", "image", "file", "audio", "forward", "mixed"}
+)
+_RUNTIME_METADATA_KINDS = frozenset(
+    {
+        "task_context_snapshot",
+        "send_done_snapshot",
+        "send_receipt",
+        "send_receipt_task",
+    }
+)
 _RUNTIME_CONTEXT_MARKERS = (
     "<task_context",
     "</task_context>",
@@ -1015,4 +1195,8 @@ _RUNTIME_CONTEXT_MARKERS = (
     "</send_receipt>",
     "<send_receipt_task",
     "</send_receipt_task>",
+    "<tool_loop_final_warning",
+    "</tool_loop_final_warning>",
+    "<tool_loop_stop",
+    "</tool_loop_stop>",
 )

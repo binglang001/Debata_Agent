@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from .archive_sqlite import SqliteArchiveStore
+from .archive_sqlite import real_chat_archive_records as real_chat_archive_records
+
+__all__ = ["ArchiveStore", "real_chat_archive_records"]
 
 
 class ArchiveStore:

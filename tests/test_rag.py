@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from pathlib import Path
 
 import httpx
@@ -462,10 +463,29 @@ async def test_rag_bootstrap_reads_real_chat_from_archive_sqlite(tmp_path: Path)
                 "conversation_id": "private:1",
             },
             {
-                "role": "assistant",
-                "content": "真实回复里提到猫",
+                "role": "tool",
+                "tool_call_id": "tc-send",
+                "content": json.dumps(
+                    {
+                        "ok": True,
+                        "status": "sent",
+                        "qq_visible": True,
+                        "send_id": "send-1",
+                        "sent": [
+                            {
+                                "conversation_id": "private:1",
+                                "target_type": "private",
+                                "target_id": "1",
+                                "msg_id": "bot-1",
+                                "content": "真实回复里提到猫",
+                                "time": "2026-06-01 10:01:00",
+                                "qq_visible": True,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
                 "conversation_id": "private:1",
-                "metadata": {"timestamp": "2026-06-01 10:01:00"},
             },
         ]
     )

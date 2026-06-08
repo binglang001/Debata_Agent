@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -11,6 +12,14 @@ from tools import ToolContext, ToolRegistry, get_default_specs
 def _approve_stub_tools(ctx: ToolContext, *names: str) -> None:
     approved = ctx.extras.setdefault("tool_search_approved_tools", set())
     approved.update(names)
+
+
+class _HistoryStub:
+    def __init__(self, records: list[dict]) -> None:
+        self._records = records
+
+    async def records(self) -> list[dict]:
+        return list(self._records)
 
 
 def _chat_record(
@@ -41,6 +50,158 @@ def _chat_record(
             ],
         },
     }
+
+
+def _send_tool_result_record(
+    content: str,
+    *,
+    conversation_id: str,
+    msg_id: str,
+    timestamp: str = "2026-06-01 10:01:00",
+) -> dict:
+    return {
+        "role": "tool",
+        "tool_call_id": "tc-send",
+        "content": json.dumps(
+            {
+                "ok": True,
+                "status": "sent",
+                "qq_visible": True,
+                "send_id": "send-1",
+                "count": 1,
+                "sent": [
+                    {
+                        "conversation_id": conversation_id,
+                        "target_type": conversation_id.split(":", 1)[0],
+                        "target_id": conversation_id.split(":", 1)[1],
+                        "msg_id": msg_id,
+                        "content": content,
+                        "time": timestamp,
+                        "qq_visible": True,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        "conversation_id": conversation_id,
+    }
+
+
+def _runtime_records(conversation_id: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "tc-send",
+                    "type": "function",
+                    "function": {"name": "send_group_message", "arguments": "{}"},
+                }
+            ],
+            "conversation_id": conversation_id,
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "tc-memory",
+            "content": json.dumps(
+                {"ok": True, "status": "done", "brief": "delete memory result"},
+                ensure_ascii=False,
+            ),
+            "conversation_id": conversation_id,
+        },
+        {
+            "role": "user",
+            "content": "<task_context>task_context 不该归档</task_context>",
+            "conversation_id": conversation_id,
+            "metadata": {"kind": "task_context_snapshot"},
+        },
+        {
+            "role": "user",
+            "content": "<send_status>send_status 不该归档</send_status>",
+            "conversation_id": conversation_id,
+            "metadata": {"kind": "send_done_snapshot"},
+        },
+        {
+            "role": "user",
+            "content": "<send_receipt>{\"interrupted\": true}</send_receipt>",
+            "conversation_id": conversation_id,
+        },
+        {
+            "role": "assistant",
+            "content": "思考过程不该归档",
+            "reasoning_content": "内部推理",
+            "conversation_id": conversation_id,
+        },
+        {
+            "role": "assistant",
+            "content": "内部最终说明不该归档",
+            "conversation_id": conversation_id,
+        },
+        {
+            "role": "system",
+            "content": "系统消息不该归档",
+            "conversation_id": conversation_id,
+        },
+    ]
+
+
+def _insert_legacy_archive_row(
+    archive: ArchiveStore,
+    *,
+    rowid: int,
+    archive_id: str,
+    role: str,
+    content: str,
+    conversation_id: str,
+    direction: str = "runtime",
+    message_kind: str = "runtime",
+    metadata: dict | None = None,
+) -> None:
+    metadata = dict(metadata or {})
+    record = {
+        "role": role,
+        "content": content,
+        "conversation_id": conversation_id,
+        "metadata": metadata,
+    }
+    with sqlite3.connect(archive.path) as conn:
+        conn.execute(
+            """
+            INSERT INTO archive_messages (
+                rowid, archive_id, timestamp, timestamp_unix, date_key, month_key,
+                conversation_id, conversation_type, target_id, sender_id,
+                sender_name, sender_role, direction, message_kind, content,
+                content_search, original_msg_id, reply_to_msg_id, metadata_json,
+                record_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                rowid,
+                archive_id,
+                metadata.get("timestamp"),
+                None,
+                None,
+                None,
+                conversation_id,
+                conversation_id.split(":", 1)[0],
+                conversation_id.split(":", 1)[1],
+                role,
+                role,
+                role,
+                direction,
+                message_kind,
+                content,
+                content,
+                None,
+                None,
+                json.dumps(metadata, ensure_ascii=False),
+                json.dumps(record, ensure_ascii=False),
+                "2026-06-01 10:00:00",
+            ),
+        )
+        conn.commit()
 
 
 @pytest.mark.asyncio
@@ -83,12 +244,12 @@ async def test_archive_append_records_short_ids_are_stable_and_compatible(tmp_pa
                 sender_name="Alice",
                 timestamp="2026-06-01 10:00:00",
             ),
-            {
-                "role": "assistant",
-                "content": "第二条回复",
-                "conversation_id": "private:1",
-                "metadata": {"timestamp": "2026-06-01 10:01:00"},
-            },
+            _send_tool_result_record(
+                "第二条回复",
+                conversation_id="private:1",
+                msg_id="bot-2",
+                timestamp="2026-06-01 10:01:00",
+            ),
         ]
     )
 
@@ -99,9 +260,89 @@ async def test_archive_append_records_short_ids_are_stable_and_compatible(tmp_pa
     assert records[0]["role"] == "user"
     assert records[0]["conversation_id"] == "private:1"
     assert records[0]["metadata"]["timestamp"] == "2026-06-01 10:00:00"
+    assert records[1]["role"] == "assistant"
+    assert records[1]["metadata"]["source"] == "send_result"
 
     reloaded = ArchiveStore(tmp_path / "archive.sqlite3")
     assert [record["archive_id"] for record in await reloaded.records()] == ids
+
+
+@pytest.mark.asyncio
+async def test_archive_append_many_keeps_only_real_chat_and_sent_outbound(tmp_path):
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
+    await archive.append_many(
+        [
+            _chat_record(
+                "真实入站图片 [图片 workspace=incoming/cat.jpg]",
+                conversation_id="group:2",
+                sender_id="2",
+                sender_name="Bob",
+                timestamp="2026-06-01 10:00:00",
+            ),
+            _send_tool_result_record(
+                "机器人实际发出的回复",
+                conversation_id="group:2",
+                msg_id="bot-1",
+            ),
+            *_runtime_records("group:2"),
+        ]
+    )
+
+    records = await archive.records()
+    assert [record["role"] for record in records] == ["user", "assistant"]
+    assert [record["content"] for record in records] == [
+        "真实入站图片 [图片 workspace=incoming/cat.jpg]",
+        "机器人实际发出的回复",
+    ]
+    assert records[1]["metadata"]["qq_visible"] is True
+    assert records[1]["metadata"]["source"] == "send_result"
+    assert records[1]["original_msg_id"] == "bot-1"
+
+    joined = "\n".join(record["content"] for record in records)
+    assert "delete memory result" not in joined
+    assert "task_context" not in joined
+    assert "send_status" not in joined
+    assert "send_receipt" not in joined
+    assert "思考过程" not in joined
+    assert "内部最终说明" not in joined
+
+
+@pytest.mark.asyncio
+async def test_archive_rejects_internal_assistant_text_from_write_and_queries(tmp_path):
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
+    await archive.append_many(
+        [
+            _chat_record(
+                "真实用户消息",
+                conversation_id="private:1",
+                sender_id="1",
+                sender_name="Alice",
+                timestamp="2026-06-01 10:00:00",
+            ),
+            {
+                "role": "assistant",
+                "content": "内部最终说明未发送到 QQ",
+                "conversation_id": "private:1",
+                "metadata": {"timestamp": "2026-06-01 10:01:00"},
+            },
+        ]
+    )
+
+    records = await archive.records()
+    assert [record["content"] for record in records] == ["真实用户消息"]
+    assert await archive.search(keyword="内部最终说明", limit=10) == []
+
+    filtered = await archive.filter_records({"keywords": ["内部最终说明"], "limit": 10})
+    assert filtered["count"] == 0
+
+    ctx = ToolContext(archive=archive)
+    executor = ToolRegistry(get_default_specs()).get_executor(ctx)
+    recalled = await executor(
+        "recall_history",
+        {"conversation_id": "private:1", "keyword": "内部最终说明", "limit": 10},
+    )
+    assert recalled["count"] == 0
+    assert "内部最终说明" not in recalled["content"]
 
 
 @pytest.mark.asyncio
@@ -287,6 +528,140 @@ async def test_filter_tool_and_recall_history_expand_archive_ids_same_conversati
     assert "别的会话前文" not in recalled["content"]
     assert "别的会话后文" not in recalled["content"]
     assert recalled["results"][1]["id"] == target_id
+
+
+@pytest.mark.asyncio
+async def test_archive_read_paths_filter_legacy_runtime_pollution(tmp_path):
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
+    await archive.append_many(
+        [
+            _chat_record(
+                "同会话前文",
+                conversation_id="group:2",
+                sender_id="1",
+                sender_name="Alice",
+                timestamp="2026-06-01 10:00:00",
+            ),
+            _chat_record(
+                "目标茶会记录",
+                conversation_id="group:2",
+                sender_id="2",
+                sender_name="Bob",
+                timestamp="2026-06-01 10:01:00",
+            ),
+            _chat_record(
+                "同会话后文",
+                conversation_id="group:2",
+                sender_id="1",
+                sender_name="Alice",
+                timestamp="2026-06-01 10:02:00",
+            ),
+        ]
+    )
+    records = await archive.records()
+    target_id = records[1]["archive_id"]
+
+    _insert_legacy_archive_row(
+        archive,
+        rowid=4,
+        archive_id="ztool",
+        role="tool",
+        content='{"ok": true, "brief": "delete memory result"}',
+        conversation_id="group:2",
+    )
+    _insert_legacy_archive_row(
+        archive,
+        rowid=5,
+        archive_id="zctx",
+        role="user",
+        content="<task_context>运行时上下文污染</task_context>",
+        conversation_id="group:2",
+        metadata={"kind": "task_context_snapshot"},
+    )
+    _insert_legacy_archive_row(
+        archive,
+        rowid=6,
+        archive_id="zasst",
+        role="assistant",
+        content="旧库内部 assistant 文本污染",
+        conversation_id="group:2",
+        direction="outbound",
+        message_kind="text",
+        metadata={"timestamp": "2026-06-01 10:03:00"},
+    )
+
+    assert "delete memory result" not in str(await archive.records())
+    assert "旧库内部 assistant 文本污染" not in str(await archive.records())
+    assert await archive.search(keyword="delete memory result", limit=10) == []
+    assert await archive.search(keyword="旧库内部 assistant", limit=10) == []
+    filtered = await archive.filter_records(
+        {"keywords": ["运行时上下文污染"], "limit": 10}
+    )
+    assert filtered["count"] == 0
+    assistant_filtered = await archive.filter_records(
+        {"keywords": ["旧库内部 assistant"], "limit": 10}
+    )
+    assert assistant_filtered["count"] == 0
+    assert await archive.get_by_ids(["ztool", "zctx", "zasst"]) == []
+    assert "旧库内部 assistant 文本污染" not in str(await archive.rag_records())
+
+    context = await archive.context_around(target_id, before=1, after=5)
+    assert [record["content"] for record in context] == [
+        "同会话前文",
+        "目标茶会记录",
+        "同会话后文",
+    ]
+
+    ctx = ToolContext(archive=archive)
+    executor = ToolRegistry(get_default_specs()).get_executor(ctx)
+    recalled = await executor(
+        "recall_history",
+        {"archive_ids": [target_id], "context_before": 1, "context_after": 5},
+    )
+    assert recalled["count"] == 3
+    assert "目标茶会记录" in recalled["content"]
+    assert "delete memory result" not in recalled["content"]
+    assert "task_context" not in recalled["content"]
+    assert "旧库内部 assistant 文本污染" not in recalled["content"]
+
+
+@pytest.mark.asyncio
+async def test_recall_history_filters_active_runtime_and_derives_sent_outbound(tmp_path):
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
+    await archive.load()
+    history = _HistoryStub(
+        [
+            _chat_record(
+                "活跃真实入站 KEEP",
+                conversation_id="private:1",
+                sender_id="1",
+                sender_name="Alice",
+                timestamp="2026-06-01 10:00:00",
+            ),
+            _send_tool_result_record(
+                "活跃机器人已发送 KEEP",
+                conversation_id="private:1",
+                msg_id="bot-active",
+            ),
+            *_runtime_records("private:1"),
+        ]
+    )
+    ctx = ToolContext(archive=archive, history=history)
+    executor = ToolRegistry(get_default_specs()).get_executor(ctx)
+
+    recalled = await executor(
+        "recall_history",
+        {"conversation_id": "private:1", "keyword": "KEEP", "limit": 10},
+    )
+
+    assert recalled["count"] == 2
+    assert "活跃真实入站 KEEP" in recalled["content"]
+    assert "活跃机器人已发送 KEEP" in recalled["content"]
+    assert all(result["role"] in {"user", "assistant"} for result in recalled["results"])
+    assert "delete memory result" not in recalled["content"]
+    assert "task_context" not in recalled["content"]
+    assert "send_status" not in recalled["content"]
+    assert "send_receipt" not in recalled["content"]
 
 
 @pytest.mark.asyncio

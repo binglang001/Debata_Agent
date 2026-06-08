@@ -23,6 +23,7 @@ from dataclasses import asdict, is_dataclass
 from html import unescape
 from typing import Any
 
+from memory.archive import real_chat_archive_records
 from utils.token_budget import TokenEstimator
 
 from .base import ToolContext, tool
@@ -1242,13 +1243,14 @@ async def recall_history(args: RecallHistoryArgs, ctx: ToolContext) -> dict:
         )
     if not args.archive_ids and ctx.history is not None:
         for record in await ctx.history.records():
-            if _history_record_matches(
-                record,
-                conversation_id=args.conversation_id,
-                keyword=args.keyword,
-                time_range=args.time_range,
-            ):
-                records.append(record)
+            for chat_record in real_chat_archive_records(record):
+                if _history_record_matches(
+                    chat_record,
+                    conversation_id=args.conversation_id,
+                    keyword=args.keyword,
+                    time_range=args.time_range,
+                ):
+                    records.append(chat_record)
         records = records[-args.limit:]
 
     markdown = _format_history_recall_markdown(records)
@@ -1451,14 +1453,15 @@ async def _local_summary_records(
                 records.append(copied)
     if ctx.history is not None:
         for record in await ctx.history.records():
-            if _summary_record_matches(
-                record,
-                conversation_id=conversation_id,
-                range_hint=range_hint,
-            ):
-                copied = dict(record)
-                copied["_source"] = "active"
-                records.append(copied)
+            for chat_record in real_chat_archive_records(record):
+                if _summary_record_matches(
+                    chat_record,
+                    conversation_id=conversation_id,
+                    range_hint=range_hint,
+                ):
+                    copied = dict(chat_record)
+                    copied["_source"] = "active"
+                    records.append(copied)
     return records
 
 
