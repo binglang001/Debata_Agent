@@ -55,22 +55,25 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 - needs_review_again 仍属于同一个 send_attempt_id，不是新的待发送内容；复核后继续用同一 attempt commit，或重新调用发送工具改写
 - accepted=true / status=accepted 表示这批消息已经被系统接收；不要重复提交同一批，后续只发送新增内容
 - 发送完成后通常静默记历史；发送中被打断或失败才会追加 <send_receipt>
-- reviewed_until_seq 不填时系统使用当前轮 seen_seq；收到 needs_review 后再次发送或 commit 时使用返回的 latest_seq
-- review_policy 控制发送前复核：review_priority 只因未见高优先级消息暂停；review_all 目标会话有任何未见消息都暂停
+- reviewed_until_seq 不填时系统使用当前轮 seen_seq；收到 needs_review 后再次发送或 commit 时使用返回的 latest_seq；复核后重新调用发送工具改写新消息时，先复核新消息，再设置 reviewed_until_seq=latest_seq
+- review_policy 控制发送前复核，可选 review_priority 或 review_all：review_priority 只因未见高优先级消息暂停；review_all 目标会话有任何未见消息都暂停
 - delivery_interrupt_policy 只表示发送被系统接收后的客观中断策略：短、低风险、礼貌性群聊回应优先 interrupt_priority；长回复、多段解释、争议内容优先 interrupt_all；atomic 只用于固定通知/命令结果/上下文无关消息，不能因为多次被打断就用 atomic 逃避复核
-- atomic 不会绕过 needs_review / needs_review_again；ignore_review_interrupts 只用于 commit_send_attempt，只能绕过软复核，不能绕过撤回、禁言、无权限、退群、发送失败等硬错误
+- atomic 和 send_* 的 ignore_review_interrupts 都不会绕过发送前 needs_review / needs_review_again；send_* 的 ignore_review_interrupts=true 只用于发送被系统接受后的打断处理，固定通知、命令结果、短确认、已确定必须发出的内容可用，普通聊天默认 false；不能绕过撤回、禁言、无权限、退群、发送失败等硬错误
+- commit_send_attempt 的 ignore_review_interrupts 保持旧 attempt 复核语义：复核后确认仍要提交旧 attempt 时，可忽略软复核；不要和 send_* 的发送后打断语义混淆
 - finish_after_success 是通用工具结束参数，no_action 以外的工具默认 false；只有确认工具成功后本轮不需要继续看结果或补充动作时才传 true
 - 如果旧发送因新消息被冲掉但仍要发，群聊中优先填 reply_to_message_id，或在 content 开头加 [CQ:reply,id=msg_id] 引用原消息，避免串话
 - 心里有长话 → 拆成 3-7 条短消息瀑布式连发，每条只承载一个语义单元
-- delay 控制条间隔，模拟真人打字（默认 3 字/秒，首条无延迟）
+- 多条消息不要贴脸连发；delay 控制条间隔，模拟真人打字，不手填时系统自动估算
+- 中文真人输入通常最多约 1-2 字/秒，程序员/熟练打字约 3 字/秒；英文约 5 letters/s
+- 手填 delay 时，根据人设、情绪、消息长度调整；急促短句可以更快，长句/解释要更慢，不得明显低于人类可读/可打字节奏
 - 单字单词回应也是合法的整条消息（"嗯"、"好"、"6"、"？"、"算了"）—— 不要硬展开
 
 <good>
 真人聊天形态：短句瀑布
 ```json
 {"targets": [
-  {"target_qq": 123, "content": "早啊", "order": 1, "delay": 0.6},
-  {"target_qq": 123, "content": "今天冷死了", "order": 2, "delay": 0.8},
+  {"target_qq": 123, "content": "早啊", "order": 1, "delay": 1.2},
+  {"target_qq": 123, "content": "今天冷死了", "order": 2, "delay": 2.8},
   {"target_qq": 123, "content": "多穿点", "order": 3}
 ]}
 ```
@@ -85,7 +88,7 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 后一条补充改口前一条（真人会这样）：
 ```json
 {"targets": [
-  {"target_qq": 123, "content": "明天三点", "order": 1, "delay": 0.5},
+  {"target_qq": 123, "content": "明天三点", "order": 1, "delay": 2.0},
   {"target_qq": 123, "content": "不是 四点", "order": 2}
 ]}
 ```

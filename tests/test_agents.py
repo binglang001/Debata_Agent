@@ -183,8 +183,23 @@ def test_tool_use_protocol_documents_runtime_contracts_without_legacy_terms():
     assert "finish_after_success" in s
     assert "no_action 是唯一显式沉默终止工具" in s
     assert "needs_review_again 仍属于同一个 send_attempt_id" in s
-    assert "atomic 不会绕过 needs_review / needs_review_again" in s
-    assert "ignore_review_interrupts 只用于 commit_send_attempt" in s
+    assert "atomic 和 send_* 的 ignore_review_interrupts 都不会绕过发送前 needs_review / needs_review_again" in s
+    assert "send_* 的 ignore_review_interrupts=true 只用于发送被系统接受后的打断处理" in s
+    assert "不能绕过撤回、禁言、无权限、退群、发送失败等硬错误" in s
+    assert "复核后重新调用发送工具改写新消息时，先复核新消息" in s
+    assert "commit_send_attempt 的 ignore_review_interrupts 保持旧 attempt 复核语义" in s
+    assert "中文真人输入通常最多约 1-2 字/秒" in s
+    assert "程序员/熟练打字约 3 字/秒" in s
+    assert "英文约 5 letters/s" in s
+    assert "多条消息不要贴脸连发" in s
+    assert '"delay": 0.6' not in s
+    assert '"delay": 0.8' not in s
+    assert '"delay": 0.5' not in s
+    assert '"content": "早啊", "order": 1, "delay": 1.2' in s
+    assert '"content": "今天冷死了", "order": 2, "delay": 2.8' in s
+    assert '"content": "明天三点", "order": 1, "delay": 2.0' in s
+    assert "ignore_review_interrupts 只用于 commit_send_attempt" not in s
+    assert "复核后重新调用发送工具改写新内容，必要时传 true 只绕过软复核" not in s
     assert "update_important_memory" in s
     assert "运行时噪声" in s
     assert "tool_search 查询完整参数" in s

@@ -98,6 +98,9 @@ def _send_metadata_from_args(args: SendPrivateArgs | SendGroupArgs) -> dict:
             "delivery_interrupt_policy",
             "interrupt_priority",
         ),
+        "ignore_review_interrupts": bool(
+            getattr(args, "ignore_review_interrupts", False)
+        ),
         "responding_to_message_ids": responding_ids,
         "reply_to_message_id": reply_to or None,
         "reason": getattr(args, "reason", None),

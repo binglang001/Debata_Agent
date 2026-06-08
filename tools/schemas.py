@@ -96,6 +96,15 @@ class SendPrivateArgs(_ToolArgs):
             "atomic=普通新消息不阻断，只适合固定通知/命令结果，不要用来逃避频繁打断。"
         ),
     )
+    ignore_review_interrupts: bool = Field(
+        default=False,
+        description=(
+            "发送工具调用被系统接受后，忽略后续普通新消息造成的软打断，"
+            "不把这次发送改成 interrupted/attempt。不能绕过发送前 needs_review，"
+            "也不能绕过撤回、权限变化、禁言、退群、发送失败等硬错误。"
+            "默认 false。"
+        ),
+    )
     responding_to_message_ids: list[str] = Field(
         default_factory=list,
         description="可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；不确定不要编造。",
@@ -173,6 +182,15 @@ class SendGroupArgs(_ToolArgs):
             "atomic=普通新消息不阻断，只适合固定通知/命令结果，不要用来逃避频繁打断。"
         ),
     )
+    ignore_review_interrupts: bool = Field(
+        default=False,
+        description=(
+            "发送工具调用被系统接受后，忽略后续普通新消息造成的软打断，"
+            "不把这次发送改成 interrupted/attempt。不能绕过发送前 needs_review，"
+            "也不能绕过撤回、权限变化、禁言、退群、发送失败等硬错误。"
+            "默认 false。"
+        ),
+    )
     responding_to_message_ids: list[str] = Field(
         default_factory=list,
         description="可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；不确定不要编造。",
@@ -215,7 +233,7 @@ class CommitSendAttemptArgs(_ToolArgs):
         default=False,
         description=(
             "仅在确认旧 attempt 前忽略软复核打断并继续提交；"
-            "不能绕过撤回、权限变化、发送失败等硬错误。默认 false。"
+            "不能绕过撤回、权限变化、禁言、退群、发送失败等硬错误。默认 false。"
         ),
     )
     reason: str | None = Field(
@@ -972,6 +990,14 @@ class SendVoiceMessageArgs(_ToolArgs):
         description=(
             "必填：一句话描述语气/音色/节奏，如「年轻女性，轻松调侃，语速中等，尾音自然」。"
             "语气提示会显著影响 TTS 质量，不要省略。"
+        ),
+    )
+    ignore_review_interrupts: bool = Field(
+        default=False,
+        description=(
+            "语音发送被系统接受后，忽略后续普通新消息造成的软打断。"
+            "不能绕过发送前 needs_review，也不能绕过撤回、权限变化、禁言、退群、发送失败等硬错误。"
+            "默认 false。"
         ),
     )
 

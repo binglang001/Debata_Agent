@@ -290,6 +290,35 @@ def test_schema_no_refs_in_output():
         assert "$defs" not in text, f"{spec_name}: schema 含 $defs"
 
 
+def test_send_schemas_expose_review_policy_and_ignore_review_interrupts():
+    specs = {s.name: s for s in get_default_specs()}
+    for spec_name in (
+        "send_private_messages",
+        "send_group_message",
+        "send_voice_message",
+    ):
+        schema = specs[spec_name].full_parameters_schema()
+        props = schema["properties"]
+        required = schema.get("required", [])
+
+        assert "ignore_review_interrupts" in props
+        assert props["ignore_review_interrupts"]["default"] is False
+        assert "系统接受后" in props["ignore_review_interrupts"]["description"]
+        assert "不能绕过发送前 needs_review" in props["ignore_review_interrupts"]["description"]
+        assert "ignore_review_interrupts" not in required
+
+    for spec_name in ("send_private_messages", "send_group_message"):
+        schema = specs[spec_name].to_openai_schema()
+        props = schema["function"]["parameters"]["properties"]
+        required = schema["function"]["parameters"].get("required", [])
+        assert "review_policy" in props
+        assert set(props["review_policy"]["enum"]) == {"review_priority", "review_all"}
+        assert props["review_policy"]["default"] == "review_priority"
+        assert "review_priority" in props["review_policy"]["description"]
+        assert "review_all" in props["review_policy"]["description"]
+        assert "review_policy" not in required
+
+
 def test_commit_send_attempt_schema_exposes_ignore_review_interrupts():
     specs = {s.name: s for s in get_default_specs()}
     schema = specs["commit_send_attempt"].to_openai_schema()
@@ -749,6 +778,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "target_id": 123,
             "text": "语音测试",
             "prompt": "年轻女性，自然口语",
+            "ignore_review_interrupts": True,
         },
         "save_important_memory": {"memory_text": "用户喜欢红茶"},
         "update_important_memory": {
@@ -900,6 +930,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     ] == ["send_voice_message", "send_private_messages", "send_group_message"]
     assert results["commit_send_attempt"]["status"] == "already_committed"
     assert sent_actions[0]["actions"][0]["kind"] == "voice"
+    assert sent_actions[0]["metadata"]["ignore_review_interrupts"] is True
     assert sent_actions[1]["actions"][0]["target_scope"] == "private"
     assert sent_actions[1]["actions"][0]["content"] == "你好"
     assert sent_actions[2]["actions"][0]["target_scope"] == "group"

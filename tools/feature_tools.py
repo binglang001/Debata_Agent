@@ -412,6 +412,10 @@ async def send_voice_message(args: SendVoiceMessageArgs, ctx: ToolContext) -> di
                 }
             ],
             "send_voice_message",
+            metadata={
+                "ignore_review_interrupts": args.ignore_review_interrupts,
+                "tool_call_id": str(ctx.extras.get("tool_call_id") or ""),
+            },
         )
 
     try:

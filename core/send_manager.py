@@ -62,6 +62,7 @@ class _SendJob:
     actions: list[dict[str, Any]]
     source_tool: str
     interrupt_policy: str
+    ignore_review_interrupts: bool
     trigger_message_id: str | None
     trigger_inbound_seq: int
     trigger_user_id: str | None
@@ -79,6 +80,8 @@ class _SendConversationState:
     needs_resync: bool = False
     in_flight: bool = False
     active_interrupt_policy: str = "interrupt_all"
+    active_ignore_review_interrupts: bool = False
+    deferred_queue_interrupt_pending: bool = False
     active_trigger_user_id: str | None = None
     active_trigger_message_id: str | None = None
 
@@ -160,6 +163,12 @@ class _AsyncSendManager:
         msg = self._inbound_to_receipt_message(ref)
         state = self._state(item.conversation_id)
         if state.in_flight or state.queue:
+            if self._ignores_post_send_interrupts(state):
+                if self._queued_jobs_should_interrupt(state, item, msg):
+                    state.needs_resync = True
+                    state.deferred_queue_interrupt_pending = True
+                    state.interrupt_messages.append(msg)
+                return
             if not self._inbound_should_interrupt(state, item, msg):
                 return
             state.needs_resync = True
@@ -356,6 +365,7 @@ class _AsyncSendManager:
             normalized,
             groups,
             source_tool,
+            ignore_review_interrupts=bool(metadata.get("ignore_review_interrupts")),
             trigger_message_id=trigger_message_id,
             trigger_inbound_seq=trigger_inbound_seq,
             trigger_user_id=trigger_user_id,
@@ -370,6 +380,7 @@ class _AsyncSendManager:
         groups: dict[str, list[dict[str, Any]]],
         source_tool: str,
         *,
+        ignore_review_interrupts: bool,
         trigger_message_id: str | None,
         trigger_inbound_seq: int,
         trigger_user_id: str | None,
@@ -393,6 +404,7 @@ class _AsyncSendManager:
                 actions=group_actions,
                 source_tool=source_tool,
                 interrupt_policy=self._group_interrupt_policy(group_actions),
+                ignore_review_interrupts=ignore_review_interrupts,
                 trigger_message_id=trigger_message_id,
                 trigger_inbound_seq=trigger_inbound_seq,
                 trigger_user_id=trigger_user_id,
@@ -496,6 +508,7 @@ class _AsyncSendManager:
             normalized,
             groups,
             attempt.source_tool,
+            ignore_review_interrupts=False,
             trigger_message_id=attempt.trigger_message_id,
             trigger_inbound_seq=attempt.trigger_inbound_seq,
             trigger_user_id=attempt.trigger_user_id,
@@ -517,6 +530,7 @@ class _AsyncSendManager:
     def mark_receipts_delivered(self, conversation_id: str) -> None:
         state = self._state(conversation_id)
         state.needs_resync = False
+        state.deferred_queue_interrupt_pending = False
         state.interrupt_messages.clear()
         state.recall_events.clear()
         state.interrupt_event.clear()
@@ -525,6 +539,7 @@ class _AsyncSendManager:
         """清理已处理的 resync 标记。"""
         state = self._state(conversation_id)
         state.needs_resync = False
+        state.deferred_queue_interrupt_pending = False
         state.interrupt_messages.clear()
         state.recall_events.clear()
         state.interrupt_event.clear()
@@ -881,6 +896,55 @@ class _AsyncSendManager:
             trigger_message_id=state.active_trigger_message_id,
         )
 
+    @staticmethod
+    def _ignores_post_send_interrupts(state: _SendConversationState) -> bool:
+        if state.in_flight:
+            return state.active_ignore_review_interrupts
+        if state.queue:
+            return bool(state.queue[0].ignore_review_interrupts)
+        return False
+
+    def _queued_jobs_should_interrupt(
+        self,
+        state: _SendConversationState,
+        item: PendingMessageItem,
+        msg: dict[str, Any],
+    ) -> bool:
+        queued = list(state.queue)
+        if not state.in_flight and queued:
+            queued = queued[1:]
+        for job in queued:
+            if job.ignore_review_interrupts:
+                continue
+            probe = dict(msg)
+            if self._job_should_interrupt(job, item, probe):
+                msg.update(
+                    {
+                        key: value
+                        for key, value in probe.items()
+                        if key == "priority_reason"
+                    }
+                )
+                return True
+        return False
+
+    def _job_should_interrupt(
+        self,
+        job: _SendJob,
+        item: PendingMessageItem,
+        msg: dict[str, Any],
+    ) -> bool:
+        if job.interrupt_policy == "interrupt_all":
+            return True
+        if job.interrupt_policy == "atomic":
+            return False
+        return self._is_priority_inbound(
+            item,
+            msg,
+            trigger_user_id=job.trigger_user_id,
+            trigger_message_id=job.trigger_message_id,
+        )
+
     def _model_thinking_inbound_should_interrupt(
         self,
         item: PendingMessageItem,
@@ -974,8 +1038,14 @@ class _AsyncSendManager:
                 job = state.queue.popleft()
                 state.in_flight = True
                 state.active_interrupt_policy = job.interrupt_policy
+                state.active_ignore_review_interrupts = job.ignore_review_interrupts
                 state.active_trigger_user_id = job.trigger_user_id
                 state.active_trigger_message_id = job.trigger_message_id
+                if (
+                    state.deferred_queue_interrupt_pending
+                    and not job.ignore_review_interrupts
+                ):
+                    state.interrupt_event.set()
                 sent: list[dict[str, Any]] = []
                 errors: list[str] = []
                 interrupted = False
@@ -1040,10 +1110,12 @@ class _AsyncSendManager:
                     state.interrupt_event.clear()
                     state.interrupt_messages.clear()
                     state.recall_events.clear()
+                    state.deferred_queue_interrupt_pending = False
                     break
         finally:
             state.in_flight = False
             state.active_interrupt_policy = "interrupt_all"
+            state.active_ignore_review_interrupts = False
             state.active_trigger_user_id = None
             state.active_trigger_message_id = None
             state.worker = None
