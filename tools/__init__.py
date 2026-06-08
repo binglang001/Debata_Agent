@@ -190,21 +190,21 @@ STUB_SCHEMA_TOOLS: set[str] = {
     "set_group_whole_ban",
     "set_group_leave",
 }
-"""低频/高风险/大 schema 工具：常驻名称与简述，调用前通过 tool_search 查询。"""
+"""低频/高风险/大 schema 工具：常驻名称与简述，调用前通过 tool_search 查询参数摘要。"""
 
 
 _STUB_SHORT_DESCRIPTIONS: dict[str, str] = {
-    "start_agent_task": "低频资料整理工具。调用前先用 tool_search 查询完整 sources 参数和约束。",
-    "summarize_chat_history": "低频群历史总结工具。调用前先用 tool_search 查询参数。",
-    "summarize_conversation": "低频本地会话总结工具。调用前先用 tool_search 查询参数。",
-    "filter_archive_records": "低频归档筛选工具。调用前先用 tool_search 查询参数。",
-    "recall_history": "低频归档检索工具。调用前先用 tool_search 查询参数。",
-    "upload_file": "文件发送工具。涉及本地文件和 QQ 上传，调用前先用 tool_search 查询约束。",
-    "send_voice_message": "语音发送工具。需要 TTS 与语气 prompt，调用前先用 tool_search 查询参数。",
-    "set_group_kick": "高风险群管理工具。踢出群成员前必须 tool_search 查询约束和参数。",
-    "set_group_ban": "高风险群管理工具。禁言群成员前必须 tool_search 查询约束和参数。",
-    "set_group_whole_ban": "高风险群管理工具。全员禁言前必须 tool_search 查询约束和参数。",
-    "set_group_leave": "高风险群管理工具。机器人退群前必须 tool_search 查询约束和参数。",
+    "start_agent_task": "低频资料整理工具。先用 tool_search 查询参数摘要；需要完整 schema 时 detail=full。",
+    "summarize_chat_history": "低频群历史总结工具。先用 tool_search 查询参数摘要；需要完整 schema 时 detail=full。",
+    "summarize_conversation": "低频本地会话总结工具。先用 tool_search 查询参数摘要；需要完整 schema 时 detail=full。",
+    "filter_archive_records": "低频归档筛选工具。先用 tool_search 查询参数摘要；需要完整 schema 时 detail=full。",
+    "recall_history": "低频归档检索工具。先用 tool_search 查询参数摘要；需要完整 schema 时 detail=full。",
+    "upload_file": "文件发送工具。先用 tool_search 查询参数摘要和约束；需要完整 schema 时 detail=full。",
+    "send_voice_message": "语音发送工具。先用 tool_search 查询参数摘要；需要完整 schema 时 detail=full。",
+    "set_group_kick": "高风险群管理工具。先用 tool_search 查询参数摘要和约束；需要完整 schema 时 detail=full。",
+    "set_group_ban": "高风险群管理工具。先用 tool_search 查询参数摘要和约束；需要完整 schema 时 detail=full。",
+    "set_group_whole_ban": "高风险群管理工具。先用 tool_search 查询参数摘要和约束；需要完整 schema 时 detail=full。",
+    "set_group_leave": "高风险群管理工具。先用 tool_search 查询参数摘要和约束；需要完整 schema 时 detail=full。",
 }
 
 
@@ -229,7 +229,7 @@ def build_default_registry(config) -> ToolRegistry:
         - platform 工具：始终启用（按需）
         - control 工具：始终启用
         - feature 工具：始终注册；执行时按 ctx 是否注入 service 返回成功或未启用
-        - 低频/高风险/大 schema 工具：始终注册为 stub，通过 tool_search 查询完整参数
+        - 低频/高风险/大 schema 工具：始终注册为 stub，通过 tool_search 查询参数摘要
 
     Args:
         config: RootConfig 实例

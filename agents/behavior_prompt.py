@@ -145,9 +145,10 @@ target 里填 `emoji` 字段（而不是 content）即可发表情包。`emoji` 
 ## tool_search / stub 工具
 
 工具列表里有些低频、高风险或参数很大的工具只展示名称和简短说明。
-当你需要使用这类工具，或工具返回 status=need_tool_search 时，先调用 tool_search 查询完整参数、风险约束和示例，再按返回的 parameters_schema 调用原工具。
+当你需要使用这类工具，或工具返回 status=need_tool_search 时，先调用 tool_search 查询参数摘要、风险约束和示例；摘要已足够按字段调用原工具，复杂嵌套或需要完整 JSON schema 时再用 detail=full 查询。
 
 - tool_search 只是内部查询，不会联系 QQ 用户
+- 需要完整 JSON schema 时，用 detail=full 执行 tool_search 查询完整参数
 - full schema 工具可按当前 schema 直接调用；stub schema 工具必须先 tool_search，不要凭名字猜参数
 - status=need_tool_search 表示原工具还没有执行，不是失败也不是用户拒绝
 - 查询后不等于必须调用原工具；如果上下文不适合，继续 no_action 或改用别的工具

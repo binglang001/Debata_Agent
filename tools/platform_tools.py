@@ -1178,14 +1178,21 @@ async def summarize_conversation(args: SummarizeConversationArgs, ctx: ToolConte
     args_model=FilterArchiveRecordsArgs,
     category="platform",
     schema_mode="stub",
-    short_description="低频归档筛选工具。调用前先用 tool_search 查询完整参数。",
+    short_description="低频归档筛选工具。先用 tool_search 查询参数摘要；需要完整 schema 时 detail=full。",
     search_tags=["platform", "archive", "history", "recall"],
 )
 async def filter_archive_records(args: FilterArchiveRecordsArgs, ctx: ToolContext) -> dict:
     if ctx.archive is None:
         return {"ok": False, "error": "未配置本地历史归档"}
 
-    result = await ctx.archive.filter_records(args)
+    raw_result = await ctx.archive.filter_records(args)
+    result = dict(raw_result)
+    raw_results = raw_result.get("results") or []
+    result["results"] = [
+        _archive_filter_summary_result(record)
+        for record in raw_results
+        if isinstance(record, dict)
+    ]
     result["status"] = "inline"
     result["brief"] = (
         f"筛出 {result.get('count', 0)} 条候选归档记录"
@@ -1198,6 +1205,10 @@ async def filter_archive_records(args: FilterArchiveRecordsArgs, ctx: ToolContex
         "offset": result.get("offset"),
         "order": result.get("order"),
     }
+    result["next"] = (
+        "默认只返回摘要和归档 ID；需要完整原文或前后文时，把 results[].id "
+        "传给 recall_history 的 archive_ids，并按需设置 context_before/context_after。"
+    )
     return result
 
 
@@ -1335,6 +1346,28 @@ def _history_record_matches(
     if time_range and time_range not in text:
         return False
     return True
+
+
+def _archive_filter_summary_result(record: dict[str, Any]) -> dict[str, Any]:
+    content = str(record.get("content") or record.get("summary") or "").strip()
+    return {
+        "id": record.get("id") or record.get("archive_id"),
+        "time": record.get("time") or record.get("timestamp"),
+        "conversation_id": record.get("conversation_id"),
+        "sender": record.get("sender"),
+        "sender_id": record.get("sender_id"),
+        "sender_name": record.get("sender_name"),
+        "direction": record.get("direction"),
+        "kind": record.get("kind") or record.get("message_kind"),
+        "snippet": _compact_archive_snippet(content),
+    }
+
+
+def _compact_archive_snippet(content: str, *, limit: int = 120) -> str:
+    compacted = " ".join(content.split())
+    if len(compacted) <= limit:
+        return compacted
+    return compacted[: limit - 1].rstrip() + "..."
 
 
 def _format_history_recall_markdown(records: list[dict[str, Any]]) -> str:

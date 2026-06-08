@@ -513,7 +513,11 @@ async def test_filter_tool_and_recall_history_expand_archive_ids_same_conversati
     assert filtered["ok"] is True
     assert filtered["count"] == 1
     target_id = filtered["results"][0]["id"]
-    assert "目标茶会记录" in filtered["results"][0]["content"]
+    assert "content" not in filtered["results"][0]
+    assert "目标茶会记录" in filtered["results"][0]["snippet"]
+    assert filtered["results"][0]["conversation_id"] == "group:2"
+    assert filtered["results"][0]["sender_id"] == "2"
+    assert "recall_history" in filtered["next"]
 
     recalled = await executor(
         "recall_history",

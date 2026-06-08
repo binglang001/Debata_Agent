@@ -1,4 +1,4 @@
-"""工具检索入口：为 stub 工具按需返回完整 schema。"""
+"""工具检索入口：为 stub 工具按需返回参数摘要或完整 schema。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from .schemas import ToolSearchArgs
 @tool(
     name="tool_search",
     description=(
-        "查询工具的完整说明、真实参数 schema、示例和风险约束。"
+        "查询工具的说明、真实参数摘要/完整 JSON schema、示例和风险约束。"
         "当工具 schema 只有简短 stub，或你不确定参数/风险时先调用。"
     ),
     args_model=ToolSearchArgs,
@@ -41,6 +41,6 @@ async def tool_search(args: ToolSearchArgs, ctx: ToolContext) -> dict:
     approved = ctx.extras.setdefault("tool_search_approved_tools", set())
     if isinstance(approved, set):
         approved.add(spec.name)
-    result = spec.tool_search_result()
+    result = spec.tool_search_result(detail=args.detail)
     result["intent"] = args.intent
     return result

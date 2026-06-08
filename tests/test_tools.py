@@ -34,6 +34,7 @@ from tools.message_builder import MessageBuildError, resolve_emoji_path
 from tools.result_shrink import tool_budget
 from tools.schemas import (
     SendVoiceMessageArgs,
+    ToolSearchArgs,
 )
 
 
@@ -568,7 +569,13 @@ def test_registry_stub_and_full_schema_modes_are_stable():
     assert filter_archive_spec is not None
     assert {"archive", "history", "recall"}.issubset(filter_archive_spec.search_tags)
     assert "targets" in schema_by_name["send_private_messages"]["parameters"]["properties"]
-    assert "tool_name" in schema_by_name["tool_search"]["parameters"]["properties"]
+    tool_search_props = schema_by_name["tool_search"]["parameters"]["properties"]
+    assert "tool_name" in tool_search_props
+    assert tool_search_props["detail"]["enum"] == ["summary", "full"]
+    assert tool_search_props["detail"]["default"] == "summary"
+    args_detail_schema = ToolSearchArgs.model_json_schema()["properties"]["detail"]
+    assert args_detail_schema["enum"] == ["summary", "full"]
+    assert args_detail_schema["default"] == "summary"
 
 
 def test_registry_excludes_sensitive_and_unused_napcat_apis():
@@ -613,8 +620,35 @@ async def test_stub_tool_requires_tool_search_before_execution(tmp_path):
     assert details["ok"] is True
     assert details["status"] == "found"
     assert details["tool_name"] == "upload_file"
-    assert "file_path" in details["parameters_schema"]["properties"]
+    assert "parameters_schema" not in details
+    assert "parameters" in details
+    assert "parameter_summary" in details
+    assert {"constraints", "examples", "risk_level", "next"}.issubset(details)
     assert "file_path" in details["required_fields"]
+    parameter_by_name = {item["name"]: item for item in details["parameters"]}
+    assert "file_path" in parameter_by_name
+    assert "target_type" in parameter_by_name
+    assert "target_id" in parameter_by_name
+    assert parameter_by_name["target_type"]["enum"] == ["private", "group"]
+    assert "完整 JSON schema" in details["next"]
+
+    archive_details = await executor("tool_search", {"tool_name": "filter_archive_records"})
+    archive_parameter_by_name = {
+        item["name"]: item for item in archive_details["parameters"]
+    }
+    time_ranges = archive_parameter_by_name["time_ranges"]
+    assert time_ranges["type"] == "array"
+    assert time_ranges["items"]["type"] == "object"
+    time_range_fields = {
+        item["name"]: item for item in time_ranges["items"]["fields"]
+    }
+    assert {"start", "end"}.issubset(time_range_fields)
+
+    full_details = await executor(
+        "tool_search",
+        {"tool_name": "upload_file", "detail": "full", "intent": "发送文件"},
+    )
+    assert "file_path" in full_details["parameters_schema"]["properties"]
 
     sent = await executor(
         "upload_file",
@@ -951,7 +985,10 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert adapter.uploaded["display_name"] == "report.md"
     assert results["tool_search"]["status"] == "found"
     assert results["tool_search"]["tool_name"] == "upload_file"
-    assert "file_path" in results["tool_search"]["parameters_schema"]["properties"]
+    assert "parameters_schema" not in results["tool_search"]
+    assert "file_path" in {
+        item["name"] for item in results["tool_search"]["parameters"]
+    }
 
     assert results["list_contacts"]["data"]["scope"] == "friends"
     assert results["list_contacts"]["friends"][0]["nickname"] == "Alice"
@@ -985,6 +1022,8 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert agent_tasks[2]["sources"][0]["conversation_id"] == "private:123"
     assert results["filter_archive_records"]["count"] == 1
     assert results["filter_archive_records"]["results"][0]["id"] == "a1"
+    assert "content" not in results["filter_archive_records"]["results"][0]
+    assert "归档消息 keyword" in results["filter_archive_records"]["results"][0]["snippet"]
     assert results["recall_history"]["count"] == 1
     assert "归档消息 keyword" in results["recall_history"]["content"]
 
@@ -2374,7 +2413,7 @@ async def test_group_admin_stub_requires_tool_search_before_execution():
     assert result["status"] == "need_tool_search"
     assert adapter.api_calls == []
 
-    details = await executor("tool_search", {"tool_name": "set_group_ban"})
+    details = await executor("tool_search", {"tool_name": "set_group_ban", "detail": "full"})
     assert details["ok"] is True
     assert details["risk_level"] == "high"
     assert "duration_seconds" in details["parameters_schema"]["properties"]

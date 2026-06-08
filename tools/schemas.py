@@ -326,7 +326,11 @@ class ToolSearchArgs(_ToolArgs):
     tool_name: str = Field(
         ...,
         min_length=1,
-        description="要查询完整说明和真实参数 schema 的工具名。",
+        description="要查询说明和真实参数的工具名。",
+    )
+    detail: Literal["summary", "full"] = Field(
+        default="summary",
+        description="返回参数摘要还是完整 JSON schema。summary 默认足够直接调用；复杂嵌套时可用 full。",
     )
     intent: str | None = Field(
         default=None,
