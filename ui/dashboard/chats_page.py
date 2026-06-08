@@ -13,9 +13,9 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..theme import Spacing
+from ..theme import Spacing, palette_for_theme, resolve_theme_name
 from ..wizard.components import EmptyState
 from .copy import DASHBOARD_COPY
 
@@ -88,6 +88,7 @@ class ChatsPage(QWidget):
         self._current_detail_html = ""
         self._visible_record_limits: dict[str, int] = {}
         self._search_text = ""
+        self._expanded_item_ids: set[str] = set()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -152,6 +153,8 @@ class ChatsPage(QWidget):
 
         self._detail = QTextBrowser()
         self._detail.setPlaceholderText("点选左侧某个会话查看")
+        self._detail.setOpenLinks(False)
+        self._detail.anchorClicked.connect(self._on_detail_anchor_clicked)
         splitter.addWidget(self._detail)
 
         splitter.setStretchFactor(0, 1)
@@ -320,6 +323,17 @@ class ChatsPage(QWidget):
         self._current_detail_html = ""
         self._refresh_current_detail()
 
+    def _on_detail_anchor_clicked(self, url: QUrl) -> None:
+        item_id = _toggle_item_id_from_url(url)
+        if not item_id:
+            return
+        if item_id in self._expanded_item_ids:
+            self._expanded_item_ids.remove(item_id)
+        else:
+            self._expanded_item_ids.add(item_id)
+        self._current_detail_html = ""
+        self._refresh_current_detail()
+
     def _update_load_more_state(self, conv: dict | None = None) -> None:
         if conv is None and self._current_key:
             conv = next((c for c in self._conversations if c["key"] == self._current_key), None)
@@ -382,24 +396,7 @@ class ChatsPage(QWidget):
         visible = filtered_items[-limit:] if limit > 0 else filtered_items
         hidden = max(0, len(filtered_items) - len(visible))
         parts = [
-            "<style>"
-            ".chat-record{margin:10px 0;}"
-            ".chat-bubble{padding:10px 12px;border-radius:8px;overflow-wrap:anywhere;word-break:break-word;}"
-            ".chat-user{background:#F6F1E8;}"
-            ".chat-assistant{background:#EAF4F0;}"
-            ".chat-tool{background:#EEF4FA;}"
-            ".chat-inbound{margin-right:12%;}"
-            ".chat-outbound{margin-left:12%;}"
-            ".chat-event{padding:8px 10px;border-left:3px solid #C8C1BA;color:#5F5952;background:#F7F6F4;overflow-wrap:anywhere;word-break:break-word;}"
-            ".chat-event-tool{border-color:#9DB9D3;background:#F5F8FB;}"
-            ".chat-event-system{border-color:#C8C1BA;background:#F7F6F4;}"
-            ".chat-head{font-weight:600;margin-bottom:6px;}"
-            ".chat-meta{color:#7A7168;font-size:12px;}"
-            ".chat-pre{white-space:pre-wrap;margin:6px 0 0 0;overflow-wrap:anywhere;word-break:break-word;}"
-            ".chat-summary{color:#6B635A;}"
-            ".chat-tool-list{margin:6px 0 0 18px;}"
-            ".chat-tool-result{margin:8px 0 0 0;padding:8px 10px;border-left:3px solid #9DB9D3;background:#F8FBFD;}"
-            "</style>"
+            _chat_html_style(_runtime_theme_name(self._runtime)),
             f"<h3 style='margin:0 0 4px 0'>{_escape(conv['label'])}</h3>"
             f"<div class='chat-meta'>已显示 {len(visible)} / 共 {len(all_items)} 条"
             f"；当前过滤后 {len(filtered_items)} 条</div>"
@@ -417,7 +414,7 @@ class ChatsPage(QWidget):
                 "</div>"
             )
         for item in visible:
-            parts.append(_render_display_item(item))
+            parts.append(_render_display_item(item, expanded_item_ids=self._expanded_item_ids))
             parts.append("<hr/>")
         return "".join(parts)
 
@@ -426,6 +423,82 @@ class ChatsPage(QWidget):
             rec,
             persona_name=_runtime_persona_name(self._runtime),
         )
+
+
+def _runtime_theme_name(runtime: Any) -> str:
+    cfg = getattr(runtime, "config", None)
+    app = getattr(cfg, "app", None)
+    theme = getattr(app, "theme", None)
+    if theme in {"light", "dark", "auto"}:
+        return resolve_theme_name(theme)
+    return resolve_theme_name("auto")
+
+
+def _chat_html_style(theme_name: str) -> str:
+    palette = palette_for_theme(theme_name)
+    if palette.name == "dark":
+        bot_bg = "#302B26"
+        peer_bg = "#213631"
+        event_bg = "#292522"
+        event_tool_bg = "#202832"
+        result_bg = "#1D252C"
+    else:
+        bot_bg = "#F1E8D6"
+        peer_bg = "#E8F1ED"
+        event_bg = "#F7F3EA"
+        event_tool_bg = "#F2F6FA"
+        result_bg = "#F8FBFD"
+    return (
+        "<style>"
+        ".chat-record{margin:10px 0;}"
+        ".chat-row{width:100%;}"
+        ".chat-bubble{display:inline-block;max-width:78%;text-align:left;"
+        "padding:10px 12px;border-radius:8px;"
+        f"border:1px solid {palette.border};color:{palette.text_primary};"
+        "overflow-wrap:anywhere;word-break:break-word;}"
+        f".chat-bot .chat-bubble{{background:{bot_bg};}}"
+        f".chat-peer .chat-bubble{{background:{peer_bg};}}"
+        ".chat-left{margin-right:16%;}"
+        ".chat-right{margin-left:16%;}"
+        ".chat-left{text-align:left;}"
+        ".chat-right{text-align:right;}"
+        ".chat-right .chat-head{text-align:right;}"
+        ".chat-event{padding:8px 10px;border-left:3px solid;"
+        f"color:{palette.text_primary};background:{event_bg};"
+        f"border-color:{palette.border};"
+        "overflow-wrap:anywhere;word-break:break-word;}"
+        f".chat-event-tool{{border-color:{palette.accent_blue};background:{event_tool_bg};}}"
+        f".chat-event-system{{border-color:{palette.border};background:{event_bg};}}"
+        f".chat-event-reasoning{{border-color:{palette.accent_primary};background:{event_bg};}}"
+        ".chat-head{font-weight:600;margin-bottom:6px;}"
+        f".chat-meta{{color:{palette.text_secondary};font-size:12px;}}"
+        ".chat-pre{white-space:pre-wrap;margin:6px 0 0 0;"
+        "overflow-wrap:anywhere;word-break:break-word;}"
+        f".chat-summary{{color:{palette.text_secondary};}}"
+        f".chat-toggle{{color:{palette.accent_blue};text-decoration:none;}}"
+        ".chat-tool-list{margin:6px 0 0 18px;}"
+        ".chat-tool-result{margin:8px 0 0 0;padding:8px 10px;border-left:3px solid;"
+        f"border-color:{palette.accent_blue};background:{result_bg};"
+        "overflow-wrap:anywhere;word-break:break-word;}"
+        "</style>"
+    )
+
+
+def _toggle_item_id_from_url(url: QUrl) -> str | None:
+    raw = url.toString()
+    prefix = "diana-chat-toggle:"
+    if not raw.startswith(prefix):
+        return None
+    item_id = unquote(raw.removeprefix(prefix))
+    return item_id or None
+
+
+def _toggle_href(item_id: str) -> str:
+    return f"diana-chat-toggle:{quote(item_id, safe='')}"
+
+
+def _display_item_expand_id(item: DisplayItem) -> str:
+    return f"{item.conversation_id}\n{item.item_id}"
 
 
 _LEGACY_HEADER_RE = re.compile(
@@ -1111,62 +1184,136 @@ def _display_item_search_text(item: DisplayItem) -> str:
     return "\n".join(parts)
 
 
-def _render_display_item(item: DisplayItem) -> str:
+def _render_display_item(
+    item: DisplayItem,
+    *,
+    expanded_item_ids: set[str] | None = None,
+) -> str:
+    expanded_item_ids = expanded_item_ids or set()
+    expand_id = _display_item_expand_id(item)
     if item.kind == "inbound_message":
-        return _render_chat_message_item(item, css="chat-user chat-inbound")
+        return _render_chat_message_item(
+            item,
+            css="chat-peer chat-right",
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
     if item.kind == "outbound_message":
-        return _render_chat_message_item(item, css="chat-assistant chat-outbound")
+        return _render_chat_message_item(
+            item,
+            css="chat-bot chat-left",
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
     if item.kind == "tool_call":
-        return _render_tool_call_item(item)
+        return _render_tool_call_item(item, expanded_item_ids=expanded_item_ids)
     if item.kind == "tool_result":
         head = f"工具结果 · {item.related_tool_call_id}" if item.related_tool_call_id else "工具结果"
-        return _render_event_record(head, _render_tool_result_content(item.text), event_class="chat-event-tool")
+        return _render_event_record(
+            head,
+            _render_tool_result_content(
+                item.text,
+                toggle_id=expand_id,
+                expanded=expand_id in expanded_item_ids,
+            ),
+            event_class="chat-event-tool",
+        )
     if item.kind == "runtime_receipt":
         title, summary = _split_display_summary(item.summary)
         head = f"系统 · {title}"
-        body = _render_collapsed_content(summary, item.text)
+        body = _render_collapsed_content(
+            summary,
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
         return _render_event_record(head, body, event_class="chat-event-system")
     if item.kind == "assistant_note":
         head = f"{item.speaker_label or '助手'} · 内部文本"
-        body = _render_collapsed_content(item.summary, item.text)
+        body = _render_collapsed_content(
+            item.summary,
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
         return _render_event_record(head, body, event_class="chat-event-system")
     if item.kind == "reasoning":
         head = f"{item.speaker_label or '助手'} · 思考过程"
-        body = _render_collapsed_content(item.summary, item.text)
-        return _render_event_record(head, body, event_class="chat-event-system")
+        body = _render_collapsed_content(
+            item.summary,
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
+        return _render_event_record(head, body, event_class="chat-event-reasoning")
     if item.kind == "system_event" and item.speaker_label == "系统" and " · " in item.summary:
         title, summary = _split_display_summary(item.summary)
         head = f"系统 · {title}"
-        body = _render_collapsed_content(summary, item.text)
+        body = _render_collapsed_content(
+            summary,
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
         return _render_event_record(head, body, event_class="chat-event-system")
     head = "系统"
-    body = _render_collapsed_content(item.summary, item.text)
+    body = _render_collapsed_content(
+        item.summary,
+        item.text,
+        toggle_id=expand_id,
+        expanded=expand_id in expanded_item_ids,
+    )
     return _render_event_record(head, body, event_class="chat-event-system")
 
 
-def _render_chat_message_item(item: DisplayItem, *, css: str) -> str:
+def _render_chat_message_item(
+    item: DisplayItem,
+    *,
+    css: str,
+    toggle_id: str,
+    expanded: bool,
+) -> str:
     label = item.speaker_label or item.role_label
     meta = _chat_item_meta(item)
     parts = [
-        f"<div class='chat-record chat-bubble {css}'>",
+        f"<div class='chat-record chat-row {css}'>",
+        "<div class='chat-bubble'>",
         f"<div class='chat-head'>{_escape(label)}",
     ]
     if meta:
         parts.append(f" <span class='chat-meta'>{_escape(meta)}</span>")
-    parts.extend(["</div>", _render_text_block(item.text or "(空消息)"), "</div>"])
+    parts.extend(
+        [
+            "</div>",
+            _render_text_block(item.text or "(空消息)", toggle_id=toggle_id, expanded=expanded),
+            "</div></div>",
+        ]
+    )
     return "".join(parts)
 
 
-def _render_tool_call_item(item: DisplayItem) -> str:
+def _render_tool_call_item(
+    item: DisplayItem,
+    *,
+    expanded_item_ids: set[str] | None = None,
+) -> str:
+    expanded_item_ids = expanded_item_ids or set()
+    expand_id = _display_item_expand_id(item)
     tool_call = item.raw.get("tool_call") if isinstance(item.raw, dict) else None
     tool_name = _tool_call_name(tool_call if isinstance(tool_call, dict) else {})
     if tool_name == "no_action":
         head = f"{item.speaker_label or '助手'} · 工具动作"
-        body = _render_collapsed_content("选择不发送消息", item.text)
+        body = _render_collapsed_content(
+            "选择不发送消息",
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+            expand_label="展开原始参数",
+        )
         return _render_event_record(head, body, event_class="chat-event-tool")
 
     parts = [
-        "<div class='chat-record chat-bubble chat-tool'>",
+        "<div class='chat-record chat-event chat-event-tool'>",
         f"<div class='chat-head'>{_escape(item.speaker_label or '助手')} · 工具动作</div>",
         f"<div class='chat-summary'>调用工具：{_escape(tool_name or '未知工具')}</div>",
         f"<div>{_escape(item.summary)}</div>",
@@ -1174,16 +1321,25 @@ def _render_tool_call_item(item: DisplayItem) -> str:
     if item.tool_results:
         for result in item.tool_results:
             result_id = result.related_tool_call_id or item.related_tool_call_id or ""
+            result_expand_id = _display_item_expand_id(result)
+            result_body = _render_tool_result_content(
+                result.text,
+                toggle_id=result_expand_id,
+                expanded=result_expand_id in expanded_item_ids,
+            )
             parts.append(
                 "<div class='chat-tool-result'>"
                 f"<div class='chat-head'>工具结果 · {_escape(result_id)}</div>"
-                f"{_render_tool_result_content(result.text)}"
+                f"{result_body}"
                 "</div>"
             )
     parts.append(
-        "<details><summary class='chat-summary'>展开原始工具参数</summary>"
-        f"<pre class='chat-pre'>{_escape(item.text)}</pre>"
-        "</details>"
+        _render_collapsible_raw(
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+            expand_label="展开原始参数",
+        )
     )
     parts.append("</div>")
     return "".join(parts)
@@ -1624,11 +1780,24 @@ def _runtime_event_summary(content: str) -> tuple[str, str] | None:
         return None
     if "<send_receipt_task" in content:
         return "发送回执任务", _compact_inline_tokens(_first_nonempty_line(content))
+    if "<send_status" in content:
+        return "发送状态", _format_send_status_summary(content)
     if "<send_receipt" in content:
         return "发送回执", _format_send_receipt_summary(content)
     if "<task_context" in content:
         return "运行时上下文", _format_task_context_summary(content)
     return None
+
+
+def _format_send_status_summary(content: str) -> str:
+    body = _extract_tag_text(content, "send_status") or content
+    lines = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip() and "不是用户新发言" not in line
+    ]
+    summary = lines[-1] if lines else _first_nonempty_line(body)
+    return _compact_inline_tokens(summary) or "发送状态"
 
 
 def _format_send_receipt_summary(content: str) -> str:
@@ -1713,9 +1882,26 @@ def _extract_tag_json(content: str, tag: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _render_tool_result_content(content: str) -> str:
+def _extract_tag_text(content: str, tag: str) -> str | None:
+    match = re.search(rf"<{tag}\b[^>]*>\s*(.*?)\s*</{tag}>", content, re.S)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _render_tool_result_content(
+    content: str,
+    *,
+    toggle_id: str | None = None,
+    expanded: bool = False,
+) -> str:
     summary = _format_tool_result_summary(content)
-    return _render_collapsed_content(summary, content)
+    return _render_collapsed_content(
+        summary,
+        content,
+        toggle_id=toggle_id,
+        expanded=expanded,
+    )
 
 
 def _format_tool_result_summary(content: str) -> str:
@@ -1734,6 +1920,8 @@ def _format_tool_result_summary(content: str) -> str:
         parts.append("成功" if payload.get("ok") else "失败")
     if payload.get("send_id"):
         parts.append(f"send_id={payload.get('send_id')}")
+    if payload.get("send_attempt_id"):
+        parts.append(f"send_attempt_id={payload.get('send_attempt_id')}")
     sent = payload.get("sent")
     if isinstance(sent, list):
         parts.append(f"已发送 {len(sent)} 条")
@@ -1753,21 +1941,151 @@ def _format_tool_result_summary(content: str) -> str:
         parts.append("QQ 可见性待确认")
     elif payload.get("qq_visible") is False:
         parts.append("未 QQ 可见")
+    if payload.get("ignored_review_interrupts") is True:
+        parts.append("已忽略复核打断")
+    forced = _format_message_list_summary(
+        payload.get("forced_unseen_messages"),
+        head="已忽略",
+        noun="新打断",
+    )
+    if forced:
+        parts.append(forced)
+    unseen = _format_message_list_summary(
+        payload.get("unseen_messages"),
+        head="发现",
+        noun="新打断",
+    )
+    if unseen:
+        parts.append(unseen)
+    priority = _format_message_list_summary(
+        payload.get("priority_interrupts"),
+        head="发现",
+        noun="高优先级打断",
+    )
+    if priority:
+        parts.append(priority)
+    if payload.get("latest_seq") is not None:
+        parts.append(f"latest_seq={payload.get('latest_seq')}")
+    if payload.get("attempt_revision") is not None:
+        parts.append(f"revision={payload.get('attempt_revision')}")
     next_hint = str(payload.get("next") or payload.get("note") or "").strip()
     if next_hint:
-        parts.append(_compact_inline_tokens(next_hint))
+        parts.append(_short_text(_compact_inline_tokens(next_hint), limit=96))
     return "；".join(parts) if parts else _compact_inline_tokens(content)
 
 
-def _render_collapsed_content(summary: str, content: str) -> str:
+def _format_message_list_summary(value: Any, *, head: str, noun: str) -> str:
+    if not isinstance(value, list) or not value:
+        return ""
+    details: list[str] = []
+    times = [
+        str(item.get("time") or item.get("timestamp") or item.get("created_at") or "").strip()
+        for item in value
+        if isinstance(item, dict)
+    ]
+    times = [item for item in times if item]
+    if times:
+        details.append(times[0] if times[0] == times[-1] else f"{times[0]}-{times[-1]}")
+    sources = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        source = str(
+            item.get("conversation_id")
+            or item.get("source")
+            or item.get("group_id")
+            or item.get("target_id")
+            or ""
+        ).strip()
+        if source and source not in sources:
+            sources.append(source)
+    if sources:
+        shown = "、".join(sources[:2])
+        if len(sources) > 2:
+            shown = f"{shown} 等 {len(sources)} 个来源"
+        details.append(f"来源 {shown}")
+    sample = _message_list_sample(value)
+    if sample:
+        details.append(f"样例：{sample}")
+    suffix = f"（{'；'.join(details)}）" if details else ""
+    return f"{head} {len(value)} 条{noun}{suffix}"
+
+
+def _message_list_sample(value: list[Any]) -> str:
+    first = next((item for item in value if isinstance(item, dict)), None)
+    if first is None:
+        return ""
+    sender = str(
+        first.get("sender_name")
+        or first.get("nickname")
+        or first.get("user_id")
+        or first.get("sender_id")
+        or ""
+    ).strip()
+    text = str(
+        first.get("text")
+        or first.get("content")
+        or first.get("message")
+        or first.get("raw_message")
+        or ""
+    ).strip()
+    text = _short_text(_compact_inline_tokens(text), limit=48)
+    if sender and text:
+        return f"{sender}: {text}"
+    return sender or text
+
+
+def _render_collapsed_content(
+    summary: str,
+    content: str,
+    *,
+    toggle_id: str | None = None,
+    expanded: bool = False,
+    expand_label: str = "展开原文",
+) -> str:
+    parts = [f"<div class='chat-summary'>{_escape(summary)}</div>"]
+    parts.append(
+        _render_collapsible_raw(
+            content,
+            toggle_id=toggle_id,
+            expanded=expanded,
+            expand_label=expand_label,
+        )
+    )
+    return "".join(parts)
+
+
+def _render_collapsible_raw(
+    content: str,
+    *,
+    toggle_id: str | None,
+    expanded: bool,
+    expand_label: str,
+) -> str:
+    if not content:
+        return ""
+    if toggle_id:
+        label = "收起" if expanded else expand_label
+        parts = [
+            "<div class='chat-summary'>"
+            f"<a class='chat-toggle' href='{_escape_attr(_toggle_href(toggle_id))}'>{_escape(label)}</a>"
+            "</div>"
+        ]
+        if expanded:
+            parts.append(f"<pre class='chat-pre'>{_escape(content)}</pre>")
+        return "".join(parts)
     return (
-        f"<div class='chat-summary'>{_escape(summary)}</div>"
-        "<details><summary class='chat-summary'>展开原文</summary>"
+        f"<details><summary class='chat-summary'>{_escape(expand_label)}</summary>"
         f"<pre class='chat-pre'>{_escape(content)}</pre></details>"
     )
 
 
-def _render_text_block(content: str) -> str:
+def _render_text_block(
+    content: str,
+    *,
+    toggle_id: str | None = None,
+    expanded: bool = False,
+) -> str:
     if not content:
         return ""
     compact = _compact_inline_tokens(content)
@@ -1775,11 +2093,24 @@ def _render_text_block(content: str) -> str:
     preview = compact
     if len(preview) > COMPACT_TEXT_LIMIT:
         preview = f"{preview[:COMPACT_TEXT_LIMIT]}..."
+    if should_collapse and expanded:
+        return (
+            _render_collapsible_raw(
+                content,
+                toggle_id=toggle_id,
+                expanded=True,
+                expand_label="展开原文",
+            )
+        )
     parts = [f"<pre class='chat-pre'>{_escape(preview)}</pre>"]
     if should_collapse:
         parts.append(
-            "<details><summary class='chat-summary'>展开原文</summary>"
-            f"<pre class='chat-pre'>{_escape(content)}</pre></details>"
+            _render_collapsible_raw(
+                content,
+                toggle_id=toggle_id,
+                expanded=False,
+                expand_label="展开原文",
+            )
         )
     return "".join(parts)
 
@@ -1861,6 +2192,8 @@ def _format_tool_call_for_display(tool_call: dict) -> str:
         return _format_private_send_args(args)
     if name == "send_group_message":
         return _format_group_send_args(args)
+    if name == "commit_send_attempt":
+        return _format_commit_send_attempt_args(args)
     if name == "no_action":
         return "不发送消息"
     if name == "upload_file":
@@ -1884,7 +2217,7 @@ def _format_tool_call_for_display(tool_call: dict) -> str:
     if name == "run_python":
         code = str(args.get("code") or "").strip().replace("\n", " ")
         return f"运行 Python：{code[:80]}{'...' if len(code) > 80 else ''}"
-    return f"{name}：{json.dumps(args, ensure_ascii=False)}"
+    return _format_generic_tool_args(name, args)
 
 
 def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
@@ -1934,6 +2267,56 @@ def _message_with_delay(target: dict[str, Any]) -> str:
     return f"{content}（{delay}s）"
 
 
+def _format_commit_send_attempt_args(args: dict[str, Any]) -> str:
+    parts = []
+    attempt_id = str(args.get("send_attempt_id") or "").strip()
+    if attempt_id:
+        parts.append(f"send_attempt_id={attempt_id}")
+    if args.get("reviewed_until_seq") is not None:
+        parts.append(f"已复核到 seq {args.get('reviewed_until_seq')}")
+    policy = str(args.get("delivery_interrupt_policy") or "").strip()
+    if policy:
+        parts.append(f"中断策略 {policy}")
+    reply_to = str(args.get("reply_to_message_id") or "").strip()
+    if reply_to:
+        parts.append(f"引用 msg_id={reply_to}")
+    if args.get("ignore_review_interrupts") is True:
+        parts.append("忽略复核打断")
+    reason = str(args.get("reason") or "").strip()
+    if reason:
+        parts.append(f"原因：{_short_text(_compact_inline_tokens(reason), limit=60)}")
+    detail = "；".join(parts) if parts else "无参数"
+    return f"提交发送尝试：{detail}"
+
+
+def _format_generic_tool_args(name: str, args: dict[str, Any]) -> str:
+    if not args:
+        return f"{name}：无参数"
+    parts = []
+    for key, value in args.items():
+        parts.append(f"{key}={_format_tool_arg_value(value)}")
+        if len(parts) >= 5:
+            break
+    if len(args) > len(parts):
+        parts.append(f"另有 {len(args) - len(parts)} 项")
+    return f"{name}：{'；'.join(parts)}"
+
+
+def _format_tool_arg_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, list):
+        sample = _message_list_sample(value)
+        suffix = f"，样例：{sample}" if sample else ""
+        return f"{len(value)} 项{suffix}"
+    if isinstance(value, dict):
+        keys = "、".join(str(key) for key in list(value)[:4])
+        return f"对象({keys})" if keys else "对象"
+    return _short_text(_compact_inline_tokens(str(value)), limit=80)
+
+
 def _format_upload_args(args: dict[str, Any]) -> str:
     target_type = args.get("target_type") or "-"
     target_id = args.get("target_id") or "-"
@@ -1947,6 +2330,16 @@ def _escape(s: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def _escape_attr(s: str) -> str:
+    return _escape(s).replace('"', "&quot;").replace("'", "&#x27;")
+
+
+def _short_text(value: str, *, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}..."
 
 
 def _scrollbar_near_bottom(bar: Any, threshold: int = 24) -> bool:
