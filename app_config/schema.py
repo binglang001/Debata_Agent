@@ -269,7 +269,16 @@ class AgentConfig(StrictModel):
     """首 token 超时（秒）。流式模式下，首字未到即超时重试。"""
 
     max_loops: int = 25
-    """工具循环最大轮次（仅 chat agent 用）。"""
+    """兼容旧配置；不再作为主 runner 的普通硬截断上限。"""
+
+    tool_loop_reminder_interval: int = Field(default=8, ge=1)
+    """连续多少个工具轮后触发一次普通提醒。"""
+
+    tool_loop_final_warning_count: int = Field(default=4, ge=1)
+    """普通提醒达到多少次后进入最终警告周期。"""
+
+    tool_loop_final_grace_loops: int = Field(default=2, ge=0)
+    """最终警告发出后还允许多少个工具轮。"""
 
     refocus_interval: int = Field(default=5, ge=0)
     """Task Contract 重注入间隔（轮）。0 = 禁用。"""

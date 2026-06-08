@@ -157,6 +157,22 @@ def test_temperature_range():
         AgentConfig(provider="x", model="y", temperature=3.0)
 
 
+def test_agent_tool_loop_reminder_defaults_and_validation():
+    cfg = AgentConfig(provider="x", model="y")
+
+    assert cfg.max_loops == 25
+    assert cfg.tool_loop_reminder_interval == 8
+    assert cfg.tool_loop_final_warning_count == 4
+    assert cfg.tool_loop_final_grace_loops == 2
+
+    with pytest.raises(ValidationError):
+        AgentConfig(provider="x", model="y", tool_loop_reminder_interval=0)
+    with pytest.raises(ValidationError):
+        AgentConfig(provider="x", model="y", tool_loop_final_warning_count=0)
+    with pytest.raises(ValidationError):
+        AgentConfig(provider="x", model="y", tool_loop_final_grace_loops=-1)
+
+
 def test_save_load_roundtrip(tmp_paths, fake_keyring):
     cfg = _minimal_config()
     cfg.app.theme = "dark"

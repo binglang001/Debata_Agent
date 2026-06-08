@@ -10,7 +10,7 @@
     1. AI 调用了 no_action → finish_reason='no_action'
     2. 所有非 no_action 工具显式允许成功后结束 → 'finish_after_success'
     3. AI 未调用工具，提示重试后仍不调用 → 'no_tool_after_retry'
-    4. 达到 max_loops → 'max_loops'，随后追加一次无工具收尾，让模型说明部分结果
+    4. 工具循环提醒宽限用完 → 'tool_loop_finalized'，随后无工具收尾
 """
 
 from __future__ import annotations
@@ -60,6 +60,11 @@ SEND_TOOL_NAMES: set[str] = {
     "send_voice_message",
 }
 
+LOOP_REMINDER_MESSAGE = (
+    "你已连续多轮调用工具。请重新审视任务内容和执行情况，不要在同一个错误上反复无意义尝试；"
+    "必要时更换方向、汇报进展或收尾。"
+)
+
 
 class AgentRunner:
     """多轮工具循环执行器。"""
@@ -100,18 +105,29 @@ class AgentRunner:
         records: list[dict[str, Any]] = []
         reasoning_logs: list[str] = []
         final_content = ""
-        finish_reason: FinishReason = "max_loops"
+        finish_reason: FinishReason = "no_response"
         loop_count = 0
+        no_tool_retry_count = 0
         prompt_tokens_total = 0
-        effective_max_loops = max(1, int(max_loops or self.cfg.max_loops))
         refocus_interval = self.cfg.refocus_interval
+        reminder_interval = max(1, int(self.cfg.tool_loop_reminder_interval))
+        final_warning_count = max(1, int(self.cfg.tool_loop_final_warning_count))
+        final_grace_loops = max(0, int(self.cfg.tool_loop_final_grace_loops))
+        tool_rounds_since_reminder = 0
+        tool_loop_reminder_count = 0
+        final_warning_sent = False
+        final_grace_remaining: int | None = None
+        final_no_tool_mode = False
 
         reasoning = self._to_provider_reasoning(self.cfg.reasoning)
         tool_names_dbg = [t["function"]["name"] for t in tools] if tools else []
         logger.info(
             f"AgentRunner[{self.provider.name}] 启动 model={self.cfg.model}, "
             f"tools={tool_names_dbg}, refocus={refocus_interval}, "
-            f"max_loops={effective_max_loops}, "
+            f"tool_loop_reminder_interval={reminder_interval}, "
+            f"tool_loop_final_warning_count={final_warning_count}, "
+            f"tool_loop_final_grace_loops={final_grace_loops}, "
+            f"legacy_max_loops={max_loops or self.cfg.max_loops}, "
             f"task_contract={task_contract[:60] if task_contract else None!r}"
         )
 
@@ -126,7 +142,11 @@ class AgentRunner:
             logger.info("注入发送回执/新消息上下文 %s 条", len(pending))
             return True
 
-        while loop_count < effective_max_loops:
+        while True:
+            if final_no_tool_mode:
+                finish_reason = "tool_loop_finalized"
+                break
+
             loop_count += 1
 
             if await append_pending_context():
@@ -152,6 +172,25 @@ class AgentRunner:
                 msgs.append(refocus)
                 records.append(refocus)
                 logger.debug(f"Task Contract 重注入（轮次 {loop_count}）")
+
+            if (
+                not final_warning_sent
+                and tool_loop_reminder_count >= final_warning_count
+                and tool_rounds_since_reminder >= max(0, reminder_interval - final_grace_loops)
+            ):
+                warning = self._build_tool_loop_final_warning(final_grace_loops)
+                msgs.append(warning)
+                records.append(warning)
+                final_warning_sent = True
+                final_grace_remaining = final_grace_loops
+                if final_grace_remaining <= 0:
+                    final_no_tool_mode = True
+                    continue
+                logger.warning(
+                    "工具循环进入最终警告：grace_loops=%s loop=%s",
+                    final_grace_remaining,
+                    loop_count,
+                )
 
             try:
                 self._emit_status(
@@ -250,12 +289,13 @@ class AgentRunner:
 
             # === 分支 1：无工具调用 → 引导重试或终止 ===
             if not result.tool_calls:
-                if await append_pending_context() and loop_count < effective_max_loops:
+                if await append_pending_context():
                     continue
-                if loop_count < effective_max_loops:
-                    # 还有下一轮：丢弃纯文本草稿，只插入系统纠正后继续。
+                if no_tool_retry_count <= 0:
+                    # 允许一次纠正重试：丢弃纯文本草稿，只插入系统纠正后继续。
                     # 不能把无效 assistant 文本放回上下文，否则下一轮可能把
                     # 内部分析/RAG 解释原样当作可发送消息。
+                    no_tool_retry_count += 1
                     err = {
                         "role": "system",
                         "content": (
@@ -266,10 +306,12 @@ class AgentRunner:
                     msgs.append(err)
                     records.append(err)
                     continue
-                # 最后一次仍未调用工具，丢弃文本
+                # 重试后仍未调用工具，丢弃文本
                 final_content = ""
                 finish_reason = "no_tool_after_retry"
                 break
+
+            no_tool_retry_count = 0
 
             assistant_record = self._build_assistant_record(result)
             msgs.append(assistant_record)
@@ -285,6 +327,54 @@ class AgentRunner:
                 tool_names=[tc.name for tc in result.tool_calls],
             )
             tc_results = await self._execute_tools(result.tool_calls, tool_executor)
+
+            stop_results = [
+                r for r in tc_results if r["result"].get("stop_after_tool")
+            ]
+            no_action_finished = any(
+                r["name"] == "no_action"
+                and not self._tool_result_blocks_completion(r["result"])
+                for r in tc_results
+            )
+            blocked_by_result = any(
+                self._tool_result_blocks_completion(r["result"]) for r in tc_results
+            )
+            finish_after_success = (
+                not blocked_by_result
+                and self._all_non_no_action_results_allow_completion(tc_results)
+            )
+            normal_finish = bool(stop_results or no_action_finished or finish_after_success)
+
+            append_final_warning_after_tool_records = False
+            if not normal_finish:
+                tool_rounds_since_reminder += 1
+                if final_grace_remaining is not None:
+                    final_grace_remaining -= 1
+                    if final_grace_remaining <= 0:
+                        final_no_tool_mode = True
+                elif (
+                    final_grace_loops <= 0
+                    and not final_warning_sent
+                    and tool_loop_reminder_count >= final_warning_count
+                    and tool_rounds_since_reminder >= reminder_interval
+                ):
+                    final_warning_sent = True
+                    final_grace_remaining = 0
+                    final_no_tool_mode = True
+                    append_final_warning_after_tool_records = True
+                if (
+                    not final_warning_sent
+                    and tool_rounds_since_reminder >= reminder_interval
+                ):
+                    tool_loop_reminder_count += 1
+                    tool_rounds_since_reminder = 0
+                    self._append_loop_reminder(
+                        tc_results,
+                        reminder_interval=reminder_interval,
+                        reminder_count=tool_loop_reminder_count,
+                        final_warning_count=final_warning_count,
+                    )
+
             for tcr in tc_results:
                 tool_record = {
                     "role": "tool",
@@ -294,48 +384,48 @@ class AgentRunner:
                 msgs.append(tool_record)
                 records.append(tool_record)
 
-            stop_results = [
-                r for r in tc_results if r["result"].get("stop_after_tool")
-            ]
+            if append_final_warning_after_tool_records:
+                warning = self._build_tool_loop_final_warning(final_grace_loops)
+                msgs.append(warning)
+                records.append(warning)
+                logger.warning(
+                    "工具循环进入最终警告：grace_loops=%s loop=%s",
+                    final_grace_remaining,
+                    loop_count,
+                )
+
             if stop_results:
                 final_content = result.content or ""
                 finish_reason = "tool_stop"
                 break
 
-            if await append_pending_context() and loop_count < effective_max_loops:
+            if await append_pending_context():
                 continue
 
             # === 终止条件检查 ===
-            if any(
-                r["name"] == "no_action"
-                and not self._tool_result_blocks_completion(r["result"])
-                for r in tc_results
-            ):
+            if no_action_finished:
                 final_content = "NO_ACTIONS"
                 finish_reason = "no_action"
                 break
 
-            if any(self._tool_result_blocks_completion(r["result"]) for r in tc_results):
+            if blocked_by_result:
                 continue
 
-            if self._all_non_no_action_results_allow_completion(tc_results):
+            if finish_after_success:
                 final_content = result.content or ""
                 finish_reason = "finish_after_success"
                 break
 
-        if loop_count >= effective_max_loops and finish_reason == "max_loops":
-            logger.warning(f"达到最大循环次数 {effective_max_loops}")
-            limit_record = {
-                "role": "system",
-                "content": (
-                    f"工具循环达到上限 {effective_max_loops} 轮，"
-                    "现在禁止继续调用工具。请基于已有消息和工具结果，"
-                    "用自然语言给出当前部分结果、已完成事项、未完成原因和建议下一步。"
-                ),
-            }
-            msgs.append(limit_record)
-            records.append(limit_record)
-            final_result = await self._finalize_after_max_loops(
+            if final_no_tool_mode:
+                finish_reason = "tool_loop_finalized"
+                break
+
+        if finish_reason == "tool_loop_finalized":
+            logger.warning("工具循环最终宽限已用完，进入无工具收尾")
+            stop_record = self._build_tool_loop_stop()
+            msgs.append(stop_record)
+            records.append(stop_record)
+            final_result = await self._finalize_tool_loop(
                 msgs,
                 usage_recorder=usage_recorder,
                 status_callback=status_callback,
@@ -434,7 +524,53 @@ class AgentRunner:
         except Exception:
             logger.debug("记录模型用量失败", exc_info=True)
 
-    async def _finalize_after_max_loops(
+    @staticmethod
+    def _append_loop_reminder(
+        tc_results: list[dict[str, Any]],
+        *,
+        reminder_interval: int,
+        reminder_count: int,
+        final_warning_count: int,
+    ) -> None:
+        if not tc_results:
+            return
+        result = dict(tc_results[-1]["result"])
+        result["loop_reminder"] = {
+            "level": "reminder",
+            "message": LOOP_REMINDER_MESSAGE,
+            "tool_loop_reminder_interval": reminder_interval,
+            "reminder_count": reminder_count,
+            "final_warning_count": final_warning_count,
+        }
+        tc_results[-1]["result"] = result
+
+    @staticmethod
+    def _build_tool_loop_final_warning(grace_loops: int) -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": (
+                '<tool_loop_final_warning priority="high">\n'
+                "系统提示：工具调用轮数过多，即将结束循环。\n"
+                f"你还有 {grace_loops} 轮工具调用机会。\n"
+                "请停止反复尝试同一错误，利用剩余机会完成必要操作、汇报当前结果并收尾。\n"
+                "</tool_loop_final_warning>"
+            ),
+        }
+
+    @staticmethod
+    def _build_tool_loop_stop() -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": (
+                '<tool_loop_stop priority="high">\n'
+                "系统提示：工具调用机会已用完。\n"
+                "请不要再调用工具。基于已有结果完成最终汇报、说明未完成原因，"
+                "或在无需回复时结束。\n"
+                "</tool_loop_stop>"
+            ),
+        }
+
+    async def _finalize_tool_loop(
         self,
         messages: list[dict[str, Any]],
         *,
@@ -442,7 +578,7 @@ class AgentRunner:
         status_callback: StatusCallback | None,
         status_label: str,
     ) -> CompletionResult | None:
-        """工具轮数用尽后做一次无工具收尾。
+        """工具循环最终宽限用尽后做一次无工具收尾。
 
         这一步不再传 tools，避免模型继续循环；结果只作为记录和上层 fallback 使用。
         """
@@ -469,7 +605,7 @@ class AgentRunner:
                 usage_recorder,
                 result.usage,
                 agent=status_label,
-                operation="agent_loop_max_loops_final",
+                operation="agent_loop_tool_loop_final",
                 **_kv_prompt_diagnostics(
                     messages,
                     None,
@@ -479,7 +615,7 @@ class AgentRunner:
             )
             return result
         except Exception as e:
-            logger.warning("AgentRunner 达到上限后的无工具收尾失败: %s", e)
+            logger.warning("AgentRunner 工具循环无工具收尾失败: %s", e)
             self._emit_status(
                 status_callback,
                 state="error",

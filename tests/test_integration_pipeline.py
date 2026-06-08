@@ -1308,7 +1308,7 @@ async def test_agent_task_max_loops_returns_partial_result(build_pipeline, tmp_p
     assert result["ok"] is True
     assert result["status"] == "partial"
     assert result["result_file"] == "agent_tasks/task-partial/result.md"
-    assert "工具循环上限" in result["error"]
+    assert "工具循环最终收尾条件" in result["error"]
     assert "content" in result and "部分结果" in result["content"]
 
 
@@ -3309,18 +3309,48 @@ async def test_multi_turn_tool_loop(build_pipeline):
 
 @pytest.mark.asyncio
 async def test_max_loops_reached_no_crash(build_pipeline):
-    """AgentRunner 在达到 max_loops 时优雅退出（不抛错），且不污染 adapter。"""
-    # 脚本：连续 3 次返回纯文本（无工具调用）—— runner 应在第 3 轮 give up
+    """AgentRunner 对无工具纯文本只做纠正重试，不把文本兜底发送。"""
+    # 脚本：连续返回纯文本（无工具调用）—— runner 应在一次纠正重试后 give up
     plain = CompletionResult(content="（纯文本）", finish_reason="stop")
     pipeline, provider, adapter, history, _ = await build_pipeline([plain, plain, plain])
 
-    await pipeline.enqueue(_msg(text="测试 max_loops"))
+    await pipeline.enqueue(_msg(text="测试无工具重试"))
     await _drain_pipeline(pipeline, max_wait=2.0)
 
     # 不应发出消息（runner 拒绝接受纯文本输出）
     assert adapter.sent == []
-    # provider 被调用了 max_loops 次（含前两次的"纠正消息"重试）
-    assert len(provider.calls) == 3
+    # provider 被调用 2 次：首次纯文本 + 一次纠正重试。
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_finalization_does_not_send_plain_text_to_qq(build_pipeline):
+    """工具循环无工具收尾只能写内部记录，不能绕过发送工具发 QQ。"""
+    save_args = {"memory_text": "循环中的中间结果"}
+    save_tc_1 = ToolCall(id="tc-save-1", name="save_important_memory", arguments=json.dumps(save_args))
+    save_tc_2 = ToolCall(id="tc-save-2", name="save_important_memory", arguments=json.dumps(save_args))
+    pipeline, provider, adapter, history, _ = await build_pipeline(
+        [
+            CompletionResult(tool_calls=[save_tc_1], finish_reason="tool_calls"),
+            CompletionResult(tool_calls=[save_tc_2], finish_reason="tool_calls"),
+            CompletionResult(content="内部最终说明，不应发送到 QQ。", finish_reason="stop"),
+        ]
+    )
+    pipeline.chat_agent.cfg.tool_loop_reminder_interval = 1
+    pipeline.chat_agent.cfg.tool_loop_final_warning_count = 1
+    pipeline.chat_agent.cfg.tool_loop_final_grace_loops = 1
+
+    await pipeline.enqueue(_msg(text="测试工具循环最终收尾"))
+    await _drain_pipeline(pipeline, max_wait=2.0)
+
+    assert adapter.sent == []
+    assert provider.calls[-1]["tools"] is None
+    records = await history.records()
+    assert any(
+        record.get("role") == "assistant"
+        and "内部最终说明" in str(record.get("content") or "")
+        for record in records
+    )
 
 
 @pytest.mark.asyncio

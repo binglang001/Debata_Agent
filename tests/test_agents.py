@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from agents.base import AgentRunResult
 from agents.behavior_prompt import (
     build_tool_use_protocol,
 )
@@ -777,8 +780,31 @@ def test_runner_assistant_record_preserves_reasoning_content():
     assert record["reasoning_content"] == "plan"
 
 
+def _basic_tool_schema(name: str = "needs_feedback") -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+
+def _work_call(idx: int, *, name: str = "needs_feedback", args: str = "{}") -> ToolCall:
+    return ToolCall(id=f"tc-{idx}", name=name, arguments=args)
+
+
+def _tool_payloads(result: AgentRunResult) -> list[dict]:
+    return [
+        json.loads(record["content"])
+        for record in result.records
+        if record.get("role") == "tool"
+    ]
+
+
 @pytest.mark.asyncio
-async def test_runner_max_loops_adds_no_tool_finalization():
+async def test_runner_tool_loop_reminder_attaches_to_last_tool_result():
     class FakeProvider(IProvider):
         def __init__(self) -> None:
             super().__init__("fake")
@@ -786,56 +812,380 @@ async def test_runner_max_loops_adds_no_tool_finalization():
 
         async def chat_completion(self, messages, *, tools=None, **kwargs):
             self.calls.append({"messages": list(messages), "tools": tools})
-            if len(self.calls) == 1:
+            if len(self.calls) <= 2:
                 return CompletionResult(
-                    tool_calls=[
-                        ToolCall(
-                            id="tc-1",
-                            name="needs_feedback",
-                            arguments="{}",
-                        )
-                    ],
+                    tool_calls=[_work_call(len(self.calls))],
                     finish_reason="tool_calls",
-                    usage=Usage(prompt_tokens=10),
+                    usage=Usage(prompt_tokens=5),
                 )
-            assert tools is None
-            assert "工具循环达到上限" in messages[-1]["content"]
             return CompletionResult(
-                content="已达到工具轮数上限，当前只完成了前半部分。",
-                finish_reason="stop",
+                tool_calls=[ToolCall(id="tc-na", name="no_action", arguments="{}")],
+                finish_reason="tool_calls",
                 usage=Usage(prompt_tokens=5),
             )
 
         async def aclose(self) -> None:
             pass
 
-    async def executor(_name, _args):
-        return {"ok": True, "brief": "done"}
+    async def executor(name, _args):
+        if name == "no_action":
+            return {"ok": True, "no_action": True}
+        return {"ok": True, "status": "partial"}
 
+    provider = FakeProvider()
     runner = AgentRunner(
-        FakeProvider(),
-        AgentConfig(provider="fake", model="fake", max_loops=1),
+        provider,
+        AgentConfig(
+            provider="fake",
+            model="fake",
+            tool_loop_reminder_interval=2,
+            tool_loop_final_warning_count=99,
+        ),
     )
 
     result = await runner.run(
         [{"role": "user", "content": "处理资料"}],
-        tools=[
-            {
-                "type": "function",
-                "function": {
-                    "name": "needs_feedback",
-                    "description": "",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-        ],
+        tools=[_basic_tool_schema(), _basic_tool_schema("no_action")],
         tool_executor=executor,
     )
 
-    assert result.finish_reason == "max_loops"
-    assert result.final_content == "已达到工具轮数上限，当前只完成了前半部分。"
-    assert result.prompt_tokens == 15
-    assert result.records[-1]["content"] == result.final_content
+    payloads = _tool_payloads(result)
+    assert "loop_reminder" not in payloads[0]
+    reminder = payloads[1]["loop_reminder"]
+    assert reminder["level"] == "reminder"
+    assert reminder["tool_loop_reminder_interval"] == 2
+    assert reminder["reminder_count"] == 1
+    assert result.finish_reason == "no_action"
+
+
+@pytest.mark.asyncio
+async def test_runner_tool_loop_reminder_resets_and_can_repeat():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) <= 4:
+                return CompletionResult(
+                    tool_calls=[_work_call(len(self.calls))],
+                    finish_reason="tool_calls",
+                    usage=Usage(prompt_tokens=5),
+                )
+            return CompletionResult(
+                tool_calls=[ToolCall(id="tc-na", name="no_action", arguments="{}")],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=5),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        if name == "no_action":
+            return {"ok": True, "no_action": True}
+        return {"ok": True, "status": "partial"}
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(
+            provider="fake",
+            model="fake",
+            tool_loop_reminder_interval=2,
+            tool_loop_final_warning_count=99,
+        ),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "处理资料"}],
+        tools=[_basic_tool_schema(), _basic_tool_schema("no_action")],
+        tool_executor=executor,
+    )
+
+    reminders = [
+        payload["loop_reminder"]["reminder_count"]
+        for payload in _tool_payloads(result)
+        if "loop_reminder" in payload
+    ]
+    assert reminders == [1, 2]
+    assert result.finish_reason == "no_action"
+
+
+@pytest.mark.asyncio
+async def test_runner_tool_loop_final_warning_and_grace_then_finalizes():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            call_no = len(self.calls)
+            if call_no == 5:
+                assert tools is not None
+                assert messages[-1]["role"] == "user"
+                assert "<tool_loop_final_warning" in messages[-1]["content"]
+                assert "你还有 2 轮工具调用机会" in messages[-1]["content"]
+            if call_no <= 6:
+                return CompletionResult(
+                    tool_calls=[_work_call(call_no)],
+                    finish_reason="tool_calls",
+                    usage=Usage(prompt_tokens=5),
+                )
+            assert tools is None
+            assert messages[-1]["role"] == "user"
+            assert "<tool_loop_stop" in messages[-1]["content"]
+            return CompletionResult(
+                content="工具循环已收尾。",
+                finish_reason="stop",
+                usage=Usage(prompt_tokens=7),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(_name, _args):
+        return {"ok": True, "status": "partial"}
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(
+            provider="fake",
+            model="fake",
+            tool_loop_reminder_interval=3,
+            tool_loop_final_warning_count=1,
+            tool_loop_final_grace_loops=2,
+        ),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "持续处理"}],
+        tools=[_basic_tool_schema()],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "tool_loop_finalized"
+    assert result.final_content == "工具循环已收尾。"
+    assert provider.calls[4]["tools"] is not None
+    assert provider.calls[5]["tools"] is not None
+    assert provider.calls[6]["tools"] is None
+
+
+@pytest.mark.asyncio
+async def test_runner_tool_loop_zero_grace_finalizes_at_next_warning_threshold():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            call_no = len(self.calls)
+            if call_no <= 4:
+                assert tools is not None
+                return CompletionResult(
+                    tool_calls=[_work_call(call_no)],
+                    finish_reason="tool_calls",
+                    usage=Usage(prompt_tokens=5),
+                )
+            assert tools is None
+            assert messages[-1]["role"] == "user"
+            assert "<tool_loop_stop" in messages[-1]["content"]
+            assert messages[-2]["role"] == "user"
+            assert "<tool_loop_final_warning" in messages[-2]["content"]
+            assert "你还有 0 轮工具调用机会" in messages[-2]["content"]
+            return CompletionResult(
+                content="零宽限收尾。",
+                finish_reason="stop",
+                usage=Usage(prompt_tokens=7),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(_name, _args):
+        return {"ok": True, "status": "partial"}
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(
+            provider="fake",
+            model="fake",
+            tool_loop_reminder_interval=2,
+            tool_loop_final_warning_count=1,
+            tool_loop_final_grace_loops=0,
+        ),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "持续处理"}],
+        tools=[_basic_tool_schema()],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "tool_loop_finalized"
+    assert result.final_content == "零宽限收尾。"
+    assert len(provider.calls) == 5
+    assert provider.calls[4]["tools"] is None
+
+
+@pytest.mark.asyncio
+async def test_runner_no_action_finishes_during_tool_loop_grace():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) <= 3:
+                return CompletionResult(
+                    tool_calls=[_work_call(len(self.calls))],
+                    finish_reason="tool_calls",
+                )
+            assert "<tool_loop_final_warning" in messages[-1]["content"]
+            return CompletionResult(
+                tool_calls=[ToolCall(id="tc-na", name="no_action", arguments="{}")],
+                finish_reason="tool_calls",
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        if name == "no_action":
+            return {"ok": True, "no_action": True}
+        return {"ok": True, "status": "partial"}
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(
+            provider="fake",
+            model="fake",
+            tool_loop_reminder_interval=2,
+            tool_loop_final_warning_count=1,
+            tool_loop_final_grace_loops=1,
+        ),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "持续处理"}],
+        tools=[_basic_tool_schema(), _basic_tool_schema("no_action")],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "no_action"
+    assert all(call["tools"] is not None for call in provider.calls)
+
+
+@pytest.mark.asyncio
+async def test_runner_finish_after_success_finishes_during_tool_loop_grace():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) <= 3:
+                return CompletionResult(
+                    tool_calls=[_work_call(len(self.calls))],
+                    finish_reason="tool_calls",
+                )
+            assert "<tool_loop_final_warning" in messages[-1]["content"]
+            return CompletionResult(
+                tool_calls=[
+                    _work_call(
+                        99,
+                        name="save_important_memory",
+                        args='{"memory_text":"完成","finish_after_success":true}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        if name == "save_important_memory":
+            return {"ok": True, "status": "done"}
+        return {"ok": True, "status": "partial"}
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(
+            provider="fake",
+            model="fake",
+            tool_loop_reminder_interval=2,
+            tool_loop_final_warning_count=1,
+            tool_loop_final_grace_loops=1,
+        ),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "持续处理"}],
+        tools=[_basic_tool_schema(), _basic_tool_schema("save_important_memory")],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "finish_after_success"
+    assert all(call["tools"] is not None for call in provider.calls)
+
+
+@pytest.mark.asyncio
+async def test_runner_legacy_max_loops_no_longer_hard_limits_tool_loop():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) <= 2:
+                return CompletionResult(
+                    tool_calls=[_work_call(len(self.calls))],
+                    finish_reason="tool_calls",
+                )
+            return CompletionResult(
+                tool_calls=[ToolCall(id="tc-na", name="no_action", arguments="{}")],
+                finish_reason="tool_calls",
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        if name == "no_action":
+            return {"ok": True, "no_action": True}
+        return {"ok": True, "status": "partial"}
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(
+            provider="fake",
+            model="fake",
+            max_loops=1,
+            tool_loop_reminder_interval=20,
+            tool_loop_final_warning_count=99,
+        ),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "处理资料"}],
+        tools=[_basic_tool_schema(), _basic_tool_schema("no_action")],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "no_action"
+    assert len(provider.calls) == 3
 
 
 @pytest.mark.asyncio

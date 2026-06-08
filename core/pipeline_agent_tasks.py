@@ -279,7 +279,11 @@ class PipelineAgentTasksMixin:
                     raise RuntimeError(
                         f"后台子 Agent 任务超过 {timeout_seconds:.0f}s 仍未产出目标结果文件"
                     ) from None
-            status = "partial" if result.finish_reason == "max_loops" else "completed"
+            status = (
+                "partial"
+                if result.finish_reason in {"max_loops", "tool_loop_finalized"}
+                else "completed"
+            )
             if result.finish_reason == "api_error":
                 status = "failed"
             if not output_path.exists():
@@ -311,7 +315,7 @@ class PipelineAgentTasksMixin:
             error_text = (
                 "后台任务超时，但目标结果文件已写出，已按现有结果返回。"
                 if timeout_with_existing_output
-                else "达到工具循环上限，已产出部分结果。"
+                else "达到工具循环最终收尾条件，已产出部分结果。"
                 if status == "partial"
                 else ""
             )

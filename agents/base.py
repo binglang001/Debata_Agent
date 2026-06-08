@@ -19,6 +19,7 @@ FinishReason = Literal[
     "finish_after_success",
     "tool_stop",
     "no_tool_after_retry",
+    "tool_loop_finalized",
     "max_loops",
     "api_error",
     "no_response",
@@ -37,7 +38,7 @@ class AgentRunResult:
 
     loop_count: int = 0
 
-    finish_reason: FinishReason = "max_loops"
+    finish_reason: FinishReason = "no_response"
     """循环结束的原因，用于上层决策"""
 
     reasoning_logs: list[str] = field(default_factory=list)
