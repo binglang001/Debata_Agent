@@ -58,10 +58,7 @@ class SummaryAgent:
         if not history_slice:
             return None
 
-        history_text = "\n".join(
-            f"[{m.get('role', '?')}] {m.get('content', '') or ''}"
-            for m in history_slice
-        )
+        history_text = "\n".join(_format_history_line(m) for m in history_slice)
         prompt = (
             "你是当前角色的记忆管理系统。请把一段旧对话历史并入全局滚动摘要。\n\n"
             f"<现有滚动摘要>\n{existing_summary_text or '（无）'}\n</现有滚动摘要>\n\n"
@@ -70,12 +67,24 @@ class SummaryAgent:
             "<任务>\n"
             "1. 输出合并后的滚动摘要，保留人物关系、长期约定、未完成事项、关键决定和跨会话背景。\n"
             "2. 不要逐条流水复述，不要保留一次性工具执行细节。\n"
-            "3. 提取少量值得长期保存的新重要记忆；没有则返回空数组。\n"
+            "3. 根据待归档对话提取少量值得长期保存的新重要记忆补充候选；没有则返回空数组。\n"
             "</任务>\n\n"
+            "<重要记忆规范>\n"
+            "1. 现存重要记忆是已经保存的事实，不要重复保存；new_important 只是补充候选，不是完整替换列表。\n"
+            "2. new_important 最多返回 3-5 条候选；只保存长期稳定事实：人物身份、偏好、稳定约定、长期目标、"
+            "管理员反馈或系统行为改进。\n"
+            "3. 每条 content 必须客观、完整、有明确主语；已有同主体事实应补充或合并，不要重复新增。\n"
+            "4. 禁止保存系统消息、task_context、send_receipt、工具结果、no_action、临时 URL、密钥、token、"
+            "cookie、rkey、clientkey 等运行时噪声。\n"
+            "5. scope 可选，只能是 global、user:QQ、group:群号；不能判断就省略，让调用方保持旧行为。\n"
+            "6. 历史里的 conversation_id=private:QQ 如果用于 scope，应写成 user:QQ；"
+            "conversation_id=group:群号 应写成 group:群号；不要把 private:QQ 当 scope 返回。\n"
+            "7. pinned 可选，只用于任何场景都必须常驻的极稳定事实；普通偏好不要设置 pinned。\n"
+            "</重要记忆规范>\n\n"
             "返回 JSON：\n"
             "```json\n"
             '{"summary_text": "合并后的滚动摘要", '
-            '"new_important": [{"timestamp": "时间", "content": "一句话描述"}, ...]}\n'
+            '"new_important": [{"content": "一句话描述", "scope": "user:123456", "pinned": false}, ...]}\n'
             "```"
         )
 
@@ -260,3 +269,10 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
         logger.error(f"总结 JSON 解析失败: {e}, raw={text[start:end][:200]}")
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _format_history_line(record: dict[str, Any]) -> str:
+    role = record.get("role", "?")
+    conversation_id = str(record.get("conversation_id") or "").strip()
+    scope_hint = f" conversation_id={conversation_id}" if conversation_id else ""
+    return f"[{role}{scope_hint}] {record.get('content', '') or ''}"

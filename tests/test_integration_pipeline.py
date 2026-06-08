@@ -3391,7 +3391,22 @@ async def test_token_compaction_archives_before_truncate(build_pipeline):
             self.existing_important_text = existing_important_text
             return {
                 "summary_text": f"{existing_summary_text}\n已归档 {len(history_slice)} 条".strip(),
-                "new_important": [{"content": "归档中提到用户喜欢测试"}],
+                "new_important": [
+                    {
+                        "content": "归档中提到用户喜欢测试",
+                        "scope": "user:123",
+                        "pinned": True,
+                    },
+                    {"content": "归档中提到用户喜欢测试"},
+                    {"content": "归档中提到旧格式也要保存"},
+                    {
+                        "content": "归档中提到非 bool pinned 不应置顶",
+                        "scope": "group:5555",
+                        "pinned": "true",
+                    },
+                    {"content": ""},
+                    "invalid",
+                ],
             }
 
     pipeline, _, _, history, important = await build_pipeline([])
@@ -3413,7 +3428,21 @@ async def test_token_compaction_archives_before_truncate(build_pipeline):
     assert archived, "压缩前应先把原文写入 archive"
     assert after < before
     assert "已归档" in pipeline.rolling_summary.text()
-    assert any("喜欢测试" in item.get("content", "") for item in important.items())
+    items = important.items()
+    scoped_item = next(
+        item for item in items if item.get("content") == "归档中提到用户喜欢测试"
+    )
+    assert scoped_item.get("scope") == "user:123"
+    assert scoped_item.get("pinned") is True
+    assert sum(
+        1 for item in items if item.get("content") == "归档中提到用户喜欢测试"
+    ) == 1
+    assert any(item.get("content") == "归档中提到旧格式也要保存" for item in items)
+    non_bool_pinned_item = next(
+        item for item in items if item.get("content") == "归档中提到非 bool pinned 不应置顶"
+    )
+    assert non_bool_pinned_item.get("scope") == "group:5555"
+    assert non_bool_pinned_item.get("pinned") is False
 
 
 @pytest.mark.asyncio

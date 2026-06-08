@@ -103,23 +103,27 @@ class PipelineSummaryMixin:
             },
             updated_at=get_time(),
         )
+        saved_important_count = 0
         if isinstance(new_important_items, list) and new_important_items:
             for item in new_important_items:
                 content = (item.get("content") or "").strip() if isinstance(item, dict) else ""
                 if content:
-                    await self.important.save(content)
+                    scope = item.get("scope") if isinstance(item.get("scope"), str) else None
+                    pinned = item.get("pinned") if isinstance(item.get("pinned"), bool) else False
+                    save_result = await self.important.save(
+                        content,
+                        scope=scope,
+                        pinned=pinned,
+                    )
+                    if save_result.get("saved"):
+                        saved_important_count += 1
 
         cut_point = len(slice_records)
         await self.history.truncate_head(cut_point)
 
-        important_count = (
-            len(new_important_items)
-            if isinstance(new_important_items, list)
-            else 0
-        )
         await self.history.add_system_note(
             f"[滚动摘要] 已归档并移出活跃历史 {cut_point} 条；"
-            f"新增重要记忆 {important_count} 条"
+            f"新增重要记忆 {saved_important_count} 条"
         )
 
     @staticmethod

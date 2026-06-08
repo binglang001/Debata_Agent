@@ -32,7 +32,7 @@ from agents.persona_loader import (
 )
 from agents.proactive_agent import ProactiveRouterAgent, _is_action_decision
 from agents.runner import AgentRunner, _kv_prompt_diagnostics
-from app_config.schema import AgentConfig
+from app_config.schema import AgentConfig, SummarizeConfig
 from providers.base import CompletionResult, IProvider, ToolCall, Usage, normalize_messages
 
 # ============================================================
@@ -209,6 +209,65 @@ def test_tool_use_protocol_documents_runtime_contracts_without_legacy_terms():
     assert "send_only" not in s
     assert "no-feedback" not in lower
     assert "no_feedback" not in lower
+
+
+@pytest.mark.asyncio
+async def test_summary_agent_rolling_prompt_documents_important_memory_contract():
+    from agents.summary_agent import SummaryAgent
+
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake-summary")
+            self.calls: list[dict] = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools, **kwargs})
+            return CompletionResult(
+                content=json.dumps(
+                    {
+                        "summary_text": "合并后的摘要",
+                        "new_important": [{"content": "用户长期偏好测试"}],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    provider = FakeProvider()
+    agent = SummaryAgent(
+        provider,
+        AgentConfig(provider="fake", model="fake-summary"),
+        SummarizeConfig(),
+    )
+
+    result = await agent.summarize_rolling(
+        [{"role": "user", "content": "我长期喜欢测试", "conversation_id": "private:123"}],
+        "已有滚动摘要",
+        "用户已经喜欢 Python",
+    )
+
+    prompt = provider.calls[0]["messages"][1]["content"]
+    assert "用户已经喜欢 Python" in prompt
+    assert "现存重要记忆是已经保存的事实，不要重复保存" in prompt
+    assert "new_important 只是补充候选，不是完整替换列表" in prompt
+    assert "最多返回 3-5 条候选" in prompt
+    assert "长期稳定事实" in prompt
+    assert "必须客观、完整、有明确主语" in prompt
+    assert "已有同主体事实应补充或合并" in prompt
+    assert "系统消息、task_context、send_receipt、工具结果、no_action、临时 URL" in prompt
+    assert "密钥、token、cookie、rkey、clientkey" in prompt
+    assert "scope 可选，只能是 global、user:QQ、group:群号" in prompt
+    assert "conversation_id=private:QQ 如果用于 scope，应写成 user:QQ" in prompt
+    assert "conversation_id=group:群号 应写成 group:群号" in prompt
+    assert "不要把 private:QQ 当 scope 返回" in prompt
+    assert "pinned 可选" in prompt
+    assert "conversation_id=private:123" in prompt
+    assert result == {
+        "summary_text": "合并后的摘要",
+        "new_important": [{"content": "用户长期偏好测试"}],
+    }
 
 
 def test_group_relevance_uses_clear_addressee_rules():
