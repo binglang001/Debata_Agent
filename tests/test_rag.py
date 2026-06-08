@@ -418,20 +418,19 @@ async def test_rag_memory_strips_media_urls_and_workspace_noise(tmp_path: Path):
     await asyncio.wait_for(service._queue.join(), timeout=1.0)
 
     indexed = "\n".join(entry.text for entry in store.all_entries())
-    assert "猫猫截图 [图片]" in indexed
-    assert "猫相关文件 [文件]" in indexed
-    assert "[音频消息: 猫叫转录文本]" in indexed
+    assert "猫猫截图 [图片 workspace=incoming/img_1.jpg]" in indexed
+    assert "猫相关文件 [文件 workspace=incoming/猫.txt]" in indexed
+    assert "[音频消息: 猫叫转录文本 workspace=incoming/voice.amr]" in indexed
     assert "猫资料链接 [链接]" in indexed
     assert "https://" not in indexed
     assert "multimedia.nt.qq.com.cn" not in indexed
-    assert "workspace=" not in indexed
     assert "url=" not in indexed
     assert "D:\\QQ_data" not in indexed
 
     out = await service.retrieve_for_query("猫", conversation_id="private:1")
     assert "猫叫转录文本" in out
     assert "https://" not in out
-    assert "workspace=" not in out
+    assert "workspace=incoming/voice.amr" in out
     await service.shutdown()
 
 

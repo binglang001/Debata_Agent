@@ -1676,6 +1676,19 @@ async def test_chat_timeline_records_real_inbound_and_successful_outbound(build_
 
 
 @pytest.mark.asyncio
+async def test_pipeline_tool_context_injects_pending_requests_and_rate_limiter(
+    build_pipeline,
+):
+    limiter = RateLimiter(window_seconds=60, max_messages=1)
+    pipeline, _, _, _, _ = await build_pipeline([], rate_limiter=limiter)
+
+    ctx = pipeline._build_tool_context(conversation_id="private:456")
+
+    assert ctx.extras["pending_requests"] is pipeline.pending_requests
+    assert ctx.extras["rate_limiter"] is limiter
+
+
+@pytest.mark.asyncio
 async def test_send_private_with_delay_returns_accepted_pending(build_pipeline):
     """多条且存在正 delay 时，工具先返回 accepted，后台仍按原拆条发完。"""
     args = {

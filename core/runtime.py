@@ -349,6 +349,10 @@ class Runtime:
                 max_messages=self.config.behavior.rate_limit.max_messages,
                 whitelist_provider=self._friend_whitelist_provider,
             )
+        if self.rate_limiter is not None:
+            self.adapter.set_friend_confirmed_callback(
+                self.rate_limiter.remember_friend
+            )
 
         # ----- 10. WakeupScheduler（双向依赖：先用占位构造，pipeline 实例化后回填）-----
         async def _wakeup_placeholder(

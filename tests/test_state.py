@@ -67,3 +67,14 @@ async def test_rate_limiter_uses_stale_whitelist_while_refreshing():
     release.set()
     assert limiter._whitelist_refresh_task is not None
     await limiter._whitelist_refresh_task
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_remember_friend_updates_whitelist_immediately():
+    limiter = RateLimiter(window_seconds=60, max_messages=0)
+
+    assert await limiter.check_and_log("friend") is True
+
+    limiter.remember_friend("friend")
+
+    assert await limiter.check_and_log("friend") is False

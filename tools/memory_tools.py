@@ -40,18 +40,20 @@ async def save_important_memory(args: SaveMemoryArgs, ctx: ToolContext) -> dict:
     except RuntimeError as e:
         return {"ok": False, "error": str(e)}
 
+    saved = bool(result["saved"])
+    status = "done" if saved else "exact_duplicate"
     return {
         "ok": True,
-        "status": "done",
-        "brief": "已保存重要记忆。" if result["saved"] else "存在完全相同的重要记忆，未重复保存。",
-        "saved": result["saved"],
+        "status": status,
+        "brief": "已保存重要记忆。" if saved else "存在完全相同的重要记忆，未重复保存。",
+        "saved": saved,
         "duplicate": result.get("duplicate", False),
         "duplicate_type": result.get("duplicate_type"),
         "existing_id": result.get("existing_id"),
         "scope": scope,
         "pinned": args.pinned,
         "data": {
-            "saved": result["saved"],
+            "saved": saved,
             "duplicate": result.get("duplicate", False),
             "duplicate_type": result.get("duplicate_type"),
             "existing_id": result.get("existing_id"),

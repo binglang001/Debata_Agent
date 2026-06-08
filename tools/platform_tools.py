@@ -915,7 +915,7 @@ async def set_friend_add_request(args: SetFriendRequestArgs, ctx: ToolContext) -
             "error": "未连接适配器",
         }
     try:
-        await ctx.adapter.handle_friend_request(
+        handled = await ctx.adapter.handle_friend_request(
             flag=args.flag,
             approve=args.approve,
             remark=args.remark or "",
@@ -928,16 +928,71 @@ async def set_friend_add_request(args: SetFriendRequestArgs, ctx: ToolContext) -
             "error": str(e),
         }
     action = "同意" if args.approve else "拒绝"
+    handled_data = handled if isinstance(handled, dict) else {}
+    status = str(handled_data.get("status") or "done")
+    if handled_data.get("ok") is False:
+        return {
+            "ok": False,
+            "status": status,
+            "brief": str(handled_data.get("brief") or "处理好友请求失败。"),
+            "error": str(handled_data.get("error") or handled_data),
+            "data": handled_data,
+        }
+    user_id = handled_data.get("user_id")
+    if status in {"done", "already_friend", "already_handled"}:
+        _remove_pending_request(ctx, args.flag)
+    if user_id is not None and (
+        args.approve or status in {"already_friend", "already_handled"}
+    ):
+        _inject_friend_whitelist(ctx, str(user_id))
+    if status in {"already_friend", "already_handled"}:
+        return {
+            "ok": True,
+            "status": status,
+            "brief": "好友请求已由 QQ/NapCat 自动处理，对方已是好友。",
+            "data": {
+                "flag": args.flag,
+                "approve": args.approve,
+                "remark": args.remark or "",
+                "user_id": str(user_id) if user_id is not None else None,
+                "already_handled": True,
+            },
+        }
     return {
         "ok": True,
-        "status": "done",
+        "status": status,
         "brief": f"已{action}好友请求。",
         "data": {
             "flag": args.flag,
             "approve": args.approve,
             "remark": args.remark or "",
+            "user_id": str(user_id) if user_id is not None else None,
         },
     }
+
+
+def _remove_pending_request(ctx: ToolContext, flag: str) -> None:
+    store = ctx.extras.get("pending_requests")
+    remove = getattr(store, "remove", None)
+    if callable(remove):
+        remove(flag)
+
+
+def _inject_friend_whitelist(ctx: ToolContext, user_id: str) -> None:
+    normalized = str(user_id or "").strip()
+    if not normalized:
+        return
+
+    cache = ctx.extras.get("friend_whitelist_cache")
+    if isinstance(cache, set):
+        cache.add(normalized)
+
+    limiter = ctx.extras.get("rate_limiter")
+    if limiter is None:
+        return
+    remember_friend = getattr(limiter, "remember_friend", None)
+    if callable(remember_friend):
+        remember_friend(normalized)
 
 
 # ============================================================

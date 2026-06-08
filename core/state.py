@@ -133,7 +133,7 @@ class RateLimiter:
 
     async def check_and_log(self, user_id: str) -> bool:
         """记录本次消息，返回 True 表示已超限。"""
-        if self.whitelist_provider is not None:
+        if self.whitelist_provider is not None or self._whitelist_cache is not None:
             whitelist = self._get_cached_whitelist()
             if whitelist is not None and user_id in whitelist:
                 return False
@@ -152,6 +152,21 @@ class RateLimiter:
             else:
                 self._records.pop(user_id, None)
             return False
+
+    def remember_friend(self, user_id: str) -> None:
+        """确认 user_id 已是好友后，立即写入白名单缓存。"""
+        normalized = str(user_id or "").strip()
+        if not normalized:
+            return
+        if self._whitelist_cache is None:
+            self._whitelist_cache = set()
+        self._whitelist_cache.add(normalized)
+        self._records.pop(normalized, None)
+        ttl = float(self.whitelist_cache_ttl_seconds or 0.0)
+        self._whitelist_cache_expires_at = max(
+            float(self._whitelist_cache_expires_at or 0.0),
+            time.time() + max(0.0, ttl),
+        )
 
     def _get_cached_whitelist(self) -> set[str] | None:
         """返回好友白名单缓存；过期时后台刷新，不阻塞消息热路径。"""

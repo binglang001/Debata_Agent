@@ -604,6 +604,9 @@ class ImportantMemoryManager:
         if not item:
             return ""
         parts: list[str] = []
+        item_id = self._item_id(item)
+        if item_id:
+            parts.append(f"[{item_id}]")
         if item.get("pinned"):
             parts.append("[置顶]")
         scope = normalize_scope(str(item.get("scope") or GLOBAL_SCOPE))

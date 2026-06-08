@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from .base import ToolContext, tool
 from .schemas import GetMsgArgs, SendPokeArgs, SetMsgEmojiLikeArgs
 
 logger = logging.getLogger(__name__)
+_POKE_COOLDOWN_SECONDS = 30.0
 
 
 @tool(
@@ -63,6 +65,15 @@ async def send_poke(args: SendPokeArgs, ctx: ToolContext) -> dict:
     if ctx.adapter is None:
         return _failed("未连接适配器，无法发送戳一戳。")
     group_id = _resolve_group_id(args.group_id, ctx)
+    wait_seconds = _poke_rate_limit_wait(args.user_id, group_id, ctx)
+    if wait_seconds is not None:
+        return {
+            "ok": False,
+            "status": "rate_limited",
+            "brief": f"戳一戳过于频繁，请约 {int(wait_seconds) + 1} 秒后再试。",
+            "error": "send_poke rate limited",
+            "data": _poke_data(args, group_id),
+        }
     params: dict[str, Any] = {"user_id": int(args.user_id)}
     if group_id is not None:
         params["group_id"] = int(group_id)
@@ -140,6 +151,26 @@ def _resolve_group_id(group_id: int | None, ctx: ToolContext) -> str | None:
         value = target.get("target_id")
         if value is not None:
             return str(value)
+    return None
+
+
+def _poke_rate_limit_wait(
+    user_id: int,
+    group_id: str | None,
+    ctx: ToolContext,
+) -> float | None:
+    now = float(ctx.extras.get("now_monotonic") or time.monotonic())
+    scope = group_id or "private"
+    key = f"{scope}:{user_id}"
+    cache = ctx.extras.setdefault("send_poke_last_at", {})
+    if not isinstance(cache, dict):
+        return None
+    last = cache.get(key)
+    if isinstance(last, (int, float)):
+        elapsed = now - float(last)
+        if elapsed < _POKE_COOLDOWN_SECONDS:
+            return _POKE_COOLDOWN_SECONDS - elapsed
+    cache[key] = now
     return None
 
 

@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from adapters.types import FriendInfo, GroupInfo, GroupMemberInfo, UserInfo
 from core.chat_timeline import ChatTimelineMessage, ChatTimelineStore
+from core.state import RateLimiter
 from features.vision.vision_service import VisionService
 from providers.base import ProviderError
 from tools import (
@@ -524,6 +525,25 @@ def test_registry_stub_and_full_schema_modes_are_stable():
         assert set(props) == {"_tool_search_required", "finish_after_success"}
     assert "targets" in schema_by_name["send_private_messages"]["parameters"]["properties"]
     assert "tool_name" in schema_by_name["tool_search"]["parameters"]["properties"]
+
+
+def test_registry_excludes_sensitive_and_unused_napcat_apis():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    forbidden = {
+        "call_api",
+        "add_friend",
+        "delete_friend",
+        "get_credentials",
+        "get_cookies",
+        "get_csrf_token",
+        "mark_private_msg_as_read",
+        "mark_group_msg_as_read",
+        "get_ai_record",
+        "send_group_ai_record",
+    }
+
+    assert forbidden.isdisjoint(set(reg.names()))
 
 
 @pytest.mark.asyncio
@@ -2151,6 +2171,7 @@ class _FakeAdapter:
         self.group_requests: list[tuple[str, str, bool, str]] = []
         self.api_calls: list[tuple[str, dict]] = []
         self.member_role = "admin"
+        self.friend_request_result: dict[str, Any] | None = None
 
     async def upload_file(self, target, file_path, *, display_name=None):
         self.uploaded.append((target, file_path, display_name))
@@ -2161,6 +2182,7 @@ class _FakeAdapter:
 
     async def handle_friend_request(self, flag, approve, remark=""):
         self.friend_requests.append((flag, approve, remark))
+        return self.friend_request_result
 
     async def handle_group_request(self, flag, sub_type, approve, reason=""):
         self.group_requests.append((flag, sub_type, approve, reason))
@@ -2438,6 +2460,27 @@ async def test_qq_action_tools_call_napcat_api():
 
 
 @pytest.mark.asyncio
+async def test_send_poke_rate_limited_in_same_context():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(
+        adapter=adapter,
+        conversation_id="group:42",
+        extras={"now_monotonic": 10.0},
+    )
+    executor = reg.get_executor(ctx)
+
+    first = await executor("send_poke", {"user_id": 456})
+    second = await executor("send_poke", {"user_id": 456})
+
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert second["status"] == "rate_limited"
+    assert [call[0] for call in adapter.api_calls] == ["send_poke"]
+
+
+@pytest.mark.asyncio
 async def test_recall_message_result_envelope():
     cfg = _make_config()
     reg = build_default_registry(cfg)
@@ -2647,6 +2690,47 @@ async def test_request_action_tools_result_envelope():
     assert fake.group_requests == [("g1", "invite", False, "暂不加入")]
 
 
+@pytest.mark.asyncio
+async def test_friend_request_already_friend_clears_pending_and_whitelist_cache():
+    class Pending:
+        def __init__(self):
+            self.removed: list[str] = []
+
+        def remove(self, flag: str) -> None:
+            self.removed.append(flag)
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    fake = _FakeAdapter()
+    fake.friend_request_result = {
+        "ok": True,
+        "status": "already_friend",
+        "already_handled": True,
+        "user_id": "1001",
+    }
+    pending = Pending()
+    limiter = RateLimiter(window_seconds=60, max_messages=0)
+    limiter.remember_friend("old")
+    ctx = ToolContext(
+        adapter=fake,
+        extras={"pending_requests": pending, "rate_limiter": limiter},
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_friend_add_request",
+        {"flag": "f1", "approve": False, "remark": "熟人"},
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "already_friend"
+    assert result["data"]["already_handled"] is True
+    assert pending.removed == ["f1"]
+    assert limiter._whitelist_cache == {"old", "1001"}
+    assert await limiter.check_and_log("1001") is False
+    assert fake.friend_requests == [("f1", False, "熟人")]
+
+
 # ============================================================
 # memory 工具：依赖注入
 # ============================================================
@@ -2681,6 +2765,14 @@ async def test_save_memory_with_manager(tmp_path):
     assert result["scope"] == "user:123"
     assert len(im.items()) == 1
     assert im.items()[0]["scope"] == "user:123"
+
+    duplicate = await executor(
+        "save_important_memory", {"memory_text": "记住张三是朋友"}
+    )
+    assert duplicate["ok"] is True
+    assert duplicate["status"] == "exact_duplicate"
+    assert duplicate["saved"] is False
+    assert duplicate["existing_id"]
 
 
 @pytest.mark.asyncio
@@ -2779,6 +2871,40 @@ async def test_delete_memory_with_manager(tmp_path):
     )
     assert result["ok"] is True
     assert result["deleted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rag_mode_memory_tools_execute_with_manager(tmp_path):
+    from memory import ImportantMemoryManager
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+
+    cfg = _make_config(memory_mode="rag")
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(important=im, conversation_id="group:42")
+    executor = reg.get_executor(ctx)
+
+    saved = await executor(
+        "save_important_memory",
+        {"memory_text": "测试群42有固定茶会", "scope": "group:42"},
+    )
+    item_id = im.items()[0]["timestamp"]
+    updated = await executor(
+        "update_important_memory",
+        {
+            "memory_id": item_id,
+            "memory_text": "测试群42有固定茶会，时间是周五",
+            "reason": "补充时间",
+        },
+    )
+    deleted = await executor("delete_important_memory", {"keyword": "茶会"})
+
+    assert saved["saved"] is True
+    assert updated["updated"] is True
+    assert updated["memory_id"] == item_id
+    assert deleted["deleted"] == 1
+    assert im.items() == []
 
 
 @pytest.mark.asyncio

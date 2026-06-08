@@ -36,6 +36,8 @@ class PipelineToolContextMixin:
             "tool_registry": self.tool_registry,
             "tool_search_approved_tools": set(),
             "self_id_by_conversation": dict(self._self_id_by_conversation),
+            "pending_requests": self.pending_requests,
+            "rate_limiter": self.rate_limiter,
         }
         if conversation_id:
             self_id = self._self_id_by_conversation.get(conversation_id)

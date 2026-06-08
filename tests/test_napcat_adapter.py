@@ -24,6 +24,7 @@ from adapters.types import (
     IncomingMessage,
     Target,
 )
+from core.state import RateLimiter
 
 # ============================================================
 # FakeConnection：内存版连接，不开真实 WebSocket
@@ -551,12 +552,115 @@ async def test_adapter_handle_friend_request():
     await adapter.start()
     conn.responders["set_friend_add_request"] = {}
 
-    await adapter.handle_friend_request("flag123", True, "好友")
+    result = await adapter.handle_friend_request("flag123", True, "好友")
+    assert result["status"] == "done"
     assert conn.sent[-1]["params"] == {
         "flag": "flag123",
         "approve": True,
         "remark": "好友",
     }
+
+
+@pytest.mark.asyncio
+async def test_adapter_drops_friend_request_event_when_user_is_already_friend():
+    conn = FakeConnection()
+    adapter = NapCatAdapter("napcat_test", conn)
+    await adapter.start()
+    limiter = RateLimiter(window_seconds=60, max_messages=0)
+    adapter.set_friend_confirmed_callback(limiter.remember_friend)
+    conn.responders["get_friend_list"] = [
+        {"user_id": 1001, "nickname": "Alice", "remark": ""},
+    ]
+    received: list[Any] = []
+
+    async def handler(event):
+        received.append(event)
+
+    adapter.subscribe(handler)
+    await conn.simulate_receive(
+        {
+            "post_type": "request",
+            "request_type": "friend",
+            "user_id": 1001,
+            "comment": "想加你",
+            "flag": "flag123",
+            "self_id": 9999,
+            "time": 1,
+        }
+    )
+
+    assert received == []
+    assert conn.sent[-1]["action"] == "get_friend_list"
+    assert await limiter.check_and_log("1001") is False
+
+
+@pytest.mark.asyncio
+async def test_adapter_friend_request_missing_but_already_friend_returns_success():
+    conn = FakeConnection()
+    adapter = NapCatAdapter("napcat_test", conn)
+    await adapter.start()
+    adapter._friend_request_users_by_flag["flag123"] = "1001"
+
+    task = asyncio.create_task(adapter.handle_friend_request("flag123", True, "好友"))
+    while len(conn.sent) < 1:
+        await asyncio.sleep(0.001)
+    await conn._dispatch(
+        {
+            "status": "failed",
+            "retcode": 1404,
+            "message": "好友请求不存在",
+            "echo": conn.sent[-1]["echo"],
+        }
+    )
+    while len(conn.sent) < 2:
+        await asyncio.sleep(0.001)
+    assert conn.sent[-1]["action"] == "get_friend_list"
+    await conn._dispatch(
+        {
+            "status": "ok",
+            "retcode": 0,
+            "data": [{"user_id": 1001, "nickname": "Alice", "remark": ""}],
+            "echo": conn.sent[-1]["echo"],
+        }
+    )
+
+    result = await task
+    assert result["status"] == "already_friend"
+    assert result["already_handled"] is True
+    assert result["user_id"] == "1001"
+
+
+@pytest.mark.asyncio
+async def test_adapter_friend_request_missing_and_not_friend_stays_failed():
+    conn = FakeConnection()
+    adapter = NapCatAdapter("napcat_test", conn)
+    await adapter.start()
+    adapter._friend_request_users_by_flag["flag123"] = "1001"
+
+    task = asyncio.create_task(adapter.handle_friend_request("flag123", True, "好友"))
+    while len(conn.sent) < 1:
+        await asyncio.sleep(0.001)
+    await conn._dispatch(
+        {
+            "status": "failed",
+            "retcode": 1404,
+            "message": "好友请求不存在",
+            "echo": conn.sent[-1]["echo"],
+        }
+    )
+    while len(conn.sent) < 2:
+        await asyncio.sleep(0.001)
+    await conn._dispatch(
+        {
+            "status": "ok",
+            "retcode": 0,
+            "data": [{"user_id": 2002, "nickname": "Bob", "remark": ""}],
+            "echo": conn.sent[-1]["echo"],
+        }
+    )
+
+    with pytest.raises(AdapterAPIError):
+        await task
 
 
 @pytest.mark.asyncio

@@ -491,21 +491,34 @@ def _normalize_media_placeholders(text: str) -> str:
     def repl(match: re.Match[str]) -> str:
         kind = match.group(1)
         attrs = match.group(2) or ""
+        workspace = _extract_media_workspace(attrs)
         if kind == "音频消息":
-            transcript = attrs.split(" url=", 1)[0].split(" workspace=", 1)[0].strip()
+            transcript = _MEDIA_RUNTIME_ATTR_PATTERN.sub("", attrs).strip()
             transcript = re.sub(r"^[:：]\s*", "", transcript).strip()
             if transcript:
-                return f"[音频消息: {transcript}]"
-            return "[音频消息]"
-        return f"[{kind}]"
+                return (
+                    f"[音频消息: {transcript} workspace={workspace}]"
+                    if workspace
+                    else f"[音频消息: {transcript}]"
+                )
+            return f"[音频消息 workspace={workspace}]" if workspace else "[音频消息]"
+        return f"[{kind} workspace={workspace}]" if workspace else f"[{kind}]"
 
     return _MEDIA_PLACEHOLDER_PATTERN.sub(repl, text)
+
+
+def _extract_media_workspace(attrs: str) -> str:
+    match = re.search(r"(?:^|\s)workspace=([^\]\s]+)", attrs or "")
+    return match.group(1).strip() if match else ""
 
 
 _MEDIA_PLACEHOLDER_PATTERN = re.compile(
     r"\[(图片|文件|音频消息)([^\]]*(?:url=|workspace=)[^\]]*)\]"
 )
 _MEDIA_ATTR_PATTERN = re.compile(
+    r"\surl=(?:[^\]\s]+)"
+)
+_MEDIA_RUNTIME_ATTR_PATTERN = re.compile(
     r"\s(?:url|workspace)=(?:[^\]\s]+)"
 )
 _URL_PATTERN = re.compile(r"https?://[^\s\]）)>\"']+")

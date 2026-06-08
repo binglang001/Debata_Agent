@@ -268,6 +268,33 @@ async def test_runtime_start_assembles_all_components(assembled_project):
 
 
 @pytest.mark.asyncio
+async def test_runtime_binds_friend_confirmed_hook_to_rate_limiter(
+    assembled_project,
+):
+    project_root, paths = assembled_project
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data["behavior"]["rate_limit"] = {
+        "window_seconds": 60,
+        "max_messages": 0,
+        "enabled": True,
+    }
+    with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+
+        await rt.adapter._emit_friend_confirmed("1001")
+
+        assert await rt.rate_limiter.check_and_log("1001") is False
+        assert await rt.rate_limiter.check_and_log("2002") is True
+    finally:
+        await rt.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_runtime_provider_health_check_does_not_block_start(
     assembled_project,
     monkeypatch,

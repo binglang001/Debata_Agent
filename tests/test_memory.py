@@ -261,6 +261,19 @@ async def test_important_save_exact_duplicate_skip(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_important_save_semantic_neighbor_is_not_blocked(tmp_path):
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+    await im.save("张三的生日是7月8日")
+
+    result = await im.save("张三生日在七月八号")
+
+    assert result["saved"] is True
+    assert result["duplicate"] is False
+    assert len(im.items()) == 2
+
+
+@pytest.mark.asyncio
 async def test_important_persists(tmp_path):
     im1 = ImportantMemoryManager(tmp_path / "imp.json")
     await im1.load()
@@ -427,6 +440,23 @@ async def test_important_text_for_context_filters_scope_and_keeps_pinned(tmp_pat
     assert "群 B 记忆" in out
     assert "私聊 A 记忆" not in out
     assert "群 C 记忆" not in out
+
+
+@pytest.mark.asyncio
+async def test_important_text_for_context_includes_stable_ids(tmp_path):
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+    await im.replace_all(
+        [
+            {"timestamp": "T1", "content": "张三是朋友"},
+            {"id": "mem-custom", "timestamp": "T2", "content": "李四是同事"},
+        ]
+    )
+
+    out = im.text_for_context(None)
+
+    assert "[T1]" in out
+    assert "[mem-custom]" in out
 
 
 @pytest.mark.asyncio
