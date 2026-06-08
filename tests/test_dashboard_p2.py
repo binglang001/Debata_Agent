@@ -392,10 +392,21 @@ def test_chats_render_record_uses_speaker_names_not_ambiguous_pronouns():
     assert "Bob(30003)" in user_html
     assert "群消息" in user_html
     assert "玖" in assistant_html
-    assert "chat-record chat-row chat-peer chat-right" in user_html
-    assert "chat-record chat-row chat-bot chat-left" in assistant_html
+    assert "chat-record chat-message-table chat-side-right chat-peer" in user_html
+    assert "chat-record chat-message-table chat-side-left chat-bot" in assistant_html
+    assert "class='chat-message-cell' width='78%' align='right'" in user_html
+    assert "class='chat-message-cell' width='78%' align='left'" in assistant_html
+    assert "class='chat-bubble-frame' align='right'" in user_html
+    assert "class='chat-bubble-frame' align='left'" in assistant_html
+    assert "class='chat-name-line' align='right'>Bob(30003)" in user_html
+    assert "class='chat-name-line' align='left'>玖" in assistant_html
+    assert user_html.index("class='chat-spacer-cell'") < user_html.index("class='chat-message-cell'")
+    assert assistant_html.index("class='chat-message-cell'") < assistant_html.index("class='chat-spacer-cell'")
+    assert user_html.index("class='chat-name-line'") < user_html.index("class='chat-bubble'")
+    assert assistant_html.index("class='chat-name-line'") < assistant_html.index("class='chat-bubble'")
     assert "chat-bubble" in user_html
     assert "chat-bubble" in assistant_html
+    assert "chat-avatar" not in user_html + assistant_html
     assert "玖 · 内部文本" in internal_html
     assert "chat-bubble" not in internal_html
     assert ">你<" not in user_html + assistant_html
@@ -448,7 +459,7 @@ def test_chats_send_receipt_renders_only_visible_sent_as_outbound_bubble():
     assert "玖" in receipt_html
     assert "真正发出" in receipt_html
     assert "已发送 · msg_id=100" in receipt_html
-    assistant_bubble = receipt_html.split("chat-record chat-row chat-bot chat-left")[-1]
+    assistant_bubble = receipt_html.split("chat-record chat-message-table chat-side-left chat-bot")[-1]
     assert "未确认草稿" not in assistant_bubble
     assert "未发" not in assistant_bubble
 
@@ -512,6 +523,37 @@ def test_chats_runtime_and_system_records_are_events_not_bubbles():
     assert "系统 · 发送状态" in send_status_html
     assert "send_id=send-1" in send_status_html
     assert "chat-bubble" not in send_status_html
+
+
+def test_chats_event_records_do_not_use_qq_message_tables():
+    tool_html = _render_record_html(
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"status":"accepted"}',
+        },
+        persona_name="玖",
+    )
+    system_html = _render_record_html(
+        {"role": "system", "content": "主动思考：本次跳过"},
+        persona_name="玖",
+    )
+    reasoning_html = _render_record_html(
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "内部推理",
+            "conversation_id": "group:1",
+        },
+        persona_name="玖",
+    )
+
+    for html in (tool_html, system_html, reasoning_html):
+        assert "chat-event" in html
+        assert "chat-message-table" not in html
+        assert "chat-side-left" not in html
+        assert "chat-side-right" not in html
+        assert "chat-bubble" not in html
 
 
 def test_chats_renders_assistant_tool_calls_as_separate_event():
@@ -722,6 +764,29 @@ def test_chats_expand_state_is_scoped_by_conversation(qapp, tmp_paths):
     assert "收起" in private_html
     assert "group-raw" not in group_html
     assert "展开原文" in group_html
+
+
+def test_chats_render_conversation_separates_messages_without_hr(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {"role": "user", "content": "你好", "conversation_id": "group:1"},
+            {
+                "role": "assistant",
+                "content": "收到",
+                "direction": "outbound",
+                "qq_visible": True,
+                "conversation_id": "group:1",
+            },
+        ],
+    }
+
+    html = page._render_conversation(conv)
+
+    assert html.count("class='chat-record chat-message-table") == 2
+    assert "<hr" not in html
 
 
 def test_chats_bubble_style_separates_light_and_dark_from_card_background():

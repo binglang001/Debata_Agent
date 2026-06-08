@@ -415,7 +415,6 @@ class ChatsPage(QWidget):
             )
         for item in visible:
             parts.append(_render_display_item(item, expanded_item_ids=self._expanded_item_ids))
-            parts.append("<hr/>")
         return "".join(parts)
 
     def _render_record(self, rec: dict) -> str:
@@ -451,18 +450,19 @@ def _chat_html_style(theme_name: str) -> str:
     return (
         "<style>"
         ".chat-record{margin:10px 0;}"
-        ".chat-row{width:100%;}"
-        ".chat-bubble{display:inline-block;max-width:78%;text-align:left;"
+        ".chat-message-table{width:100%;border-collapse:collapse;margin:10px 0;}"
+        ".chat-message-cell{vertical-align:top;}"
+        ".chat-spacer-cell{font-size:1px;line-height:1px;}"
+        ".chat-bubble-frame{border-collapse:separate;}"
+        ".chat-name-line{font-weight:600;margin:0 0 4px 0;}"
+        ".chat-bubble{text-align:left;max-width:100%;"
         "padding:10px 12px;border-radius:8px;"
         f"border:1px solid {palette.border};color:{palette.text_primary};"
         "overflow-wrap:anywhere;word-break:break-word;}"
         f".chat-bot .chat-bubble{{background:{bot_bg};}}"
         f".chat-peer .chat-bubble{{background:{peer_bg};}}"
-        ".chat-left{margin-right:16%;}"
-        ".chat-right{margin-left:16%;}"
-        ".chat-left{text-align:left;}"
-        ".chat-right{text-align:right;}"
-        ".chat-right .chat-head{text-align:right;}"
+        ".chat-side-left .chat-name-line{text-align:left;}"
+        ".chat-side-right .chat-name-line{text-align:right;}"
         ".chat-event{padding:8px 10px;border-left:3px solid;"
         f"color:{palette.text_primary};background:{event_bg};"
         f"border-color:{palette.border};"
@@ -1194,14 +1194,16 @@ def _render_display_item(
     if item.kind == "inbound_message":
         return _render_chat_message_item(
             item,
-            css="chat-peer chat-right",
+            css="chat-peer",
+            side="right",
             toggle_id=expand_id,
             expanded=expand_id in expanded_item_ids,
         )
     if item.kind == "outbound_message":
         return _render_chat_message_item(
             item,
-            css="chat-bot chat-left",
+            css="chat-bot",
+            side="left",
             toggle_id=expand_id,
             expanded=expand_id in expanded_item_ids,
         )
@@ -1270,26 +1272,38 @@ def _render_chat_message_item(
     item: DisplayItem,
     *,
     css: str,
+    side: Literal["left", "right"],
     toggle_id: str,
     expanded: bool,
 ) -> str:
     label = item.speaker_label or item.role_label
     meta = _chat_item_meta(item)
-    parts = [
-        f"<div class='chat-record chat-row {css}'>",
-        "<div class='chat-bubble'>",
-        f"<div class='chat-head'>{_escape(label)}",
+    side_class = f"chat-side-{side}"
+    align = side
+    spacer_cell = "<td class='chat-spacer-cell' width='22%'>&nbsp;</td>"
+    message_cell_parts = [
+        f"<td class='chat-message-cell' width='78%' align='{align}' valign='top'>",
+        f"<div class='chat-name-line' align='{align}'>{_escape(label)}",
     ]
     if meta:
-        parts.append(f" <span class='chat-meta'>{_escape(meta)}</span>")
-    parts.extend(
+        message_cell_parts.append(f" <span class='chat-meta'>{_escape(meta)}</span>")
+    message_cell_parts.extend(
         [
             "</div>",
+            f"<table class='chat-bubble-frame' align='{align}' cellspacing='0' cellpadding='0' border='0'>",
+            "<tr><td class='chat-bubble'>",
             _render_text_block(item.text or "(空消息)", toggle_id=toggle_id, expanded=expanded),
-            "</div></div>",
+            "</td></tr></table>",
+            "</td>",
         ]
     )
-    return "".join(parts)
+    message_cell = "".join(message_cell_parts)
+    cells = f"{message_cell}{spacer_cell}" if side == "left" else f"{spacer_cell}{message_cell}"
+    return (
+        f"<table class='chat-record chat-message-table {side_class} {css}' "
+        "width='100%' cellspacing='0' cellpadding='0' border='0'>"
+        f"<tr>{cells}</tr></table>"
+    )
 
 
 def _render_tool_call_item(
