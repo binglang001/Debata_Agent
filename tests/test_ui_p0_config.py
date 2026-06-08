@@ -38,7 +38,8 @@ from ui.dashboard.settings_page import (
 )
 from ui.wizard.flow import next_step
 from ui.wizard.step_views.embedding import EmbeddingStepView
-from ui.wizard.steps import StepId
+from ui.wizard.step_views.summary import SummaryStepView
+from ui.wizard.steps import STEPS, StepId
 from ui.wizard.window import WizardWindow
 
 
@@ -233,6 +234,32 @@ def test_wizard_embedding_step_is_fixed_in_flow():
     ) == StepId.EMBEDDING
 
 
+def test_wizard_embedding_step_metadata_uses_rag_enhancement_copy():
+    text = STEPS[StepId.EMBEDDING].subtitle
+
+    assert "重要记忆始终启用" in text
+    assert "RAG 历史向量召回增强" in text
+    assert "普通文件模式更轻" not in text
+    assert "RAG 模式会用 embedding" not in text
+
+
+def test_wizard_summary_uses_rag_enhancement_copy(qapp):
+    from ui.wizard.context import WizardContext
+
+    ctx = WizardContext()
+    ctx.long_term_memory_mode = "rag"
+    view = SummaryStepView(ctx)
+    try:
+        view.refresh()
+        text = "\n".join(label.text() for label in view.findChildren(QtWidgets.QLabel))
+
+        assert "重要记忆始终启用；已启用 RAG 历史召回增强" in text
+        assert "文件模式" not in text
+        assert "向量模式" not in text
+    finally:
+        view.deleteLater()
+
+
 def test_wizard_embedding_local_requires_ready_model(qapp, monkeypatch):
     from ui.wizard.context import WizardContext
 
@@ -252,6 +279,24 @@ def test_wizard_embedding_local_requires_ready_model(qapp, monkeypatch):
         )
 
         assert view.save() is False
+    finally:
+        view.deleteLater()
+
+
+def test_wizard_embedding_copy_keeps_important_memory_enabled(qapp):
+    from ui.wizard.context import WizardContext
+
+    view = EmbeddingStepView(WizardContext())
+    try:
+        labels = [w.text() for w in view.findChildren(QtWidgets.QLabel)]
+        buttons = [w.text() for w in view.findChildren(QtWidgets.QAbstractButton)]
+        text = "\n".join(labels + buttons)
+
+        assert "重要记忆始终启用" in text
+        assert "RAG 是可选的历史向量召回增强" in text
+        assert "文件模式更轻" not in text
+        assert "文件模式（默认" not in text
+        assert "RAG 模式会用 embedding" not in text
     finally:
         view.deleteLater()
 
@@ -294,7 +339,7 @@ def test_wizard_embedding_default_does_not_reuse_deepseek_main(qapp):
         view._refresh_provider_choices()
 
         assert view._api_provider.currentData() == "new:volcengine"
-        assert view._api_model.text() == "doubao-embedding-text-240515"
+        assert view._api_model.text() == "doubao-embedding-vision-251215"
         assert view._api_provider.findData("existing:deepseek_main") < 0
     finally:
         view.deleteLater()
@@ -334,7 +379,43 @@ def test_wizard_embedding_volcengine_uses_current_model(qapp):
         view._api_provider.setCurrentIndex(idx)
         view._on_provider_changed()
 
-        assert view._api_model.text() == "doubao-embedding-text-240515"
+        assert view._api_model.text() == "doubao-embedding-vision-251215"
+    finally:
+        view.deleteLater()
+
+
+def test_wizard_embedding_refresh_fills_missing_api_model_default(qapp):
+    from ui.wizard.context import WizardContext
+
+    ctx = WizardContext()
+    ctx.long_term_memory_mode = "rag"
+    ctx.embedding_type = "api"
+    ctx.embedding_provider = ""
+    ctx.embedding_model = ""
+    view = EmbeddingStepView(ctx)
+    try:
+        view.refresh()
+
+        assert view._api_provider.currentData() == "new:volcengine"
+        assert view._api_model.text() == "doubao-embedding-vision-251215"
+    finally:
+        view.deleteLater()
+
+
+def test_wizard_embedding_refresh_preserves_custom_api_model(qapp):
+    from ui.wizard.context import WizardContext
+
+    ctx = WizardContext()
+    ctx.long_term_memory_mode = "rag"
+    ctx.embedding_type = "api"
+    ctx.embedding_provider = "embedding_volcengine"
+    ctx.embedding_provider_preset = "volcengine"
+    ctx.embedding_model = "custom-embedding-model"
+    view = EmbeddingStepView(ctx)
+    try:
+        view.refresh()
+
+        assert view._api_model.text() == "custom-embedding-model"
     finally:
         view.deleteLater()
 

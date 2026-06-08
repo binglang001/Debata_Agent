@@ -126,7 +126,8 @@ STEPS: dict[StepId, Step] = {
         id=StepId.EMBEDDING,
         title="记忆方式",
         subtitle=(
-            "选择长期记忆的工作方式。普通文件模式更轻，RAG 模式会用 embedding 模型做语义检索。"
+            "重要记忆始终启用。这里选择是否额外启用 RAG 历史向量召回增强，"
+            "启用时需要 embedding 服务。"
         ),
         fields=["long_term_memory_mode", "embedding_type", "embedding_provider", "embedding_model"],
     ),

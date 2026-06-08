@@ -1721,7 +1721,7 @@ def test_dashboard_theme_apply_short_circuits_same_resolved_theme(qapp, monkeypa
     assert page._current_theme == "dark"
 
 
-def test_memory_page_rag_mode_shows_index_view(qapp):
+def test_memory_page_rag_mode_keeps_important_memory_tab(qapp):
     class FakeImportant:
         def items(self):
             return [{"timestamp": "t1", "content": "用户喜欢红茶"}]
@@ -1755,12 +1755,85 @@ def test_memory_page_rag_mode_shows_index_view(qapp):
     try:
         page.refresh()
 
+        assert not page._tabs.isHidden()
+        assert page._tabs.tabText(0) == "重要记忆"
+        assert page._tabs.tabText(1) == "RAG 历史索引"
+        assert page._title.text() == "重要记忆"
+        assert "重要记忆始终启用" in page._rag_status.text()
+        assert page._list.count() == 1
+        assert "用户喜欢红茶" in page._list.item(0).text()
+        assert not page._add_row_widget.isHidden()
+        assert not page._action_row_widget.isHidden()
+
+        page._tabs.setCurrentIndex(1)
+        qapp.processEvents()
+
         assert page._title.text() == "RAG 历史向量索引"
         assert "索引 1 条" in page._rag_status.text()
+        assert "重要记忆仍单独保存和注入" in page._rag_status.text()
         assert page._list.count() == 1
         assert page._add_row_widget.isHidden()
         assert page._action_row_widget.isHidden()
         assert page._metadata_row_widget.isHidden()
+    finally:
+        page.deleteLater()
+
+
+def test_memory_page_rag_not_ready_copy_keeps_important_memory_enabled(qapp):
+    class FakeImportant:
+        def items(self):
+            return [{"timestamp": "t1", "content": "用户喜欢红茶"}]
+
+    cfg = _minimal_root_config()
+    cfg.features = FeaturesConfig(
+        long_term_memory=LongTermMemoryConfig(mode="rag")
+    )
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "important": FakeImportant(),
+            "rag_store": None,
+            "embedding_service": None,
+        },
+    )()
+    page = MemoryPage(runtime)
+    try:
+        page._tabs.setCurrentIndex(1)
+        page.refresh()
+
+        assert "重要记忆仍照常可用" in page._rag_status.text()
+        assert "不读写重要记忆文件" not in page._rag_status.text()
+    finally:
+        page.deleteLater()
+
+
+def test_settings_longterm_memory_copy_describes_rag_as_enhancement(qapp, tmp_paths):
+    cfg = _minimal_root_config()
+    cfg.features = FeaturesConfig(long_term_memory=LongTermMemoryConfig(mode="file"))
+    runtime = _dashboard_runtime(tmp_paths, cfg)
+    page = SettingsPage(runtime)
+    calls = []
+    page._save_now = lambda **kwargs: calls.append(kwargs)
+    try:
+        labels = [w.text() for w in page.findChildren(QtWidgets.QLabel)]
+        buttons = [w.text() for w in page.findChildren(QtWidgets.QAbstractButton)]
+        text = "\n".join(labels + buttons)
+
+        assert "重要记忆始终启用" in text
+        assert "RAG 历史召回增强" in text
+        assert "文件模式（默认" not in text
+        assert "RAG 向量检索" not in text
+
+        rag_button = next(
+            rb for rb in page.findChildren(QtWidgets.QRadioButton)
+            if "启用 RAG 历史召回增强" in rb.text()
+        )
+        rag_button.setChecked(True)
+
+        assert cfg.features.long_term_memory.mode == "rag"
+        assert calls[-1]["change_desc"] == "long_term_memory.mode=rag"
     finally:
         page.deleteLater()
 

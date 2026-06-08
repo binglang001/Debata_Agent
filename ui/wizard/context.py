@@ -141,7 +141,7 @@ class WizardContext:
     long_term_memory_mode: Literal["file", "rag"] = "file"
     long_term_memory_keyword_trigger_save: bool = True
 
-    # RAG embedding（mode=rag 时才用）
+    # RAG 历史召回 embedding（mode=rag 时才用）
     embedding_type: Literal["api", "local"] = "api"
     embedding_provider: str = "volcengine"
     embedding_provider_preset: str = ""

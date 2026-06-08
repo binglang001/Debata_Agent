@@ -235,7 +235,7 @@ class SettingsPage(
     def _build_memory_section(self) -> SectionCard:
         card = SectionCard(
             title="记忆方式",
-            subtitle="长期记忆模式与 RAG embedding 配置集中在这里，改动后重启生效。",
+            subtitle="重要记忆始终启用；这里配置是否额外启用 RAG 历史召回增强，改动后重启生效。",
         )
         card.add_content(self._build_longterm_memory_card())
         card.add_content(self._build_embedding_card())

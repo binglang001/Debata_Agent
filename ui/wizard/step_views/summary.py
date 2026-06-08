@@ -111,9 +111,12 @@ class SummaryStepView(BaseStepView):
             ("联网搜索", c.web_search),
         ]:
             feat_lines.append((label, "开" if choice.enabled else "—"))
-        feat_lines.append(
-            ("长期记忆", "向量模式" if c.long_term_memory_mode == "rag" else "文件模式")
+        memory_text = (
+            "重要记忆始终启用；已启用 RAG 历史召回增强"
+            if c.long_term_memory_mode == "rag"
+            else "重要记忆始终启用；未启用 RAG 历史召回"
         )
+        feat_lines.append(("长期记忆", memory_text))
         self._summary_layout.addWidget(self._section(COPY["summary.section_features"], feat_lines))
 
         # 渠道

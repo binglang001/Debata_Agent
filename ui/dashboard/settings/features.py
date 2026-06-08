@@ -388,21 +388,21 @@ class SettingsFeaturesMixin:
         return f"API · provider={t.provider or '?'}{detail}"
 
     def _build_embedding_card(self) -> QWidget:
-        """RAG embedding 配置卡片。"""
+        """RAG 历史召回 embedding 配置卡片。"""
         wrap = QFrame()
         wrap.setObjectName("Card")
         outer = QVBoxLayout(wrap)
         outer.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
         outer.setSpacing(Spacing.SM)
 
-        title = QLabel("Embedding（RAG 向量检索）")
+        title = QLabel("Embedding（RAG 历史召回）")
         title.setProperty("role", "title-3")
         outer.addWidget(title)
 
-        desc_text = "将对话内容转为数学向量用于语义检索，让长记忆模式下 AI 只注入最相关的少量记忆。"
+        desc_text = "将历史对话转为向量，用于 RAG 历史召回增强；重要记忆仍按原有机制保存和注入。"
         lt = self._cfg().features.long_term_memory
         if lt.mode != "rag":
-            desc_text += "\n当前长期记忆模式不是 RAG，此处配置暂不生效。"
+            desc_text += "\n当前未启用 RAG 历史召回，此处配置暂不生效。"
         desc = QLabel(desc_text)
         desc.setProperty("role", "secondary")
         desc.setWordWrap(True)
@@ -470,14 +470,19 @@ class SettingsFeaturesMixin:
         outer.setSpacing(Spacing.SM)
 
         lt = self._cfg().features.long_term_memory
-        title = QLabel("长期记忆模式")
+        title = QLabel("长期记忆")
         title.setProperty("role", "title-3")
         outer.addWidget(title)
 
+        desc = QLabel("重要记忆始终启用。这里仅控制是否额外从历史对话中做 RAG 向量召回。")
+        desc.setProperty("role", "secondary")
+        desc.setWordWrap(True)
+        outer.addWidget(desc)
+
         group = QButtonGroup(wrap)
         group.setExclusive(True)
-        rb_file = QRadioButton("文件模式（默认 · 零开销 · AI 主动调工具）")
-        rb_rag = QRadioButton("RAG 向量检索（需启用下方 Embedding 配置）")
+        rb_file = QRadioButton("不启用 RAG 历史召回（默认 · 重要记忆仍启用）")
+        rb_rag = QRadioButton("启用 RAG 历史召回增强（需启用下方 Embedding 配置）")
         rb_file.setChecked(lt.mode == "file")
         rb_rag.setChecked(lt.mode == "rag")
         group.addButton(rb_file)

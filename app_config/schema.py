@@ -480,8 +480,8 @@ class LongTermMemoryConfig(StrictModel):
     """长期记忆配置。"""
 
     mode: Literal["file", "rag"] = "file"
-    """file = 纯文件模式（默认，零开销，AI 主动调 save_important_memory 工具触发）;
-    rag = 会话历史向量检索（需 features.embedding 启用，不使用 important.json）"""
+    """file = 不启用 RAG 历史召回，重要记忆仍保存并注入；
+    rag = 在重要记忆之外增加会话历史向量检索（需 features.embedding 启用）"""
 
     keyword_trigger_save: bool = True
     """命中关键词（"记住"/"约定"/"我叫"等）时强制保存为重要记忆，不依赖 AI 主动调用工具。"""
@@ -490,7 +490,7 @@ class LongTermMemoryConfig(StrictModel):
     """RAG 模式下每次召回的相关历史条目数（仅 mode=rag 生效）"""
 
     rag_extractor_interval: int = 15
-    """预留：被动结构化抽取触发间隔。当前 RAG 索引历史原文，不使用重要记忆抽取。"""
+    """预留：被动结构化抽取触发间隔。当前 RAG 索引历史原文，不替代重要记忆。"""
 
 
 class EmbeddingFeatureConfig(StrictModel):
