@@ -1,6 +1,6 @@
 """消息类工具：发送私聊/群消息、撤回、上传文件。
 
-发送类工具保留 order / delay / typing_delay 的节奏。运行在 MessagePipeline
+发送类工具保留 order / delay 的节奏。运行在 MessagePipeline
 内时交给 Phase 0 异步发送队列；没有队列回调的独立调用退回同步直发兜底。
 """
 
@@ -18,7 +18,6 @@ from .message_builder import (
     MessageBuildError,
     build_message_action,
     contains_forbidden,
-    typing_delay,
 )
 from .schemas import (
     CommitSendAttemptArgs,
@@ -29,8 +28,6 @@ from .schemas import (
 )
 
 logger = logging.getLogger(__name__)
-
-_MEDIA_DELAY_SECONDS = 0.5
 
 
 def _mark_activity(ctx: ToolContext) -> None:
@@ -119,38 +116,8 @@ def _inject_context_tool_call_id(metadata: dict, ctx: ToolContext) -> dict:
     return result
 
 
-def _bounded_delay(value: float, ctx: ToolContext) -> float:
-    max_delay = max(0.0, float(ctx.typing_max_delay_seconds))
-    min_delay = min(max(0.0, float(ctx.typing_min_delay_seconds)), max_delay)
-    return min(max(0.0, float(value), min_delay), max_delay)
-
-
-def _estimate_send_delay(content: str | None, ctx: ToolContext) -> float:
-    if content:
-        return typing_delay(
-            content,
-            chars_per_second=ctx.typing_chars_per_second,
-            english_chars_per_second=ctx.typing_english_chars_per_second,
-            min_delay_seconds=ctx.typing_min_delay_seconds,
-            max_delay=ctx.typing_max_delay_seconds,
-        )
-    return _bounded_delay(_MEDIA_DELAY_SECONDS, ctx)
-
-
-def _normalize_send_delay(
-    *,
-    model_delay: float | None,
-    content: str | None,
-    ctx: ToolContext,
-    multi_message: bool,
-) -> float:
-    estimated_delay = _estimate_send_delay(content, ctx)
-    if model_delay is None:
-        return estimated_delay
-    delay = max(0.0, float(model_delay))
-    if not multi_message or not ctx.typing_clamp_model_delay:
-        return delay
-    return _bounded_delay(max(delay, estimated_delay), ctx)
+def _normalize_send_delay(model_delay: float) -> float:
+    return float(model_delay)
 
 
 def _apply_reply_to_first_text(actions: list[dict], reply_to_message_id: str | None) -> None:
@@ -209,8 +176,6 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
 
     # 按 order 升序排序，保证逐条发送顺序与 LLM 意图一致
     sorted_targets = sorted(args.targets, key=lambda t: t.order)
-    multi_message = len(sorted_targets) > 1
-
     for t in sorted_targets:
         try:
             message_action = build_message_action(
@@ -231,12 +196,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
             )
             continue
 
-        delay = _normalize_send_delay(
-            model_delay=t.delay,
-            content=t.content,
-            ctx=ctx,
-            multi_message=multi_message,
-        )
+        delay = _normalize_send_delay(t.delay)
 
         actions.append(
             {
@@ -325,8 +285,6 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
     errors: list[str] = []
 
     sorted_targets = sorted(args.targets, key=lambda t: t.order)
-    multi_message = len(sorted_targets) > 1
-
     for t in sorted_targets:
         try:
             message_action = build_message_action(
@@ -343,12 +301,7 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
             errors.append("内容含禁止标签")
             continue
 
-        delay = _normalize_send_delay(
-            model_delay=t.delay,
-            content=t.content,
-            ctx=ctx,
-            multi_message=multi_message,
-        )
+        delay = _normalize_send_delay(t.delay)
 
         actions.append(
             {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import ui.dashboard.tool_display as tool_display
 from ui.dashboard.tool_display import format_tool_call, format_tool_result
 
 
@@ -115,3 +116,81 @@ def test_tool_display_formats_unknown_tool_result_without_raw_json():
     assert "items 为列表 2 项" in display.detail
     assert "payload 为对象，包含 ok、count" in display.detail
     assert '"items"' not in display.detail
+
+
+def test_tool_display_reuses_cached_tool_result_json_parse(monkeypatch):
+    tool_display._clear_tool_display_caches()
+    loads_calls = 0
+    original_loads = json.loads
+
+    def counted_loads(value):
+        nonlocal loads_calls
+        loads_calls += 1
+        return original_loads(value)
+
+    monkeypatch.setattr(tool_display.json, "loads", counted_loads)
+    content = json.dumps({"status": "done", "items": [{"id": 1}]}, ensure_ascii=False)
+
+    first = format_tool_result(content)
+    second = format_tool_result(content)
+
+    assert second == first
+    assert loads_calls == 1
+
+
+def test_tool_display_reuses_cached_tool_call_json_parse(monkeypatch):
+    tool_display._clear_tool_display_caches()
+    loads_calls = 0
+    original_loads = json.loads
+
+    def counted_loads(value):
+        nonlocal loads_calls
+        loads_calls += 1
+        return original_loads(value)
+
+    monkeypatch.setattr(tool_display.json, "loads", counted_loads)
+    arguments = json.dumps({"keyword": "alpha", "items": [{"id": 1}]}, ensure_ascii=False)
+    tool_call = {"function": {"name": "custom_tool", "arguments": arguments}}
+
+    first = format_tool_call(tool_call)
+    second = format_tool_call(tool_call)
+
+    assert second == first
+    assert loads_calls == 1
+
+
+def test_tool_display_tool_call_cache_key_changes_after_argument_mutation():
+    tool_display._clear_tool_display_caches()
+    args = {"keyword": "alpha"}
+    tool_call = {"function": {"name": "custom_tool", "arguments": args}}
+
+    first = format_tool_call(tool_call)
+    args["keyword"] = "beta"
+    second = format_tool_call(tool_call)
+
+    assert "keyword 为 alpha" in first.detail
+    assert "keyword 为 beta" in second.detail
+
+
+def test_tool_display_cache_evicts_old_entries(monkeypatch):
+    tool_display._clear_tool_display_caches()
+    loads_calls = 0
+    original_loads = json.loads
+
+    def counted_loads(value):
+        nonlocal loads_calls
+        loads_calls += 1
+        return original_loads(value)
+
+    monkeypatch.setattr(tool_display.json, "loads", counted_loads)
+    first_content = json.dumps({"status": "done", "value": 0}, ensure_ascii=False)
+
+    format_tool_result(first_content)
+    for value in range(1, tool_display._TOOL_DISPLAY_CACHE_MAX_SIZE + 1):
+        format_tool_result(json.dumps({"status": "done", "value": value}, ensure_ascii=False))
+
+    before = loads_calls
+    format_tool_result(first_content)
+
+    assert len(tool_display._FORMAT_TOOL_RESULT_CACHE) == tool_display._TOOL_DISPLAY_CACHE_MAX_SIZE
+    assert loads_calls == before + 1

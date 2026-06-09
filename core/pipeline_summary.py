@@ -48,12 +48,21 @@ class PipelineSummaryMixin:
         estimator = self._token_estimator()
         active_tokens = estimator.estimate_messages(records)
         budget = self._context_budget()
-        trigger = self.behavior_cfg.summarize.trigger_at_tokens
+        summarize_cfg = self.behavior_cfg.summarize
+        trigger = summarize_cfg.trigger_at_tokens
         if trigger is None:
-            trigger = int(budget.max_context_tokens * 0.75)
-        target_after = self.behavior_cfg.summarize.target_after_tokens
+            trigger = int(
+                budget.max_context_tokens
+                * summarize_cfg.trigger_at_context_percent
+                / 100
+            )
+        target_after = summarize_cfg.target_after_tokens
         if target_after is None:
-            target_after = int(budget.max_context_tokens * 0.50)
+            target_after = int(
+                budget.max_context_tokens
+                * summarize_cfg.target_after_context_percent
+                / 100
+            )
         if active_tokens < trigger:
             return
         target_after = max(1, min(target_after, active_tokens - 1))

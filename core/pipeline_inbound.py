@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 # 速率超限时的提示模板（占位符运行时替换）
 _RATE_LIMIT_REPLY_TEMPLATE = "已超出速率限制（{window_seconds} 秒内最多 {max_messages} 条），请添加机器人为好友后继续使用"
+_SAFE_PAYLOAD_MAX_STRING_LENGTH = 2000
+_SAFE_PAYLOAD_MAX_DEPTH = 3
+_SAFE_PAYLOAD_MAX_ITEMS = 30
 
 
 def _message_pipeline_global(name: str, fallback):
@@ -117,6 +120,12 @@ class PipelineInboundMixin:
             text=text,
             timestamp=getattr(event, "timestamp", None),
         )
+        await self._append_qq_message_received_event(
+            event,
+            conversation_id=conversation_id,
+            text=text,
+            received_at=received_at,
+        )
         await self.batch.append(item)
         self._send_manager.notify_inbound(item)
         logger.debug(
@@ -142,6 +151,80 @@ class PipelineInboundMixin:
         if target is not None and getattr(target, "scope", None) == "private":
             return f"private:{target.target_id}"
         return f"private:{event.user_id}"
+
+    async def _append_qq_message_received_event(
+        self,
+        event: IncomingMessage,
+        *,
+        conversation_id: str,
+        text: str,
+        received_at: float,
+    ) -> None:
+        """把 QQ 可见入站消息追加到磁盘事件库。"""
+        event_store = getattr(self, "event_store", None) or getattr(self, "_event_store", None)
+        if event_store is None:
+            return
+
+        target = getattr(event, "source_target", None)
+        source = _optional_text(getattr(event, "adapter", None)) or _optional_text(
+            getattr(target, "adapter", None)
+        )
+        external_id = _optional_text(getattr(event, "message_id", None))
+        target_id = (
+            _optional_text(getattr(target, "target_id", None))
+            or _optional_text(getattr(event, "group_id", None))
+            or _optional_text(getattr(event, "user_id", None))
+        )
+        timestamp_unix = _incoming_timestamp_unix(event, received_at)
+        payload: dict[str, Any] = {
+            "direction": "inbound",
+            "conversation_id": conversation_id,
+            "source": source,
+            "msg_id": external_id,
+            "message_id": external_id,
+            "user_id": _optional_text(getattr(event, "user_id", None)),
+            "nickname": _optional_text(getattr(event, "nickname", None)),
+            "sender_name": _optional_text(getattr(event, "nickname", None))
+            or _optional_text(getattr(event, "user_id", None)),
+            "group_id": _optional_text(getattr(event, "group_id", None)),
+            "target_id": target_id,
+            "target_scope": _optional_text(getattr(target, "scope", None))
+            or _optional_text(getattr(event, "scope", None)),
+            "text": text,
+            "content": text,
+            "timestamp_unix": timestamp_unix,
+            "received_at": received_at,
+            "self_id": _optional_text(getattr(event, "self_id", None)),
+            "reply_to": _optional_text(getattr(event, "reply_to", None)),
+            "raw_event": _incoming_raw_event_payload(event),
+        }
+        media_payload = _incoming_media_payload(event)
+        if media_payload:
+            payload["media"] = media_payload
+
+        idempotency_key = None
+        if external_id:
+            idempotency_key = f"qq_message_received:{source or ''}:{conversation_id}:{external_id}"
+
+        debug_enabled = logger.isEnabledFor(logging.DEBUG)
+        write_started_at = time.perf_counter() if debug_enabled else 0.0
+        await event_store.append_event(
+            event_type="qq_message_received",
+            conversation_id=conversation_id,
+            source=source,
+            external_id=external_id,
+            idempotency_key=idempotency_key,
+            timestamp_unix=timestamp_unix,
+            payload=payload,
+        )
+        if debug_enabled:
+            logger.debug(
+                "QQ 入站消息 EventStore 写入指标 conversation_id=%s msg_id=%s "
+                "elapsed_ms=%.3f",
+                conversation_id,
+                external_id,
+                (time.perf_counter() - write_started_at) * 1000,
+            )
 
     async def _batch_loop(self, return_target: Target) -> None:
         """合并窗口循环：等待 → 取一批 → 处理 → 若被中断则重循环。
@@ -258,21 +341,135 @@ class PipelineInboundMixin:
         )
         try:
             msg_id = await self.adapter.send_text(event.source_target, text)
-            if msg_id is not None:
-                conversation_id = self._conversation_id_from_event(event)
-                self._self_id_by_conversation[conversation_id] = str(
-                    getattr(event, "self_id", "") or ""
-                )
-                self._record_successful_outbound(
-                    {
-                        "target_scope": event.source_target.scope,
-                        "target_id": event.source_target.target_id,
-                        "content": text,
-                        "label": text,
-                        "kind": "text",
-                    },
-                    conversation_id=conversation_id,
-                    msg_id=str(msg_id),
-                )
         except Exception:
             logger.debug("发送速率超限提示失败（adapter 可能未连接）")
+            return
+        if msg_id is None:
+            return
+        conversation_id = self._conversation_id_from_event(event)
+        self._self_id_by_conversation[conversation_id] = str(
+            getattr(event, "self_id", "") or ""
+        )
+        await self._record_successful_outbound(
+            {
+                "target_scope": event.source_target.scope,
+                "target_id": event.source_target.target_id,
+                "content": text,
+                "label": text,
+                "kind": "text",
+            },
+            conversation_id=conversation_id,
+            msg_id=str(msg_id),
+        )
+
+
+def _incoming_timestamp_unix(event: IncomingMessage, received_at: float) -> float:
+    timestamp = _positive_float_or_none(getattr(event, "timestamp", None))
+    if timestamp is not None:
+        return timestamp
+    received = _positive_float_or_none(received_at)
+    if received is not None and received > 1_000_000_000:
+        return received
+    return time.time()
+
+
+def _incoming_raw_event_payload(event: IncomingMessage) -> dict[str, Any]:
+    raw_event: dict[str, Any] = {
+        "adapter": _optional_text(getattr(event, "adapter", None)),
+        "event_type": _enum_or_text(getattr(event, "event_type", None)),
+        "timestamp": _positive_float_or_none(getattr(event, "timestamp", None)),
+        "self_id": _optional_text(getattr(event, "self_id", None)),
+        "message_id": _optional_text(getattr(event, "message_id", None)),
+        "scope": _optional_text(getattr(event, "scope", None)),
+        "user_id": _optional_text(getattr(event, "user_id", None)),
+        "nickname": _optional_text(getattr(event, "nickname", None)),
+        "group_id": _optional_text(getattr(event, "group_id", None)),
+        "text": _optional_text(getattr(event, "text", None)),
+        "raw_message": _optional_text(getattr(event, "raw_message", None)),
+        "reply_to": _optional_text(getattr(event, "reply_to", None)),
+    }
+    raw = getattr(event, "raw", None)
+    if isinstance(raw, dict) and raw:
+        raw_event["raw"] = _safe_basic_payload(raw)
+    return raw_event
+
+
+def _incoming_media_payload(event: IncomingMessage) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for segment in list(getattr(event, "media", []) or [])[:20]:
+        item: dict[str, Any] = {
+            "type": _enum_or_text(getattr(segment, "type", None)),
+            "file_id": _optional_text(getattr(segment, "file_id", None)),
+            "url": _optional_text(getattr(segment, "url", None)),
+            "name": _optional_text(getattr(segment, "name", None)),
+        }
+        extra = getattr(segment, "extra", None)
+        if isinstance(extra, dict) and extra:
+            item["extra"] = _safe_basic_payload(extra)
+        payload.append({key: value for key, value in item.items() if value is not None})
+    return payload
+
+
+def _safe_basic_payload(value: Any, *, depth: int = 0) -> Any:
+    """限制 raw 中的基础字段规模，避免把平台原始大对象整包塞进事件库。"""
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        return _truncate_safe_payload_text(value)
+    if depth >= _SAFE_PAYLOAD_MAX_DEPTH:
+        return _safe_payload_text(value)
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for index, (key, child) in enumerate(value.items()):
+            if index >= _SAFE_PAYLOAD_MAX_ITEMS:
+                break
+            result[_safe_payload_key(key)] = _safe_basic_payload(child, depth=depth + 1)
+        return result
+    if isinstance(value, list | tuple):
+        return [
+            _safe_basic_payload(child, depth=depth + 1)
+            for child in value[:_SAFE_PAYLOAD_MAX_ITEMS]
+        ]
+    return _safe_payload_text(value)
+
+
+def _truncate_safe_payload_text(text: str) -> str:
+    if len(text) <= _SAFE_PAYLOAD_MAX_STRING_LENGTH:
+        return text
+    return text[:_SAFE_PAYLOAD_MAX_STRING_LENGTH]
+
+
+def _safe_payload_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return _truncate_safe_payload_text(str(value).strip()) or None
+
+
+def _safe_payload_key(value: Any) -> str:
+    return _truncate_safe_payload_text(str(value))
+
+
+def _positive_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _enum_or_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None:
+        value = enum_value
+    return _optional_text(value)

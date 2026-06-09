@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...theme import Spacing
+from ...widgets.unit_fields import unit_spinbox
 from ...wizard.components import SectionCard
 from . import CollapsibleSection
 
@@ -25,7 +26,7 @@ class SettingsSoftwareMixin:
     def _build_software_behavior_section(self) -> SectionCard:
         card = SectionCard(
             title="软件行为",
-            subtitle="界面主题、消息节奏、主动思考和陌生人限速。常用项在上方，高风险项保持收起前的简洁说明。",
+            subtitle="界面主题、消息合并、主动思考和陌生人限速。常用项在上方，高风险项保持收起前的简洁说明。",
         )
         card.add_content(self._build_appearance_section())
 
@@ -37,23 +38,21 @@ class SettingsSoftwareMixin:
         merge_spin.setRange(0.0, 60.0)
         merge_spin.setSingleStep(0.5)
         merge_spin.setValue(b.merge_window_seconds)
-        merge_spin.setSuffix(" 秒")
         merge_spin.setToolTip("同一窗口内收到的连续消息会合并成一次模型调用。")
         merge_spin.editingFinished.connect(
             lambda: self._on_behavior_field("merge_window_seconds", merge_spin.value())
         )
-        form.addRow(QLabel("消息合并窗口"), merge_spin)
+        form.addRow(QLabel("消息合并窗口"), unit_spinbox(merge_spin, "秒"))
 
         recall_spin = QDoubleSpinBox()
         recall_spin.setRange(0.0, 60.0)
         recall_spin.setSingleStep(0.5)
         recall_spin.setValue(b.recall_merge_window_seconds)
-        recall_spin.setSuffix(" 秒")
         recall_spin.setToolTip("撤回事件在该时间内合并处理，避免频繁打断。")
         recall_spin.editingFinished.connect(
             lambda: self._on_behavior_field("recall_merge_window_seconds", recall_spin.value())
         )
-        form.addRow(QLabel("撤回合并窗口"), recall_spin)
+        form.addRow(QLabel("撤回合并窗口"), unit_spinbox(recall_spin, "秒"))
 
         hist_spin = QSpinBox()
         hist_spin.setRange(1, 1000)
@@ -62,17 +61,7 @@ class SettingsSoftwareMixin:
         hist_spin.editingFinished.connect(
             lambda: self._on_behavior_field("default_history_fetch_count", hist_spin.value())
         )
-        form.addRow(QLabel("默认拉历史条数"), hist_spin)
-
-        chars_spin = QDoubleSpinBox()
-        chars_spin.setRange(0.1, 50.0)
-        chars_spin.setSingleStep(0.5)
-        chars_spin.setValue(b.typing.chars_per_second)
-        chars_spin.setToolTip("影响分条发送时模拟打字的等待时间。")
-        chars_spin.editingFinished.connect(
-            lambda: self._on_behavior_nested("typing", "chars_per_second", chars_spin.value())
-        )
-        form.addRow(QLabel("打字速度（字/秒）"), chars_spin)
+        form.addRow(QLabel("默认拉历史条数"), unit_spinbox(hist_spin, "条"))
 
         card.add_layout(form)
 
@@ -92,24 +81,78 @@ class SettingsSoftwareMixin:
         proactive_spin.setRange(10.0, 86400.0)
         proactive_spin.setSingleStep(60.0)
         proactive_spin.setValue(b.proactive_think_interval_seconds)
-        proactive_spin.setSuffix(" 秒")
         proactive_spin.editingFinished.connect(
             lambda: self._on_behavior_field("proactive_think_interval_seconds", proactive_spin.value())
         )
-        proactive_form.addRow(QLabel("主动思考间隔"), proactive_spin)
+        proactive_form.addRow(QLabel("主动思考间隔"), unit_spinbox(proactive_spin, "秒"))
 
         proactive_budget = QSpinBox()
         proactive_budget.setRange(1024, 65536)
         proactive_budget.setSingleStep(1024)
         proactive_budget.setValue(b.proactive_context_token_budget)
-        proactive_budget.setSuffix(" token")
         proactive_budget.setToolTip("主动思考路由器读取近期上下文和记忆的预算。默认 4K。")
         proactive_budget.editingFinished.connect(
             lambda: self._on_behavior_field("proactive_context_token_budget", proactive_budget.value())
         )
-        proactive_form.addRow(QLabel("主动思考上下文"), proactive_budget)
+        proactive_form.addRow(QLabel("主动思考上下文"), unit_spinbox(proactive_budget, "token"))
         proactive_section.add_layout(proactive_form)
         card.add_content(proactive_section)
+
+        proactive_budget_section = CollapsibleSection(
+            "主动思考预算",
+            "控制主动路由器读取文本、工具结果、摘要和历史的预算。",
+            expanded=False,
+        )
+        proactive_budget_form = QFormLayout()
+        proactive_budget_form.setSpacing(Spacing.SM)
+        self._add_behavior_spin_row(
+            proactive_budget_form,
+            "输入文本片段",
+            "proactive_router_text_limit_tokens",
+            b.proactive_router_text_limit_tokens,
+            32,
+            100_000,
+            "token",
+        )
+        self._add_behavior_spin_row(
+            proactive_budget_form,
+            "工具结果 inline",
+            "proactive_router_tool_result_inline_tokens",
+            b.proactive_router_tool_result_inline_tokens,
+            32,
+            100_000,
+            "token",
+        )
+        self._add_behavior_spin_row(
+            proactive_budget_form,
+            "工具结果硬上限",
+            "proactive_router_tool_result_hard_cap_tokens",
+            b.proactive_router_tool_result_hard_cap_tokens,
+            64,
+            100_000,
+            "token",
+        )
+        self._add_behavior_spin_row(
+            proactive_budget_form,
+            "历史摘要上限",
+            "proactive_router_summary_limit_tokens",
+            b.proactive_router_summary_limit_tokens,
+            128,
+            100_000,
+            "token",
+        )
+        self._add_behavior_spin_row(
+            proactive_budget_form,
+            "历史窗口预算",
+            "proactive_router_history_token_budget",
+            b.proactive_router_history_token_budget,
+            1024,
+            1_000_000,
+            "token",
+            step=1024,
+        )
+        proactive_budget_section.add_layout(proactive_budget_form)
+        card.add_content(proactive_budget_section)
 
         rate_section = CollapsibleSection(
             "陌生人限速",
@@ -131,16 +174,14 @@ class SettingsSoftwareMixin:
         rl_window = QSpinBox()
         rl_window.setRange(1, 3600)
         rl_window.setValue(b.rate_limit.window_seconds)
-        rl_window.setSuffix(" 秒")
         rl_window.editingFinished.connect(lambda: self._on_behavior_nested("rate_limit", "window_seconds", rl_window.value()))
-        rate_form.addRow(QLabel("窗口"), rl_window)
+        rate_form.addRow(QLabel("窗口"), unit_spinbox(rl_window, "秒"))
 
         rl_max = QSpinBox()
         rl_max.setRange(1, 1000)
         rl_max.setValue(b.rate_limit.max_messages)
-        rl_max.setSuffix(" 条")
         rl_max.editingFinished.connect(lambda: self._on_behavior_nested("rate_limit", "max_messages", rl_max.value()))
-        rate_form.addRow(QLabel("最多条数"), rl_max)
+        rate_form.addRow(QLabel("最多条数"), unit_spinbox(rl_max, "条"))
         rate_section.add_layout(rate_form)
         card.add_content(rate_section)
 
@@ -169,3 +210,25 @@ class SettingsSoftwareMixin:
         diag.setWordWrap(True)
         card.add_content(diag)
         return card
+
+    def _add_behavior_spin_row(
+        self,
+        form: QFormLayout,
+        label: str,
+        field: str,
+        value: int,
+        minimum: int,
+        maximum: int,
+        unit: str,
+        *,
+        step: int = 1,
+    ) -> None:
+        spin = QSpinBox()
+        spin.setObjectName(f"behavior_{field}_spin")
+        spin.setRange(minimum, maximum)
+        spin.setSingleStep(step)
+        spin.setValue(value)
+        spin.editingFinished.connect(
+            lambda s=spin, f=field: self._on_behavior_field(f, s.value())
+        )
+        form.addRow(QLabel(label), unit_spinbox(spin, unit))

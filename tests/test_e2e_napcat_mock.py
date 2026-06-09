@@ -151,8 +151,6 @@ def _make_config() -> RootConfig:
             default_history_fetch_count=100,
             typing=TypingConfig(
                 chars_per_second=999.0,
-                min_delay_seconds=0.0,
-                max_delay_seconds=0.01,
             ),
             rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
             summarize=SummarizeConfig(
@@ -217,7 +215,14 @@ async def test_private_message_napcat_json_to_send(tmp_path):
                     id="tc-1",
                     name="send_private_messages",
                     arguments=json.dumps({
-                        "targets": [{"target_qq": "123456", "content": "收到，回复中", "order": 1}],
+                        "targets": [
+                            {
+                                "target_qq": "123456",
+                                "content": "收到，回复中",
+                                "order": 1,
+                                "delay": 0,
+                            }
+                        ],
                     }),
                 ),
             ],
@@ -291,7 +296,7 @@ async def test_group_message_napcat_json_to_send(tmp_path):
                     name="send_group_message",
                     arguments=json.dumps({
                         "group_id": 5555,
-                        "targets": [{"content": "收到群聊", "order": 1}],
+                        "targets": [{"content": "收到群聊", "order": 1, "delay": 0}],
                     }),
                 ),
             ],

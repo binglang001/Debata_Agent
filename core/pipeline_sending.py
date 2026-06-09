@@ -465,29 +465,30 @@ class PipelineSendingMixin:
                     )
                     return None
                 msg_id = await send_voice(target, Path(audio_path))
-                self.mark_activity()
-                if msg_id is not None:
-                    self._record_successful_outbound(
-                        action,
-                        conversation_id=f"{scope}:{target_id}",
-                        msg_id=str(msg_id),
-                    )
-                return msg_id
-            msg_id = await self.adapter.send_text(target, content)
-            self.mark_activity()
-            if msg_id is not None:
-                self._record_successful_outbound(
-                    action,
-                    conversation_id=f"{scope}:{target_id}",
-                    msg_id=str(msg_id),
-                )
-            return msg_id
+            else:
+                msg_id = await self.adapter.send_text(target, content)
         except Exception as e:
             logger.error(f"发送失败 {target}: {e}")
             await self.history.add_system_note(
                 f"⚠ 发送失败 → {label or target_id}（{type(e).__name__}: {e}）"
             )
             return None
+
+        self.mark_activity()
+        if msg_id is not None:
+            try:
+                await self._record_successful_outbound(
+                    action,
+                    conversation_id=f"{scope}:{target_id}",
+                    msg_id=str(msg_id),
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    "QQ 消息已发送，但 qq_message_sent 事件持久化失败："
+                    f"scope={scope} target_id={target_id} msg_id={msg_id} "
+                    f"error={type(e).__name__}: {e}"
+                ) from e
+        return msg_id
 
     async def _send_scheduled_message(
         self,

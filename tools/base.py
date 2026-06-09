@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_TOOL_RESULT_FORMAT = "structured_json"
+
 
 class ToolSchemaMode(StrEnum):
     FULL = "full"
@@ -173,9 +175,7 @@ class ToolContext:
 
     typing_chars_per_second: float = 1.0
     typing_english_chars_per_second: float = 5.0
-    typing_min_delay_seconds: float = 1.0
-    typing_max_delay_seconds: float = 8.0
-    typing_clamp_model_delay: bool = True
+    """遗留打字速度字段；发送工具不再读取这些字段。"""
 
     tool_result_soft_limit_tokens: int = 600
     tool_result_hard_cap_tokens: int = 1500
@@ -317,6 +317,8 @@ class ToolSpec:
         result = {
             "ok": True,
             "status": "found",
+            "result_format": _TOOL_RESULT_FORMAT,
+            "result_type": "tool_metadata",
             "tool_name": self.name,
             "description": self.description,
             "short_description": self.short_description or self.description,
@@ -327,10 +329,12 @@ class ToolSpec:
             "constraints": _tool_constraints(self),
         }
         if detail == "full":
+            result["brief"] = f"已返回 {self.name} 的完整 schema；这是工具元数据。"
             result["parameters_schema"] = parameters
             result["next"] = "已返回完整 JSON schema。若确认要使用该工具，请按 parameters_schema 调用原工具。"
             return result
 
+        result["brief"] = f"已返回 {self.name} 的参数摘要；这是工具元数据。"
         summary_fields = _summarize_parameter_fields(parameters)
         result["parameters"] = summary_fields
         result["parameter_summary"] = {
@@ -489,7 +493,10 @@ class ToolRegistry:
         ) -> dict[str, Any]:
             spec = self._specs.get(tool_name)
             if spec is None:
-                return {"ok": False, "error": f"unknown tool: {tool_name}"}
+                return _ensure_tool_result_envelope(
+                    tool_name,
+                    {"ok": False, "error": f"unknown tool: {tool_name}"},
+                )
             finish_after_success = (
                 tool_name != "no_action"
                 and raw_args.get("finish_after_success") is True
@@ -501,20 +508,26 @@ class ToolRegistry:
                 spec.schema_mode == ToolSchemaMode.STUB
                 and tool_name not in ctx.extras.get("tool_search_approved_tools", set())
             ):
-                return {
-                    "ok": False,
-                    "status": "need_tool_search",
-                    "tool_name": tool_name,
-                    "brief": f"工具 {tool_name} 需要先查询完整说明。",
-                    "next": "请先调用 tool_search 获取参数摘要和风险约束，再决定是否调用。",
-                }
+                return _ensure_tool_result_envelope(
+                    tool_name,
+                    {
+                        "ok": False,
+                        "status": "need_tool_search",
+                        "tool_name": tool_name,
+                        "brief": f"工具 {tool_name} 需要先查询完整说明。",
+                        "next": "请先调用 tool_search 获取参数摘要和风险约束，再决定是否调用。",
+                    },
+                )
 
             try:
                 args = spec.args_model.model_validate(raw_args)
             except Exception as e:
                 # Pydantic ValidationError 详情比较长，简化输出
                 logger.warning(f"工具 {tool_name} 参数校验失败: {e}")
-                return {"ok": False, "error": f"参数无效: {e}"}
+                return _ensure_tool_result_envelope(
+                    tool_name,
+                    {"ok": False, "error": f"参数无效: {e}"},
+                )
 
             try:
                 old_tool_call_id = ctx.extras.get("tool_call_id")
@@ -523,7 +536,10 @@ class ToolRegistry:
                 result = await spec.func(args, ctx)
             except Exception as e:
                 logger.exception(f"工具 {tool_name} 执行异常: {e}")
-                return {"ok": False, "error": str(e)}
+                return _ensure_tool_result_envelope(
+                    tool_name,
+                    {"ok": False, "error": str(e)},
+                )
             finally:
                 if tool_call_id:
                     if old_tool_call_id is None:
@@ -543,6 +559,7 @@ class ToolRegistry:
             from .result_shrink import shrink_tool_result
 
             shrunk = shrink_tool_result(tool_name, result, ctx)
+            shrunk = _ensure_tool_result_envelope(tool_name, shrunk)
             if finish_after_success and not _tool_result_blocks_completion(shrunk):
                 shrunk = dict(shrunk)
                 completion = dict(shrunk.get("turn_completion") or {})
@@ -552,6 +569,95 @@ class ToolRegistry:
             return shrunk
 
         return executor
+
+
+def _ensure_tool_result_envelope(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
+    enveloped = dict(result)
+    if "ok" not in enveloped:
+        enveloped["ok"] = _infer_tool_result_ok(enveloped)
+    if "status" not in enveloped:
+        enveloped["status"] = (
+            "done" if _tool_result_ok_is_success(enveloped.get("ok")) else "failed"
+        )
+    enveloped["tool"] = tool_name
+    enveloped["result_format"] = _TOOL_RESULT_FORMAT
+    if not _has_readable_brief(enveloped.get("brief")):
+        enveloped["brief"] = _make_tool_result_brief(tool_name, enveloped)
+    return enveloped
+
+
+def _infer_tool_result_ok(result: dict[str, Any]) -> bool:
+    if _tool_result_has_error(result):
+        return False
+    status = result.get("status")
+    if isinstance(status, str):
+        return not _tool_status_is_failure(status)
+    if isinstance(status, (list, tuple, set)):
+        return not any(_tool_status_is_failure(str(item)) for item in status)
+    if result.get("success") is False:
+        return False
+    return True
+
+
+def _tool_result_has_error(result: dict[str, Any]) -> bool:
+    for key in ("error", "errors"):
+        value = result.get(key)
+        if value not in (None, "", [], {}):
+            return True
+    return False
+
+
+def _tool_status_is_failure(status: str) -> bool:
+    normalized = status.strip().lower()
+    failure_statuses = {
+        "denied",
+        "error",
+        "failed",
+        "need_tool_search",
+        "not_found",
+        "stale",
+        "timeout",
+        "unavailable",
+        "unsupported",
+    }
+    return (
+        normalized in failure_statuses
+        or normalized.endswith("_failed")
+        or "failed" in normalized
+        or "error" in normalized
+    )
+
+
+def _tool_result_ok_is_success(value: Any) -> bool:
+    if value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "failed", "error", "no"}
+    return True
+
+
+def _has_readable_brief(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _make_tool_result_brief(tool_name: str, result: dict[str, Any]) -> str:
+    status = str(result.get("status") or "").strip()
+    status_suffix = f"，status={status}" if status else ""
+    if result.get("ok") is False:
+        return f"{tool_name} 未完成{status_suffix}。"
+    if result.get("no_action") is True:
+        return "本轮不执行操作。"
+    sent = result.get("sent")
+    if isinstance(sent, list):
+        return f"{tool_name} 已处理 {len(sent)} 条发送结果{status_suffix}。"
+    count = result.get("count")
+    if isinstance(count, int):
+        return f"{tool_name} 返回 {count} 项{status_suffix}。"
+    if "artifact" in result or "path" in result:
+        return f"{tool_name} 已返回结果文件{status_suffix}。"
+    if status:
+        return f"{tool_name} 返回结构化结果，status={status}。"
+    return f"{tool_name} 已返回结构化结果。"
 
 
 def _tool_constraints(spec: ToolSpec) -> list[str]:

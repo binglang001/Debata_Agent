@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 from adapters.types import IncomingMessage, MediaSegment, MediaType
 from core.chat_timeline import ChatTimelineMessage, ChatTimelineStore
 
@@ -169,3 +172,83 @@ def test_snapshot_keeps_append_order_and_sliding_capacity():
     assert list(snapshot) == ["private:123"]
     assert [item.msg_id for item in snapshot["private:123"]] == ["m2", "m3", "m4"]
     assert [item.timestamp for item in snapshot["private:123"]] == [2.0, 3.0, 4.0]
+
+
+def test_append_notifies_listener_with_safe_copy():
+    store = ChatTimelineStore()
+    received: list[ChatTimelineMessage] = []
+    notified = threading.Event()
+
+    def listener(message: ChatTimelineMessage) -> None:
+        message.text = "listener 改写"
+        received.append(message)
+        notified.set()
+
+    unsubscribe = store.subscribe(listener)
+    try:
+        store.append(_timeline_message("m1", "原始"))
+
+        assert notified.wait(1.0)
+        assert [item.msg_id for item in received] == ["m1"]
+        assert store.recent("private:123", 10)[0].text == "原始"
+    finally:
+        unsubscribe()
+
+
+def test_listener_exception_does_not_affect_append():
+    store = ChatTimelineStore()
+    failed = threading.Event()
+    notified = threading.Event()
+
+    def failing_listener(_message: ChatTimelineMessage) -> None:
+        failed.set()
+        raise RuntimeError("listener failed")
+
+    def listener(_message: ChatTimelineMessage) -> None:
+        notified.set()
+
+    unsubscribe_failed = store.subscribe(failing_listener)
+    unsubscribe_ok = store.subscribe(listener)
+    try:
+        store.append(_timeline_message("m1", "原始"))
+
+        assert store.recent("private:123", 10)[0].msg_id == "m1"
+        assert failed.wait(1.0)
+        assert notified.wait(1.0)
+    finally:
+        unsubscribe_failed()
+        unsubscribe_ok()
+
+
+def test_unsubscribe_stops_notifications():
+    store = ChatTimelineStore()
+    notified = threading.Event()
+    unsubscribe = store.subscribe(lambda _message: notified.set())
+
+    unsubscribe()
+    unsubscribe()
+    store.append(_timeline_message("m1", "原始"))
+
+    assert not notified.wait(0.1)
+
+
+def test_append_does_not_wait_for_slow_listener():
+    store = ChatTimelineStore()
+    listener_started = threading.Event()
+    release_listener = threading.Event()
+
+    def slow_listener(_message: ChatTimelineMessage) -> None:
+        listener_started.set()
+        release_listener.wait(1.0)
+
+    unsubscribe = store.subscribe(slow_listener)
+    try:
+        started_at = time.perf_counter()
+        store.append(_timeline_message("m1", "原始"))
+        elapsed = time.perf_counter() - started_at
+
+        assert elapsed < 0.2
+        assert listener_started.wait(1.0)
+    finally:
+        release_listener.set()
+        unsubscribe()

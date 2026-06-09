@@ -29,11 +29,41 @@ from app_config.schema import AgentConfig, ProviderConfig, ReasoningConfig
 from ...theme import Spacing
 from ...widgets import show_message
 from ...widgets.model_combo import ModelComboBox
+from ...widgets.unit_fields import unit_spinbox
 from ...widgets.wheel_freeze import install_wheel_freeze
 from ...wizard.components import SectionCard
 from ..copy import DASHBOARD_COPY
 from .dialogs import _AddProviderDialog, _load_provider_presets_for_dialog
 from .helpers import _progress_slot
+from .widgets import CollapsibleSection
+
+
+def _agent_label(agent_name: str) -> str:
+    return {
+        "chat": "主聊天",
+        "proactive": "主动思考",
+        "summary": "历史总结",
+        "persona_gen": "人格生成",
+    }.get(agent_name, agent_name)
+
+
+def _agent_supports_tool_loop(agent_name: str) -> bool:
+    return agent_name == "chat"
+
+
+def _unit_spinbox_with_checkbox(
+    spin: QSpinBox,
+    unit: str,
+    checkbox: QCheckBox,
+) -> QWidget:
+    row = QWidget()
+    lay = QHBoxLayout(row)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(Spacing.SM)
+    lay.addWidget(unit_spinbox(spin, unit, add_stretch=False))
+    lay.addWidget(checkbox)
+    lay.addStretch(1)
+    return row
 
 
 class SettingsModelMixin:
@@ -84,11 +114,12 @@ class SettingsModelMixin:
         a_hint.setWordWrap(True)
         card.add_content(a_hint)
 
-        for agent_name in ("chat", "proactive", "summary"):
+        for agent_name in ("chat", "proactive", "summary", "persona_gen"):
             agent_cfg = getattr(self._cfg().agents, agent_name)
             if agent_cfg is None:
                 continue
             card.add_content(self._build_agent_row(agent_name, agent_cfg))
+        card.add_content(self._build_agent_budget_group())
         if self._cfg().agents.chat is not None:
             card.add_content(self._build_tool_loop_reminder_group())
         return card
@@ -489,9 +520,7 @@ class SettingsModelMixin:
         outer.setSpacing(Spacing.XS)
 
         head = QHBoxLayout()
-        label = {"chat": "主聊天", "proactive": "主动思考", "summary": "历史总结"}.get(
-            agent_name, agent_name
-        )
+        label = _agent_label(agent_name)
         title = QLabel(label)
         title.setProperty("role", "title-3")
         head.addWidget(title)
@@ -576,25 +605,92 @@ class SettingsModelMixin:
         outer.addLayout(form)
         return wrap
 
+    def _build_agent_budget_group(self) -> QWidget:
+        section = CollapsibleSection(
+            "Agent 输出预算",
+            "控制各 Agent 的回复上限和思考阶段上限；主聊天额外控制工具循环最终收尾上限。",
+            expanded=False,
+        )
+        form = QFormLayout()
+        form.setSpacing(Spacing.SM)
+        for agent_name, agent_cfg in self._cfg()._iter_agents():
+            label = _agent_label(agent_name)
+
+            max_tokens = QSpinBox()
+            max_tokens.setObjectName(f"agentBudget{agent_name}MaxTokensSpin")
+            max_tokens.setRange(1, 4_000_000)
+            max_tokens.setSingleStep(1024)
+            max_tokens.setValue(agent_cfg.max_tokens)
+            max_tokens.editingFinished.connect(
+                lambda an=agent_name, s=max_tokens: self._on_agent_budget_field_changed(
+                    an,
+                    "max_tokens",
+                    s.value(),
+                )
+            )
+            form.addRow(QLabel(f"{label}回复上限"), unit_spinbox(max_tokens, "token"))
+
+            reasoning_tokens = QSpinBox()
+            reasoning_tokens.setObjectName(f"agentBudget{agent_name}ReasoningMaxTokensSpin")
+            reasoning_tokens.setRange(512, 4_000_000)
+            reasoning_tokens.setSingleStep(1024)
+            reasoning_value = (
+                agent_cfg.reasoning.max_tokens
+                if agent_cfg.reasoning and agent_cfg.reasoning.max_tokens is not None
+                else None
+            )
+            reasoning_tokens.setValue(reasoning_value or 4096)
+            reasoning_unspecified = QCheckBox("不指定")
+            reasoning_unspecified.setObjectName(
+                f"agentBudget{agent_name}ReasoningUnspecifiedCheck"
+            )
+            reasoning_unspecified.setChecked(reasoning_value is None)
+            reasoning_tokens.setEnabled(not reasoning_unspecified.isChecked())
+
+            def _on_reasoning_unspecified(on: bool, an=agent_name, s=reasoning_tokens) -> None:
+                s.setEnabled(not on)
+                self._on_agent_reasoning_max_tokens_changed(an, None if on else s.value())
+
+            reasoning_unspecified.toggled.connect(_on_reasoning_unspecified)
+            reasoning_tokens.editingFinished.connect(
+                lambda an=agent_name, s=reasoning_tokens, c=reasoning_unspecified:
+                None if c.isChecked() else self._on_agent_reasoning_max_tokens_changed(
+                    an,
+                    s.value(),
+                )
+            )
+            form.addRow(
+                QLabel(f"{label}思考上限"),
+                _unit_spinbox_with_checkbox(reasoning_tokens, "token", reasoning_unspecified),
+            )
+
+            if not _agent_supports_tool_loop(agent_name):
+                continue
+
+            final_tokens = QSpinBox()
+            final_tokens.setObjectName(f"agentBudget{agent_name}ToolLoopFinalMaxTokensSpin")
+            final_tokens.setRange(512, 4_000_000)
+            final_tokens.setSingleStep(1024)
+            final_tokens.setValue(agent_cfg.tool_loop_final_max_tokens)
+            final_tokens.editingFinished.connect(
+                lambda an=agent_name, s=final_tokens: self._on_agent_tool_loop_field_changed(
+                    an,
+                    "tool_loop_final_max_tokens",
+                    s.value(),
+                )
+            )
+            form.addRow(QLabel(f"{label}工具收尾上限"), unit_spinbox(final_tokens, "token"))
+        section.add_layout(form)
+        return section
+
     def _build_tool_loop_reminder_group(self) -> QWidget:
         agent_cfg = self._cfg().agents.chat
-        wrap = QFrame()
-        wrap.setObjectName("Card")
-        outer = QVBoxLayout(wrap)
-        outer.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
-        outer.setSpacing(Spacing.SM)
-
-        title = QLabel("工具循环提醒")
-        title.setProperty("role", "title-3")
-        outer.addWidget(title)
-
-        hint = QLabel(
+        section = CollapsibleSection(
+            "工具循环提醒",
             "连续多轮调用工具时先周期性提醒；达到最终警告后仍有宽限轮。"
-            "这不是达到某轮数就立即禁止工具的普通硬停止。"
+            "这不是达到某轮数就立即禁止工具的普通硬停止。",
+            expanded=False,
         )
-        hint.setProperty("role", "secondary")
-        hint.setWordWrap(True)
-        outer.addWidget(hint)
 
         form = QFormLayout()
         form.setSpacing(Spacing.SM)
@@ -603,7 +699,6 @@ class SettingsModelMixin:
         interval_spin.setObjectName("toolLoopReminderIntervalSpin")
         interval_spin.setRange(1, 1000)
         interval_spin.setValue(max(1, int(agent_cfg.tool_loop_reminder_interval or 8)))
-        interval_spin.setSuffix(" 轮")
         interval_spin.setToolTip("连续多少个工具轮后触发一次普通提醒。")
         install_wheel_freeze(interval_spin)
         interval_spin.editingFinished.connect(
@@ -613,13 +708,12 @@ class SettingsModelMixin:
                 interval_spin.value(),
             )
         )
-        form.addRow(QLabel("工具轮数提醒间隔"), interval_spin)
+        form.addRow(QLabel("工具轮数提醒间隔"), unit_spinbox(interval_spin, "轮"))
 
         warning_spin = QSpinBox()
         warning_spin.setObjectName("toolLoopFinalWarningCountSpin")
         warning_spin.setRange(1, 1000)
         warning_spin.setValue(max(1, int(agent_cfg.tool_loop_final_warning_count or 4)))
-        warning_spin.setSuffix(" 次")
         warning_spin.setToolTip("普通提醒达到多少次后进入最终警告周期。")
         install_wheel_freeze(warning_spin)
         warning_spin.editingFinished.connect(
@@ -629,13 +723,12 @@ class SettingsModelMixin:
                 warning_spin.value(),
             )
         )
-        form.addRow(QLabel("最终警告前提醒次数"), warning_spin)
+        form.addRow(QLabel("最终警告前提醒次数"), unit_spinbox(warning_spin, "次"))
 
         grace_spin = QSpinBox()
         grace_spin.setObjectName("toolLoopFinalGraceLoopsSpin")
         grace_spin.setRange(0, 1000)
         grace_spin.setValue(max(0, int(agent_cfg.tool_loop_final_grace_loops or 0)))
-        grace_spin.setSuffix(" 轮")
         grace_spin.setToolTip("最终警告发出后还允许多少个工具轮。")
         install_wheel_freeze(grace_spin)
         grace_spin.editingFinished.connect(
@@ -645,10 +738,10 @@ class SettingsModelMixin:
                 grace_spin.value(),
             )
         )
-        form.addRow(QLabel("最终警告后宽限轮数"), grace_spin)
+        form.addRow(QLabel("最终警告后宽限轮数"), unit_spinbox(grace_spin, "轮"))
 
-        outer.addLayout(form)
-        return wrap
+        section.add_layout(form)
+        return section
 
     def _on_agent_provider_changed(self, agent_name: str, new_provider: str) -> None:
         if self._suppress_signals or not new_provider:
@@ -719,6 +812,7 @@ class SettingsModelMixin:
             "tool_loop_reminder_interval": 1,
             "tool_loop_final_warning_count": 1,
             "tool_loop_final_grace_loops": 0,
+            "tool_loop_final_max_tokens": 512,
         }
         min_value = minimums.get(field_name)
         if min_value is None:
@@ -728,8 +822,51 @@ class SettingsModelMixin:
             return
         setattr(a, field_name, value)
         self._save_now(
-            needs_restart=False,
-            change_desc=f"agents.{agent_name}.{field_name}={value} (hot)",
+            needs_restart=True,
+            change_desc=f"agents.{agent_name}.{field_name}={value}",
+        )
+
+    def _on_agent_budget_field_changed(
+        self,
+        agent_name: str,
+        field_name: str,
+        value: int,
+    ) -> None:
+        if self._suppress_signals:
+            return
+        a = getattr(self._cfg().agents, agent_name, None)
+        if a is None:
+            return
+        value = max(1, int(value))
+        if getattr(a, field_name) == value:
+            return
+        setattr(a, field_name, value)
+        self._save_now(
+            needs_restart=True,
+            change_desc=f"agents.{agent_name}.{field_name}={value}",
+        )
+
+    def _on_agent_reasoning_max_tokens_changed(
+        self,
+        agent_name: str,
+        value: int | None,
+    ) -> None:
+        if self._suppress_signals:
+            return
+        a = getattr(self._cfg().agents, agent_name, None)
+        if a is None:
+            return
+        if a.reasoning is None:
+            if value is None:
+                return
+            a.reasoning = ReasoningConfig(enabled=False, budget=None, max_tokens=int(value))
+        elif a.reasoning.max_tokens != value:
+            a.reasoning.max_tokens = value
+        else:
+            return
+        self._save_now(
+            needs_restart=True,
+            change_desc=f"agents.{agent_name}.reasoning.max_tokens",
         )
 
     def _on_agent_reasoning_changed(self, agent_name: str, enabled: bool, budget) -> None:
@@ -739,7 +876,13 @@ class SettingsModelMixin:
         if a is None:
             return
         if enabled:
-            a.reasoning = ReasoningConfig(enabled=True, budget=budget)
+            max_tokens = a.reasoning.max_tokens if a.reasoning else None
+            a.reasoning = ReasoningConfig(enabled=True, budget=budget, max_tokens=max_tokens)
         else:
-            a.reasoning = None
+            max_tokens = a.reasoning.max_tokens if a.reasoning else None
+            a.reasoning = (
+                ReasoningConfig(enabled=False, budget=None, max_tokens=max_tokens)
+                if max_tokens is not None
+                else None
+            )
         self._save_now(needs_restart=True, change_desc=f"agents.{agent_name}.reasoning")

@@ -13,9 +13,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from .store import JsonlStore
 
@@ -34,12 +38,18 @@ def _on_notify_done(task: asyncio.Task) -> None:
 
 AppendCallback = Callable[[list[dict]], Awaitable[None]]
 
+HISTORY_RECORD_EVENT_TYPE = "history_record_appended"
+HISTORY_EVENT_PAYLOAD_SOURCE = "history_jsonl"
+HISTORY_JOURNAL_SCHEMA_VERSION = 1
+
 
 class HistoryManager:
     """对话历史管理器。一个 persona 对应一个实例。"""
 
-    def __init__(self, history_path: Path) -> None:
+    def __init__(self, history_path: Path, event_store: Any = None) -> None:
         self._store = JsonlStore(history_path)
+        self._event_store = event_store
+        self._mutation_lock = asyncio.Lock()
         self._append_callbacks: list[AppendCallback] = []
         # 保留 notify task 引用避免 GC（订阅者执行完后自动 discard）
         self._notify_tasks: set[asyncio.Task] = set()
@@ -62,6 +72,74 @@ class HistoryManager:
             self._notify_tasks.add(task)
             task.add_done_callback(self._notify_tasks.discard)
 
+    async def _append_records_and_mirror(self, records: list[dict]) -> None:
+        """先写完整 JSONL，再把轻量索引镜像到事件库。"""
+        if not records:
+            return
+        history_start = await self._store.length()
+        await self._store.append_many(records)
+        if self._event_store is None:
+            return
+
+        try:
+            await self._event_store.append_events(
+                [
+                    _history_record_event(
+                        record,
+                        history_index=history_start + batch_index,
+                        batch_index=batch_index,
+                    )
+                    for batch_index, record in enumerate(records)
+                ]
+            )
+        except Exception as e:
+            logger.warning(
+                f"history EventStore 镜像失败，已保留完整 JSONL: {e}",
+                exc_info=True,
+            )
+
+    async def _mirror_truncated(self, cut_point: int, remaining: int) -> None:
+        """把 JSONL 截断动作镜像到事件库，失败不影响历史旧语义。"""
+        if self._event_store is None or cut_point <= 0:
+            return
+        try:
+            await self._event_store.append_event(
+                event_type="history_truncated",
+                payload={
+                    "cut_point": cut_point,
+                    "remaining_count": remaining,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"history EventStore 截断镜像失败: {e}", exc_info=True)
+
+    async def _record_system_note_event(self, record: dict) -> None:
+        """记录 system note 专用轻量事件，失败不影响 JSONL 历史。"""
+        if self._event_store is None:
+            return
+        try:
+            history_length = await self._store.length()
+            history_index = max(0, history_length - 1)
+            content = str(record.get("content") or "")
+            content_length, content_hash = _content_fingerprint(content)
+            conversation_id = _history_record_conversation_id(record)
+            await self._event_store.append_event(
+                event_type="system_note_recorded",
+                conversation_id=conversation_id,
+                payload={
+                    "role": "system",
+                    "history_index": history_index,
+                    "history_offset": history_index,
+                    "conversation_id": conversation_id,
+                    "content_hash": content_hash,
+                    "content_length": content_length,
+                    "record_keys": [str(key) for key in record.keys()],
+                    "source": "history_jsonl",
+                },
+            )
+        except Exception as e:
+            logger.warning(f"history system note 事件记录失败: {e}", exc_info=True)
+
     async def load(self, force_reload: bool = False) -> list[dict]:
         """加载所有历史。"""
         return await self._store.load(force_reload=force_reload)
@@ -73,7 +151,15 @@ class HistoryManager:
         records() 更适合"取当前完整记录"这种调用场景，
         在 message_pipeline 拼装 messages 时用 records() 表达意图更清晰。
         """
-        return await self._store.load()
+        started_at = time.perf_counter()
+        records = await self._store.load()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "HistoryManager records 指标 returned_records=%d elapsed_ms=%.3f",
+                len(records),
+                (time.perf_counter() - started_at) * 1000,
+            )
+        return records
 
     async def records_for_conversation(
         self,
@@ -109,8 +195,9 @@ class HistoryManager:
             record["metadata"] = metadata
         if conversation_id:
             record["conversation_id"] = conversation_id
-        await self._store.append(record)
-        await self._notify([record])
+        async with self._mutation_lock:
+            await self._append_records_and_mirror([record])
+            await self._notify([record])
 
     async def add_assistant_message(
         self,
@@ -126,8 +213,9 @@ class HistoryManager:
             record["reasoning_content"] = reasoning_content
         if conversation_id:
             record["conversation_id"] = conversation_id
-        await self._store.append(record)
-        await self._notify([record])
+        async with self._mutation_lock:
+            await self._append_records_and_mirror([record])
+            await self._notify([record])
 
     async def add_tool_result(
         self,
@@ -138,8 +226,9 @@ class HistoryManager:
         record = {"role": "tool", "tool_call_id": tool_call_id, "content": content}
         if conversation_id:
             record["conversation_id"] = conversation_id
-        await self._store.append(record)
-        await self._notify([record])
+        async with self._mutation_lock:
+            await self._append_records_and_mirror([record])
+            await self._notify([record])
 
     async def add_system_note(
         self,
@@ -152,8 +241,10 @@ class HistoryManager:
         record = {"role": "system", "content": content}
         if conversation_id:
             record["conversation_id"] = conversation_id
-        await self._store.append(record)
-        await self._notify([record])
+        async with self._mutation_lock:
+            await self._append_records_and_mirror([record])
+            await self._record_system_note_event(record)
+            await self._notify([record])
 
     async def add_records(
         self,
@@ -161,15 +252,32 @@ class HistoryManager:
         conversation_id: str | None = None,
     ) -> None:
         """批量追加（如 agent 一轮工具循环后的所有 records）。"""
+        started_at = time.perf_counter()
+        debug_enabled = logger.isEnabledFor(logging.DEBUG)
         if not records:
+            if debug_enabled:
+                logger.debug(
+                    "HistoryManager add_records 指标 input_records=0 appended_records=0 "
+                    "elapsed_ms=%.3f",
+                    (time.perf_counter() - started_at) * 1000,
+                )
             return
         if conversation_id:
             records = [
                 ({**record, "conversation_id": record.get("conversation_id") or conversation_id})
                 for record in records
             ]
-        await self._store.append_many(records)
-        await self._notify(records)
+        async with self._mutation_lock:
+            await self._append_records_and_mirror(records)
+            await self._notify(records)
+        if debug_enabled:
+            logger.debug(
+                "HistoryManager add_records 指标 input_records=%d appended_records=%d "
+                "elapsed_ms=%.3f",
+                len(records),
+                len(records),
+                (time.perf_counter() - started_at) * 1000,
+            )
 
     async def length(self) -> int:
         return await self._store.length()
@@ -179,11 +287,15 @@ class HistoryManager:
 
     async def truncate_head(self, cut_point: int) -> int:
         """删除最早的 cut_point 条记录。返回剩余长度。"""
-        return await self._store.truncate_head(cut_point)
+        async with self._mutation_lock:
+            remaining = await self._store.truncate_head(cut_point)
+            await self._mirror_truncated(cut_point, remaining)
+        return remaining
 
     async def clear(self) -> None:
         """清空所有历史（慎用）。"""
-        await self._store.clear()
+        async with self._mutation_lock:
+            await self._store.clear()
 
 
 def _infer_conversation_id(record: dict) -> str | None:
@@ -222,3 +334,92 @@ def _infer_conversation_id(record: dict) -> str | None:
     if user_id:
         return f"private:{user_id}"
     return None
+
+
+def _history_record_event_payload(
+    record: dict,
+    *,
+    history_index: int,
+    batch_index: int,
+) -> dict:
+    content_length, content_hash = _content_fingerprint(record.get("content"))
+    conversation_id = _history_record_conversation_id(record)
+    payload = {
+        "source": HISTORY_EVENT_PAYLOAD_SOURCE,
+        "history_index": history_index,
+        "history_offset": history_index,
+        "batch_index": batch_index,
+        "role": _optional_text(record.get("role")),
+        "conversation_id": conversation_id,
+        "tool_call_id": _optional_text(record.get("tool_call_id")),
+        "tool_call_ids": _tool_call_ids(record),
+        "content_hash": content_hash,
+        "content_length": content_length,
+        "record_keys": [str(key) for key in record.keys()],
+    }
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _history_record_event(
+    record: dict,
+    *,
+    history_index: int,
+    batch_index: int,
+) -> dict:
+    conversation_id = _history_record_conversation_id(record)
+    return {
+        "event_type": HISTORY_RECORD_EVENT_TYPE,
+        "conversation_id": conversation_id,
+        "source": "history_manager",
+        "tool_call_id": _optional_text(record.get("tool_call_id")),
+        "payload": _history_record_event_payload(
+            record,
+            history_index=history_index,
+            batch_index=batch_index,
+        ),
+        "schema_version": HISTORY_JOURNAL_SCHEMA_VERSION,
+    }
+
+
+def _history_record_conversation_id(record: dict) -> str | None:
+    return _optional_text(record.get("conversation_id")) or _infer_conversation_id(record)
+
+
+def _tool_call_ids(record: dict) -> list[str] | None:
+    tool_call_id = _optional_text(record.get("tool_call_id"))
+    if tool_call_id:
+        return [tool_call_id]
+    tool_calls = record.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return None
+    ids = [
+        cleaned
+        for tool_call in tool_calls
+        if isinstance(tool_call, dict)
+        for cleaned in [_optional_text(tool_call.get("id"))]
+        if cleaned is not None
+    ]
+    return ids or None
+
+
+def _content_fingerprint(content: object) -> tuple[int, str]:
+    if isinstance(content, str):
+        text = content
+    elif content is None:
+        text = ""
+    else:
+        text = json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    return len(text), hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

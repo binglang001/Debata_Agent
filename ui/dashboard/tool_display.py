@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
+
+_TOOL_DISPLAY_CACHE_MAX_SIZE = 128
+_TOOL_DISPLAY_CACHE_LOCK = threading.RLock()
+_FORMAT_TOOL_CALL_CACHE: OrderedDict[tuple[Any, ...], ToolDisplay] = OrderedDict()
+_FORMAT_TOOL_RESULT_CACHE: OrderedDict[tuple[Any, ...], ToolDisplay] = OrderedDict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +24,16 @@ class ToolDisplay:
 
 
 def format_tool_call(tool_call: dict[str, Any]) -> ToolDisplay:
+    cache_key = ("tool_call", _snapshot_cache_token(_tool_call_cache_content(tool_call)))
+    cached = _cache_get(_FORMAT_TOOL_CALL_CACHE, cache_key)
+    if cached is not None:
+        return cached
+    display = _format_tool_call_uncached(tool_call)
+    _cache_put(_FORMAT_TOOL_CALL_CACHE, cache_key, display)
+    return display
+
+
+def _format_tool_call_uncached(tool_call: dict[str, Any]) -> ToolDisplay:
     func = tool_call.get("function") if isinstance(tool_call, dict) else None
     if not isinstance(func, dict):
         return ToolDisplay(
@@ -73,6 +90,22 @@ def format_tool_result(
     tool_name: str | None = None,
     tool_call_id: str | None = None,
 ) -> ToolDisplay:
+    del tool_call_id
+    name = (tool_name or "").strip()
+    cache_key = ("tool_result", name, _snapshot_cache_token(content))
+    cached = _cache_get(_FORMAT_TOOL_RESULT_CACHE, cache_key)
+    if cached is not None:
+        return cached
+    display = _format_tool_result_uncached(content, tool_name=name)
+    _cache_put(_FORMAT_TOOL_RESULT_CACHE, cache_key, display)
+    return display
+
+
+def _format_tool_result_uncached(
+    content: str,
+    *,
+    tool_name: str | None = None,
+) -> ToolDisplay:
     payload = _parse_json_payload(content)
     name = (tool_name or "").strip()
     if name == "commit_send_attempt" or _looks_like_commit_send_attempt_result(payload):
@@ -86,6 +119,102 @@ def format_tool_result(
 
 def summarize_value(value: Any) -> str:
     return _summarize_value(value)
+
+
+def _cache_get(cache: OrderedDict[tuple[Any, ...], ToolDisplay], key: tuple[Any, ...]) -> ToolDisplay | None:
+    with _TOOL_DISPLAY_CACHE_LOCK:
+        display = cache.get(key)
+        if display is not None:
+            cache.move_to_end(key)
+        return display
+
+
+def _cache_put(cache: OrderedDict[tuple[Any, ...], ToolDisplay], key: tuple[Any, ...], display: ToolDisplay) -> None:
+    with _TOOL_DISPLAY_CACHE_LOCK:
+        cache[key] = display
+        cache.move_to_end(key)
+        while len(cache) > _TOOL_DISPLAY_CACHE_MAX_SIZE:
+            cache.popitem(last=False)
+
+
+def _tool_call_cache_content(tool_call: Any) -> tuple[Any, ...]:
+    if not isinstance(tool_call, dict):
+        return ("invalid", tool_call)
+    func = tool_call.get("function")
+    if not isinstance(func, dict):
+        return ("invalid_function", func)
+    return ("function", func.get("name"), func.get("arguments"))
+
+
+def _snapshot_cache_token(value: Any) -> str:
+    hasher = hashlib.blake2b(digest_size=16)
+    _update_snapshot_hash(hasher, value)
+    return hasher.hexdigest()
+
+
+def _update_snapshot_hash(hasher: Any, value: Any) -> None:
+    if value is None:
+        hasher.update(b"none;")
+        return
+    if isinstance(value, bool):
+        hasher.update(b"bool:1;" if value else b"bool:0;")
+        return
+    if isinstance(value, str):
+        _hash_bytes(hasher, b"str", value.encode("utf-8", "surrogatepass"))
+        return
+    if isinstance(value, bytes):
+        _hash_bytes(hasher, b"bytes", value)
+        return
+    if isinstance(value, int):
+        _hash_text(hasher, b"int", str(value))
+        return
+    if isinstance(value, float):
+        _hash_text(hasher, b"float", repr(value))
+        return
+    if isinstance(value, dict):
+        _hash_text(hasher, b"dict-len", str(len(value)))
+        for key, item in value.items():
+            hasher.update(b"key:")
+            _update_snapshot_hash(hasher, key)
+            hasher.update(b"value:")
+            _update_snapshot_hash(hasher, item)
+        return
+    if isinstance(value, list):
+        _hash_text(hasher, b"list-len", str(len(value)))
+        for item in value:
+            _update_snapshot_hash(hasher, item)
+        return
+    if isinstance(value, tuple):
+        _hash_text(hasher, b"tuple-len", str(len(value)))
+        for item in value:
+            _update_snapshot_hash(hasher, item)
+        return
+    if isinstance(value, (set, frozenset)):
+        child_tokens = sorted(_snapshot_cache_token(item) for item in value)
+        _hash_text(hasher, b"set-len", str(len(child_tokens)))
+        for token in child_tokens:
+            _hash_text(hasher, b"set-item", token)
+        return
+    _hash_text(hasher, b"object", f"{type(value).__module__}.{type(value).__qualname__}:{value!s}")
+
+
+def _hash_text(hasher: Any, marker: bytes, value: str) -> None:
+    _hash_bytes(hasher, marker, value.encode("utf-8", "surrogatepass"))
+
+
+def _hash_bytes(hasher: Any, marker: bytes, value: bytes) -> None:
+    hasher.update(marker)
+    hasher.update(b":")
+    hasher.update(str(len(value)).encode("ascii"))
+    hasher.update(b":")
+    hasher.update(value)
+    hasher.update(b";")
+
+
+def _clear_tool_display_caches() -> None:
+    with _TOOL_DISPLAY_CACHE_LOCK:
+        _FORMAT_TOOL_CALL_CACHE.clear()
+        _FORMAT_TOOL_RESULT_CACHE.clear()
 
 
 def _format_commit_send_attempt_call(name: str, args: dict[str, Any]) -> ToolDisplay:

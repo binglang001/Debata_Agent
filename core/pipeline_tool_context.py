@@ -7,10 +7,14 @@ callback wiring, or outbound timeline recording while moving methods.
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 
 from adapters.types import Target
 from tools import ToolContext
+
+logger = logging.getLogger(__name__)
 
 
 class PipelineToolContextMixin:
@@ -97,11 +101,6 @@ class PipelineToolContextMixin:
             tts=self.tts,
             workspace_dir=self.workspace_dir,
             emoji_dir=self.emoji_dir,
-            typing_chars_per_second=self.behavior_cfg.typing.chars_per_second,
-            typing_english_chars_per_second=self.behavior_cfg.typing.english_chars_per_second,
-            typing_min_delay_seconds=self.behavior_cfg.typing.min_delay_seconds,
-            typing_max_delay_seconds=self.behavior_cfg.typing.max_delay_seconds,
-            typing_clamp_model_delay=self.behavior_cfg.typing.clamp_model_delay,
             tool_result_default_budget_tokens=self.behavior_cfg.context.tool_result_default_budget_tokens,
             tool_result_default_hard_cap_tokens=self.behavior_cfg.context.tool_result_default_hard_cap_tokens,
             tool_result_budgets=dict(self.behavior_cfg.context.tool_result_budgets),
@@ -116,7 +115,7 @@ class PipelineToolContextMixin:
             extras=extras,
         )
 
-    def _record_successful_outbound(
+    async def _record_successful_outbound(
         self,
         action: dict[str, Any],
         *,
@@ -125,6 +124,7 @@ class PipelineToolContextMixin:
     ) -> None:
         """记录 QQ 上真实发送成功的出站消息。"""
         self_id = self._self_id_by_conversation.get(conversation_id) or None
+        timestamp_unix = time.time()
         normalized = {
             "target_scope": action.get("target_scope") or action.get("action"),
             "target_id": action.get("target_id") or action.get("target"),
@@ -137,4 +137,72 @@ class PipelineToolContextMixin:
             conversation_id=conversation_id,
             msg_id=msg_id,
             self_id=self_id,
+            timestamp=timestamp_unix,
         )
+        event_store = getattr(self, "event_store", None) or getattr(self, "_event_store", None)
+        if event_store is None:
+            return
+        await self._append_qq_message_sent_event(
+            event_store,
+            normalized,
+            conversation_id=conversation_id,
+            msg_id=msg_id,
+            self_id=self_id,
+            timestamp_unix=timestamp_unix,
+        )
+
+    async def _append_qq_message_sent_event(
+        self,
+        event_store: Any,
+        action: dict[str, Any],
+        *,
+        conversation_id: str,
+        msg_id: str,
+        self_id: str | None,
+        timestamp_unix: float,
+    ) -> None:
+        source = _optional_text(getattr(self.adapter, "name", None))
+        external_id = _optional_text(msg_id)
+        payload = {
+            "direction": "outbound",
+            "conversation_id": conversation_id,
+            "source": source,
+            "msg_id": external_id,
+            "content": action.get("content") or "",
+            "label": action.get("label") or action.get("content") or "",
+            "kind": action.get("kind", "text"),
+            "target_scope": action.get("target_scope"),
+            "target_id": action.get("target_id"),
+            "self_id": self_id,
+            "timestamp_unix": timestamp_unix,
+        }
+        debug_enabled = logger.isEnabledFor(logging.DEBUG)
+        write_started_at = time.perf_counter() if debug_enabled else 0.0
+        await event_store.append_event(
+            event_type="qq_message_sent",
+            conversation_id=conversation_id,
+            source=source,
+            external_id=external_id,
+            idempotency_key=(
+                f"qq_message_sent:{conversation_id}:{external_id}:sent"
+                if external_id
+                else None
+            ),
+            timestamp_unix=timestamp_unix,
+            payload=payload,
+        )
+        if debug_enabled:
+            logger.debug(
+                "QQ 出站消息 EventStore 写入指标 conversation_id=%s msg_id=%s "
+                "elapsed_ms=%.3f",
+                conversation_id,
+                external_id,
+                (time.perf_counter() - write_started_at) * 1000,
+            )
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

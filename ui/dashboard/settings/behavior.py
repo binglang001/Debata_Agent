@@ -20,24 +20,14 @@ class SettingsBehaviorMixin:
             return
         self._cfg().behavior.context.tool_result_budgets = default_tool_result_budgets()
         self._save_now(
-            needs_restart=False,
+            needs_restart=True,
             change_desc="behavior.context.tool_result_budgets restore defaults",
         )
         # 当前页面的 spinbox 不热重建；重新进入设置页会看到推荐值。
 
-    # hot 字段（立即生效，无需重启）
-    _HOT_FIELDS = {
-        "chars_per_second", "max_delay_seconds",
-        "window_seconds", "max_messages", "enabled",
-        "trigger_at_messages", "range_start_messages", "range_end_messages",
-        "trigger_at_tokens", "target_after_tokens",
-        "max_context_tokens", "reserve_output_tokens", "memory_token_budget", "summary_token_budget",
-        "tool_result_default_budget_tokens", "tool_result_default_hard_cap_tokens",
-        "tool_result_budgets", "tool_result_soft_limit_tokens", "tool_result_hard_cap_tokens",
-        "tool_result_soft_overrides",
-        "default_history_fetch_count",
-        "proactive_context_token_budget",
-    }
+    # 通用 behavior 处理器里的字段都依赖运行时启动时装配；明确热生效的配置
+    # 由各自处理器直接传 needs_restart=False（如日志级别、主题、白名单）。
+    _HOT_FIELDS: set[str] = set()
 
     def _on_behavior_field(self, field: str, value) -> None:
         if self._suppress_signals:
@@ -84,7 +74,7 @@ class SettingsBehaviorMixin:
             return
         setattr(budget, field, value)
         self._save_now(
-            needs_restart=False,
+            needs_restart=True,
             change_desc=f"behavior.context.tool_result_budgets.{tool_name}.{field}",
         )
 

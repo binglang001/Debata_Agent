@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from app_config.loader import ConfigError, load_config, save_config
+from app_config.loader import ConfigError, load_config, save_config, set_active_config
 from app_config.schema import (
     AgentConfig,
     AgentsConfig,
     ASRFeatureConfig,
+    ContextLengthBudgetRule,
     NapCatAdapterConfig,
     ProviderConfig,
     RootConfig,
@@ -42,6 +45,203 @@ def test_minimal_valid_config():
     budgets = cfg.behavior.context.tool_result_budgets
     assert budgets["read_file"].inline_budget_tokens == 2500
     assert budgets["get_recent_chat_messages"].artifact_threshold_tokens == 3000
+
+
+def test_budget_limit_schema_defaults_load_for_legacy_config():
+    cfg = RootConfig.model_validate(
+        {
+            "agents": {"chat": {"provider": "ds", "model": "deepseek-chat"}},
+            "providers": {"ds": {"preset": "deepseek", "api_key_id": "ds_main"}},
+        }
+    )
+
+    assert cfg.agents.chat.tool_loop_final_max_tokens == 4096
+    assert cfg.behavior.summarize.trigger_at_tokens is None
+    assert cfg.behavior.summarize.target_after_tokens is None
+    assert cfg.behavior.summarize.trigger_at_context_percent == 75
+    assert cfg.behavior.summarize.target_after_context_percent == 50
+    assert cfg.behavior.context.prompt_overhead_estimate_tokens == 12000
+    assert cfg.behavior.context.min_working_history_tokens == 4096
+    assert cfg.behavior.context.current_conversation_min_records == 8
+    assert cfg.behavior.context.runtime_record_keep_count == 12
+    assert cfg.behavior.context.send_receipt_keep_count == 4
+    assert cfg.behavior.context.no_action_keep_count == 8
+    rec = cfg.behavior.context.recommended_context_budget
+    assert rec.model_name_budget_tokens["deepseek-v4-pro"] == 350_000
+    assert rec.model_name_budget_tokens["deepseek-v4"] == 300_000
+    assert rec.model_name_budget_tokens["claude"] == 150_000
+    assert rec.context_length_rules[0].min_context_length_tokens == 1_000_000
+    assert rec.context_length_rules[0].budget_tokens == 300_000
+    assert rec.context_length_rules[1].min_context_length_tokens == 200_000
+    assert rec.context_length_rules[1].budget_tokens == 150_000
+    assert rec.context_length_rules[2].min_context_length_tokens == 128_000
+    assert rec.context_length_rules[2].budget_tokens == 96_000
+    assert rec.context_length_scale_percent == 75
+    assert rec.min_scaled_budget_tokens == 4096
+    assert rec.fallback_budget_tokens == 96_000
+    assert cfg.behavior.proactive_router_text_limit_tokens == 256
+    assert cfg.behavior.proactive_router_tool_result_inline_tokens == 96
+    assert cfg.behavior.proactive_router_tool_result_hard_cap_tokens == 160
+    assert cfg.behavior.proactive_router_summary_limit_tokens == 1024
+    assert cfg.behavior.proactive_router_history_token_budget == 16384
+    assert "persona_refine_history_turns" not in type(cfg.behavior).model_fields
+    assert cfg.features.vision.max_tokens == 1024
+
+
+def test_data_config_explicit_budget_defaults_roundtrip(tmp_paths):
+    config_path = Path(__file__).resolve().parent.parent / "data" / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    expected = {
+        ("agents", "chat", "tool_loop_final_max_tokens"): 4096,
+        ("features", "vision", "max_tokens"): 1024,
+        ("behavior", "summarize", "trigger_at_context_percent"): 75,
+        ("behavior", "summarize", "target_after_context_percent"): 50,
+        ("behavior", "context", "prompt_overhead_estimate_tokens"): 12000,
+        ("behavior", "context", "min_working_history_tokens"): 4096,
+        ("behavior", "context", "current_conversation_min_records"): 8,
+        ("behavior", "context", "runtime_record_keep_count"): 12,
+        ("behavior", "context", "send_receipt_keep_count"): 4,
+        ("behavior", "context", "no_action_keep_count"): 8,
+        (
+            "behavior",
+            "context",
+            "recommended_context_budget",
+            "model_name_budget_tokens",
+            "deepseek-v4-pro",
+        ): 350_000,
+        (
+            "behavior",
+            "context",
+            "recommended_context_budget",
+            "model_name_budget_tokens",
+            "deepseek-v4",
+        ): 300_000,
+        (
+            "behavior",
+            "context",
+            "recommended_context_budget",
+            "model_name_budget_tokens",
+            "claude",
+        ): 150_000,
+        (
+            "behavior",
+            "context",
+            "recommended_context_budget",
+            "context_length_scale_percent",
+        ): 75,
+        (
+            "behavior",
+            "context",
+            "recommended_context_budget",
+            "min_scaled_budget_tokens",
+        ): 4096,
+        (
+            "behavior",
+            "context",
+            "recommended_context_budget",
+            "fallback_budget_tokens",
+        ): 96_000,
+        ("behavior", "proactive_router_text_limit_tokens"): 256,
+        ("behavior", "proactive_router_tool_result_inline_tokens"): 96,
+        ("behavior", "proactive_router_tool_result_hard_cap_tokens"): 160,
+        ("behavior", "proactive_router_summary_limit_tokens"): 1024,
+        ("behavior", "proactive_router_history_token_budget"): 16384,
+    }
+
+    for keys, value in expected.items():
+        node = raw
+        for key in keys:
+            node = node[key]
+        assert node == value
+
+    RootConfig.model_validate(raw)
+    tmp_paths.CONFIG_FILE.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+    loaded = load_config(tmp_paths, set_global=False)
+    assert loaded.agents.chat.tool_loop_final_max_tokens == 4096
+    assert loaded.features.vision.max_tokens == 1024
+    loaded_rules = loaded.behavior.context.recommended_context_budget.context_length_rules
+    assert [(r.min_context_length_tokens, r.budget_tokens) for r in loaded_rules] == [
+        (1_000_000, 300_000),
+        (200_000, 150_000),
+        (128_000, 96_000),
+    ]
+
+    save_config(tmp_paths, loaded, backup=False)
+    saved = yaml.safe_load(tmp_paths.CONFIG_FILE.read_text(encoding="utf-8"))
+    for keys, value in expected.items():
+        node = saved
+        for key in keys:
+            node = node[key]
+        assert node == value
+    saved_rules = saved["behavior"]["context"]["recommended_context_budget"][
+        "context_length_rules"
+    ]
+    assert saved_rules == [
+        {"min_context_length_tokens": 1_000_000, "budget_tokens": 300_000},
+        {"min_context_length_tokens": 200_000, "budget_tokens": 150_000},
+        {"min_context_length_tokens": 128_000, "budget_tokens": 96_000},
+    ]
+    assert "persona_refine_history_turns" not in saved["behavior"]
+
+
+def test_deprecated_typing_delay_fields_are_ignored_and_not_saved(tmp_paths):
+    raw = _minimal_config().model_dump(mode="json", exclude_none=True)
+    raw["behavior"]["typing"] = {
+        "chars_per_second": 2.0,
+        "english_chars_per_second": 6.0,
+        "min_delay_seconds": 0.1,
+        "max_delay_seconds": 9.0,
+        "clamp_model_delay": False,
+    }
+
+    cfg = RootConfig.model_validate(raw)
+    typing_dump = cfg.behavior.typing.model_dump()
+    assert typing_dump == {
+        "chars_per_second": 2.0,
+        "english_chars_per_second": 6.0,
+    }
+    assert "min_delay_seconds" not in type(cfg.behavior.typing).model_fields
+    assert "max_delay_seconds" not in type(cfg.behavior.typing).model_fields
+    assert "clamp_model_delay" not in type(cfg.behavior.typing).model_fields
+
+    tmp_paths.CONFIG_FILE.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+    loaded = load_config(tmp_paths, set_global=False)
+    save_config(tmp_paths, loaded, backup=False)
+
+    saved = yaml.safe_load(tmp_paths.CONFIG_FILE.read_text(encoding="utf-8"))
+    saved_typing = saved["behavior"]["typing"]
+    assert saved_typing == {
+        "chars_per_second": 2.0,
+        "english_chars_per_second": 6.0,
+    }
+
+
+def test_recommended_context_budget_uses_loaded_config():
+    from core.pipeline_context import _recommended_context_budget
+
+    cfg = _minimal_config()
+    rec = cfg.behavior.context.recommended_context_budget
+    rec.model_name_budget_tokens = {"unit-model": 123_456}
+    rec.context_length_rules = [
+        ContextLengthBudgetRule(
+            min_context_length_tokens=10_000,
+            budget_tokens=7_000,
+        )
+    ]
+    rec.context_length_scale_percent = 50
+    rec.min_scaled_budget_tokens = 2_048
+    rec.fallback_budget_tokens = 6_000
+    try:
+        set_active_config(cfg)
+
+        assert _recommended_context_budget("unit-model-pro") == 123_456
+        assert _recommended_context_budget("other", 12_000) == 7_000
+        assert _recommended_context_budget("other", 8_000) == 4_000
+        assert _recommended_context_budget("other", 100) == 2_048
+        assert _recommended_context_budget("other") == 6_000
+    finally:
+        set_active_config(_minimal_config())
 
 
 def test_napcat_adapter_path_normalizes_legacy_values():
@@ -164,6 +364,7 @@ def test_agent_tool_loop_reminder_defaults_and_validation():
     assert cfg.tool_loop_reminder_interval == 8
     assert cfg.tool_loop_final_warning_count == 4
     assert cfg.tool_loop_final_grace_loops == 2
+    assert cfg.tool_loop_final_max_tokens == 4096
 
     with pytest.raises(ValidationError):
         AgentConfig(provider="x", model="y", tool_loop_reminder_interval=0)
@@ -171,6 +372,8 @@ def test_agent_tool_loop_reminder_defaults_and_validation():
         AgentConfig(provider="x", model="y", tool_loop_final_warning_count=0)
     with pytest.raises(ValidationError):
         AgentConfig(provider="x", model="y", tool_loop_final_grace_loops=-1)
+    with pytest.raises(ValidationError):
+        AgentConfig(provider="x", model="y", tool_loop_final_max_tokens=511)
 
 
 def test_save_load_roundtrip(tmp_paths, fake_keyring):

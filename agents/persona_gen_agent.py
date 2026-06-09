@@ -30,7 +30,9 @@
 
 from __future__ import annotations
 
+import copy
 import logging
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,6 +42,17 @@ from providers.base import IProvider
 from .base import StatusCallback, UsageRecorder
 
 logger = logging.getLogger(__name__)
+
+PERSONA_TOP_LEVEL_TAGS = (
+    "identity",
+    "past",
+    "personality",
+    "voice",
+    "boundaries",
+    "relation_with_user",
+    "consistency_anchors",
+)
+_PERSONA_TOP_LEVEL_TAG_SET = set(PERSONA_TOP_LEVEL_TAGS)
 
 
 # ============================================================
@@ -129,9 +142,12 @@ def _resolve_relation(rel: str, detail: str) -> str:
         "friend": "用户是角色的朋友。已经认识。",
         "stranger": "用户和角色刚认识。还在试探阶段。",
     }
+    if rel.startswith("special:"):
+        special_detail = detail.strip() or rel.split(":", 1)[1].strip()
+        return special_detail or "用户和角色是特殊关系；具体关系未补充。"
+    if rel == "special":
+        return detail.strip() or "用户和角色是特殊关系；具体关系未补充。"
     base = mapping.get(rel, "")
-    if rel == "special" and detail:
-        return detail
     return base + (f"（补充：{detail}）" if detail else "")
 
 
@@ -413,11 +429,101 @@ PERSONA_REFINE_SYSTEM_PROMPT = """你刚刚生成了一份人格档案，用户�
 1. 用户没提的部分，保持不变（不要"顺手"重写其他段落）
 2. 用户的意见可能模糊（"再冷淡一点"、"多带点喵"、"古风感更重"），你要把它落实到具体的句子改动——尤其是把风格变化体现到 `<voice>` 段的样例与"口癖行为化"描述里
 3. 用户对角色的最终决定权高于规范化原则。规范化原则用来"把风格做实"，不是用来"过滤风格"。但即便如此，立体性、具体性、边界、防漂移这几条仍要遵守——风格只是给档案上的色，骨架不能塌
-4. 修改完后，**完整输出新的 XML 档案**（不要只输出 diff），保持原结构
-5. 新版 XML 仍必须使用第二人称描述角色本人：写"你是 / 你会 / 你不会"，不要改回"她/他/ta/这个角色"
+4. 你可以输出两种格式之一：
+   - 整份新的 XML 档案：包含 identity / past / personality / voice / boundaries / relation_with_user / consistency_anchors 等顶层标签
+   - 一个或多个顶层 XML 标签片段：只输出本轮需要替换的顶层标签，例如 `<voice>...</voice>` 或 `<voice>...</voice><boundaries>...</boundaries>`
+5. 如果只改了少数段落，优先输出对应顶层标签片段；如果用户要求整体重写，或多处联动很强，可以输出整份 XML
+6. 新版 XML 仍必须使用第二人称描述角色本人：写"你是 / 你会 / 你不会"，不要改回"她/他/ta/这个角色"
 
-不要加任何说明性文字，只输出修订后的完整 XML。
+不要加任何说明性文字，不要输出 Markdown 代码块，不要解释改了哪里。直接输出 XML 或顶层 XML 标签片段。
 """
+
+
+def build_persona_refine_user_message(user_feedback: str, current_xml: str) -> str:
+    """构造本轮 refine 的 user 消息；当前完整 XML 固定放尾部以便模型判断状态。"""
+    return (
+        "本轮用户反馈：\n"
+        f"{(user_feedback or '').strip()}\n\n"
+        "当前完整 XML（本轮编辑基准；如果你只输出标签片段，也必须按它判断当前状态）：\n"
+        f"{(current_xml or '').strip()}"
+    )
+
+
+def _normalize_edit_history(
+    edit_history: list[dict[str, str]] | None,
+) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for item in edit_history or []:
+        role = str(item.get("role", ""))
+        if role not in {"user", "assistant"}:
+            continue
+        content = item.get("content")
+        if content is None:
+            continue
+        normalized.append({"role": role, "content": str(content)})
+    return normalized
+
+
+def _merge_persona_xml(current_xml: str, model_output: str) -> str:
+    """把模型输出合并成完整 XML；完整档案直用，顶层标签片段替换当前对应标签。"""
+    cleaned = _strip_xml_response(model_output)
+    output_root = _parse_persona_xml_fragment(cleaned, source="模型输出")
+    if _is_full_persona_xml(output_root):
+        return cleaned
+
+    replacements = {
+        child.tag: child
+        for child in list(output_root)
+        if isinstance(child.tag, str) and child.tag in _PERSONA_TOP_LEVEL_TAG_SET
+    }
+    if not replacements:
+        raise ValueError("模型输出不是完整人格 XML，也没有可合并的顶层标签片段")
+
+    current_root = _parse_persona_xml_fragment(current_xml, source="当前人格 XML")
+    merged_children: list[ET.Element] = []
+    replaced: set[str] = set()
+    for child in list(current_root):
+        if isinstance(child.tag, str) and child.tag in replacements:
+            merged_children.append(copy.deepcopy(replacements[child.tag]))
+            replaced.add(child.tag)
+        else:
+            merged_children.append(copy.deepcopy(child))
+
+    for tag in PERSONA_TOP_LEVEL_TAGS:
+        if tag in replacements and tag not in replaced:
+            merged_children.append(copy.deepcopy(replacements[tag]))
+
+    return "\n\n".join(_element_to_xml_text(child) for child in merged_children)
+
+
+def _strip_xml_response(text: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+def _parse_persona_xml_fragment(xml_text: str, *, source: str) -> ET.Element:
+    try:
+        return ET.fromstring(f"<persona_root>{xml_text}</persona_root>")
+    except ET.ParseError as exc:
+        raise ValueError(f"{source} 不是可解析的 XML") from exc
+
+
+def _is_full_persona_xml(root: ET.Element) -> bool:
+    tags = {child.tag for child in list(root) if isinstance(child.tag, str)}
+    return _PERSONA_TOP_LEVEL_TAG_SET.issubset(tags)
+
+
+def _element_to_xml_text(element: ET.Element) -> str:
+    item = copy.deepcopy(element)
+    item.tail = None
+    return ET.tostring(item, encoding="unicode", short_empty_elements=False).strip()
 
 
 # ============================================================
@@ -489,17 +595,14 @@ class PersonaGenAgent:
         prev_prompt: str,
         user_feedback: str,
         refined_count: int = 0,
+        edit_history: list[dict[str, str]] | None = None,
+        current_brief: PersonaBrief | None = None,
     ) -> PersonaGenResult:
         """根据用户意见修订上一版人格档案。"""
-        user_content = (
-            "之前的人格档案：\n"
-            f"{prev_prompt}\n\n"
-            "用户的修改意见：\n"
-            f"{user_feedback}\n\n"
-            "请按意见调整并完整输出新版 XML。"
-        )
+        user_content = build_persona_refine_user_message(user_feedback, prev_prompt)
         messages = [
             {"role": "system", "content": PERSONA_REFINE_SYSTEM_PROMPT},
+            *_normalize_edit_history(edit_history),
             {"role": "user", "content": user_content},
         ]
 
@@ -518,12 +621,17 @@ class PersonaGenAgent:
         )
         await self._record_usage(result.usage, operation="persona_refine")
 
-        persona_xml = (result.content or "").strip()
+        raw_response = (result.content or "").strip()
+        persona_xml = _merge_persona_xml(prev_prompt, raw_response)
         return PersonaGenResult(
             persona_prompt=persona_xml,
-            display_name=_extract_name_from_xml(persona_xml) or "新角色",
+            display_name=(
+                (current_brief.name.strip() if current_brief and current_brief.name else "")
+                or _extract_name_from_xml(persona_xml)
+                or "新角色"
+            ),
             reasoning=result.reasoning_content,
-            raw_response=persona_xml,
+            raw_response=raw_response,
             refined_count=refined_count + 1,
         )
 
@@ -628,7 +736,9 @@ __all__ = [
     "PersonaBrief",
     "PersonaGenAgent",
     "PersonaGenResult",
+    "PERSONA_TOP_LEVEL_TAGS",
     "PERSONA_GEN_SYSTEM_PROMPT",
     "PERSONA_REFINE_SYSTEM_PROMPT",
+    "build_persona_refine_user_message",
     "render_persona_file",
 ]

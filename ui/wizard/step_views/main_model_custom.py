@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from ...theme import Spacing
 from ...widgets.model_combo import ModelComboBox
+from ...widgets.unit_fields import unit_spinbox
 from ..components import ApiKeyInput, SectionCard
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
@@ -128,7 +129,10 @@ class MainModelCustomStepView(BaseStepView):
         self._max_tokens_spin.setRange(64, 131072)
         self._max_tokens_spin.setSingleStep(1024)
         self._max_tokens_spin.setValue(16384)
-        form.addRow(QLabel(COPY["main_model_custom.max_tokens_label"]), self._max_tokens_spin)
+        form.addRow(
+            QLabel(COPY["main_model_custom.max_tokens_label"]),
+            unit_spinbox(self._max_tokens_spin, "token"),
+        )
 
         # reasoning
         self._reasoning_check = QCheckBox(COPY["main_model_custom.reasoning_label"])
@@ -149,11 +153,23 @@ class MainModelCustomStepView(BaseStepView):
 
         # 思考阶段 max_tokens（可选）
         self._reasoning_tokens_spin = QSpinBox()
-        self._reasoning_tokens_spin.setRange(0, 65536)
+        self._reasoning_tokens_spin.setRange(512, 65536)
         self._reasoning_tokens_spin.setSingleStep(1024)
-        self._reasoning_tokens_spin.setValue(0)
-        self._reasoning_tokens_spin.setSpecialValueText("不指定")
-        form.addRow(QLabel("思考 token 上限"), self._reasoning_tokens_spin)
+        self._reasoning_tokens_spin.setValue(4096)
+        self._reasoning_tokens_unspecified = QCheckBox("不指定")
+        self._reasoning_tokens_unspecified.setChecked(True)
+        self._reasoning_tokens_unspecified.toggled.connect(self._on_reasoning_tokens_mode_changed)
+        reasoning_tokens_row = QHBoxLayout()
+        reasoning_tokens_row.setContentsMargins(0, 0, 0, 0)
+        reasoning_tokens_row.setSpacing(Spacing.SM)
+        reasoning_tokens_row.addWidget(
+            unit_spinbox(self._reasoning_tokens_spin, "token", add_stretch=False)
+        )
+        reasoning_tokens_row.addWidget(self._reasoning_tokens_unspecified)
+        reasoning_tokens_row.addStretch(1)
+        reasoning_tokens_wrap = QWidget()
+        reasoning_tokens_wrap.setLayout(reasoning_tokens_row)
+        form.addRow(QLabel("思考 token 上限"), reasoning_tokens_wrap)
         form.addRow(QLabel(""), self._hint(
             "仅 Claude thinking 等需要单独控制思考阶段长度时填；留「不指定」即可。"
         ))
@@ -174,7 +190,15 @@ class MainModelCustomStepView(BaseStepView):
 
     def _on_reasoning_toggled(self, on: bool) -> None:
         self._budget_combo.setEnabled(on)
-        self._reasoning_tokens_spin.setEnabled(on)
+        self._reasoning_tokens_unspecified.setEnabled(on)
+        self._reasoning_tokens_spin.setEnabled(
+            on and not self._reasoning_tokens_unspecified.isChecked()
+        )
+
+    def _on_reasoning_tokens_mode_changed(self, unspecified: bool) -> None:
+        self._reasoning_tokens_spin.setEnabled(
+            self._reasoning_check.isChecked() and not unspecified
+        )
 
     def _on_provider_changed(self, idx: int) -> None:
         preset = self._provider_combo.itemData(idx)
@@ -257,7 +281,8 @@ class MainModelCustomStepView(BaseStepView):
         idx2 = self._budget_combo.findData(m.reasoning_budget)
         if idx2 >= 0:
             self._budget_combo.setCurrentIndex(idx2)
-        self._reasoning_tokens_spin.setValue(m.reasoning_max_tokens or 0)
+        self._reasoning_tokens_unspecified.setChecked(m.reasoning_max_tokens is None)
+        self._reasoning_tokens_spin.setValue(m.reasoning_max_tokens or 4096)
         self._on_reasoning_toggled(m.reasoning_enabled)
 
     def save(self) -> bool:
@@ -295,8 +320,11 @@ class MainModelCustomStepView(BaseStepView):
         m.reasoning_enabled = self._reasoning_check.isChecked()
         if m.reasoning_enabled:
             m.reasoning_budget = self._budget_combo.currentData()
-            tok = self._reasoning_tokens_spin.value()
-            m.reasoning_max_tokens = tok if tok > 0 else None
+            m.reasoning_max_tokens = (
+                None
+                if self._reasoning_tokens_unspecified.isChecked()
+                else self._reasoning_tokens_spin.value()
+            )
         else:
             m.reasoning_budget = None
             m.reasoning_max_tokens = None

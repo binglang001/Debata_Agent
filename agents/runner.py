@@ -35,7 +35,14 @@ from providers.base import (
     normalize_messages,
 )
 
-from .base import AgentRunResult, FinishReason, StatusCallback, ToolExecutor, UsageRecorder
+from .base import (
+    AgentRunResult,
+    FinishReason,
+    RuntimeEventCallback,
+    StatusCallback,
+    ToolExecutor,
+    UsageRecorder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +82,14 @@ class AgentRunner:
         agent_cfg: AgentConfig,
         *,
         no_feedback_tools: set[str] | None = None,
+        runtime_event_callback: RuntimeEventCallback | None = None,
     ) -> None:
         self.provider = provider
         self.cfg = agent_cfg
         self.no_feedback_tools = (
             no_feedback_tools if no_feedback_tools is not None else DEFAULT_NO_FEEDBACK_TOOLS
         )
+        self.runtime_event_callback = runtime_event_callback
 
     async def run(
         self,
@@ -93,6 +102,7 @@ class AgentRunner:
         max_loops: int | None = None,
         usage_recorder: UsageRecorder | None = None,
         status_callback: StatusCallback | None = None,
+        runtime_event_callback: RuntimeEventCallback | None = None,
         status_label: str = "主模型",
     ) -> AgentRunResult:
         """执行多轮工具循环。
@@ -118,6 +128,7 @@ class AgentRunner:
         final_warning_sent = False
         final_grace_remaining: int | None = None
         final_no_tool_mode = False
+        runtime_events = runtime_event_callback or self.runtime_event_callback
 
         reasoning = self._to_provider_reasoning(self.cfg.reasoning)
         tool_names_dbg = [t["function"]["name"] for t in tools] if tools else []
@@ -326,7 +337,12 @@ class AgentRunner:
                 loop=loop_count,
                 tool_names=[tc.name for tc in result.tool_calls],
             )
-            tc_results = await self._execute_tools(result.tool_calls, tool_executor)
+            tc_results = await self._execute_tools(
+                result.tool_calls,
+                tool_executor,
+                runtime_event_callback=runtime_events,
+                loop=loop_count,
+            )
 
             stop_results = [
                 r for r in tc_results if r["result"].get("stop_after_tool")
@@ -595,7 +611,10 @@ class AgentRunner:
                 tools=None,
                 temperature=self.cfg.temperature,
                 top_p=self.cfg.top_p,
-                max_tokens=min(int(self.cfg.max_tokens or 2048), 4096),
+                max_tokens=min(
+                    int(self.cfg.max_tokens or self.cfg.tool_loop_final_max_tokens),
+                    int(self.cfg.tool_loop_final_max_tokens),
+                ),
                 reasoning=self._to_provider_reasoning(self.cfg.reasoning),
                 stream=True,
                 timeout=self.cfg.first_token_timeout_seconds * 4 + 60.0,
@@ -637,19 +656,41 @@ class AgentRunner:
         self,
         tool_calls: list[ToolCall],
         executor: ToolExecutor,
+        *,
+        runtime_event_callback: RuntimeEventCallback | None = None,
+        loop: int | None = None,
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
-        for tc in tool_calls:
+        for step, tc in enumerate(tool_calls, start=1):
             name = tc.name
             try:
                 args = json.loads(tc.arguments) if tc.arguments else {}
                 if not isinstance(args, dict):
                     raise ValueError(f"工具参数必须是对象: {tc.arguments!r}")
             except (json.JSONDecodeError, ValueError) as e:
-                result = {"ok": False, "error": f"参数解析失败: {e}"}
+                result = _build_runner_tool_error_result(
+                    name,
+                    brief="工具参数解析失败。",
+                    error=f"参数解析失败: {e}",
+                )
+                await self._emit_runtime_event(
+                    runtime_event_callback,
+                    _build_tool_result_event(
+                        tc,
+                        args=None,
+                        result=result,
+                        error_type=type(e).__name__,
+                        loop=loop,
+                        step=step,
+                    ),
+                )
                 results.append({"id": tc.id, "name": name, "args": {}, "result": result})
                 continue
 
+            await self._emit_runtime_event(
+                runtime_event_callback,
+                _build_tool_started_event(tc, args, loop=loop, step=step),
+            )
             try:
                 if _executor_accepts_tool_call_id(executor):
                     result = await executor(name, args, tool_call_id=tc.id)
@@ -659,11 +700,40 @@ class AgentRunner:
                     result = {"ok": True, "value": result}
             except Exception as e:
                 logger.exception(f"工具 {name} 执行失败: {e}")
-                result = {"ok": False, "error": str(e)}
+                result = _build_runner_tool_error_result(
+                    name,
+                    brief="工具执行失败。",
+                    error=str(e),
+                )
+                error_type = type(e).__name__
+            else:
+                error_type = None
 
             result = self._maybe_mark_turn_completion(name, args, result)
+            await self._emit_runtime_event(
+                runtime_event_callback,
+                _build_tool_result_event(
+                    tc,
+                    args=args,
+                    result=result,
+                    error_type=error_type,
+                    loop=loop,
+                    step=step,
+                ),
+            )
             results.append({"id": tc.id, "name": name, "args": args, "result": result})
         return results
+
+    @staticmethod
+    async def _emit_runtime_event(
+        callback: RuntimeEventCallback | None,
+        event: dict[str, Any],
+    ) -> None:
+        if callback is None:
+            return
+        maybe_awaitable = callback(event)
+        if inspect.isawaitable(maybe_awaitable):
+            await maybe_awaitable
 
     @staticmethod
     def _maybe_mark_turn_completion(
@@ -715,6 +785,183 @@ class AgentRunner:
             r["result"].get("turn_completion", {}).get("allowed") is True
             for r in non_no_action
         )
+
+
+def _build_runner_tool_error_result(
+    tool_name: str,
+    *,
+    brief: str,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "failed",
+        "tool": tool_name,
+        "result_format": "structured_json",
+        "brief": brief,
+        "error": error,
+    }
+
+
+def _build_tool_started_event(
+    tc: ToolCall,
+    args: dict[str, Any],
+    *,
+    loop: int | None,
+    step: int,
+) -> dict[str, Any]:
+    payload = {
+        "tool_call_id": tc.id,
+        "tool_name": tc.name,
+        **_tool_args_summary(args=args, raw_arguments=tc.arguments),
+    }
+    _add_loop_step(payload, loop=loop, step=step)
+    return {
+        "event_type": "tool_call_started",
+        "source": "agent_runner",
+        "tool_call_id": tc.id,
+        "payload": payload,
+    }
+
+
+def _build_tool_result_event(
+    tc: ToolCall,
+    *,
+    args: dict[str, Any] | None,
+    result: dict[str, Any],
+    error_type: str | None,
+    loop: int | None,
+    step: int,
+) -> dict[str, Any]:
+    payload = {
+        "tool_call_id": tc.id,
+        "tool_name": tc.name,
+        **_tool_args_summary(args=args, raw_arguments=tc.arguments),
+        **_tool_result_summary(result, error_type=error_type),
+    }
+    _add_loop_step(payload, loop=loop, step=step)
+    return {
+        "event_type": "tool_result_received",
+        "source": "agent_runner",
+        "tool_call_id": tc.id,
+        "payload": payload,
+    }
+
+
+def _tool_args_summary(
+    *,
+    args: dict[str, Any] | None,
+    raw_arguments: str,
+) -> dict[str, Any]:
+    if args is None:
+        args_length = len(raw_arguments or "")
+        args_keys: list[str] = []
+        args_key_count = 0
+        args_hash = _short_hash(raw_arguments or "")
+    else:
+        text = _stable_json_text(args)
+        args_keys, args_key_count = _limited_keys(args)
+        args_length = len(text)
+        args_hash = _short_hash(text)
+    return {
+        "args_hash": args_hash,
+        "args_keys": args_keys,
+        "args_key_count": args_key_count,
+        "args_length": args_length,
+        "args_preview": _summary_preview(
+            "args",
+            keys=args_keys,
+            key_count=args_key_count,
+            length=args_length,
+        ),
+    }
+
+
+def _tool_result_summary(
+    result: dict[str, Any],
+    *,
+    error_type: str | None,
+) -> dict[str, Any]:
+    text = _stable_json_text(result)
+    result_keys, result_key_count = _limited_keys(result)
+    payload: dict[str, Any] = {
+        "result_hash": _short_hash(text),
+        "result_keys": result_keys,
+        "result_key_count": result_key_count,
+        "result_length": len(text),
+        "result_preview": _summary_preview(
+            "result",
+            keys=result_keys,
+            key_count=result_key_count,
+            length=len(text),
+        ),
+    }
+    ok = result.get("ok")
+    if isinstance(ok, bool):
+        payload["ok"] = ok
+    status = _light_status(result.get("status"))
+    if status is not None:
+        payload["status"] = status
+    event_error_type = _event_error_type(result, error_type)
+    if event_error_type:
+        payload["error_type"] = event_error_type
+    return payload
+
+
+def _limited_keys(value: dict[str, Any]) -> tuple[list[str], int]:
+    keys = sorted(str(key) for key in value.keys())
+    return keys[:20], len(keys)
+
+
+def _summary_preview(
+    kind: str,
+    *,
+    keys: list[str],
+    key_count: int,
+    length: int,
+) -> str:
+    joined = ",".join(keys) if keys else "-"
+    suffix = ",..." if key_count > len(keys) else ""
+    return f"{kind}: keys={joined}{suffix}; length={length}"[:80]
+
+
+def _stable_json_text(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _light_status(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        return value[:80]
+    if isinstance(value, list | tuple | set | frozenset):
+        return [str(item)[:40] for item in list(value)[:5]]
+    return type(value).__name__
+
+
+def _event_error_type(result: dict[str, Any], explicit: str | None) -> str | None:
+    if explicit:
+        return str(explicit)[:80]
+    value = result.get("error_type")
+    if value:
+        return str(value)[:80]
+    if result.get("ok") is False and result.get("error"):
+        return "tool_error"
+    return None
+
+
+def _add_loop_step(payload: dict[str, Any], *, loop: int | None, step: int) -> None:
+    if loop is not None:
+        payload["loop"] = loop
+    payload["step"] = step
 
 
 def _kv_prompt_diagnostics(

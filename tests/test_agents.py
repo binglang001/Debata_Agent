@@ -20,6 +20,7 @@ from agents.persona_gen_agent import (
     PERSONA_GEN_SYSTEM_PROMPT,
     PERSONA_REFINE_SYSTEM_PROMPT,
     PersonaBrief,
+    PersonaGenAgent,
     PersonaGenResult,
     render_persona_file,
 )
@@ -188,16 +189,36 @@ def test_tool_use_protocol_documents_runtime_contracts_without_legacy_terms():
     assert "不能绕过撤回、禁言、无权限、退群、发送失败等硬错误" in s
     assert "复核后重新调用发送工具改写新消息时，先复核新消息" in s
     assert "commit_send_attempt 的 ignore_review_interrupts 保持旧 attempt 复核语义" in s
-    assert "中文真人输入通常最多约 1-2 字/秒" in s
-    assert "程序员/熟练打字约 3 字/秒" in s
-    assert "英文约 5 letters/s" in s
+    assert "群聊里不要机械每条引用" in s
+    assert "前后有多人插话" in s
+    assert "短回复会让人看不出在回谁" in s
+    assert '"行/OK/可以/知道了"这类简短确认' in s
+    assert "中文约 1.5 字/秒" in s
+    assert "每条 target 都必须填写 delay" in s
+    assert "本条发出后到下一条发出前的等待秒数" in s
+    assert "第 i 条 delay 按第 i+1 条即将发送的可见内容估算" in s
+    assert "非最后一条通常不要低于 2 秒" in s
+    assert "转折、补充、犹豫或长内容加 2-5 秒" in s
+    assert "表情包和图片按约 1.5-3 秒" in s
+    assert "单条消息只发一条时 delay=0 合法" in s
+    assert "最后一条填 0" in s
     assert "多条消息不要贴脸连发" in s
+    assert "系统自动估算" not in s
+    assert "系统校正" not in s
+    assert "自动估算" not in s
+    assert "系统会按人类输入速度校正" not in s
     assert '"delay": 0.6' not in s
     assert '"delay": 0.8' not in s
     assert '"delay": 0.5' not in s
-    assert '"content": "早啊", "order": 1, "delay": 1.2' in s
-    assert '"content": "今天冷死了", "order": 2, "delay": 2.8' in s
-    assert '"content": "明天三点", "order": 1, "delay": 2.0' in s
+    assert '"delay": 1.2' not in s
+    assert '"delay": 2.0' not in s
+    assert '"delay": 2.8' not in s
+    assert '"content": "早啊", "order": 1, "delay": 4.5' in s
+    assert '"content": "今天冷死了", "order": 2, "delay": 3.0' in s
+    assert '"content": "多穿点", "order": 3, "delay": 0' in s
+    assert '"content": "嗯", "order": 1, "delay": 0' in s
+    assert '"content": "明天三点", "order": 1, "delay": 4.5' in s
+    assert '"content": "不是 四点", "order": 2, "delay": 0' in s
     assert "ignore_review_interrupts 只用于 commit_send_attempt" not in s
     assert "复核后重新调用发送工具改写新内容，必要时传 true 只绕过软复核" not in s
     assert "update_important_memory" in s
@@ -209,6 +230,17 @@ def test_tool_use_protocol_documents_runtime_contracts_without_legacy_terms():
     assert "send_only" not in s
     assert "no-feedback" not in lower
     assert "no_feedback" not in lower
+
+
+def test_tool_use_protocol_documents_tool_result_json_contract():
+    s = build_tool_use_protocol("file")
+
+    assert "role=tool.content 的 JSON 字符串" in s
+    assert "优先看 ok/status/brief/next" in s
+    assert "data/results/content/artifact 是工具数据" in s
+    assert "recall_history 的 content" in s
+    assert "不得把 brief/next/status/content 原样发给 QQ" in s
+    assert "sent[].content 是已经发送过的消息正文" in s
 
 
 @pytest.mark.asyncio
@@ -305,6 +337,18 @@ def test_direct_address_should_not_disappear_silently():
     assert "被递话后沉默不是收尾" in sys
     assert "想结束也要给一个可见短回应" in sys
     assert "短收尾或贴合的表情包" in sys
+
+
+def test_group_reply_reference_rules_are_conditional():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+
+    assert "回复某条具体消息、回答某个人的问题、前后有多人插话" in sys
+    assert "复核/被打断后继续提交旧回复" in sys
+    assert "如果短回复会产生歧义，要引用、@ 或点名" in sys
+    assert '"行/OK/可以/知道了"这类简短确认尤其如此' in sys
+    assert "不要机械每条都引用" in sys
+    assert "上下文清楚、上一句就是目标消息时自然短回即可" in sys
 
 
 def test_group_claims_and_banter_keep_independent_judgment():
@@ -530,6 +574,148 @@ def test_persona_generation_prompt_requires_second_person():
     assert "<identity>\n你是[角色名]" in PERSONA_GEN_SYSTEM_PROMPT
     assert "你不会做的事：" in PERSONA_GEN_SYSTEM_PROMPT
     assert "仍必须使用第二人称描述角色本人" in PERSONA_REFINE_SYSTEM_PROMPT
+    assert "一个或多个顶层 XML 标签片段" in PERSONA_REFINE_SYSTEM_PROMPT
+
+
+def test_persona_brief_formats_special_relation_detail():
+    brief = PersonaBrief(name="Mika", relation="special:我是她的导师")
+    block = brief.to_brief_block()
+    assert "用户和角色的关系" in block
+    assert "我是她的导师" in block
+
+    detail_brief = PersonaBrief(name="Mika", relation="special", relation_detail="长期网友")
+    assert "长期网友" in detail_brief.to_brief_block()
+
+
+_PERSONA_XML = """<identity>旧 identity</identity>
+<past>旧 past</past>
+<personality>旧 personality</personality>
+<voice>旧 voice</voice>
+<boundaries>旧 boundaries</boundaries>
+<relation_with_user>旧 relation</relation_with_user>
+<consistency_anchors>旧 anchors</consistency_anchors>"""
+
+
+class _PersonaFakeProvider(IProvider):
+    def __init__(self, content: str) -> None:
+        super().__init__("fake-persona")
+        self.content = content
+        self.calls: list[dict] = []
+
+    async def chat_completion(self, messages, *, tools=None, **kwargs):
+        self.calls.append({"messages": list(messages), "tools": tools, **kwargs})
+        return CompletionResult(content=self.content, usage=Usage(prompt_tokens=1))
+
+    async def aclose(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_persona_refine_messages_keep_history_before_current_user():
+    provider = _PersonaFakeProvider(_PERSONA_XML)
+    agent = PersonaGenAgent(provider, AgentConfig(provider="fake", model="fake"))
+    history = [
+        {"role": "user", "content": "上一轮用户消息"},
+        {"role": "assistant", "content": "<voice>上一轮原始回复</voice>"},
+    ]
+
+    result = await agent.refine(
+        _PERSONA_XML,
+        "这轮把语气放轻",
+        refined_count=2,
+        edit_history=history,
+        current_brief=PersonaBrief(name="Mika"),
+    )
+
+    messages = provider.calls[0]["messages"]
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
+    assert messages[1:3] == history
+    assert "这轮把语气放轻" in messages[-1]["content"]
+    assert messages[-1]["content"].rstrip().endswith(_PERSONA_XML)
+    assert result.refined_count == 3
+
+
+def test_persona_edit_history_append_never_trims_long_history():
+    from ui.wizard.context import append_persona_edit_history
+
+    history: list[dict[str, str]] = []
+    for idx in range(12):
+        history = append_persona_edit_history(
+            history,
+            f"第 {idx} 轮用户消息",
+            f"<voice>第 {idx} 轮回复</voice>",
+        )
+
+    updated = append_persona_edit_history(history, "本轮用户消息", "<voice>本轮回复</voice>")
+
+    assert len(updated) == 26
+    assert updated[0] == {"role": "user", "content": "第 0 轮用户消息"}
+    assert updated[1] == {"role": "assistant", "content": "<voice>第 0 轮回复</voice>"}
+    assert updated[-2:] == [
+        {"role": "user", "content": "本轮用户消息"},
+        {"role": "assistant", "content": "<voice>本轮回复</voice>"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_persona_refine_keeps_all_long_history_messages():
+    provider = _PersonaFakeProvider(_PERSONA_XML)
+    agent = PersonaGenAgent(provider, AgentConfig(provider="fake", model="fake"))
+    history = [
+        entry
+        for idx in range(12)
+        for entry in (
+            {"role": "user", "content": f"第 {idx} 轮用户消息"},
+            {"role": "assistant", "content": f"<voice>第 {idx} 轮回复</voice>"},
+        )
+    ]
+
+    await agent.refine(
+        _PERSONA_XML,
+        "第 13 轮继续调整",
+        refined_count=12,
+        edit_history=history,
+        current_brief=PersonaBrief(name="Mika"),
+    )
+
+    messages = provider.calls[0]["messages"]
+    assert [m["role"] for m in messages] == ["system", *[m["role"] for m in history], "user"]
+    assert messages[1:-1] == history
+    assert "第 13 轮继续调整" in messages[-1]["content"]
+    assert messages[-1]["content"].rstrip().endswith(_PERSONA_XML)
+
+
+@pytest.mark.asyncio
+async def test_persona_refine_merges_top_level_tag_fragment():
+    provider = _PersonaFakeProvider("<voice>新 voice</voice>")
+    agent = PersonaGenAgent(provider, AgentConfig(provider="fake", model="fake"))
+
+    result = await agent.refine(_PERSONA_XML, "只改说话方式")
+
+    assert result.raw_response == "<voice>新 voice</voice>"
+    assert "<voice>新 voice</voice>" in result.persona_prompt
+    assert "<identity>旧 identity</identity>" in result.persona_prompt
+    assert "<boundaries>旧 boundaries</boundaries>" in result.persona_prompt
+    assert "<voice>旧 voice</voice>" not in result.persona_prompt
+
+
+@pytest.mark.asyncio
+async def test_persona_refine_full_xml_replaces_directly():
+    new_xml = """<identity>新 identity</identity>
+<past>新 past</past>
+<personality>新 personality</personality>
+<voice>新 voice</voice>
+<boundaries>新 boundaries</boundaries>
+<relation_with_user>新 relation</relation_with_user>
+<consistency_anchors>新 anchors</consistency_anchors>"""
+    provider = _PersonaFakeProvider(new_xml)
+    agent = PersonaGenAgent(provider, AgentConfig(provider="fake", model="fake"))
+
+    result = await agent.refine(_PERSONA_XML, "整份重写", refined_count=4)
+
+    assert result.persona_prompt == new_xml
+    assert result.raw_response == new_xml
+    assert result.refined_count == 5
 
 
 def test_build_task_context_empty():
@@ -905,7 +1091,7 @@ async def test_runner_tool_loop_reminder_attaches_to_last_tool_result():
             self.calls = []
 
         async def chat_completion(self, messages, *, tools=None, **kwargs):
-            self.calls.append({"messages": list(messages), "tools": tools})
+            self.calls.append({"messages": list(messages), "tools": tools, **kwargs})
             if len(self.calls) <= 2:
                 return CompletionResult(
                     tool_calls=[_work_call(len(self.calls))],
@@ -960,7 +1146,7 @@ async def test_runner_tool_loop_reminder_resets_and_can_repeat():
             self.calls = []
 
         async def chat_completion(self, messages, *, tools=None, **kwargs):
-            self.calls.append({"messages": list(messages), "tools": tools})
+            self.calls.append({"messages": list(messages), "tools": tools, **kwargs})
             if len(self.calls) <= 4:
                 return CompletionResult(
                     tool_calls=[_work_call(len(self.calls))],
@@ -1015,7 +1201,7 @@ async def test_runner_tool_loop_final_warning_and_grace_then_finalizes():
             self.calls = []
 
         async def chat_completion(self, messages, *, tools=None, **kwargs):
-            self.calls.append({"messages": list(messages), "tools": tools})
+            self.calls.append({"messages": list(messages), "tools": tools, **kwargs})
             call_no = len(self.calls)
             if call_no == 5:
                 assert tools is not None
@@ -1052,6 +1238,7 @@ async def test_runner_tool_loop_final_warning_and_grace_then_finalizes():
             tool_loop_reminder_interval=3,
             tool_loop_final_warning_count=1,
             tool_loop_final_grace_loops=2,
+            tool_loop_final_max_tokens=1536,
         ),
     )
 
@@ -1066,6 +1253,7 @@ async def test_runner_tool_loop_final_warning_and_grace_then_finalizes():
     assert provider.calls[4]["tools"] is not None
     assert provider.calls[5]["tools"] is not None
     assert provider.calls[6]["tools"] is None
+    assert provider.calls[6]["max_tokens"] == 1536
 
 
 @pytest.mark.asyncio
@@ -1637,7 +1825,10 @@ async def test_runner_failed_no_action_does_not_finish_tool_loop():
                         ToolCall(
                             id="tc-send",
                             name="send_private_messages",
-                            arguments='{"targets": [{"target_qq": 123, "content": "已处理"}]}',
+                            arguments=(
+                                '{"targets": [{"target_qq": 123, "content": "已处理",'
+                                ' "order": 1, "delay": 0}]}'
+                            ),
                         )
                     ],
                     finish_reason="tool_calls",
