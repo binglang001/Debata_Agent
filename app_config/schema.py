@@ -489,9 +489,6 @@ class LongTermMemoryConfig(StrictModel):
     """file = 不启用 RAG 历史召回，重要记忆仍保存并注入；
     rag = 在重要记忆之外增加会话历史向量检索（需 features.embedding 启用）"""
 
-    keyword_trigger_save: bool = True
-    """命中关键词（"记住"/"约定"/"我叫"等）时强制保存为重要记忆，不依赖 AI 主动调用工具。"""
-
     rag_top_k: int = 5
     """RAG 模式下每次召回的相关历史条目数（仅 mode=rag 生效）"""
 
@@ -577,31 +574,32 @@ class RateLimitConfig(StrictModel):
 
 
 class SummarizeConfig(StrictModel):
-    """历史总结触发阈值。
-
-    Phase A 起按 token 触发 compaction；旧的消息条数字段保留为兼容配置。
-    """
-
-    trigger_at_messages: int = 200
-    """达到多少条 history 记录后触发总结。"""
-
-    range_start_messages: int = 50
-    """SummaryAgent 选择 cut_point 的下限（保留这之后的对话）。"""
-
-    range_end_messages: int = 150
-    """SummaryAgent 选择 cut_point 的上限。"""
+    """滚动摘要压缩触发阈值。"""
 
     trigger_at_tokens: int | None = None
-    """活跃 history 估算 token 达到此值时触发 compaction。显式配置优先于百分比推导。"""
+    """活跃窗口估算 token 达到此值时触发滚动摘要。显式配置优先于百分比推导。"""
 
     target_after_tokens: int | None = None
-    """compaction 后活跃 history 目标 token。显式配置优先于百分比推导。"""
+    """滚动摘要后活跃窗口目标 token。显式配置优先于百分比推导。"""
 
     trigger_at_context_percent: int = Field(default=75, ge=50, le=100)
-    """未显式配置 trigger_at_tokens 时，按工作上下文预算此百分比推导触发阈值。"""
+    """未显式配置 trigger_at_tokens 时，按工作上下文预算此百分比推导滚动摘要触发阈值。"""
 
     target_after_context_percent: int = Field(default=50, ge=50, le=100)
-    """未显式配置 target_after_tokens 时，按工作上下文预算此百分比推导压缩目标。"""
+    """未显式配置 target_after_tokens 时，按工作上下文预算此百分比推导活跃窗口目标。"""
+
+    retry_target_after_context_percent: int = Field(default=30, ge=5, le=100)
+    """第一次压缩后仍超预算或压缩失败时，重试压缩使用的活跃窗口目标百分比。"""
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_deprecated_working_range_fields(cls, data: object) -> object:
+        if isinstance(data, dict):
+            data = dict(data)
+            data.pop("range_start_messages", None)
+            data.pop("range_end_messages", None)
+            data.pop("trigger_at_messages", None)
+        return data
 
 
 class ToolResultBudgetConfig(StrictModel):
@@ -737,26 +735,11 @@ class ContextConfig(StrictModel):
     prompt_overhead_estimate_tokens: int = Field(default=12000, ge=0)
     """系统提示、工具 schema 等非历史内容的预估开销。"""
 
-    min_working_history_tokens: int = Field(default=4096, ge=1024)
-    """工作上下文中至少保留给活跃历史的 token 预算。"""
-
     memory_token_budget: int = Field(default=4096, ge=256)
     """长期重要记忆注入预算。Phase A 先作为预算字段预留，Phase D 精细使用。"""
 
     summary_token_budget: int = Field(default=4096, ge=256)
     """滚动摘要注入预算。"""
-
-    current_conversation_min_records: int = Field(default=8, ge=0)
-    """当前会话活跃历史至少保留的记录数。"""
-
-    runtime_record_keep_count: int = Field(default=12, ge=0)
-    """运行时记录注入时保留的最近记录数。"""
-
-    send_receipt_keep_count: int = Field(default=4, ge=0)
-    """发送回执记录注入时保留的最近记录数。"""
-
-    no_action_keep_count: int = Field(default=8, ge=0)
-    """no_action 记录注入时保留的最近记录数。"""
 
     tool_result_default_budget_tokens: int = Field(default=800, ge=256)
     """未单独配置的工具结果 inline 默认预算。"""
@@ -777,6 +760,21 @@ class ContextConfig(StrictModel):
 
     tool_result_soft_overrides: dict[str, int] = Field(default_factory=dict)
     """旧配置兼容：按工具名覆盖软阈值，如 {"describe_image": 900}。"""
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_deprecated_working_window_fields(cls, data: object) -> object:
+        if isinstance(data, dict):
+            data = dict(data)
+            for field in (
+                "min_working_history_tokens",
+                "current_conversation_min_records",
+                "runtime_record_keep_count",
+                "send_receipt_keep_count",
+                "no_action_keep_count",
+            ):
+                data.pop(field, None)
+        return data
 
 
 class BehaviorConfig(StrictModel):

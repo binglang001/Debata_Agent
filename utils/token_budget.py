@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -35,15 +36,10 @@ class TokenEstimator:
 
     def estimate_messages(self, messages: list[dict[str, Any]]) -> int:
         total = 0
-        for message in messages:
+        for message in _normalize_messages_for_estimate(messages):
             total += 4
-            for key, value in message.items():
-                if key == "content":
-                    total += self.estimate_text(str(value or ""))
-                elif key in {"tool_calls", "metadata"}:
-                    total += self.estimate_text(str(value))
-                else:
-                    total += 1
+            for value in message.values():
+                total += self.estimate_text(_field_text_for_estimate(value))
         return max(1, total)
 
     def update_calibration(self, estimated: int, actual_prompt_tokens: int) -> None:
@@ -80,3 +76,21 @@ def _encoding_for_model(model: str = ""):
             return tiktoken.get_encoding("o200k_base")
         except Exception:
             return tiktoken.get_encoding("cl100k_base")
+
+
+def _normalize_messages_for_estimate(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按 provider 默认发送口径规整消息，避免把本地存储字段计入预算。"""
+    from providers.base import normalize_messages
+
+    return normalize_messages(messages)
+
+
+def _field_text_for_estimate(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value)

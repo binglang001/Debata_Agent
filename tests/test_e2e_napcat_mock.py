@@ -141,7 +141,7 @@ def _make_config() -> RootConfig:
         adapters={"fake": NapCatAdapterConfig()},
         agents=AgentsConfig(chat=_make_agent_cfg()),
         features=FeaturesConfig(
-            long_term_memory=LongTermMemoryConfig(mode="file", keyword_trigger_save=True),
+            long_term_memory=LongTermMemoryConfig(mode="file"),
         ),
         persona=PersonaConfig(active="test"),
         behavior=BehaviorConfig(
@@ -153,11 +153,7 @@ def _make_config() -> RootConfig:
                 chars_per_second=999.0,
             ),
             rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
-            summarize=SummarizeConfig(
-                trigger_at_messages=99999,
-                range_start_messages=50,
-                range_end_messages=150,
-            ),
+            summarize=SummarizeConfig(),
         ),
     )
 

@@ -153,7 +153,6 @@ class WizardContext:
         default_factory=lambda: FeatureChoice(enabled=True)
     )
     long_term_memory_mode: Literal["file", "rag"] = "file"
-    long_term_memory_keyword_trigger_save: bool = True
 
     # RAG 历史召回 embedding（mode=rag 时才用）
     embedding_type: Literal["api", "local"] = "api"

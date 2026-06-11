@@ -132,6 +132,10 @@ python main.py
 
 设置页 → 模型 → 改 Provider 密钥或 Agent 模型。点「测试连接」确认可用。
 
+### 调上下文预算
+
+设置页 → Token预算 → 滚动摘要压缩，可以调触发滚动摘要的上下文占比、压缩后的活跃窗口目标，以及第一次压缩仍超预算时的重试压缩目标。正常使用建议保留默认值；这里不再提供“保留最近 N 条工作历史”一类旧裁剪开关。
+
 ### 调主题
 
 ![外观](https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/dashboard_appearance.png)

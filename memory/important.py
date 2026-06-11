@@ -72,16 +72,6 @@ def scope_from_conversation_id(conversation_id: str | None) -> str | None:
     return None
 
 
-# 默认的"记住"类关键词。命中即强制保存（绕过 AI 主动判断）
-DEFAULT_FORCE_SAVE_KEYWORDS: list[str] = [
-    "记住", "请记住", "一定要记住", "记一下", "记下", "帮我记", "帮我记一下",
-    "记一笔", "记：", "记:", "重要的是",
-    "约定", "约好", "承诺",
-    "我叫", "我是", "我的名字",
-    "我的 QQ", "我的qq", "QQ 是", "qq是",
-]
-
-
 class ImportantMemoryManager:
     """重要记忆管理器。"""
 
@@ -398,72 +388,6 @@ class ImportantMemoryManager:
                 logger.warning(f"RAG 索引移除失败：{e}")
         return True
 
-    async def force_save_from_keyword(
-        self,
-        text: str,
-        keywords: list[str] | None = None,
-        *,
-        scope: str | None = None,
-        pinned: bool = False,
-    ) -> dict:
-        """关键词触发的强制保存（不走去重检查，用于"记住 X"/"我叫 X"等场景）。
-
-        Args:
-            text: 待提取的原始消息文本
-            keywords: 关键词列表，命中任一即触发保存。None 时使用默认列表
-
-        Returns:
-            {"saved": bool, "matched_keyword": str | None, "content": str}
-        """
-        if not self._loaded:
-            raise RuntimeError("ImportantMemoryManager 尚未调用 load()")
-
-        if keywords is None:
-            keywords = DEFAULT_FORCE_SAVE_KEYWORDS
-
-        text = (text or "").strip()
-        if not text:
-            return {"saved": False, "matched_keyword": None, "content": ""}
-
-        matched = next((k for k in keywords if k in text), None)
-        if matched is None:
-            return {"saved": False, "matched_keyword": None, "content": ""}
-
-        content = _strip_memory_keyword(text, matched)
-        duplicate_id = self._find_exact_duplicate_id(content)
-        if duplicate_id:
-            return {
-                "saved": False,
-                "matched_keyword": matched,
-                "content": content,
-                "duplicate": True,
-                "duplicate_type": "exact",
-                "existing_id": duplicate_id,
-            }
-
-        item = self._normalize_item(
-            {
-                "id": self._new_item_id(),
-                "timestamp": self._now_fn(),
-                "content": content,
-                "source": f"keyword:{matched}",
-                "scope": normalize_scope(scope),
-                "pinned": bool(pinned),
-            }
-        )
-        self._items.append(item)
-        await self._store.write(self._items)
-        self._refresh_text_cache()
-        logger.info(f"关键词强制保存触发 ({matched}): {content[:50]}")
-        await self._index_in_rag(item)
-        return {
-            "saved": True,
-            "matched_keyword": matched,
-            "content": content,
-            "duplicate": False,
-            "id": self._item_id(item),
-        }
-
     async def update_metadata(
         self,
         item_id: str,
@@ -700,15 +624,6 @@ def _default_now() -> str:
     from datetime import datetime
 
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _strip_memory_keyword(text: str, keyword: str) -> str:
-    """去掉用户显式“记住/记一下”等引导词，保存真正的事实内容。"""
-    content = text.strip()
-    if keyword and content.startswith(keyword):
-        content = content[len(keyword):]
-        content = re.sub(r"^[\s:：,，。.!！-]+", "", content).strip()
-    return content or text.strip()
 
 
 def _normalize_memory_text_for_exact_match(text: str) -> str:

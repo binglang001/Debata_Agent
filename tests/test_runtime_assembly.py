@@ -166,7 +166,7 @@ def _write_minimal_config(paths):
             },
         },
         "features": {
-            "long_term_memory": {"mode": "file", "keyword_trigger_save": True},
+            "long_term_memory": {"mode": "file"},
             "web_search": {"enabled": False},
         },
         "persona": {"active": "test_bot"},

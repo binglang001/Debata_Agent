@@ -146,24 +146,6 @@ class PipelineTurnsMixin:
                 conversation_id=record_conversation_id,
             )
 
-        history_window = await self._select_working_history(conversation_id)
-        important_text = await self._important_memory_text(conversation_id)
-        rag_context_text = await self._rag_context_text(
-            conversation_id,
-            query=user_event or task_context,
-            before_ts=_earliest_record_ts(history_window),
-        )
-        messages = build_messages(
-            persona=self.persona,
-            history=history_window,
-            important_memory_text=important_text,
-            rag_context_text=rag_context_text,
-            rolling_summary_text=self._rolling_summary_text(),
-            current_context=task_context,
-            memory_mode=self.features_cfg.long_term_memory.mode,
-            user_event=user_event,
-        )
-
         ctx = self._build_tool_context(
             default_target=default_target,
             conversation_id=conversation_id,
@@ -195,6 +177,42 @@ class PipelineTurnsMixin:
                 return await base_executor(tool_name, args, tool_call_id=tool_call_id)
 
             executor = _guarded_executor
+
+        async def _rebuild_messages() -> list[dict[str, Any]]:
+            history_window = await self._select_working_history(conversation_id)
+            important_text = await self._important_memory_text(conversation_id)
+            rag_context_text = await self._rag_context_text(
+                conversation_id,
+                query=user_event or task_context,
+                before_ts=_earliest_record_ts(history_window),
+            )
+            return build_messages(
+                persona=self.persona,
+                history=history_window,
+                important_memory_text=important_text,
+                rag_context_text=rag_context_text,
+                rolling_summary_text=self._rolling_summary_text(),
+                current_context=task_context,
+                memory_mode=self.features_cfg.long_term_memory.mode,
+                user_event=user_event,
+            )
+
+        budget_result = await self._prepare_main_prompt_for_model(
+            conversation_id=conversation_id,
+            phase=f"run_one_turn:{task_phase}",
+            tools_schema=tools_schema,
+            rebuild_messages=_rebuild_messages,
+        )
+        if not budget_result.ok:
+            logger.error(
+                "run_one_turn 预算预检失败，跳过模型调用 conversation_id=%s "
+                "estimated=%s budget=%s",
+                conversation_id,
+                budget_result.estimated_tokens,
+                budget_result.budget_tokens,
+            )
+            return
+        messages = budget_result.messages
 
         async def _run_locked() -> None:
             self._send_manager.begin_model_turn(conversation_id)

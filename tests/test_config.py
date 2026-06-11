@@ -60,12 +60,15 @@ def test_budget_limit_schema_defaults_load_for_legacy_config():
     assert cfg.behavior.summarize.target_after_tokens is None
     assert cfg.behavior.summarize.trigger_at_context_percent == 75
     assert cfg.behavior.summarize.target_after_context_percent == 50
+    assert cfg.behavior.summarize.retry_target_after_context_percent == 30
+    assert "range_start_messages" not in type(cfg.behavior.summarize).model_fields
+    assert "range_end_messages" not in type(cfg.behavior.summarize).model_fields
     assert cfg.behavior.context.prompt_overhead_estimate_tokens == 12000
-    assert cfg.behavior.context.min_working_history_tokens == 4096
-    assert cfg.behavior.context.current_conversation_min_records == 8
-    assert cfg.behavior.context.runtime_record_keep_count == 12
-    assert cfg.behavior.context.send_receipt_keep_count == 4
-    assert cfg.behavior.context.no_action_keep_count == 8
+    assert "min_working_history_tokens" not in type(cfg.behavior.context).model_fields
+    assert "current_conversation_min_records" not in type(cfg.behavior.context).model_fields
+    assert "runtime_record_keep_count" not in type(cfg.behavior.context).model_fields
+    assert "send_receipt_keep_count" not in type(cfg.behavior.context).model_fields
+    assert "no_action_keep_count" not in type(cfg.behavior.context).model_fields
     rec = cfg.behavior.context.recommended_context_budget
     assert rec.model_name_budget_tokens["deepseek-v4-pro"] == 350_000
     assert rec.model_name_budget_tokens["deepseek-v4"] == 300_000
@@ -97,12 +100,8 @@ def test_data_config_explicit_budget_defaults_roundtrip(tmp_paths):
         ("features", "vision", "max_tokens"): 1024,
         ("behavior", "summarize", "trigger_at_context_percent"): 75,
         ("behavior", "summarize", "target_after_context_percent"): 50,
+        ("behavior", "summarize", "retry_target_after_context_percent"): 30,
         ("behavior", "context", "prompt_overhead_estimate_tokens"): 12000,
-        ("behavior", "context", "min_working_history_tokens"): 4096,
-        ("behavior", "context", "current_conversation_min_records"): 8,
-        ("behavior", "context", "runtime_record_keep_count"): 12,
-        ("behavior", "context", "send_receipt_keep_count"): 4,
-        ("behavior", "context", "no_action_keep_count"): 8,
         (
             "behavior",
             "context",
@@ -183,6 +182,54 @@ def test_data_config_explicit_budget_defaults_roundtrip(tmp_paths):
         {"min_context_length_tokens": 128_000, "budget_tokens": 96_000},
     ]
     assert "persona_refine_history_turns" not in saved["behavior"]
+    assert "range_start_messages" not in saved["behavior"]["summarize"]
+    assert "range_end_messages" not in saved["behavior"]["summarize"]
+    assert "min_working_history_tokens" not in saved["behavior"]["context"]
+    assert "current_conversation_min_records" not in saved["behavior"]["context"]
+    assert "runtime_record_keep_count" not in saved["behavior"]["context"]
+    assert "send_receipt_keep_count" not in saved["behavior"]["context"]
+    assert "no_action_keep_count" not in saved["behavior"]["context"]
+
+
+def test_deprecated_context_window_fields_are_ignored_and_not_saved(tmp_paths):
+    raw = _minimal_config().model_dump(mode="json", exclude_none=True)
+    raw["behavior"]["summarize"].update(
+        {
+            "range_start_messages": 50,
+            "range_end_messages": 150,
+        }
+    )
+    raw["behavior"]["context"].update(
+        {
+            "min_working_history_tokens": 4096,
+            "current_conversation_min_records": 8,
+            "runtime_record_keep_count": 12,
+            "send_receipt_keep_count": 4,
+            "no_action_keep_count": 8,
+        }
+    )
+
+    cfg = RootConfig.model_validate(raw)
+    assert "range_start_messages" not in cfg.behavior.summarize.model_dump()
+    assert "range_end_messages" not in cfg.behavior.summarize.model_dump()
+    assert "min_working_history_tokens" not in cfg.behavior.context.model_dump()
+    assert "current_conversation_min_records" not in cfg.behavior.context.model_dump()
+    assert "runtime_record_keep_count" not in cfg.behavior.context.model_dump()
+    assert "send_receipt_keep_count" not in cfg.behavior.context.model_dump()
+    assert "no_action_keep_count" not in cfg.behavior.context.model_dump()
+
+    tmp_paths.CONFIG_FILE.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+    loaded = load_config(tmp_paths, set_global=False)
+    save_config(tmp_paths, loaded, backup=False)
+
+    saved = yaml.safe_load(tmp_paths.CONFIG_FILE.read_text(encoding="utf-8"))
+    assert "range_start_messages" not in saved["behavior"]["summarize"]
+    assert "range_end_messages" not in saved["behavior"]["summarize"]
+    assert "min_working_history_tokens" not in saved["behavior"]["context"]
+    assert "current_conversation_min_records" not in saved["behavior"]["context"]
+    assert "runtime_record_keep_count" not in saved["behavior"]["context"]
+    assert "send_receipt_keep_count" not in saved["behavior"]["context"]
+    assert "no_action_keep_count" not in saved["behavior"]["context"]
 
 
 def test_deprecated_typing_delay_fields_are_ignored_and_not_saved(tmp_paths):

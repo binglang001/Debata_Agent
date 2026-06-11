@@ -9,6 +9,7 @@ from memory import (
     ImportantMemoryManager,
     JsonlStore,
     JsonStore,
+    RollingSummaryStore,
     StoreError,
 )
 
@@ -53,6 +54,25 @@ async def test_json_store_corrupted_raises(tmp_path):
     store = JsonStore(path)
     with pytest.raises(StoreError):
         await store.read()
+
+
+@pytest.mark.asyncio
+async def test_rolling_summary_loads_legacy_top_level_active_start_index(tmp_path):
+    path = tmp_path / "rolling_summary.json"
+    path.write_text(
+        (
+            '{"summary_text":"旧摘要","active_start_index":7,'
+            '"archived_until":{"last_compaction_count":3},"updated_at":"T1"}'
+        ),
+        encoding="utf-8",
+    )
+    store = RollingSummaryStore(path)
+
+    data = await store.load()
+
+    assert store.text() == "旧摘要"
+    assert store.active_start_index() == 7
+    assert data["archived_until"]["active_start_index"] == 7
 
 
 # ============================================================

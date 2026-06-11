@@ -60,7 +60,8 @@ venv/Scripts/python -m pytest tests/test_kv_cache_real.py -m live -s
 - ✗ 在 messages 中间（不是末尾）追加新内容
 - ✗ tool 段顺序在不同轮次发生变化（schema 字段无序生成）
 - ✗ 切换 persona / 切换 provider 模型
-- ✗ history 总结后 truncate_head 改变了前缀（这是必要的破坏）
+- △ 滚动摘要成功提交后会移动 `active_start_index`，下一轮前缀会明确重建一次；
+  `history.jsonl` 仍全量保留，不再通过 `truncate_head` 删除事实账本。
 
 ## 多 Provider 对比
 

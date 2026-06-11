@@ -490,25 +490,14 @@ class SettingsFeaturesMixin:
         outer.addWidget(rb_file)
         outer.addWidget(rb_rag)
 
-        chk_kw = QCheckBox("命中关键词强制保存（记住 / 约定 / 我叫等）")
-        chk_kw.setChecked(lt.keyword_trigger_save)
-        outer.addWidget(chk_kw)
-
         def _on_mode(*_) -> None:
             if self._suppress_signals:
                 return
             lt.mode = "rag" if rb_rag.isChecked() else "file"
             self._save_now(needs_restart=True, change_desc=f"long_term_memory.mode={lt.mode}")
 
-        def _on_kw(on: bool) -> None:
-            if self._suppress_signals:
-                return
-            lt.keyword_trigger_save = on
-            self._save_now(needs_restart=True, change_desc="long_term_memory.keyword_trigger_save")
-
         rb_file.toggled.connect(_on_mode)
         rb_rag.toggled.connect(_on_mode)
-        chk_kw.toggled.connect(_on_kw)
         return wrap
 
     def _validate_features_then_save(self, change_desc: str) -> None:

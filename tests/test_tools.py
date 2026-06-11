@@ -1,4 +1,4 @@
-"""测试工具系统：schema 派生 / Registry 启用禁用 / 工具执行 / 关键词保存。"""
+"""测试工具系统：schema 派生 / Registry 启用禁用 / 工具执行。"""
 
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from tools import (
     build_message_action,
     contains_forbidden,
     get_default_specs,
-    try_save_from_user,
     typing_delay,
 )
 from tools.base import _inline_refs, _strip_pydantic_metadata, tool
@@ -279,6 +278,13 @@ def test_send_private_schema_derivation():
     assert "delay" in target_required
     assert "最后一条也必须填写" in target_props["delay"]["description"]
     assert "1.5 个中文字/秒" in target_props["delay"]["description"]
+    props = fn["parameters"]["properties"]
+    assert "responding_to_message_ids" in props
+    assert "reply_to_message_id" in props
+    assert "回答被引用的消息或复核后继续旧内容" in props["responding_to_message_ids"]["description"]
+    assert "只在需要锚定原消息时填" in props["reply_to_message_id"]["description"]
+    assert "没有可靠 msg_id 不要编造" in props["reply_to_message_id"]["description"]
+    assert "reply_to_message_id" not in fn["parameters"]["required"]
 
 
 def test_send_targets_require_delay():
@@ -381,19 +387,27 @@ def test_send_group_schema_describes_conditional_reply_reference():
     reply_desc = send_props["reply_to_message_id"]["description"]
     responding_desc = send_props["responding_to_message_ids"]["description"]
 
-    assert "前后有多人插话" in reply_desc
-    assert "行/OK/可以/知道了" in reply_desc
-    assert "不要机械每条都填" in reply_desc
-    assert "不确定不要编造" in reply_desc
-    assert "跨消息回应或复核后提交旧内容" in responding_desc
+    assert "回复对象不是紧邻上一条" in reply_desc
+    assert "多人连续插话" in reply_desc
+    assert "回答被引用的消息" in reply_desc
+    assert "行/OK/可以/知道了/不要" in reply_desc
+    assert "普通顺序闲聊不要机械每条都填" in reply_desc
+    assert "没有可靠 msg_id 不要编造" in reply_desc
+    assert "回复对象不是紧邻上一条" in responding_desc
+    assert "回答被引用的消息或复核后提交旧内容" in responding_desc
 
     commit_schema = specs["commit_send_attempt"].to_openai_schema()
     commit_desc = commit_schema["function"]["parameters"]["properties"][
         "reply_to_message_id"
     ]["description"]
+    commit_required = commit_schema["function"]["parameters"].get("required", [])
     assert "群聊复核后提交旧 attempt" in commit_desc
+    assert "提交旧 attempt 前先复核旧回复是否需要补引用" in commit_desc
+    assert "回答被引用的消息" in commit_desc
     assert "短确认会看不出回谁" in commit_desc
-    assert "不要机械每条都填" in commit_desc
+    assert "普通顺序闲聊不要机械每条都填" in commit_desc
+    assert "没有可靠 msg_id 不要编造" in commit_desc
+    assert "reply_to_message_id" not in commit_required
 
 
 def test_commit_send_attempt_schema_exposes_ignore_review_interrupts():
@@ -2005,50 +2019,6 @@ def test_build_message_action_image_url():
     assert action["kind"] == "image"
     assert action["image_url"] == "https://example.com/a.png"
     assert action["label"] == "[图片]"
-
-
-# ============================================================
-# keyword_save 联动
-# ============================================================
-
-
-@pytest.mark.asyncio
-async def test_keyword_save_hits(tmp_path):
-    from memory import ImportantMemoryManager
-
-    im = ImportantMemoryManager(tmp_path / "imp.json")
-    await im.load()
-    result = await try_save_from_user("记住我喜欢猫", im, enabled=True)
-    assert result is not None
-    assert result["saved"] is True
-    assert result["matched_keyword"] == "记住"
-
-
-@pytest.mark.asyncio
-async def test_keyword_save_disabled(tmp_path):
-    from memory import ImportantMemoryManager
-
-    im = ImportantMemoryManager(tmp_path / "imp.json")
-    await im.load()
-    result = await try_save_from_user("记住我喜欢猫", im, enabled=False)
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_keyword_save_no_match(tmp_path):
-    from memory import ImportantMemoryManager
-
-    im = ImportantMemoryManager(tmp_path / "imp.json")
-    await im.load()
-    result = await try_save_from_user("今天天气真好", im, enabled=True)
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_keyword_save_no_manager():
-    """important=None 时应安全返回 None。"""
-    result = await try_save_from_user("记住啥的", None, enabled=True)
-    assert result is None
 
 
 # ============================================================

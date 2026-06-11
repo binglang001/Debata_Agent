@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -154,6 +155,76 @@ def build_task_context(
     return f'<task_context priority="medium">\n{content}\n</task_context>'
 
 
+def _provider_safe_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把无法合法回放的工具记录转为系统上下文，原始 history 不变。"""
+    safe: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(history):
+        record = history[idx]
+        role = record.get("role")
+        if role == "assistant" and record.get("tool_calls"):
+            ids = _assistant_tool_call_ids(record)
+            tool_group: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            cursor = idx + 1
+            while cursor < len(history) and history[cursor].get("role") == "tool":
+                tool_record = history[cursor]
+                tool_call_id = str(tool_record.get("tool_call_id") or "")
+                if tool_call_id not in ids:
+                    break
+                tool_group.append(tool_record)
+                seen.add(tool_call_id)
+                cursor += 1
+                if seen >= ids:
+                    break
+            if ids and seen >= ids:
+                safe.append(record)
+                safe.extend(tool_group)
+                idx = cursor
+                continue
+            safe.append(_tool_like_record_as_system(record, kind="assistant_tool_call"))
+            idx += 1
+            continue
+        if role == "tool":
+            safe.append(_tool_like_record_as_system(record, kind="tool_result"))
+            idx += 1
+            continue
+        safe.append(record)
+        idx += 1
+    return safe
+
+
+def _assistant_tool_call_ids(record: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for tool_call in record.get("tool_calls") or []:
+        if not isinstance(tool_call, dict):
+            continue
+        call_id = str(tool_call.get("id") or "")
+        if call_id:
+            ids.add(call_id)
+    return ids
+
+
+def _tool_like_record_as_system(record: dict[str, Any], *, kind: str) -> dict[str, Any]:
+    payload = {
+        "kind": kind,
+        "role": record.get("role"),
+        "tool_call_id": record.get("tool_call_id"),
+        "tool_calls": record.get("tool_calls"),
+        "content": record.get("content"),
+    }
+    return {
+        "role": "system",
+        "content": (
+            "<historical_tool_record_unreplayable>\n"
+            "以下是历史中的工具调用/工具结果记录。由于缺少可直接回放给 provider 的相邻配对，"
+            "运行时已把它转为普通上下文；原始事件仍保存在历史中。\n"
+            f"{json.dumps(payload, ensure_ascii=False, default=str)}\n"
+            "</historical_tool_record_unreplayable>"
+        ),
+    }
+
+
 def build_messages(
     persona: Persona,
     history: list[dict[str, Any]],
@@ -191,7 +262,7 @@ def build_messages(
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_override}
         ]
-        messages.extend(history)
+        messages.extend(_provider_safe_history(history))
         if current_context:
             messages.append({"role": "system", "content": current_context})
         if user_event:
@@ -221,7 +292,7 @@ def build_messages(
             }
         )
 
-    messages.extend(history)
+    messages.extend(_provider_safe_history(history))
 
     if current_context_record is not None:
         content = str(current_context_record.get("content") or "")

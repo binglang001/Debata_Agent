@@ -227,11 +227,29 @@ class SqliteArchiveStore:
             "CREATE INDEX IF NOT EXISTS idx_archive_date "
             "ON archive_messages(date_key)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_archive_record_json "
+            "ON archive_messages(record_json)"
+        )
         conn.commit()
 
     def _append_many_sync(self, records: list[dict[str, Any]]) -> None:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             now = _now_text()
+            existing_record_json = self._existing_record_json(conn, records)
+            seen_record_json: set[str] = set()
+            pending: list[tuple[_NormalizedRecord, str, str]] = []
+            for record in records:
+                normalized = _normalize_record(record)
+                record_json = _json_dumps(normalized.record)
+                if record_json in existing_record_json or record_json in seen_record_json:
+                    continue
+                seen_record_json.add(record_json)
+                pending.append((normalized, record_json, _json_dumps(normalized.metadata)))
+            if not pending:
+                conn.commit()
+                return
             next_rowid = int(
                 conn.execute(
                     "SELECT COALESCE(MAX(rowid), 0) + 1 FROM archive_messages"
@@ -239,12 +257,9 @@ class SqliteArchiveStore:
             )
             message_rows: list[tuple[Any, ...]] = []
             media_rows: list[tuple[Any, ...]] = []
-            for offset, record in enumerate(records):
+            for offset, (normalized, record_json, metadata_json) in enumerate(pending):
                 rowid = next_rowid + offset
                 archive_id = "a" + _base36(rowid)
-                normalized = _normalize_record(record)
-                record_json = _json_dumps(normalized.record)
-                metadata_json = _json_dumps(normalized.metadata)
                 message_rows.append(
                     (
                         rowid,
@@ -304,6 +319,30 @@ class SqliteArchiveStore:
                     media_rows,
                 )
             conn.commit()
+
+    @staticmethod
+    def _existing_record_json(
+        conn: sqlite3.Connection,
+        records: list[dict[str, Any]],
+    ) -> set[str]:
+        record_json_values = list(
+            dict.fromkeys(_json_dumps(_normalize_record(record).record) for record in records)
+        )
+        existing: set[str] = set()
+        for start in range(0, len(record_json_values), 500):
+            chunk = record_json_values[start:start + 500]
+            if not chunk:
+                continue
+            placeholders = _placeholders(len(chunk))
+            rows = conn.execute(
+                f"""
+                SELECT record_json FROM archive_messages
+                WHERE record_json IN ({placeholders})
+                """,
+                chunk,
+            ).fetchall()
+            existing.update(str(row["record_json"]) for row in rows if row["record_json"])
+        return existing
 
     def _records_sync(self) -> list[dict]:
         with self._connect() as conn:

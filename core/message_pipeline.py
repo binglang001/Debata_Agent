@@ -4,11 +4,10 @@
     1. 接收 IncomingMessage（来自 EventBus）
     2. 速率限制（非好友）
     3. 重建可读文本（CQ 码解析 + 附加媒体 URL）
-    4. 关键词强制保存重要记忆（RAG 只影响历史召回，不关闭 important.json）
-    5. 合并窗口暂存
-    6. 批处理触发：合并窗口到时，组装 messages → 调 ChatAgent
-    7. 发送类工具走同步快路径或每会话异步发送队列
-    8. 历史持久化 + 总结触发
+    4. 合并窗口暂存
+    5. 批处理触发：合并窗口到时，组装 messages → 调 ChatAgent
+    6. 发送类工具走同步快路径或每会话异步发送队列
+    7. 历史持久化 + 总结触发
 
 这是 P1.8 的核心模块，已装实完整链路：消息合并 / 异步发送 / 媒体抽取 /
 总结触发 / 工具循环 / 唤醒响应。
@@ -86,30 +85,6 @@ from .pipeline_context import (
 )
 from .pipeline_context import (
     _recommended_context_budget as _recommended_context_budget,
-)
-from .pipeline_history import (
-    _WORKING_HISTORY_NO_ACTION_KEEP as _WORKING_HISTORY_NO_ACTION_KEEP,
-)
-from .pipeline_history import (
-    _WORKING_HISTORY_SEND_RECEIPT_KEEP as _WORKING_HISTORY_SEND_RECEIPT_KEEP,
-)
-from .pipeline_history import (
-    _assistant_tool_call_names as _assistant_tool_call_names,
-)
-from .pipeline_history import (
-    _no_action_pair_indices as _no_action_pair_indices,
-)
-from .pipeline_history import (
-    _record_timestamp as _record_timestamp,
-)
-from .pipeline_history import (
-    _runtime_context_kind as _runtime_context_kind,
-)
-from .pipeline_history import (
-    _tool_result_is_no_action as _tool_result_is_no_action,
-)
-from .pipeline_history import (
-    _working_history_force_keep_indices as _working_history_force_keep_indices,
 )
 from .pipeline_inbound import (
     _RATE_LIMIT_REPLY_TEMPLATE as _RATE_LIMIT_REPLY_TEMPLATE,
@@ -317,73 +292,6 @@ class MessagePipeline(
             extra=f"context_len={len(task_context)}",
         )
 
-        stage_t0 = time.monotonic()
-        history_window = await self._select_working_history(conversation_id)
-        _log_slow_batch_stage(
-            "select_working_history",
-            stage_t0,
-            conversation_id=conversation_id,
-            extra=f"records={len(history_window)}",
-        )
-        estimator = self._token_estimator()
-
-        stage_t0 = time.monotonic()
-        important_text = await self._important_memory_text(
-            conversation_id,
-        )
-        _log_slow_batch_stage(
-            "important_memory_text",
-            stage_t0,
-            conversation_id=conversation_id,
-            extra=f"memory_len={len(important_text)}",
-        )
-
-        stage_t0 = time.monotonic()
-        rag_context_text = await self._rag_context_text(
-            conversation_id,
-            query=items[-1].text if items else None,
-            before_ts=_earliest_record_ts(history_window),
-        )
-        _log_slow_batch_stage(
-            "rag_context_text",
-            stage_t0,
-            conversation_id=conversation_id,
-            extra=f"rag_len={len(rag_context_text)}",
-        )
-        logger.debug(
-            "批处理上下文准备完成 conversation_id=%s memory_len=%s rag_len=%s elapsed=%.3fs",
-            conversation_id,
-            len(important_text),
-            len(rag_context_text),
-            time.monotonic() - batch_t0,
-        )
-
-        stage_t0 = time.monotonic()
-        rolling_summary_text = self._rolling_summary_text(estimator)
-        _log_slow_batch_stage(
-            "rolling_summary_text",
-            stage_t0,
-            conversation_id=conversation_id,
-            extra=f"summary_len={len(rolling_summary_text)}",
-        )
-
-        stage_t0 = time.monotonic()
-        messages = build_messages(
-            persona=self.persona,
-            history=history_window,
-            important_memory_text=important_text,
-            rag_context_text=rag_context_text,
-            rolling_summary_text=rolling_summary_text,
-            current_context_record=task_context_record,
-            memory_mode=self.features_cfg.long_term_memory.mode,
-        )
-        _log_slow_batch_stage(
-            "build_messages",
-            stage_t0,
-            conversation_id=conversation_id,
-            extra=f"messages={len(messages)}",
-        )
-
         # 构造 ToolContext
         stage_t0 = time.monotonic()
         default_target = items[-1].raw_event.source_target if items else None
@@ -410,15 +318,103 @@ class MessagePipeline(
             extra=f"tools={len(tools_schema)}",
         )
 
+        async def _rebuild_messages() -> list[dict[str, Any]]:
+            stage_t0 = time.monotonic()
+            history_window = await self._select_working_history(conversation_id)
+            _log_slow_batch_stage(
+                "select_working_history",
+                stage_t0,
+                conversation_id=conversation_id,
+                extra=f"records={len(history_window)}",
+            )
+            estimator = self._token_estimator()
+
+            stage_t0 = time.monotonic()
+            important_text = await self._important_memory_text(
+                conversation_id,
+            )
+            _log_slow_batch_stage(
+                "important_memory_text",
+                stage_t0,
+                conversation_id=conversation_id,
+                extra=f"memory_len={len(important_text)}",
+            )
+
+            stage_t0 = time.monotonic()
+            rag_context_text = await self._rag_context_text(
+                conversation_id,
+                query=items[-1].text if items else None,
+                before_ts=_earliest_record_ts(history_window),
+            )
+            _log_slow_batch_stage(
+                "rag_context_text",
+                stage_t0,
+                conversation_id=conversation_id,
+                extra=f"rag_len={len(rag_context_text)}",
+            )
+            logger.debug(
+                "批处理上下文准备完成 conversation_id=%s memory_len=%s rag_len=%s elapsed=%.3fs",
+                conversation_id,
+                len(important_text),
+                len(rag_context_text),
+                time.monotonic() - batch_t0,
+            )
+
+            stage_t0 = time.monotonic()
+            rolling_summary_text = self._rolling_summary_text(estimator)
+            _log_slow_batch_stage(
+                "rolling_summary_text",
+                stage_t0,
+                conversation_id=conversation_id,
+                extra=f"summary_len={len(rolling_summary_text)}",
+            )
+
+            stage_t0 = time.monotonic()
+            rebuilt_messages = build_messages(
+                persona=self.persona,
+                history=history_window,
+                important_memory_text=important_text,
+                rag_context_text=rag_context_text,
+                rolling_summary_text=rolling_summary_text,
+                current_context_record=task_context_record,
+                memory_mode=self.features_cfg.long_term_memory.mode,
+            )
+            _log_slow_batch_stage(
+                "build_messages",
+                stage_t0,
+                conversation_id=conversation_id,
+                extra=f"messages={len(rebuilt_messages)}",
+            )
+            return rebuilt_messages
+
         stage_t0 = time.monotonic()
-        estimated_prompt_tokens = estimator.estimate_messages(messages)
-        if tools_schema:
-            estimated_prompt_tokens += estimator.estimate_text(str(tools_schema))
+        budget_result = await self._prepare_main_prompt_for_model(
+            conversation_id=conversation_id,
+            phase="main_reply",
+            tools_schema=tools_schema,
+            rebuild_messages=_rebuild_messages,
+        )
+        if not budget_result.ok:
+            _log_slow_batch_stage(
+                "main_prompt_budget_failed",
+                stage_t0,
+                conversation_id=conversation_id,
+                extra=(
+                    f"estimated={budget_result.estimated_tokens} "
+                    f"budget={budget_result.budget_tokens}"
+                ),
+            )
+            return False
+        messages = budget_result.messages
+        estimated_prompt_tokens = budget_result.estimated_tokens
         _log_slow_batch_stage(
-            "estimate_prompt_tokens",
+            "main_prompt_budget_preflight",
             stage_t0,
             conversation_id=conversation_id,
-            extra=f"estimated={estimated_prompt_tokens}",
+            extra=(
+                f"estimated={estimated_prompt_tokens} "
+                f"budget={budget_result.budget_tokens}"
+            ),
         )
 
         # 只串行模型轮；Phase 0 后台发送不占 reply_lock。

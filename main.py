@@ -649,7 +649,7 @@ def _run_cli_wizard(paths) -> None:
                 ),
             ),
             features=FeaturesConfig(
-                long_term_memory=LongTermMemoryConfig(mode="file", keyword_trigger_save=True),
+                long_term_memory=LongTermMemoryConfig(mode="file"),
             ),
             persona=PersonaConfig(active=persona_name),
             behavior=BehaviorConfig(),

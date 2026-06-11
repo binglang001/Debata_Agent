@@ -7,7 +7,6 @@ import asyncio
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
-    QCheckBox,
     QComboBox,
     QFormLayout,
     QFrame,
@@ -113,10 +112,6 @@ class EmbeddingStepView(BaseStepView):
         rag_lay.addWidget(guide_btn)
         card.add_content(rag_row)
         card.add_content(self._mk_secondary("在重要记忆之外，从历史对话中按语义召回相关内容。"))
-
-        self._keyword_chk = QCheckBox("重要记忆关键词强制保存（记住 / 约定 / 我叫等）")
-        self._keyword_chk.setChecked(True)
-        card.add_content(self._keyword_chk)
 
         sep = QFrame()
         sep.setProperty("role", "separator")
@@ -512,7 +507,6 @@ class EmbeddingStepView(BaseStepView):
 
     def refresh(self) -> None:
         self._refresh_provider_choices()
-        self._keyword_chk.setChecked(self.context.long_term_memory_keyword_trigger_save)
         if self.context.long_term_memory_mode == "rag":
             self._rb_rag.setChecked(True)
         else:
@@ -546,7 +540,6 @@ class EmbeddingStepView(BaseStepView):
 
     def save(self) -> bool:
         self.context.long_term_memory_mode = "rag" if self._rb_rag.isChecked() else "file"
-        self.context.long_term_memory_keyword_trigger_save = self._keyword_chk.isChecked()
 
         if self.context.long_term_memory_mode == "file":
             return True
