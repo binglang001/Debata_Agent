@@ -27,7 +27,7 @@
 #
 # RAG / Embedding 默认规则:
 #   - Embedding 模型与 chat 模型是独立模型，不能默认复用主 chat provider
-#   - 火山引擎 embedding 默认模型: doubao-embedding-vision-251215
+#   - 火山引擎文本 embedding 默认模型: doubao-embedding-text-240515
 #   - OpenAI embedding 推荐: text-embedding-3-small
 #   - 其余 provider 若无 embedding 模型，RAG 默认选择独立 embedding provider
 #
@@ -647,20 +647,25 @@ providers:
     base_url: https://ark.cn-beijing.volces.com/api/v3
     reasoning_style: thinking_extra_body
     has_embedding: true
-    embedding_note: "doubao-embedding-vision-251215 是默认 RAG embedding 模型（图文多模态向量）"
+    embedding_note: "RAG 文本检索默认使用 doubao-embedding-text-240515；Vision embedding 需走多模态 endpoint"
     vision_reuse: true
     vision_reuse_note: "Seed 2.0 Lite/Pro 原生多模态；Seed 1.6 Vision 为专用视觉模型"
     embedding_models:
-      - id: doubao-embedding-vision-251215
-        display_name: 豆包 Embedding Vision（默认 · 图文多模态）
-        dimensions: 2048
-        status: recommended
-        notes: "2025-06-15 发布；支持文本+图像+视频联合嵌入；1024/2048 维度可配；RAG 默认模型"
-      - id: doubao-embedding-text-01
+      - id: doubao-embedding-text-240515
         display_name: 豆包 Embedding Text
         dimensions: 1024
+        status: recommended
+        notes: "文本向量；用于 /embeddings，适合 RAG 文本检索"
+      - id: doubao-embedding-text-01
+        display_name: 豆包 Embedding Text（旧版）
+        dimensions: 1024
         status: active
-        notes: "纯文本向量；轻量"
+        notes: "纯文本向量；旧模型 ID，若控制台无权限请换 doubao-embedding-text-240515"
+      - id: doubao-embedding-vision-251215
+        display_name: 豆包 Embedding Vision（多模态）
+        dimensions: 2048
+        status: active
+        notes: "2025-06-15 发布；支持文本+图像+视频联合嵌入；需走 /embeddings/multimodal"
     models:
       - id: doubao-seed-2-0-lite-260428
         display_name: 豆包 Seed 2.0 Lite（推荐 · 多模态）

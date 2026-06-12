@@ -36,17 +36,32 @@ class PrivateMessageTarget(_ToolArgs):
     target_qq: int = Field(..., description="接收者 QQ 号")
     content: str | None = Field(
         default=None,
-        description="消息正文；可在开头加 [CQ:reply,id=msg_id] 引用回复。content 与 image 二选一。",
+        description="消息正文；可在开头加 [CQ:reply,id=msg_id] 引用回复。content、emoji、image 三选一。",
+    )
+    emoji: str | None = Field(
+        default=None,
+        description="表情包名称，不带文件后缀；必须从 task_context 的可用表情包列表中选择。content、emoji、image 三选一。",
     )
     image: str | None = Field(
         default=None,
-        description="表情包文件名（emoji 目录下的文件名）。content 与 image 二选一。",
+        description="要发送的图片 URL 或 workspace 相对路径；不是表情包。content、emoji、image 三选一。",
     )
     order: int = Field(..., description="发送顺序，从小到大")
     delay: float | None = Field(
         default=None,
         description="本条发出后的等待秒数。不填时按消息长度自动估算。",
     )
+
+    @model_validator(mode="after")
+    def validate_payload_choice(self) -> PrivateMessageTarget:
+        values = [
+            value
+            for value in (self.content, self.emoji, self.image)
+            if str(value or "").strip()
+        ]
+        if len(values) != 1:
+            raise ValueError("content、emoji、image 必须且只能填写一个")
+        return self
 
 
 class SendPrivateArgs(_ToolArgs):
@@ -68,13 +83,29 @@ class GroupMessageTarget(_ToolArgs):
         default=None,
         description="消息正文；@人用 [CQ:at,qq=QQ号]；引用用 [CQ:reply,id=msg_id]。",
     )
+    emoji: str | None = Field(
+        default=None,
+        description="表情包名称，不带文件后缀；必须从 task_context 的可用表情包列表中选择。content、emoji、image 三选一。",
+    )
     image: str | None = Field(
-        default=None, description="表情包文件名。content 与 image 二选一。"
+        default=None,
+        description="要发送的图片 URL 或 workspace 相对路径；不是表情包。content、emoji、image 三选一。",
     )
     order: int = Field(..., description="发送顺序，从小到大")
     delay: float | None = Field(
         default=None, description="本条发出后的等待秒数。不填时按长度估算。"
     )
+
+    @model_validator(mode="after")
+    def validate_payload_choice(self) -> GroupMessageTarget:
+        values = [
+            value
+            for value in (self.content, self.emoji, self.image)
+            if str(value or "").strip()
+        ]
+        if len(values) != 1:
+            raise ValueError("content、emoji、image 必须且只能填写一个")
+        return self
 
 
 class SendGroupArgs(_ToolArgs):
@@ -396,7 +427,8 @@ class StartAgentTaskArgs(_ToolArgs):
         description=(
             "资料来源列表。支持 workspace_path/tool_call_id/tool_result_file/forward_id/"
             "conversation_history/message_id/image_ref/inline_text/inline_json/"
-            "workspace_glob/directory；不支持 URL。"
+            "workspace_glob/directory；不支持 URL。image_ref 仅用于已有可用图像理解能力时的资料整理，"
+            "不能用来绕过 describe_image 失败。"
         ),
     )
     output_format: Literal["markdown", "json", "text"] = Field(
@@ -414,6 +446,15 @@ class StartAgentTaskArgs(_ToolArgs):
         description=(
             "后台子 Agent 最多可调用工具多少轮。复杂资料整理可调高；"
             "必须在 5 到 60 之间。不填则使用主 Agent 当前默认值。"
+        ),
+    )
+    timeout_seconds: int | None = Field(
+        default=None,
+        ge=60,
+        le=3600,
+        description=(
+            "后台任务总超时秒数。一般不用填写；系统会根据工具轮数自动给足时间。"
+            "超时后若结果文件已写出会返回已有结果，否则返回失败说明。"
         ),
     )
 

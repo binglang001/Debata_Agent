@@ -31,6 +31,7 @@ dependencies = [
 
     # === 工具 ===
     "ddgs>=8.0.0",            # DuckDuckGo 搜索
+    "edge-tts>=7.2.0",        # 免费 Edge 在线语音合成（依赖微软在线服务，可能受网络/策略影响）
     "platformdirs>=4.2.0",    # 跨平台用户数据目录
     "python-dotenv>=1.0.0",   # 旧 .env 迁移时使用
     "pypdf>=4.0.0",           # workspace 内 PDF 文件文本抽取
@@ -42,10 +43,6 @@ dependencies = [
 # 性能优化（Linux/Mac 自动使用 uvloop）
 perf = [
     "uvloop>=0.19.0 ; sys_platform != 'win32'",
-]
-
-# 本地 ASR 插件依赖。也会在用户打开模型安装指引时按需后台安装。
-asr-local = [
 ]
 
 # 本地 TTS 插件依赖。也会在用户打开模型安装指引时按需后台安装。

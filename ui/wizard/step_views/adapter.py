@@ -153,6 +153,12 @@ class AdapterStepView(BaseStepView):
                 break
         return mode
 
+    def _host_text(self) -> str:
+        host = self._host_edit.text().strip()
+        if host:
+            return host
+        return "0.0.0.0" if self._current_mode() == "server" else "127.0.0.1"
+
     async def _test_connection(self, token: str) -> tuple[bool, str]:
         """实测 NapCat 连接。
 
@@ -165,7 +171,7 @@ class AdapterStepView(BaseStepView):
         )
 
         mode = self._current_mode()
-        host = self._host_edit.text().strip() or "127.0.0.1"
+        host = self._host_text()
         port = self._port_spin.value()
         path = self._path_edit.text().strip() or "/"
         conn = None
@@ -213,7 +219,8 @@ class AdapterStepView(BaseStepView):
                 True,
                 (
                     f"端口可用，已在 {host}:{port}{path} 监听。"
-                    "NapCat 还没连入；请去 NapCat 端配置反向 WS 指向这里再触发一次。"
+                    "NapCat 还没连入；请去 NapCat 端配置反向 WS，"
+                    "目标地址填这台机器的局域网 IP。"
                 ),
             )
         except Exception as e:  # noqa: BLE001
@@ -269,11 +276,8 @@ class AdapterStepView(BaseStepView):
             if isinstance(rb, QRadioButton) and rb.isChecked():
                 mode = rb.property("mode_value") or "client"
                 break
-        host = self._host_edit.text().strip()
+        host = self._host_text()
         path = self._path_edit.text().strip() or "/"
-        if not host:
-            self.invalid_input.emit("请填一下地址")
-            return False
         if self._manage_check.isChecked() and not self._process_path_edit.text().strip():
             self.invalid_input.emit("勾了「托管 NapCat 进程」就要填启动脚本或可执行文件路径")
             return False

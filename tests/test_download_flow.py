@@ -71,10 +71,10 @@ def test_models_detail_opens_install_guide_for_error_status(qapp):
 
     record = PluginRecord(
         meta=PluginMeta(
-            name="whisper",
-            display_name="Whisper",
-            kind="asr",
-            model_dir="whisper",
+            name="voxcpm2",
+            display_name="VoxCPM2",
+            kind="tts",
+            model_dir="VoxCPM2",
             auto_download=True,
             download_sources=[
                 DownloadSource(
@@ -112,10 +112,10 @@ def test_install_guide_matches_nested_model_folder_and_preserves_dest_prefix(
 
     record = PluginRecord(
         meta=PluginMeta(
-            name="whisper",
-            display_name="Whisper",
-            kind="asr",
-            model_dir="faster-whisper",
+            name="voxcpm2",
+            display_name="VoxCPM2",
+            kind="tts",
+            model_dir="VoxCPM2",
             download_sources=[
                 DownloadSource(
                     url="https://example.com/model.bin",
@@ -135,7 +135,7 @@ def test_install_guide_matches_nested_model_folder_and_preserves_dest_prefix(
 
     install_model_folder(source, record)
 
-    target = tmp_path / "models" / "faster-whisper" / "large-v3"
+    target = tmp_path / "models" / "VoxCPM2" / "large-v3"
     assert (target / "model.bin").read_bytes() == b"model"
     assert (target / "config.json").read_text(encoding="utf-8") == "{}"
     assert (target / "extra.json").read_text(encoding="utf-8") == "{}"
@@ -337,6 +337,39 @@ def test_plugin_install_status_requires_download_sources(tmp_path: Path):
     assert manager._detect_install_status(meta) == PluginStatus.NOT_INSTALLED
 
     (tmp_path / "model" / "large-v3" / "config.json").write_text("{}", encoding="utf-8")
+    assert manager._detect_install_status(meta) == PluginStatus.INSTALLED
+
+
+def test_embedding_plugin_accepts_sentence_transformer_bin_weights(tmp_path: Path):
+    from plugins.base import PluginManager
+
+    manager = PluginManager(tmp_path / "plugins")
+    model_dir = tmp_path / "bge"
+    (model_dir / "1_Pooling").mkdir(parents=True)
+    for filename in (
+        "config.json",
+        "modules.json",
+        "sentence_bert_config.json",
+        "tokenizer_config.json",
+        "vocab.txt",
+        "1_Pooling/config.json",
+    ):
+        (model_dir / filename).write_text("{}", encoding="utf-8")
+    (model_dir / "pytorch_model.bin").write_bytes(b"x")
+
+    meta = PluginMeta(
+        name="embedding_bge_zh",
+        display_name="BGE",
+        kind="embedding",
+        model_dir=str(model_dir),
+        download_sources=[
+            DownloadSource(
+                url="https://example.com/model.safetensors",
+                dest_filename="model.safetensors",
+            ),
+        ],
+    )
+
     assert manager._detect_install_status(meta) == PluginStatus.INSTALLED
 
 

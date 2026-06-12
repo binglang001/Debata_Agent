@@ -159,6 +159,10 @@ class IAdapter(ABC):
         """根据 file_id 获取可下载 URL。"""
         raise NotImplementedError(f"{self.name} 不支持 file_id → URL 解析")
 
+    async def get_image_url(self, file_id: str) -> str | None:
+        """根据图片 file_id 获取本地路径或可下载 URL。"""
+        raise NotImplementedError(f"{self.name} 不支持 image file_id → URL 解析")
+
     async def upload_file(
         self,
         target: Target,

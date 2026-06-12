@@ -42,6 +42,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -51,8 +52,9 @@ from pathlib import Path
 from typing import Any
 
 from adapters.base import IAdapter
-from adapters.types import IncomingMessage, MediaType, Target
-from agents import ChatAgent, Persona, SummaryAgent, build_messages
+from adapters.types import IncomingMessage, MediaSegment, MediaType, Target
+from agents import ChatAgent, Persona, SummaryAgent, build_messages, build_task_context
+from agents.base import AgentRunResult
 from app_config.schema import BehaviorConfig, FeaturesConfig, WhitelistConfig
 from memory import (
     ArchiveStore,
@@ -107,6 +109,7 @@ class _SendConversationState:
     worker: asyncio.Task | None = None
     interrupt_event: asyncio.Event = field(default_factory=asyncio.Event)
     interrupt_messages: list[dict[str, Any]] = field(default_factory=list)
+    recall_events: list[dict[str, Any]] = field(default_factory=list)
     pending_receipts: list[dict[str, Any]] = field(default_factory=list)
     needs_resync: bool = False
     in_flight: bool = False
@@ -180,6 +183,64 @@ class _AsyncSendManager:
         )
         receipt["new_messages"].append(msg)
 
+    def notify_recall(
+        self,
+        conversation_id: str,
+        *,
+        message_id: str,
+        note: str,
+    ) -> None:
+        """记录撤回导致的会话状态变化，阻止模型继续发送旧判断。"""
+        state = self._state(conversation_id)
+        needs_interrupt = (
+            state.in_flight
+            or bool(state.queue)
+            or self.is_model_active(conversation_id)
+            or bool(state.pending_receipts)
+        )
+        if not needs_interrupt:
+            return
+        recalled = {
+            "conversation_id": conversation_id,
+            "time": get_time(),
+            "msg_id": str(message_id),
+            "note": note,
+            "qq_visible": False,
+        }
+        state.recall_events.append(recalled)
+        if len(state.recall_events) > 50:
+            del state.recall_events[:-50]
+        state.interrupt_messages = [
+            msg for msg in state.interrupt_messages
+            if str(msg.get("msg_id") or "") != str(message_id)
+        ]
+        for receipt in state.pending_receipts:
+            receipt["new_messages"] = [
+                msg for msg in receipt.get("new_messages", [])
+                if str(msg.get("msg_id") or "") != str(message_id)
+            ]
+            known = {
+                str(msg.get("msg_id") or "")
+                for msg in receipt.get("recalled_messages", [])
+            }
+            if str(message_id) not in known:
+                receipt.setdefault("recalled_messages", []).append(recalled)
+
+        if state.in_flight or state.queue:
+            state.needs_resync = True
+            state.interrupt_event.set()
+            return
+        if not self.is_model_active(conversation_id):
+            return
+        state.needs_resync = True
+        receipt = self._find_or_create_model_interrupt_receipt(state, conversation_id)
+        known = {
+            str(msg.get("msg_id") or "")
+            for msg in receipt.get("recalled_messages", [])
+        }
+        if str(message_id) not in known:
+            receipt.setdefault("recalled_messages", []).append(recalled)
+
     async def submit(
         self,
         actions: list[dict[str, Any]],
@@ -195,12 +256,10 @@ class _AsyncSendManager:
             return {
                 "ok": True,
                 "status": "sent",
-                "brief": "没有可发送的有效消息。",
                 "qq_visible": False,
                 "send_id": send_id,
                 "count": 0,
                 "sent": [],
-                "sent_messages": [],
             }
 
         groups: dict[str, list[dict[str, Any]]] = {}
@@ -210,20 +269,28 @@ class _AsyncSendManager:
         stale_convs = [cid for cid in groups if self._state(cid).needs_resync]
         if stale_convs:
             new_visible_messages: list[dict[str, Any]] = []
+            recalled_messages: list[dict[str, Any]] = []
             for cid in stale_convs:
-                new_visible_messages.extend(self._state(cid).interrupt_messages)
-            return {
+                state = self._state(cid)
+                new_visible_messages.extend(state.interrupt_messages)
+                recalled_messages.extend(state.recall_events)
+            result = {
                 "ok": False,
                 "status": "stale",
-                "brief": "发送未执行：目标会话刚收到新消息，需要重新判断。",
                 "qq_visible": False,
                 "send_id": send_id,
-                "note": "该会话刚来新消息，请先看新消息再决定发不发",
                 "stale_conversations": stale_convs,
                 "attempted_messages": self._attempted_items(normalized, send_id),
                 "new_visible_messages": new_visible_messages,
-                "next": "不要自动补发 attempted_messages；先阅读 new_visible_messages，必要时调用 get_recent_chat_messages 确认 QQ 当前聊天记录后重新判断。",
+                "next": (
+                    "重新判断；不要原样补发 attempted_messages。"
+                    "如果结合新消息后仍需要回应，可以发送调整后的消息。"
+                    "必要时调用 get_recent_chat_messages。"
+                ),
             }
+            if recalled_messages:
+                result["recalled_messages"] = recalled_messages
+            return result
 
         can_sync = all(self._can_sync_send(cid, acts) for cid, acts in groups.items())
         if can_sync:
@@ -255,14 +322,12 @@ class _AsyncSendManager:
         return {
             "ok": True,
             "status": "queued",
-            "brief": "消息已进入发送队列，QQ 可见状态待后台发送确认。",
             "qq_visible": "pending",
             "send_id": send_id,
             "data": {
                 "conversation_ids": list(groups.keys()),
                 "message_count": sum(len(items) for items in groups.values()),
             },
-            "note": "已进入发送队列；正常发完只静默记历史，被打断或失败才会追加 send_receipt。",
         }
 
     def pop_pending_receipts(self, conversation_id: str) -> list[dict[str, Any]]:
@@ -275,6 +340,15 @@ class _AsyncSendManager:
         state = self._state(conversation_id)
         state.needs_resync = False
         state.interrupt_messages.clear()
+        state.recall_events.clear()
+        state.interrupt_event.clear()
+
+    def clear_resync(self, conversation_id: str) -> None:
+        """清理已处理的 resync 标记。"""
+        state = self._state(conversation_id)
+        state.needs_resync = False
+        state.interrupt_messages.clear()
+        state.recall_events.clear()
         state.interrupt_event.clear()
 
     def _state(self, conversation_id: str) -> _SendConversationState:
@@ -303,6 +377,8 @@ class _AsyncSendManager:
             "label": str(action.get("label") or action.get("content") or ""),
             "delay": float(action.get("delay") or 0.0),
             "audio_path": str(action.get("audio_path") or ""),
+            "image_path": str(action.get("image_path") or ""),
+            "image_url": str(action.get("image_url") or ""),
         }
 
     def _can_sync_send(self, conversation_id: str, actions: list[dict[str, Any]]) -> bool:
@@ -344,16 +420,10 @@ class _AsyncSendManager:
         result: dict[str, Any] = {
             "ok": bool(sent) or not errors,
             "status": "sent",
-            "brief": (
-                f"已发送 {len(sent)} 条消息，QQ 可见。"
-                if sent
-                else "发送尝试完成，但没有消息发出。"
-            ),
             "qq_visible": bool(sent),
             "send_id": send_id,
             "count": len(sent),
             "sent": sent,
-            "sent_messages": sent,
         }
         if errors:
             result["errors"] = errors
@@ -413,14 +483,21 @@ class _AsyncSendManager:
                     "interrupted": interrupted,
                     "new_messages": list(state.interrupt_messages),
                 }
+                if state.recall_events:
+                    receipt["recalled_messages"] = list(state.recall_events)
                 if errors:
                     receipt["errors"] = errors
                 clean = not interrupted and not errors
                 await self._handle_receipt(conversation_id, receipt, clean=clean)
 
+                if clean and state.needs_resync and not state.queue:
+                    self.clear_resync(conversation_id)
+                    self.pipeline._schedule_deferred_batch(conversation_id)
+
                 if interrupted:
                     state.interrupt_event.clear()
                     state.interrupt_messages.clear()
+                    state.recall_events.clear()
                     break
         finally:
             state.in_flight = False
@@ -449,6 +526,16 @@ class _AsyncSendManager:
             if send_voice is None:
                 raise RuntimeError("当前适配器不支持发送语音")
             msg_id = await send_voice(target, Path(action.get("audio_path") or ""))
+        elif kind in {"emoji", "image"}:
+            msg_id = await self.pipeline.adapter.send_image(
+                target,
+                image_path=(
+                    Path(str(action.get("image_path")))
+                    if action.get("image_path")
+                    else None
+                ),
+                image_url=str(action.get("image_url") or "") or None,
+            )
         else:
             content = action.get("content") or ""
             msg_id = await self.pipeline.adapter.send_text(target, content)
@@ -587,6 +674,14 @@ _RATE_LIMIT_REPLY_TEMPLATE = "已超出速率限制（{window_seconds} 秒内最
 _PREFIX_ESTIMATE_TOKENS = 12_000
 _CURRENT_CONVERSATION_MIN_RECORDS = 8
 _PROACTIVE_ROUTER_HISTORY_BUDGET = 16_384
+_SLOW_BATCH_STAGE_SECONDS = 1.0
+_OUT_OF_BAND_DENIED_TOOLS = frozenset(
+    {
+        "start_agent_task",
+        "summarize_conversation",
+        "summarize_chat_history",
+    }
+)
 
 
 def _recommended_context_budget(model: str, context_length: int | None = None) -> int:
@@ -607,6 +702,26 @@ def _recommended_context_budget(model: str, context_length: int | None = None) -
     if "claude" in name:
         return 150_000
     return 96_000
+
+
+def _log_slow_batch_stage(
+    stage: str,
+    started_at: float,
+    *,
+    conversation_id: str,
+    extra: str = "",
+) -> None:
+    elapsed = time.monotonic() - started_at
+    if elapsed < _SLOW_BATCH_STAGE_SECONDS:
+        return
+    suffix = f" {extra}" if extra else ""
+    logger.warning(
+        "批处理阶段耗时过长 stage=%s conversation_id=%s elapsed=%.3fs%s",
+        stage,
+        conversation_id,
+        elapsed,
+        suffix,
+    )
 
 
 def _record_timestamp(record: dict[str, Any]) -> Any:
@@ -662,6 +777,73 @@ def _record_conversation_id(record: dict[str, Any]) -> str | None:
     return None
 
 
+def _make_task_context_record(
+    task_context: str,
+    *,
+    conversation_id: str | None = None,
+) -> dict[str, Any] | None:
+    content = build_task_context(task_context)
+    if not content:
+        return None
+    record: dict[str, Any] = {
+        "role": "user",
+        "content": content,
+        "metadata": {"kind": "task_context_snapshot"},
+    }
+    if conversation_id:
+        record["conversation_id"] = conversation_id
+    return record
+
+
+def _make_runtime_context_record(
+    content: str,
+    *,
+    kind: str,
+    tag: str,
+    conversation_id: str | None = None,
+) -> dict[str, Any] | None:
+    content = content.strip()
+    if not content:
+        return None
+    record: dict[str, Any] = {
+        "role": "user",
+        "content": (
+            f"<{tag}>\n"
+            "系统说明：以下内容由运行时系统提供，不是用户新发言。\n"
+            f"{content}\n"
+            f"</{tag}>"
+        ),
+        "metadata": {"kind": kind},
+    }
+    if conversation_id:
+        record["conversation_id"] = conversation_id
+    return record
+
+
+def _earliest_record_ts(records: list[dict[str, Any]]) -> str | None:
+    timestamps: list[str] = []
+    for record in records:
+        ts = _record_timestamp(record)
+        if isinstance(ts, str) and ts:
+            timestamps.append(ts)
+    return min(timestamps) if timestamps else None
+
+
+def _filter_tool_schemas(
+    schemas: list[dict[str, Any]],
+    denied_tools: set[str] | frozenset[str],
+) -> list[dict[str, Any]]:
+    if not denied_tools:
+        return schemas
+    result: list[dict[str, Any]] = []
+    for schema in schemas:
+        function = schema.get("function") if isinstance(schema, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if name not in denied_tools:
+            result.append(schema)
+    return result
+
+
 def _safe_agent_task_filename(name: str, *, default: str, suffix: str) -> str:
     """把模型给的输出文件名压成 workspace 内单文件名。"""
     raw = Path(name or default).name.strip() or default
@@ -679,6 +861,70 @@ def _clamp_agent_task_max_loops(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         raw = default
     return min(60, max(5, raw))
+
+
+def _agent_task_timeout_seconds(value: Any, *, max_loops: int, first_token_timeout: float) -> float:
+    """后台任务总超时。
+
+    正常终止仍由工具循环和 stop_after_tool 控制；这里只作为最后保险，
+    避免模型/工具卡住后工具调用永远不返回。
+    """
+    try:
+        raw = float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        raw = 0.0
+    if raw > 0:
+        return min(3600.0, max(60.0, raw))
+
+    per_loop = max(30.0, float(first_token_timeout or 30.0) * 4 + 60.0)
+    return min(3600.0, max(180.0, per_loop * max(1, max_loops) + 60.0))
+
+
+def _stable_json_hash(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _agent_task_source_hash(sources: Any) -> str:
+    return _stable_json_hash(sources if isinstance(sources, list) else [])
+
+
+def _agent_task_prompt_hash(payload: dict[str, Any]) -> str:
+    return _stable_json_hash(
+        {
+            "prompt": str(payload.get("prompt") or ""),
+            "output_format": str(payload.get("output_format") or "markdown"),
+        }
+    )
+
+
+def _agent_task_dedupe_key(
+    *,
+    source_hash: str,
+    prompt_hash: str,
+    output_name: str,
+) -> str:
+    return f"{source_hash}:{prompt_hash}:{output_name}"
+
+
+def _summarize_agent_task_manifest(manifest: dict[str, Any]) -> dict[str, int]:
+    summary = {
+        "message_count": 0,
+        "nested_forward_count": 0,
+        "expired_forward_count": 0,
+        "image_count": 0,
+        "truncated_count": 0,
+    }
+    for item in manifest.get("sources") or []:
+        if not isinstance(item, dict):
+            continue
+        for key in summary:
+            summary[key] += int(item.get(key) or 0)
+        if item.get("truncated") is True:
+            summary["truncated_count"] += 1
+        if item.get("error") and "截断" in str(item.get("error")):
+            summary["truncated_count"] += 1
+    return summary
 
 
 def _agent_task_partial_text(
@@ -791,6 +1037,14 @@ def _file_head_tail_preview(path: Path, *, lines: int = 8) -> dict[str, Any]:
     }
 
 
+def _first_meaningful_line(text: str, *, max_chars: int = 160) -> str:
+    for line in text.splitlines():
+        stripped = line.strip().strip("#").strip()
+        if stripped:
+            return stripped[:max_chars]
+    return ""
+
+
 class MessagePipeline:
     """消息处理管道。
 
@@ -867,9 +1121,10 @@ class MessagePipeline:
         self._inbound_seq = 0
         self._send_manager = _AsyncSendManager(self)
         self._send_receipt_tasks: dict[str, asyncio.Task] = {}
-        self._agent_task_tasks: dict[str, asyncio.Task] = {}
+        self._agent_task_meta: dict[str, dict[str, Any]] = {}
         self.chat_timeline = ChatTimelineStore(max_per_conversation=1000)
         self._self_id_by_conversation: dict[str, str] = {}
+        self._warn_context_compaction_invariants()
 
     def mark_activity(self) -> None:
         """刷新活动时间。主动思考只在足够空闲后触发。"""
@@ -913,8 +1168,12 @@ class MessagePipeline:
                     )
                     return
 
-        # 速率限制
-        if self.rate_limiter and await self.rate_limiter.check_and_log(event.user_id):
+        # 速率限制只针对私聊陌生人。群聊本身由群白名单/审核控制，不按群成员逐个限速。
+        if (
+            self.rate_limiter
+            and not event.is_group()
+            and await self.rate_limiter.check_and_log(event.user_id)
+        ):
             await self._send_rate_limit_reply(event)
             return
 
@@ -1035,6 +1294,26 @@ class MessagePipeline:
         # 保留引用，避免 task 在 await 跨边界时被 GC
         self._requeue_task = asyncio.create_task(_requeue_check())
 
+    def _schedule_deferred_batch(self, conversation_id: str) -> None:
+        """发送收尾竞态解除后，恢复处理此前被 defer 的入站消息。"""
+
+        async def _start_if_pending() -> None:
+            async with self.batch.lock:
+                items = [
+                    item
+                    for item in await self.batch.peek_locked()
+                    if item.conversation_id == conversation_id
+                ]
+            if not items:
+                return
+            if self._batch_task is not None and not self._batch_task.done():
+                return
+            self._batch_task = asyncio.create_task(
+                self._batch_loop(items[-1].raw_event.source_target)
+            )
+
+        self._requeue_task = asyncio.create_task(_start_if_pending())
+
     def _build_user_record(
         self,
         items: list[PendingMessageItem],
@@ -1091,15 +1370,46 @@ class MessagePipeline:
         now = get_time()
         user_record = self._build_user_record(items, now)
         conversation_id = user_record.get("conversation_id") or "legacy:unknown"
+        stage_t0 = time.monotonic()
         await self.history.add_records([user_record], conversation_id=conversation_id)
+        _log_slow_batch_stage("history_add_user", stage_t0, conversation_id=conversation_id)
         logger.info(f"合并处理 {len(items)} 条消息")
 
         # 构造给 LLM 的 messages（emoji_hint / pending_requests 已在 _build_task_context 内拼装）
+        stage_t0 = time.monotonic()
         task_context = self._build_task_context(now, conversation_id)
+        task_context_record = _make_task_context_record(
+            task_context,
+            conversation_id=conversation_id,
+        )
+        _log_slow_batch_stage(
+            "build_task_context",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"context_len={len(task_context)}",
+        )
 
+        stage_t0 = time.monotonic()
+        history_window = await self._select_working_history(conversation_id)
+        _log_slow_batch_stage(
+            "select_working_history",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"records={len(history_window)}",
+        )
+        estimator = self._token_estimator()
+
+        stage_t0 = time.monotonic()
         important_text = await self._important_memory_text(
             conversation_id,
             query=items[-1].text if items else None,
+            before_ts=_earliest_record_ts(history_window),
+        )
+        _log_slow_batch_stage(
+            "important_memory_text",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"memory_len={len(important_text)}",
         )
         logger.debug(
             "批处理记忆准备完成 conversation_id=%s memory_len=%s elapsed=%.3fs",
@@ -1108,19 +1418,33 @@ class MessagePipeline:
             time.monotonic() - batch_t0,
         )
 
-        history_window = await self._select_working_history(conversation_id)
-        estimator = self._token_estimator()
+        stage_t0 = time.monotonic()
+        rolling_summary_text = self._rolling_summary_text(estimator)
+        _log_slow_batch_stage(
+            "rolling_summary_text",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"summary_len={len(rolling_summary_text)}",
+        )
 
+        stage_t0 = time.monotonic()
         messages = build_messages(
             persona=self.persona,
             history=history_window,
             important_memory_text=important_text,
-            rolling_summary_text=self._rolling_summary_text(estimator),
-            current_context=task_context,
+            rolling_summary_text=rolling_summary_text,
+            current_context_record=task_context_record,
             memory_mode=self.features_cfg.long_term_memory.mode,
+        )
+        _log_slow_batch_stage(
+            "build_messages",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"messages={len(messages)}",
         )
 
         # 构造 ToolContext
+        stage_t0 = time.monotonic()
         default_target = items[-1].raw_event.source_target if items else None
         latest_user_text = "\n".join(item.text for item in items)
         ctx = self._build_tool_context(
@@ -1133,12 +1457,32 @@ class MessagePipeline:
         )
         executor = self.tool_registry.get_executor(ctx)
         tools_schema = self.tool_registry.get_schemas()
+        _log_slow_batch_stage(
+            "build_tool_context_schema",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"tools={len(tools_schema)}",
+        )
+
+        stage_t0 = time.monotonic()
         estimated_prompt_tokens = estimator.estimate_messages(messages)
         if tools_schema:
             estimated_prompt_tokens += estimator.estimate_text(str(tools_schema))
+        _log_slow_batch_stage(
+            "estimate_prompt_tokens",
+            stage_t0,
+            conversation_id=conversation_id,
+            extra=f"estimated={estimated_prompt_tokens}",
+        )
 
         # 只串行模型轮；Phase 0 后台发送不占 reply_lock。
+        stage_t0 = time.monotonic()
         async with self.reply_lock:
+            _log_slow_batch_stage(
+                "reply_lock_wait",
+                stage_t0,
+                conversation_id=conversation_id,
+            )
             self._send_manager.begin_model_turn(conversation_id)
             model_t0 = time.monotonic()
             try:
@@ -1162,9 +1506,14 @@ class MessagePipeline:
             )
 
             # 写 records
-            if result.records:
+            records_to_add = [
+                record
+                for record in [task_context_record, *list(result.records or [])]
+                if record is not None
+            ]
+            if records_to_add:
                 await self.history.add_records(
-                    result.records,
+                    records_to_add,
                     conversation_id=conversation_id,
                 )
 
@@ -1255,7 +1604,7 @@ class MessagePipeline:
         for receipt in receipts:
             records.append(
                 {
-                    "role": "system",
+                    "role": "user",
                     "content": self._format_send_receipt(receipt),
                     "conversation_id": conversation_id,
                 }
@@ -1273,11 +1622,15 @@ class MessagePipeline:
         msg_ids = ", ".join(
             str(item.get("msg_id")) for item in sent if item.get("msg_id") is not None
         )
-        await self.history.add_system_note(
+        record = _make_runtime_context_record(
             f"{get_time()} 发送完成（全部消息已发出）"
             f" send_id={receipt.get('send_id')} msg_ids=[{msg_ids}]",
+            kind="send_done_snapshot",
+            tag="send_status",
             conversation_id=conversation_id or None,
         )
+        if record is not None:
+            await self.history.add_records([record], conversation_id=conversation_id or None)
 
     def _schedule_send_receipt_turn(self, conversation_id: str) -> None:
         task = self._send_receipt_tasks.get(conversation_id)
@@ -1297,59 +1650,29 @@ class MessagePipeline:
             receipt_block = "\n".join(
                 r.get("content", "")
                 for r in receipt_records
-                if r.get("role") == "system" and r.get("content")
+                if "<send_receipt>" in str(r.get("content") or "")
             )
             task_context = (
                 "<send_receipt_task priority=\"high\">\n"
-                "下面是本轮需要处理的发送状态回执，"
-                "请以 sent / unsent / interrupted / new_messages 字段为准：\n"
+                "处理下面的运行时发送回执，按 JSON 字段判断：\n"
                 f"{receipt_block}\n"
-                "已发出的消息保持已发送；"
-                "未发出的消息不要自动补发，先结合新消息判断是否需要回应。\n"
+                "未发出的消息不要原样自动补发，先结合新消息判断；仍需回应时发送调整后的消息。\n"
                 "</send_receipt_task>"
             )
             target = self._target_from_conversation_id(conversation_id)
-            messages = build_messages(
-                persona=self.persona,
-                history=await self._select_working_history(conversation_id),
-                important_memory_text=await self._important_memory_text(
-                    conversation_id,
-                    query=task_context,
-                ),
-                rolling_summary_text=self._rolling_summary_text(),
-                current_context=task_context,
-                memory_mode=self.features_cfg.long_term_memory.mode,
-            )
-            ctx = self._build_tool_context(
+            await self.run_one_turn(
+                task_context,
+                lock_already_held=True,
                 default_target=target,
                 conversation_id=conversation_id,
+                task_contract="处理发送回执和新消息",
+                task_phase="send_receipt",
             )
-            executor = self.tool_registry.get_executor(ctx)
-            self._send_manager.begin_model_turn(conversation_id)
-            try:
-                result = await self.chat_agent.run(
-                    messages,
-                    tools=self.tool_registry.get_schemas(),
-                    tool_executor=executor,
-                    task_contract="处理发送回执和新消息",
-                    pending_context_provider=lambda: self._consume_send_receipts(
-                        conversation_id
-                    ),
-                )
-            finally:
-                self._send_manager.end_model_turn(conversation_id)
-            if result.records:
-                await self.history.add_records(result.records, conversation_id=conversation_id)
-            await self._execute_collected(ctx.collected)
-            self.mark_activity()
 
     def _format_send_receipt(self, receipt: dict[str, Any]) -> str:
         return (
             "<send_receipt>\n"
-            "发送回执：这是当前会话的发送状态记录，请以 sent / unsent / interrupted / new_messages 字段判断结果。\n"
-            "sent 表示已经发出，qq_visible=true；unsent 表示未发出，qq_visible=false；interrupted 表示发送是否被新消息中断；new_messages 是中断期间 QQ 上真实出现的新消息。\n"
-            "未发出的消息不要自动补发，先结合新消息判断是否需要回应。\n"
-            "如果当前 QQ 真实聊天状态不清楚，先调用 get_recent_chat_messages。\n"
+            "系统说明：运行时发送状态；按 JSON 字段判断，未发不要原样自动补发，可重判后调整发送。\n"
             f"{json.dumps(receipt, ensure_ascii=False)}\n"
             "</send_receipt>"
         )
@@ -1413,6 +1736,7 @@ class MessagePipeline:
         conversation_id: str | None,
         *,
         query: str | None = None,
+        before_ts: str | None = None,
         token_budget: int | None = None,
     ) -> str:
         """按当前会话选择长期记忆注入文本。"""
@@ -1424,6 +1748,7 @@ class MessagePipeline:
             return await self.rag_memory.retrieve_for_query(
                 query,
                 conversation_id=conversation_id,
+                before_ts=before_ts,
                 top_k=self.features_cfg.long_term_memory.rag_top_k,
                 token_budget=budget,
                 estimator=estimator,
@@ -1521,6 +1846,25 @@ class MessagePipeline:
             - budget.summary_token_budget
             - _PREFIX_ESTIMATE_TOKENS,
         )
+
+    def _warn_context_compaction_invariants(self) -> None:
+        working_budget = self._working_history_budget()
+        summarize = self.behavior_cfg.summarize
+        if self.summary_agent is None or self.archive is None or self.rolling_summary is None:
+            logger.warning(
+                "未启用滚动摘要/归档压缩；长会话超过工作窗口后会逐条淘汰历史，KV 缓存命中率会下降"
+            )
+            return
+        trigger = summarize.trigger_at_tokens
+        if trigger is None:
+            trigger = int(self._context_budget().max_context_tokens * 0.75)
+        if trigger >= working_budget:
+            logger.warning(
+                "滚动摘要触发线高于工作窗口预算：trigger=%s working_budget=%s；"
+                "长会话可能先发生窗口淘汰，导致 KV 缓存前缀逐轮重建",
+                trigger,
+                working_budget,
+            )
 
     def _select_history_records(
         self,
@@ -1682,8 +2026,18 @@ class MessagePipeline:
         """
         now = get_time()
         self.mark_activity()
-        await self.history.add_system_note(f"{now} 定时唤醒：{reminder}")
         logger.info(f"定时任务执行 mode={mode}: {reminder!r}")
+
+        conversation_id: str | None = None
+        if target:
+            target_type = target.get("target_type")
+            target_id = target.get("target_id")
+            if target_type and target_id is not None:
+                conversation_id = f"{target_type}:{target_id}"
+        await self.history.add_system_note(
+            f"{now} 定时唤醒：{reminder}",
+            conversation_id=conversation_id or "system:wakeup",
+        )
 
         if mode == "send_message":
             if target and message_text:
@@ -1695,71 +2049,40 @@ class MessagePipeline:
             return
 
         target_hint = ""
-        conversation_id: str | None = None
         if target:
             target_type = target.get("target_type")
             target_id = target.get("target_id")
             if target_type and target_id is not None:
-                conversation_id = f"{target_type}:{target_id}"
                 target_hint = (
                     f"\n本次唤醒来自一个明确的提醒目标：{target_type}:{target_id}。"
                     "如果 reminder 要求通知这个目标，请调用发送消息工具；如果任务无需通知，可以 no_action。"
                 )
         task_context = (
-            "<wakeup_task priority=\"critical\">\n"
-            f"现在是{now}。这是定时唤醒，不是新用户消息。\n"
-            f"提醒任务：{reminder}\n"
-            "提醒任务应已包含设置时的用户原话、提醒目标和具体动作；优先按提醒任务执行。\n"
-            "只处理这条提醒任务；不要把历史中已经完成、无关或仅作为背景的请求当作当前任务重复执行。\n"
+            f"现在是{now}。这是定时唤醒轮的环境信息，不是新用户消息。\n"
             "固定消息发送应在设置阶段使用 schedule_wakeup 的 mode=send_message；本模式只处理需要查询、整理、判断或调用工具的复杂任务。\n"
-            "只有纯内部继续任务且确实无需通知时才 no_action。"
             f"{target_hint}"
-            "\n</wakeup_task>"
         )
-
-        messages = build_messages(
-            persona=self.persona,
-            history=await self._select_working_history(conversation_id),
-            important_memory_text=await self._important_memory_text(
-                conversation_id,
-                query=task_context,
+        user_event = (
+            "[系统事件 · 非用户消息] 定时唤醒已到。\n"
+            f"提醒任务原文：{reminder}\n"
+            "现在就执行这条提醒；通常需要给提醒目标发送消息或完成提醒中指定的查询/判断。\n"
+            "只处理这一条提醒，做完即止；不要延续或重复最近对话里已完成、无关或仅作背景的话题。\n"
+            "只有这条提醒确实纯内部、无需通知时，才调用 no_action。"
+        )
+        await self.run_one_turn(
+            task_context,
+            user_event=user_event,
+            default_target=(
+                self._target_from_conversation_id(conversation_id)
+                if conversation_id
+                else None
             ),
-            rolling_summary_text=self._rolling_summary_text(),
-            current_context=task_context,
-            memory_mode=self.features_cfg.long_term_memory.mode,
-        )
-
-        ctx = self._build_tool_context(
-            default_target=self._target_from_conversation_id(conversation_id)
-            if conversation_id
-            else None,
             conversation_id=conversation_id,
+            history_conversation_id=conversation_id or "system:wakeup",
+            task_contract=f"定时唤醒任务：{reminder}",
+            task_phase="wakeup",
+            tool_denylist=_OUT_OF_BAND_DENIED_TOOLS,
         )
-        executor = self.tool_registry.get_executor(ctx)
-        tools_schema = self.tool_registry.get_schemas()
-
-        async with self.reply_lock:
-            self._send_manager.begin_model_turn(conversation_id)
-            try:
-                result = await self.chat_agent.run(
-                    messages,
-                    tools=tools_schema,
-                    tool_executor=executor,
-                    task_contract=f"定时唤醒任务：{reminder}",
-                    pending_context_provider=(
-                        (lambda: self._consume_send_receipts(conversation_id))
-                        if conversation_id
-                        else None
-                    ),
-                )
-            finally:
-                self._send_manager.end_model_turn(conversation_id)
-
-            if result.records:
-                await self.history.add_records(result.records)
-            if ctx.collected:
-                await self._execute_collected(ctx.collected)
-        self.mark_activity()
 
     # ============================================================
     # 通用 Agent 调用：供 recall_handler / request_handler / proactive_loop 复用
@@ -1769,10 +2092,16 @@ class MessagePipeline:
         self,
         task_context: str,
         *,
+        user_event: str | None = None,
         as_system_note: str | None = None,
         lock_already_held: bool = False,
         default_target: Target | None = None,
         conversation_id: str | None = None,
+        history_conversation_id: str | None = None,
+        task_contract: str | None = None,
+        task_phase: str = "normal",
+        tool_policy: dict[str, Any] | None = None,
+        tool_denylist: set[str] | frozenset[str] | None = None,
     ) -> None:
         """通用单轮 Agent 入口：注入 task_context，跑一轮，处理 collected。
 
@@ -1780,29 +2109,63 @@ class MessagePipeline:
             task_context: 本轮 ephemeral context（时间、事件描述、提醒等）
             as_system_note: 若给，会在调 Agent 前写入 history 作为事件记录
                 （如撤回通知、请求通知）
+            history_conversation_id: 仅用于历史展示归类。默认沿用
+                conversation_id；后台主动思考这类全局系统事件可传
+                system:proactive，避免被归入最近一个聊天会话。
+            task_contract: 本轮任务锚点，传给 AgentRunner 防止工具循环漂移。
+            task_phase: 本轮运行阶段，保留给日志归类和未来策略扩展。
+            tool_policy: 本轮工具策略所需的结构化上下文。
+            tool_denylist: 本轮不暴露也不允许调用的工具名集合。
         """
         self.mark_activity()
+        record_conversation_id = history_conversation_id or conversation_id
         if as_system_note:
-            await self.history.add_system_note(as_system_note)
+            await self.history.add_system_note(
+                as_system_note,
+                conversation_id=record_conversation_id,
+            )
 
+        history_window = await self._select_working_history(conversation_id)
         messages = build_messages(
             persona=self.persona,
-            history=await self._select_working_history(None),
+            history=history_window,
             important_memory_text=await self._important_memory_text(
                 conversation_id,
-                query=task_context,
+                query=user_event or task_context,
+                before_ts=_earliest_record_ts(history_window),
             ),
             rolling_summary_text=self._rolling_summary_text(),
             current_context=task_context,
             memory_mode=self.features_cfg.long_term_memory.mode,
+            user_event=user_event,
         )
 
         ctx = self._build_tool_context(
             default_target=default_target,
             conversation_id=conversation_id,
+            task_phase=task_phase,
+            tool_policy=tool_policy,
         )
         executor = self.tool_registry.get_executor(ctx)
-        tools_schema = self.tool_registry.get_schemas()
+        denied_tools = set(tool_denylist or ())
+        tools_schema = _filter_tool_schemas(
+            self.tool_registry.get_schemas(),
+            denied_tools,
+        )
+        if denied_tools:
+            base_executor = executor
+
+            async def _guarded_executor(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+                if tool_name in denied_tools:
+                    return {
+                        "ok": False,
+                        "status": "denied",
+                        "error": f"本轮系统事件不允许调用工具 {tool_name}",
+                        "next": "只处理当前系统事件；如无需行动请调用 no_action。",
+                    }
+                return await base_executor(tool_name, args)
+
+            executor = _guarded_executor
 
         async def _run_locked() -> None:
             self._send_manager.begin_model_turn(conversation_id)
@@ -1811,6 +2174,7 @@ class MessagePipeline:
                     messages,
                     tools=tools_schema,
                     tool_executor=executor,
+                    task_contract=task_contract,
                     pending_context_provider=(
                         (lambda: self._consume_send_receipts(conversation_id))
                         if conversation_id
@@ -1821,7 +2185,10 @@ class MessagePipeline:
                 self._send_manager.end_model_turn(conversation_id)
 
             if result.records:
-                await self.history.add_records(result.records)
+                await self.history.add_records(
+                    result.records,
+                    conversation_id=record_conversation_id,
+                )
             if ctx.collected:
                 await self._execute_collected(ctx.collected)
             self.mark_activity()
@@ -1844,6 +2211,8 @@ class MessagePipeline:
         trigger_message_id: str | None = None,
         trigger_inbound_seq: int = 0,
         trigger_user_id: str | None = None,
+        task_phase: str = "normal",
+        tool_policy: dict[str, Any] | None = None,
     ) -> ToolContext:
         """每次 Agent 调用前构造新的 ToolContext。
 
@@ -1859,6 +2228,9 @@ class MessagePipeline:
         if latest_user_text:
             extras["latest_user_message"] = latest_user_text
         extras["chat_timeline"] = self.chat_timeline
+        extras["task_phase"] = task_phase
+        if tool_policy:
+            extras["tool_policy"] = tool_policy
 
         async def _send_actions(
             actions: list[dict[str, Any]],
@@ -1908,6 +2280,20 @@ class MessagePipeline:
             extras=extras,
         )
 
+    def _same_workspace_path(self, left: Any, right: Any) -> bool:
+        left_s = str(left or "").strip()
+        right_s = str(right or "").strip()
+        if not left_s or not right_s:
+            return False
+        if self.workspace_dir is None:
+            return left_s.replace("\\", "/") == right_s.replace("\\", "/")
+        try:
+            left_path = _resolve_agent_workspace_path(left_s, self.workspace_dir)
+            right_path = _resolve_agent_workspace_path(right_s, self.workspace_dir)
+            return left_path.resolve(strict=False) == right_path.resolve(strict=False)
+        except Exception:
+            return left_s.replace("\\", "/") == right_s.replace("\\", "/")
+
     def _record_successful_outbound(
         self,
         action: dict[str, Any],
@@ -1950,12 +2336,33 @@ class MessagePipeline:
             parts.append(f"现在是{now}。")
         if conversation_id:
             parts.append(f"当前会话：{conversation_id}。")
+            recent_group = self._recent_group_context(conversation_id)
+            if recent_group:
+                parts.append(recent_group)
 
         pending_info = self.pending_requests.to_prompt_text()
         if pending_info:
             parts.append(pending_info)
 
         return "\n".join(parts)
+
+    def _recent_group_context(self, conversation_id: str, *, limit: int = 10) -> str:
+        """给群聊轮次追加最近真实 QQ 可见消息，帮助判断发言对象和断层。"""
+        if not conversation_id.startswith("group:"):
+            return ""
+        messages = self.chat_timeline.recent(conversation_id, limit)
+        if not messages:
+            return ""
+        markdown = self.chat_timeline.to_markdown(messages)
+        if not markdown:
+            return ""
+        return (
+            f'<recent_group_messages source="qq_visible" limit="{limit}">\n'
+            "以下是当前群最近的真实 QQ 可见消息，用来判断最近几条消息实际在对谁说、"
+            "是否有插话、引用或断层。它们不是新的用户指令。\n"
+            f"{markdown}\n"
+            "</recent_group_messages>"
+        )
 
     # ============================================================
     # 后台子 Agent 任务
@@ -1968,28 +2375,37 @@ class MessagePipeline:
         conversation_id: str | None,
         default_target: Target | None,
     ) -> dict[str, Any]:
-        """创建后台资料处理任务，立即返回 task_id。"""
+        """运行资料处理子 Agent，并把结果作为当前工具结果返回。"""
         if self.workspace_dir is None:
             return {"ok": False, "error": "workspace 未配置，无法启动后台子 Agent 任务"}
 
-        task_id = f"agent-{int(time.time() * 1000)}-{len(self._agent_task_tasks) + 1}"
-        task = asyncio.create_task(
-            self._run_agent_task(
-                task_id,
-                payload,
-                conversation_id=conversation_id,
-                default_target=default_target,
+        task_id = f"agent-{int(time.time() * 1000)}-{len(self._agent_task_meta) + 1}"
+        source_hash = str(payload.get("_source_hash") or _agent_task_source_hash(payload.get("sources") or []))
+        prompt_hash = str(payload.get("_prompt_hash") or _agent_task_prompt_hash(payload))
+        output_name = str(payload.get("output_name") or "")
+        dedupe_key = str(
+            payload.get("_dedupe_key")
+            or _agent_task_dedupe_key(
+                source_hash=source_hash,
+                prompt_hash=prompt_hash,
+                output_name=output_name,
             )
         )
-        self._agent_task_tasks[task_id] = task
-        task.add_done_callback(lambda _task: self._agent_task_tasks.pop(task_id, None))
-        self.mark_activity()
-        return {
-            "ok": True,
-            "status": "queued",
+        self._agent_task_meta[task_id] = {
             "task_id": task_id,
-            "note": "后台子 Agent 已启动；完成后系统会把结果作为一次新请求回传。",
+            "status": "queued",
+            "conversation_id": conversation_id,
+            "source_hash": source_hash,
+            "prompt_hash": prompt_hash,
+            "dedupe_key": dedupe_key,
         }
+        self.mark_activity()
+        return await self._run_agent_task(
+            task_id,
+            payload,
+            conversation_id=conversation_id,
+            default_target=default_target,
+        )
 
     async def _run_agent_task(
         self,
@@ -1998,7 +2414,7 @@ class MessagePipeline:
         *,
         conversation_id: str | None,
         default_target: Target | None,
-    ) -> None:
+    ) -> dict[str, Any]:
         task_dir = self.workspace_dir / "agent_tasks" / task_id if self.workspace_dir else None
         try:
             if task_dir is None:
@@ -2020,6 +2436,15 @@ class MessagePipeline:
                 payload.get("max_loops"),
                 int(getattr(getattr(self.chat_agent, "cfg", None), "max_loops", 25) or 25),
             )
+            first_token_timeout = float(
+                getattr(getattr(self.chat_agent, "cfg", None), "first_token_timeout_seconds", 30.0)
+                or 30.0
+            )
+            timeout_seconds = _agent_task_timeout_seconds(
+                payload.get("timeout_seconds"),
+                max_loops=max_loops,
+                first_token_timeout=first_token_timeout,
+            )
             source_manifest = await self._materialize_agent_task_sources(
                 payload.get("sources") or [],
                 task_dir,
@@ -2028,6 +2453,24 @@ class MessagePipeline:
             manifest_path.write_text(
                 json.dumps(source_manifest, ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8",
+            )
+            self._agent_task_meta.setdefault(task_id, {"task_id": task_id})
+            self._agent_task_meta[task_id].update(
+                {
+                    "status": "running",
+                    "output_path": _workspace_rel(output_path, self.workspace_dir),
+                    "result_file": _workspace_rel(output_path, self.workspace_dir),
+                    "manifest_path": _workspace_rel(manifest_path, self.workspace_dir),
+                    "manifest_summary": _summarize_agent_task_manifest(source_manifest),
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+            logger.info(
+                "后台子 Agent 任务启动 task_id=%s max_loops=%s timeout=%.1fs output=%s",
+                task_id,
+                max_loops,
+                timeout_seconds,
+                _workspace_rel(output_path, self.workspace_dir),
             )
 
             from tools import ToolContext, ToolRegistry, get_default_specs
@@ -2066,6 +2509,22 @@ class MessagePipeline:
             )
             output_rel = _workspace_rel(output_path, self.workspace_dir)
             manifest_rel = _workspace_rel(manifest_path, self.workspace_dir)
+            sub_executor = sub_registry.get_executor(sub_ctx)
+
+            async def _sub_executor(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+                result = await sub_executor(tool_name, args)
+                if (
+                    tool_name == "write_file"
+                    and result.get("ok", False)
+                    and self._same_workspace_path(result.get("path"), output_rel)
+                ):
+                    result = dict(result)
+                    result["stop_after_tool"] = True
+                    result["next"] = (
+                        "目标结果文件已写出，本后台任务将立即结束并把结果返回给主 Agent。"
+                    )
+                return result
+
             messages = [
                 {
                     "role": "system",
@@ -2088,14 +2547,40 @@ class MessagePipeline:
                     ),
                 },
             ]
-            result = await self.chat_agent.run(
-                messages,
-                tools=sub_registry.get_schemas(),
-                tool_executor=sub_registry.get_executor(sub_ctx),
-                task_contract=f"后台资料处理任务 {task_id}",
-                max_loops=max_loops,
-            )
+            timeout_with_existing_output = False
+            try:
+                result = await asyncio.wait_for(
+                    self.chat_agent.run(
+                        messages,
+                        tools=sub_registry.get_schemas(),
+                        tool_executor=_sub_executor,
+                        task_contract=f"后台资料处理任务 {task_id}",
+                        max_loops=max_loops,
+                    ),
+                    timeout=timeout_seconds,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "后台子 Agent 任务超时 task_id=%s timeout=%.1fs output_exists=%s",
+                    task_id,
+                    timeout_seconds,
+                    output_path.exists(),
+                )
+                if output_path.exists():
+                    timeout_with_existing_output = True
+                    result = AgentRunResult(
+                        final_content="后台子 Agent 超时，但目标结果文件已经写出。",
+                        records=[],
+                        loop_count=max_loops,
+                        finish_reason="tool_stop",
+                    )
+                else:
+                    raise RuntimeError(
+                        f"后台子 Agent 任务超过 {timeout_seconds:.0f}s 仍未产出目标结果文件"
+                    ) from None
             status = "partial" if result.finish_reason == "max_loops" else "completed"
+            if result.finish_reason == "api_error":
+                status = "failed"
             if not output_path.exists():
                 fallback = (result.final_content or "").strip()
                 if status == "partial":
@@ -2106,18 +2591,61 @@ class MessagePipeline:
                         output_rel=output_rel,
                         max_loops=max_loops,
                     )
+                elif status == "failed":
+                    fallback = "后台子 Agent 调用失败，未产出可用结果。"
                 elif not fallback:
                     fallback = "后台子 Agent 已结束，但没有写出结果内容。"
                 output_path.write_text(fallback, encoding="utf-8")
 
-            await self._deliver_agent_task_result(
-                task_id,
-                status=status,
-                result_path=output_path,
-                conversation_id=conversation_id,
-                default_target=default_target,
-                error="达到工具循环上限，已产出部分结果。" if status == "partial" else "",
+            self._agent_task_meta.setdefault(task_id, {"task_id": task_id})
+            self._agent_task_meta[task_id].update(
+                {
+                    "status": status,
+                    "result_file": _workspace_rel(output_path, self.workspace_dir),
+                    "finish_reason": result.finish_reason,
+                    "loop_count": result.loop_count,
+                    "timeout_with_existing_output": timeout_with_existing_output,
+                }
             )
+            error_text = (
+                "后台任务超时，但目标结果文件已写出，已按现有结果返回。"
+                if timeout_with_existing_output
+                else "达到工具循环上限，已产出部分结果。"
+                if status == "partial"
+                else ""
+            )
+            content = output_path.read_text(encoding="utf-8", errors="replace")
+            rel_path = _workspace_rel(output_path, self.workspace_dir)
+            preview = _file_head_tail_preview(output_path)
+            summary = _first_meaningful_line(content) or "后台子 Agent 已写出结果"
+            return {
+                "ok": status != "failed",
+                "status": status,
+                "brief": f"后台子 Agent 任务已结束：{summary}",
+                "task_id": task_id,
+                "result_file": rel_path,
+                "path": rel_path,
+                "content": content,
+                "summary": summary,
+                "error": error_text,
+                "preview": preview,
+                "data": {
+                    "task_id": task_id,
+                    "status": status,
+                    "result_file": rel_path,
+                    "summary": summary,
+                    "manifest_file": manifest_rel,
+                    "manifest_summary": _summarize_agent_task_manifest(source_manifest),
+                    "max_loops": max_loops,
+                    "timeout_seconds": timeout_seconds,
+                    "loop_count": result.loop_count,
+                    "finish_reason": result.finish_reason,
+                    "timeout_with_existing_output": timeout_with_existing_output,
+                },
+                "next": (
+                    "结果已作为本工具返回；如果 content 被截断，可用 read_file 读取 result_file。"
+                ),
+            }
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2130,14 +2658,40 @@ class MessagePipeline:
                     error_path.write_text(str(e), encoding="utf-8")
                 except Exception:
                     error_path = None
-            await self._deliver_agent_task_result(
-                task_id,
-                status="failed",
-                result_path=error_path,
-                conversation_id=conversation_id,
-                default_target=default_target,
-                error=str(e),
+            self._agent_task_meta.setdefault(task_id, {"task_id": task_id})
+            self._agent_task_meta[task_id].update(
+                {
+                    "status": "failed",
+                    "result_file": _workspace_rel(error_path, self.workspace_dir)
+                    if error_path
+                    else "",
+                    "error": str(e),
+                }
             )
+            rel_path = _workspace_rel(error_path, self.workspace_dir) if error_path else ""
+            content = (
+                error_path.read_text(encoding="utf-8", errors="replace")
+                if error_path and error_path.exists()
+                else str(e)
+            )
+            return {
+                "ok": False,
+                "status": "failed",
+                "brief": f"后台子 Agent 任务失败：{str(e)[:160]}",
+                "task_id": task_id,
+                "result_file": rel_path,
+                "path": rel_path,
+                "content": content,
+                "summary": "后台子 Agent 任务失败",
+                "error": str(e),
+                "data": {
+                    "task_id": task_id,
+                    "status": "failed",
+                    "result_file": rel_path,
+                    "summary": "后台子 Agent 任务失败",
+                },
+                "next": "请根据 error 决定是否重试或改用更小的资料范围。",
+            }
 
     async def _materialize_agent_task_sources(
         self,
@@ -2309,35 +2863,6 @@ class MessagePipeline:
             records.extend(await self.history.records())
         return records
 
-    async def _deliver_agent_task_result(
-        self,
-        task_id: str,
-        *,
-        status: str,
-        result_path: Path | None,
-        conversation_id: str | None,
-        default_target: Target | None,
-        error: str,
-    ) -> None:
-        rel_path = _workspace_rel(result_path, self.workspace_dir) if result_path else ""
-        preview = _file_head_tail_preview(result_path) if result_path and result_path.exists() else {}
-        task_context = (
-            "<agent_task_result priority=\"high\">\n"
-            "后台子 Agent 任务已结束。这是一次系统请求，请根据原用户请求继续处理："
-            "需要回复就发送消息，需要交付文件就调用 upload_file。\n"
-            f"task_id: {task_id}\n"
-            f"status: {status}\n"
-            f"result_file: {rel_path}\n"
-            f"error: {error or ''}\n"
-            f"preview: {json.dumps(preview, ensure_ascii=False)}\n"
-            "</agent_task_result>"
-        )
-        await self.run_one_turn(
-            task_context,
-            default_target=default_target,
-            conversation_id=conversation_id,
-        )
-
     async def _build_readable_text(self, event: IncomingMessage) -> str:
         """把 IncomingMessage 重建为人类可读文本（CQ 解析 + 媒体 URL/转录附加）。
 
@@ -2358,12 +2883,25 @@ class MessagePipeline:
         # 升级媒体占位为含 URL / 转录的版本
         for seg in event.media:
             try:
-                if seg.type == MediaType.IMAGE and seg.url:
-                    ws_path = await self._save_media_to_workspace(
-                        seg.url, suggested_name=f"img_{event.message_id}.jpg"
-                    )
-                    suffix = f" workspace={ws_path}" if ws_path else ""
-                    text = text.replace("[图片]", f"[图片 url={seg.url}{suffix}]", 1)
+                if seg.type == MediaType.IMAGE:
+                    source = await self._image_media_source(seg)
+                    ws_path = None
+                    if source:
+                        ws_path = await self._save_media_to_workspace(
+                            source, suggested_name=f"img_{event.message_id}.jpg"
+                        )
+                    if ws_path and seg.url:
+                        replacement = f"[图片 workspace={ws_path} url={seg.url}]"
+                    elif ws_path:
+                        replacement = f"[图片 workspace={ws_path}]"
+                    elif seg.url:
+                        replacement = f"[图片 url={seg.url}]"
+                    else:
+                        replacement = "[图片]"
+                    if "[图片]" in text:
+                        text = text.replace("[图片]", replacement, 1)
+                    else:
+                        text = f"{text} {replacement}".strip()
                 elif seg.type in (MediaType.VOICE, MediaType.RECORD):
                     # 先把语音文件落到 workspace，供本地/API ASR 使用；失败不阻塞后续 fallback。
                     ws_path = None
@@ -2424,6 +2962,20 @@ class MessagePipeline:
 
         return text
 
+    async def _image_media_source(self, seg: MediaSegment) -> str | None:
+        """优先用平台 file_id 换本地图片路径，普通 URL 只做兜底。"""
+        resolver = getattr(self.adapter, "get_image_url", None)
+        if seg.file_id and resolver is not None:
+            try:
+                source = await resolver(seg.file_id)
+                if source:
+                    return source
+            except (AttributeError, NotImplementedError):
+                pass
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"获取图片文件失败 file_id={seg.file_id}: {e}")
+        return seg.url or seg.file_id
+
     async def _transcribe_voice_with_asr(
         self, event: IncomingMessage, ws_path: str | None
     ) -> str:
@@ -2469,10 +3021,12 @@ class MessagePipeline:
         try:
             import re
             import shutil
+            from html import unescape
             from urllib.parse import unquote, urlparse
 
             import httpx
 
+            url = unescape((url or "").strip())
             incoming = self.workspace_dir / "incoming"
             incoming.mkdir(parents=True, exist_ok=True)
             parsed = urlparse(url)
@@ -2694,7 +3248,6 @@ class MessagePipeline:
             self._batch_task,
             self._requeue_task,
             self._summary_task,
-            *self._agent_task_tasks.values(),
         ]
         for task in tasks:
             if task and not task.done():

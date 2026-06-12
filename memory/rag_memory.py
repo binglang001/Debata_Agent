@@ -79,12 +79,25 @@ class SqliteVectorStore:
             for document in documents:
                 self._entries[document.id] = document
 
+    async def remove_ids(self, ids: Iterable[str]) -> int:
+        ids = {entry_id for entry_id in ids if entry_id}
+        if not ids:
+            return 0
+        async with self._lock:
+            await asyncio.to_thread(self._remove_ids_sync, ids)
+            removed = 0
+            for entry_id in ids:
+                if self._entries.pop(entry_id, None) is not None:
+                    removed += 1
+            return removed
+
     def top_k(
         self,
         query_vec: list[float],
         *,
         k: int,
         conversation_id: str | None = None,
+        before_ts: str | None = None,
     ) -> list[RagHit]:
         if not query_vec or not self._entries:
             return []
@@ -92,6 +105,12 @@ class SqliteVectorStore:
         if conversation_id:
             candidates = [
                 entry for entry in candidates if entry.conversation_id == conversation_id
+            ]
+        if before_ts:
+            candidates = [
+                entry
+                for entry in candidates
+                if not entry.timestamp or entry.timestamp < before_ts
             ]
         scored = [
             RagHit(document=entry, score=cosine_similarity(query_vec, entry.vector))
@@ -196,6 +215,16 @@ class SqliteVectorStore:
             )
             conn.commit()
 
+    def _remove_ids_sync(self, ids: set[str]) -> None:
+        if not ids:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "DELETE FROM rag_documents WHERE id = ?",
+                [(entry_id,) for entry_id in ids],
+            )
+            conn.commit()
+
 
 class RagMemoryService:
     """Background indexer and query-time retriever for conversation RAG."""
@@ -221,6 +250,11 @@ class RagMemoryService:
 
     async def load(self) -> None:
         await self.store.load()
+        removed = await self.store.remove_ids(
+            entry.id for entry in self.store.all_entries() if _document_is_runtime_context(entry)
+        )
+        if removed:
+            logger.info("RAG 向量库已清理 %s 条运行时上下文记录", removed)
 
     def start(self) -> None:
         if self._closed:
@@ -272,6 +306,7 @@ class RagMemoryService:
         query: str,
         *,
         conversation_id: str | None = None,
+        before_ts: str | None = None,
         top_k: int | None = None,
         token_budget: int | None = None,
         estimator: TokenEstimator | None = None,
@@ -289,6 +324,7 @@ class RagMemoryService:
             qvec,
             k=top_k or self.top_k,
             conversation_id=conversation_id,
+            before_ts=before_ts,
         )
         if not hits:
             return ""
@@ -352,14 +388,22 @@ def _record_to_candidate(
     role = str(record.get("role") or "")
     if role not in {"user", "assistant"}:
         return None
+    conversation_id = str(record.get("conversation_id") or "") or None
+    if conversation_id and conversation_id.startswith("system:"):
+        return None
+    if role == "assistant" and record.get("tool_calls"):
+        return None
+    meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    if _metadata_is_runtime_context(meta):
+        return None
     text = _record_content_text(record.get("content"))
     if not text:
         return None
     text = _compact_text(text)[:max_text_chars]
     if not text:
         return None
-    meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    conversation_id = str(record.get("conversation_id") or "") or None
+    if _text_is_runtime_context(text):
+        return None
     timestamp = str(meta.get("timestamp") or record.get("timestamp") or "")
     stable_payload = {
         "role": role,
@@ -381,6 +425,38 @@ def _record_to_candidate(
             "metadata": meta,
         },
     }
+
+
+_RUNTIME_CONTEXT_KINDS = frozenset(
+    {
+        "task_context_snapshot",
+        "send_done_snapshot",
+    }
+)
+_RUNTIME_CONTEXT_MARKERS = (
+    "<task_context",
+    "</task_context>",
+    "<send_status",
+    "</send_status>",
+    "<send_receipt",
+    "</send_receipt>",
+    "<send_receipt_task",
+    "</send_receipt_task>",
+)
+
+
+def _metadata_is_runtime_context(meta: dict[str, Any]) -> bool:
+    return meta.get("kind") in _RUNTIME_CONTEXT_KINDS
+
+
+def _text_is_runtime_context(text: str) -> bool:
+    return any(marker in text for marker in _RUNTIME_CONTEXT_MARKERS)
+
+
+def _document_is_runtime_context(document: RagDocument) -> bool:
+    metadata = document.meta.get("metadata")
+    meta = metadata if isinstance(metadata, dict) else {}
+    return _metadata_is_runtime_context(meta) or _text_is_runtime_context(document.text)
 
 
 def _record_content_text(content: Any) -> str:

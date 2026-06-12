@@ -168,7 +168,7 @@ class WindowResizeFilter(QObject):
         self._manual_edges = Qt.Edge(0)
         self._manual_start_pos: QPoint | None = None
         self._manual_start_geo: QRect | None = None
-        target.destroyed.connect(self._remove_all_filters)
+        target.destroyed.connect(lambda *_: self._remove_all_filters())
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         root = getattr(self, "_root", None)
@@ -380,7 +380,7 @@ class WindowDragFilter(QObject):
         self._root = root
         self._filtered_widgets: list[QWidget] = []
         self._drag_pos: QPoint | None = None
-        target.destroyed.connect(self._remove_all_filters)
+        target.destroyed.connect(lambda *_: self._remove_all_filters())
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         root = getattr(self, "_root", None)

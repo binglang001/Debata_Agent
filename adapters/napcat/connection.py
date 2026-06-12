@@ -430,7 +430,7 @@ class ForwardWSConnection(NapCatConnection):
             max_size=2**24,
         )
         logger.info(
-            f"NapCat 正向 WS 服务监听: ws://{self.host}:{self.port}{self.path}"
+            f"NapCat 反向 WS 服务监听: ws://{self.host}:{self.port}{self.path}"
         )
         self._set_state("disconnected")
 

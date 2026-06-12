@@ -54,24 +54,23 @@ class VoxCPM2Service(ITTSService):
             if self._ready.is_set():
                 return
             self._closed = False
-            device = self._select_device()
             logger.info(
-                "加载 VoxCPM2 模型: dir=%s device=%s denoiser=%s cfg=%.1f steps=%d",
+                "开始后台加载 VoxCPM2 模型: dir=%s device=%s denoiser=%s cfg=%.1f steps=%d",
                 self._model_dir,
-                device,
+                self._device,
                 self._load_denoiser,
                 self._cfg_value,
                 self._inference_timesteps,
             )
 
             t0 = asyncio.get_running_loop().time()
-            model = await asyncio.to_thread(self._load_model_sync, device)
+            device, model = await asyncio.to_thread(self._load_model_with_device_sync)
             if self._closed:
                 return
             self._model = model
             self._ready.set()
             elapsed = asyncio.get_running_loop().time() - t0
-            logger.info(f"TTS 预热完成（耗时 {elapsed:.1f}s）")
+            logger.info("TTS 预热完成（耗时 %.1fs，device=%s）", elapsed, device)
 
     def _select_device(self) -> str:
         device = (self._device or "auto").strip().lower()
@@ -91,6 +90,11 @@ class VoxCPM2Service(ITTSService):
             logger.warning("配置了 VoxCPM2 device=%s，但 CUDA 不可用，已回退到 CPU", device)
             return "cpu"
         return device
+
+    def _load_model_with_device_sync(self) -> tuple[str, object]:
+        """Resolve torch/CUDA device and load the model in the worker thread."""
+        device = self._select_device()
+        return device, self._load_model_sync(device)
 
     def _load_model_sync(self, device: str):
         if self._load_denoiser:

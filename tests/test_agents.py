@@ -28,8 +28,9 @@ from agents.persona_loader import (
     validate_persona_name,
 )
 from agents.proactive_agent import ProactiveRouterAgent, _is_action_decision
+from agents.runner import AgentRunner, _kv_prompt_diagnostics
 from app_config.schema import AgentConfig
-from providers.base import CompletionResult
+from providers.base import CompletionResult, IProvider, ToolCall, Usage, normalize_messages
 
 # ============================================================
 # persona_loader
@@ -132,6 +133,7 @@ def test_tool_use_protocol_file_mode():
 def test_tool_use_protocol_rag_mode():
     s = build_tool_use_protocol("rag")
     assert "RAG 会话向量检索" in s
+    assert "retrieved_conversation_context" in s
     assert "save_important_memory" in s
     assert "没有 save_important_memory" in s
     assert "必须主动保存" not in s
@@ -151,8 +153,112 @@ def test_emoji_hint_in_protocol():
     """关于发图片表情包的明确提示必须在协议里。"""
     s = build_tool_use_protocol("file")
     assert "表情包" in s
-    assert "image" in s
-    assert "别忘了" in s or "不需要犹豫" in s  # 鼓励性表述
+    assert "emoji" in s
+    assert "image` 字段用于发送普通图片" in s
+    assert "正常短回复" in s
+
+
+def test_tool_trigger_policy_in_protocol():
+    s = build_tool_use_protocol("file")
+    assert "工具是内部观察" in s
+    assert "看完不代表必须回复" in s
+    assert "get_recent_chat_messages" in s
+    assert "describe_image" in s
+    assert "get_forward_msg" in s
+    assert "read_file" in s
+    assert "stale" in s
+    assert "stale / interrupted" in s
+
+
+def test_group_relevance_uses_clear_addressee_rules():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "先分清当前会话是私聊还是群聊" in sys
+    assert "私聊里，对方通常是在跟你说" in sys
+    assert "最近几条消息实际在对谁说" in sys
+    assert "群聊里出现\"你\"、\"你觉得\"、问号" in sys
+    assert "不要自动理解成自己" in sys
+    assert "最近聊天里的发言对象" in sys
+    assert "递话证据" in sys
+
+
+def test_group_relevance_does_not_treat_unaddressed_you_as_self():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "最近小线程是 A 问 B、B 回 A" in sys
+    assert "后续无 @ 的\"你觉得/你说/是不是\"默认仍在问 B" in sys
+    assert "不是在问你" in sys
+    assert "不能只凭字面有\"你\"、问号或\"要求你表态\"来成立" in sys
+
+
+def test_group_relevance_raises_threshold_after_boundary_message():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "没叫你 / 不是问你 / 别插话 / 滚" in sys
+    assert "附近未点名消息默认不要接" in sys
+    assert "除非后来明确 @你、引用你、叫你名字" in sys
+
+
+def test_direct_address_should_not_disappear_silently():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "被递话后沉默不是收尾" in sys
+    assert "想结束也要给一个可见短回应" in sys
+    assert "短收尾或贴合的表情包" in sys
+
+
+def test_group_claims_and_banter_keep_independent_judgment():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "只是\"这个人的说法\"" in sys
+    assert "不自动等于事实" in sys
+    assert "管理员也可能只是在拱火或逗你" in sys
+    assert "字面义、谐音义、玩梗义" in sys
+    assert "不必判成\"完全信 A / 完全信 B\"" in sys
+
+
+def test_kv_prompt_diagnostics_do_not_emit_temp_fields():
+    diag = _kv_prompt_diagnostics(
+        [{"role": "user", "content": "<task_context>ctx</task_context>"}],
+        [{"type": "function", "function": {"name": "no_action"}}],
+        loop=1,
+        model="deepseek-v4-pro",
+    )
+
+    assert "kv_message_count" in diag
+    assert "kv_prefix_8k_hash" in diag
+    assert not any(key.startswith("kv_temp") for key in diag)
+
+
+def test_kv_prompt_diagnostics_scan_runtime_user_context():
+    diag = _kv_prompt_diagnostics(
+        [
+            {"role": "system", "content": "<core_rules>x</core_rules>"},
+            {
+                "role": "user",
+                "content": (
+                    "<task_context><recent_group_messages>x</recent_group_messages>"
+                    "<send_receipt>x</send_receipt>"
+                    "<retrieved_conversation_context>x</retrieved_conversation_context>"
+                    "</task_context>"
+                ),
+            },
+        ],
+        [],
+        loop=1,
+    )
+
+    assert diag["kv_has_send_receipt"] is True
+    assert diag["kv_has_recent_group_messages"] is True
+    assert diag["kv_has_rag"] is True
+
+
+def test_behavior_prompt_does_not_hardcode_persona_replies():
+    p = _persona()
+    sys = build_combined_system_prompt(p)
+    assert "行为规则不提供固定口癖" in sys
+    for phrase in ["草", "绷不住", "这什么"]:
+        assert phrase not in sys
 
 
 # ============================================================
@@ -212,8 +318,11 @@ def test_build_combined_system_prompt_memory_mode_default():
 
 def test_build_combined_system_prompt_rag_mode_no_active_save():
     p = _persona()
-    sys = build_combined_system_prompt(p, memory_mode="rag")
+    sys = build_combined_system_prompt(p, important_memory_text="历史片段", memory_mode="rag")
     assert "RAG 会话向量检索" in sys
+    assert "<retrieved_conversation_context" in sys
+    assert "历史片段" in sys
+    assert "<long_term_memory" not in sys
     assert "save_important_memory" in sys
     assert "没有 save_important_memory" in sys
     assert "必须主动保存" not in sys
@@ -315,15 +424,16 @@ def test_build_messages_structure():
         current_context="时间：2026/05/23",
     )
 
-    # 顺序：system(combined) → system(admin) → user → assistant → system(task_context)
+    # 顺序：system(combined) → system(admin) → user → assistant → user(task_context)
     assert msgs[0]["role"] == "system"
     assert "<persona" in msgs[0]["content"]
     assert msgs[1]["role"] == "system"
     assert "<admin_info" in msgs[1]["content"]
     assert msgs[2]["role"] == "user"
     assert msgs[3]["role"] == "assistant"
-    assert msgs[4]["role"] == "system"
+    assert msgs[4]["role"] == "user"
     assert "<task_context" in msgs[4]["content"]
+    assert "不是用户新发言" in msgs[4]["content"]
     assert "2026/05/23" in msgs[4]["content"]
 
 
@@ -355,6 +465,80 @@ def test_build_messages_memory_mode_propagates():
     assert "RAG 会话向量检索" in msgs_rag[0]["content"]
     assert "必须主动保存" not in msgs_rag[0]["content"]
     assert "必须主动保存" in msgs_file[0]["content"]
+
+
+def test_build_messages_rag_memory_is_tail_context_for_cache_stability():
+    p = _persona()
+    history = [{"role": "user", "content": "旧消息"}]
+    first = build_messages(
+        p,
+        history,
+        important_memory_text="RAG 片段 A",
+        current_context="现在是 10:00",
+        memory_mode="rag",
+    )
+    second = build_messages(
+        p,
+        history,
+        important_memory_text="RAG 片段 B",
+        current_context="现在是 10:00",
+        memory_mode="rag",
+    )
+
+    assert first[0]["content"] == second[0]["content"]
+    assert "RAG 片段 A" not in first[0]["content"]
+    assert "RAG 片段 B" not in second[0]["content"]
+    assert [m["role"] for m in first] == ["system", "user", "user", "user"]
+    assert "旧消息" in first[1]["content"]
+    assert "task_context" in first[2]["content"]
+    assert "不是用户新发言" in first[2]["content"]
+    assert "RAG 片段 A" in first[3]["content"]
+    assert "不是用户新发言" in first[3]["content"]
+
+
+def test_build_messages_can_reuse_persisted_task_context_record_for_prefix_stability():
+    p = _persona()
+    history = [{"role": "user", "content": "本轮用户消息"}]
+    task_record = {
+        "role": "user",
+        "content": "<task_context priority=\"medium\">\n现在是 10:00。\n</task_context>",
+        "metadata": {"kind": "task_context_snapshot"},
+        "conversation_id": "private:1",
+    }
+
+    current = build_messages(
+        p,
+        history,
+        current_context_record=task_record,
+        memory_mode="rag",
+    )
+    next_turn = build_messages(
+        p,
+        [*history, task_record, {"role": "assistant", "content": ""}],
+        current_context_record={
+            "role": "user",
+            "content": "<task_context priority=\"medium\">\n现在是 10:01。\n</task_context>",
+        },
+        memory_mode="rag",
+    )
+
+    assert normalize_messages(current[:3]) == normalize_messages(next_turn[:3])
+    assert current[2]["content"] == task_record["content"]
+
+
+def test_build_messages_user_event_is_final_user_message():
+    p = _persona()
+    msgs = build_messages(
+        p,
+        [{"role": "assistant", "content": "旧回复"}],
+        current_context="现在是 10:00",
+        user_event="[系统事件 · 非用户消息] 定时唤醒已到。",
+    )
+
+    assert msgs[-1]["role"] == "user"
+    assert "系统事件" in msgs[-1]["content"]
+    assert msgs[-2]["role"] == "user"
+    assert "task_context" in msgs[-2]["content"]
 
 
 # ============================================================
@@ -546,8 +730,338 @@ def test_runner_assistant_record_preserves_reasoning_content():
     assert record["reasoning_content"] == "plan"
 
 
+@pytest.mark.asyncio
+async def test_runner_max_loops_adds_no_tool_finalization():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) == 1:
+                return CompletionResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="tc-1",
+                            name="needs_feedback",
+                            arguments="{}",
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                    usage=Usage(prompt_tokens=10),
+                )
+            assert tools is None
+            assert "工具循环达到上限" in messages[-1]["content"]
+            return CompletionResult(
+                content="已达到工具轮数上限，当前只完成了前半部分。",
+                finish_reason="stop",
+                usage=Usage(prompt_tokens=5),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(_name, _args):
+        return {"ok": True, "brief": "done"}
+
+    runner = AgentRunner(
+        FakeProvider(),
+        AgentConfig(provider="fake", model="fake", max_loops=1),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "处理资料"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "needs_feedback",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "max_loops"
+    assert result.final_content == "已达到工具轮数上限，当前只完成了前半部分。"
+    assert result.prompt_tokens == 15
+    assert result.records[-1]["content"] == result.final_content
+
+
+@pytest.mark.asyncio
+async def test_runner_async_agent_task_tools_do_not_finish_as_no_feedback():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) == 1:
+                return CompletionResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="tc-agent",
+                            name="start_agent_task",
+                            arguments='{"prompt":"整理资料"}',
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                    usage=Usage(prompt_tokens=7),
+                )
+            assert messages[-1]["role"] == "tool"
+            assert "agent-test" in messages[-1]["content"]
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(id="tc-na", name="no_action", arguments="{}")
+                ],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=8),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        if name == "start_agent_task":
+            return {
+                "ok": True,
+                "status": "completed",
+                "task_id": "agent-test",
+                "result_file": "agent_tasks/agent-test/result.md",
+                "content": "任务结果",
+            }
+        if name == "no_action":
+            return {"ok": True, "no_action": True}
+        raise AssertionError(name)
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(provider="fake", model="fake", max_loops=3),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "启动后台任务"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "start_agent_task",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "no_action",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "no_action"
+    assert len(provider.calls) == 2
+    assert result.prompt_tokens == 15
+
+
+@pytest.mark.asyncio
+async def test_runner_failed_no_action_does_not_finish_tool_loop():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) == 1:
+                return CompletionResult(
+                    tool_calls=[ToolCall(id="tc-na-fail", name="no_action", arguments="{}")],
+                    finish_reason="tool_calls",
+                    usage=Usage(prompt_tokens=5),
+                )
+            assert "policy_rejected" in messages[-1]["content"]
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_private_messages",
+                        arguments='{"send_only": true, "targets": [{"target_qq": 123, "content": "已处理"}]}',
+                    )
+                ],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=6),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        if name == "no_action":
+            return {"ok": False, "status": "policy_rejected"}
+        if name == "send_private_messages":
+            return {"ok": True, "status": "sent"}
+        raise AssertionError(name)
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(provider="fake", model="fake", max_loops=3),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "交付结果"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "no_action",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "send_private_messages",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "send_only_complete"
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_runner_stop_after_tool_finishes_immediately():
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-write",
+                        name="write_file",
+                        arguments='{"path": "result.md", "content": "done"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=5),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        assert name == "write_file"
+        return {"ok": True, "path": "result.md", "stop_after_tool": True}
+
+    runner = AgentRunner(
+        FakeProvider(),
+        AgentConfig(provider="fake", model="fake", max_loops=3),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "写结果"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "tool_stop"
+    assert result.loop_count == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_drops_plain_text_draft_before_retry():
+    leaked_draft = "思考过程\nRAG里提到撤回消息，所以我应该这样回复"
+
+    class FakeProvider(IProvider):
+        def __init__(self) -> None:
+            super().__init__("fake")
+            self.calls = []
+
+        async def chat_completion(self, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            if len(self.calls) == 1:
+                return CompletionResult(
+                    content=leaked_draft,
+                    finish_reason="stop",
+                    usage=Usage(prompt_tokens=5),
+                )
+            joined = "\n".join(str(m.get("content") or "") for m in messages)
+            assert leaked_draft not in joined
+            assert "上一轮纯文本已被系统丢弃" in joined
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(id="tc-na", name="no_action", arguments="{}")
+                ],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=6),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    async def executor(name, _args):
+        assert name == "no_action"
+        return {"ok": True, "no_action": True}
+
+    provider = FakeProvider()
+    runner = AgentRunner(
+        provider,
+        AgentConfig(provider="fake", model="fake", max_loops=3),
+    )
+
+    result = await runner.run(
+        [{"role": "user", "content": "不要泄漏内部分析"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "no_action",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_executor=executor,
+    )
+
+    assert result.finish_reason == "no_action"
+    assert len(provider.calls) == 2
+    assert not any(
+        r.get("role") == "assistant" and r.get("content") == leaked_draft
+        for r in result.records
+    )
+
+
 def test_proactive_router_treats_only_clean_take_actions_as_action():
     assert _is_action_decision("TAKE_ACTIONS") is True
+    assert _is_action_decision("TAKE_ACTIONS: 用户要求下次主动思考时提醒") is True
     assert _is_action_decision(" TAKE_ACTIONS ") is True
     assert _is_action_decision("<｜｜DSML｜｜TOOL_CALLS>\n<｜｜DSML｜｜INVOKE NAME=send_private_messages>") is False
     assert _is_action_decision("两分钟到了，提醒用户。\n\n<｜｜DSML｜｜TOOL_CALLS>") is False
@@ -565,4 +1079,18 @@ async def test_proactive_router_provider_dsml_content_returns_false():
         AgentConfig(provider="fake", model="router", max_tokens=64),
     )
 
-    assert await agent.should_act([]) is False
+    assert await agent.should_act([]) == (False, "")
+
+
+@pytest.mark.asyncio
+async def test_proactive_router_returns_reason():
+    class FakeProvider:
+        async def chat_completion(self, *_args, **_kwargs):
+            return CompletionResult(content="TAKE_ACTIONS: 用户要求空闲后提醒他")
+
+    agent = ProactiveRouterAgent(
+        FakeProvider(),
+        AgentConfig(provider="fake", model="router", max_tokens=64),
+    )
+
+    assert await agent.should_act([]) == (True, "用户要求空闲后提醒他")

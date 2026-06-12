@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -10,7 +11,12 @@ import pytest
 from adapters.base import AdapterAPIError, AdapterNotConnectedError
 from adapters.napcat.adapter import NapCatAdapter
 from adapters.napcat.api_call import NapCatApiCaller
-from adapters.napcat.connection import ConnectionStatus, NapCatConnection, ReverseWSConnection
+from adapters.napcat.connection import (
+    ConnectionStatus,
+    ForwardWSConnection,
+    NapCatConnection,
+    ReverseWSConnection,
+)
 from adapters.napcat.process import NapCatProcessManager
 from adapters.types import (
     FriendInfo,
@@ -118,6 +124,40 @@ def test_process_manager_uses_cmd_for_windows_bat(tmp_path, monkeypatch):
         "/c",
         str(script),
         "--demo",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_process_manager_uses_taskkill_tree_on_windows(tmp_path, monkeypatch):
+    script = tmp_path / "start.bat"
+    script.write_text("@echo off\n", encoding="utf-8")
+    manager = NapCatProcessManager(script)
+    manager._process = SimpleNamespace(pid=4321)  # type: ignore[assignment]
+    calls: list[list[str]] = []
+
+    class FakeTaskkillProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok", None
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        calls.append(list(cmd))
+        assert kwargs["stdout"] is asyncio.subprocess.PIPE
+        assert kwargs["stderr"] is asyncio.subprocess.STDOUT
+        return FakeTaskkillProcess()
+
+    monkeypatch.setattr(
+        "adapters.napcat.process.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    await manager._terminate_windows_tree(force=False)
+    await manager._terminate_windows_tree(force=True)
+
+    assert calls == [
+        ["taskkill", "/PID", "4321", "/T"],
+        ["taskkill", "/F", "/PID", "4321", "/T"],
     ]
 
 
@@ -298,6 +338,24 @@ def test_adapter_from_config_uses_startup_connect_timeout():
     assert conn.fast_reconnect_interval == 0.1
     assert conn.reconnect_jitter == 0.0
     assert adapter._api.wait_connected_timeout == 1.25  # type: ignore[attr-defined]
+
+
+def test_adapter_from_config_server_loopback_binds_all_interfaces():
+    class FakeSecrets:
+        def get(self, _key: str) -> None:
+            return None
+
+    from app_config.schema import NapCatAdapterConfig
+
+    cfg = NapCatAdapterConfig(mode="server", host="localhost", port=8082, path="/")
+
+    adapter = NapCatAdapter.from_config("napcat_test", cfg, FakeSecrets())  # type: ignore[arg-type]
+
+    conn = adapter._connection  # type: ignore[attr-defined]
+    assert isinstance(conn, ForwardWSConnection)
+    assert conn.host == "0.0.0.0"
+    assert conn.port == 8082
+    assert conn.path == "/"
 
 
 # ============================================================
@@ -611,6 +669,20 @@ async def test_adapter_get_file_url_failure_returns_none():
     asyncio.create_task(respond_failed())
     url = await adapter.get_file_url("missing")
     assert url is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_get_image_url_success():
+    conn = FakeConnection()
+    adapter = NapCatAdapter("napcat_test", conn)
+    await adapter.start()
+    conn.responders["get_image"] = {"file": "D:\\QQ\\NapCat\\temp\\abc.jpg"}
+
+    url = await adapter.get_image_url("abc.jpg")
+
+    assert url == "D:\\QQ\\NapCat\\temp\\abc.jpg"
+    assert conn.sent[-1]["action"] == "get_image"
+    assert conn.sent[-1]["params"] == {"file": "abc.jpg"}
 
 
 @pytest.mark.asyncio

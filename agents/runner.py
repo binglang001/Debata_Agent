@@ -11,11 +11,12 @@
     2. AI 全部调用 send_* 且 send_only=True 且全部成功 → 'send_only_complete'
     3. AI 调用的全是 no_feedback 类工具且全部成功 → 'all_no_feedback'
     4. AI 未调用工具，提示重试后仍不调用 → 'no_tool_after_retry'
-    5. 达到 max_loops → 'max_loops'
+    5. 达到 max_loops → 'max_loops'，随后追加一次无工具收尾，让模型说明部分结果
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -30,9 +31,10 @@ from providers.base import (
     ProviderTimeoutError,
     ReasoningConfig,
     ToolCall,
+    normalize_messages,
 )
 
-from .base import AgentRunResult, FinishReason, ToolExecutor
+from .base import AgentRunResult, FinishReason, StatusCallback, ToolExecutor, UsageRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +48,6 @@ DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "set_friend_add_request",
     "set_group_add_request",
     "schedule_wakeup",
-    "start_agent_task",
-    "summarize_chat_history",
-    "summarize_conversation",
 }
 
 # 发送类工具：send_only=True 时同样算作终止信号
@@ -84,6 +83,9 @@ class AgentRunner:
         task_contract: str | None = None,
         pending_context_provider: Callable[[], Awaitable[list[dict[str, Any]]]] | None = None,
         max_loops: int | None = None,
+        usage_recorder: UsageRecorder | None = None,
+        status_callback: StatusCallback | None = None,
+        status_label: str = "主模型",
     ) -> AgentRunResult:
         """执行多轮工具循环。
 
@@ -150,6 +152,13 @@ class AgentRunner:
                 logger.debug(f"Task Contract 重注入（轮次 {loop_count}）")
 
             try:
+                self._emit_status(
+                    status_callback,
+                    state="thinking",
+                    text=f"{status_label}思考中",
+                    model=self.cfg.model,
+                    loop=loop_count,
+                )
                 result = await self.provider.chat_completion(
                     msgs,
                     model=self.cfg.model,
@@ -164,6 +173,13 @@ class AgentRunner:
                 )
             except ProviderTimeoutError as e:
                 logger.error(f"AgentRunner 超时（轮次 {loop_count}）: {e}")
+                self._emit_status(
+                    status_callback,
+                    state="error",
+                    text=f"{status_label}超时",
+                    model=self.cfg.model,
+                    loop=loop_count,
+                )
                 return AgentRunResult(
                     final_content="",
                     records=records,
@@ -174,6 +190,13 @@ class AgentRunner:
                 )
             except ProviderError as e:
                 logger.error(f"AgentRunner API 错误（轮次 {loop_count}）: {e}")
+                self._emit_status(
+                    status_callback,
+                    state="error",
+                    text=f"{status_label}调用失败",
+                    model=self.cfg.model,
+                    loop=loop_count,
+                )
                 return AgentRunResult(
                     final_content="",
                     records=records,
@@ -184,6 +207,13 @@ class AgentRunner:
                 )
             except Exception as e:
                 logger.exception(f"AgentRunner 未知错误（轮次 {loop_count}）: {e}")
+                self._emit_status(
+                    status_callback,
+                    state="error",
+                    text=f"{status_label}异常",
+                    model=self.cfg.model,
+                    loop=loop_count,
+                )
                 return AgentRunResult(
                     final_content="",
                     records=records,
@@ -194,12 +224,22 @@ class AgentRunner:
                 )
 
             prompt_tokens_total += result.usage.prompt_tokens
+            await self._record_usage(
+                usage_recorder,
+                result.usage,
+                agent=status_label,
+                operation="agent_loop",
+                loop=loop_count,
+                **_kv_prompt_diagnostics(
+                    msgs,
+                    tools,
+                    loop=loop_count,
+                    model=self.cfg.model,
+                ),
+            )
             if result.reasoning_content:
                 reasoning_logs.append(result.reasoning_content)
 
-            assistant_record = self._build_assistant_record(result)
-            msgs.append(assistant_record)
-            records.append(assistant_record)
             content_preview = (result.content or "")[:60]
             logger.info(
                 f"轮次 {loop_count}: content={content_preview!r}, "
@@ -216,23 +256,37 @@ class AgentRunner:
                     finish_reason = "send_only_complete"
                     break
                 if loop_count < effective_max_loops:
-                    # 还有下一轮：插入系统纠正后继续
+                    # 还有下一轮：丢弃纯文本草稿，只插入系统纠正后继续。
+                    # 不能把无效 assistant 文本放回上下文，否则下一轮可能把
+                    # 内部分析/RAG 解释原样当作可发送消息。
                     err = {
                         "role": "system",
                         "content": (
                             "错误：未调用工具。必须调用 send_* 发消息或 no_action 不操作。"
-                            "纯文本无效。"
+                            "上一轮纯文本已被系统丢弃，不要复述、转发或引用它。"
                         ),
                     }
                     msgs.append(err)
                     records.append(err)
                     continue
                 # 最后一次仍未调用工具，丢弃文本
-                final_content = content
+                final_content = ""
                 finish_reason = "no_tool_after_retry"
                 break
 
+            assistant_record = self._build_assistant_record(result)
+            msgs.append(assistant_record)
+            records.append(assistant_record)
+
             # === 分支 2：执行所有工具调用 ===
+            self._emit_status(
+                status_callback,
+                state="tool",
+                text=f"调用工具：{', '.join(tc.name for tc in result.tool_calls)}",
+                model=self.cfg.model,
+                loop=loop_count,
+                tool_names=[tc.name for tc in result.tool_calls],
+            )
             tc_results = await self._execute_tools(result.tool_calls, tool_executor)
             if any(
                 r["name"] in SEND_TOOL_NAMES and r["result"].get("ok", True)
@@ -248,11 +302,22 @@ class AgentRunner:
                 msgs.append(tool_record)
                 records.append(tool_record)
 
+            stop_results = [
+                r for r in tc_results if r["result"].get("stop_after_tool")
+            ]
+            if stop_results:
+                final_content = result.content or ""
+                finish_reason = "tool_stop"
+                break
+
             if await append_pending_context() and loop_count < effective_max_loops:
                 continue
 
             # === 终止条件检查 ===
-            if any(r["name"] == "no_action" for r in tc_results):
+            if any(
+                r["name"] == "no_action" and r["result"].get("ok", True)
+                for r in tc_results
+            ):
                 final_content = "NO_ACTIONS"
                 finish_reason = "no_action"
                 break
@@ -264,18 +329,40 @@ class AgentRunner:
 
         if loop_count >= effective_max_loops and finish_reason == "max_loops":
             logger.warning(f"达到最大循环次数 {effective_max_loops}")
+            limit_record = {
+                "role": "system",
+                "content": (
+                    f"工具循环达到上限 {effective_max_loops} 轮，"
+                    "现在禁止继续调用工具。请基于已有消息和工具结果，"
+                    "用自然语言给出当前部分结果、已完成事项、未完成原因和建议下一步。"
+                ),
+            }
+            msgs.append(limit_record)
+            records.append(limit_record)
+            final_result = await self._finalize_after_max_loops(
+                msgs,
+                usage_recorder=usage_recorder,
+                status_callback=status_callback,
+                status_label=status_label,
+            )
+            if final_result is not None:
+                prompt_tokens_total += final_result.usage.prompt_tokens
+                if final_result.reasoning_content:
+                    reasoning_logs.append(final_result.reasoning_content)
+                final_record = self._build_assistant_record(final_result)
+                records.append(final_record)
+                final_content = (final_result.content or "").strip()
             if not final_content:
                 final_content = self._last_assistant_text(records)
-            records.append(
-                {
-                    "role": "system",
-                    "content": (
-                        f"工具循环达到上限 {effective_max_loops} 轮，"
-                        "已停止继续调用工具；上层应根据已有工具结果产出部分结果或说明未完成原因。"
-                    ),
-                }
-            )
 
+        self._emit_status(
+            status_callback,
+            state="idle",
+            text="空闲",
+            model=self.cfg.model,
+            loop=loop_count,
+            finish_reason=finish_reason,
+        )
         return AgentRunResult(
             final_content=final_content,
             records=records,
@@ -331,6 +418,89 @@ class AgentRunner:
                     return content
         return ""
 
+    async def _record_usage(
+        self,
+        recorder: UsageRecorder | None,
+        usage,
+        **metadata: Any,
+    ) -> None:
+        if recorder is None:
+            return
+        try:
+            await recorder(
+                usage,
+                {
+                    "provider": self.provider.name,
+                    "model": self.cfg.model,
+                    **metadata,
+                },
+            )
+        except Exception:
+            logger.debug("记录模型用量失败", exc_info=True)
+
+    async def _finalize_after_max_loops(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        usage_recorder: UsageRecorder | None,
+        status_callback: StatusCallback | None,
+        status_label: str,
+    ) -> CompletionResult | None:
+        """工具轮数用尽后做一次无工具收尾。
+
+        这一步不再传 tools，避免模型继续循环；结果只作为记录和上层 fallback 使用。
+        """
+        try:
+            self._emit_status(
+                status_callback,
+                state="thinking",
+                text=f"{status_label}整理部分结果",
+                model=self.cfg.model,
+            )
+            result = await self.provider.chat_completion(
+                messages,
+                model=self.cfg.model,
+                tools=None,
+                temperature=self.cfg.temperature,
+                top_p=self.cfg.top_p,
+                max_tokens=min(int(self.cfg.max_tokens or 2048), 4096),
+                reasoning=self._to_provider_reasoning(self.cfg.reasoning),
+                stream=True,
+                timeout=self.cfg.first_token_timeout_seconds * 4 + 60.0,
+                first_token_timeout=self.cfg.first_token_timeout_seconds,
+            )
+            await self._record_usage(
+                usage_recorder,
+                result.usage,
+                agent=status_label,
+                operation="agent_loop_max_loops_final",
+                **_kv_prompt_diagnostics(
+                    messages,
+                    None,
+                    loop=0,
+                    model=self.cfg.model,
+                ),
+            )
+            return result
+        except Exception as e:
+            logger.warning("AgentRunner 达到上限后的无工具收尾失败: %s", e)
+            self._emit_status(
+                status_callback,
+                state="error",
+                text=f"{status_label}收尾失败",
+                model=self.cfg.model,
+            )
+            return None
+
+    @staticmethod
+    def _emit_status(callback: StatusCallback | None, **payload: Any) -> None:
+        if callback is None:
+            return
+        try:
+            callback(payload)
+        except Exception:
+            logger.debug("更新模型状态失败", exc_info=True)
+
     async def _execute_tools(
         self,
         tool_calls: list[ToolCall],
@@ -383,3 +553,53 @@ class AgentRunner:
             if r["name"] in SEND_TOOL_NAMES:
                 return "send_only_complete"
         return "all_no_feedback"
+
+
+def _kv_prompt_diagnostics(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    *,
+    loop: int,
+    model: str = "",
+) -> dict[str, Any]:
+    """生成轻量 KV 诊断信息，只记录结构和哈希，不记录正文。"""
+    normalized = normalize_messages(messages)
+    serialized = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    roles = [str(m.get("role") or "") for m in normalized]
+    joined_content = "\n".join(str(m.get("content") or "") for m in normalized)
+    tools_text = json.dumps(
+        tools or [],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    diag: dict[str, Any] = {
+        "kv_loop": int(loop),
+        "kv_message_count": len(normalized),
+        "kv_roles_hash": _short_hash("|".join(roles)),
+        "kv_system_count": sum(1 for role in roles if role == "system"),
+        "kv_assistant_count": sum(1 for role in roles if role == "assistant"),
+        "kv_tool_count": sum(1 for role in roles if role == "tool"),
+        "kv_tools_count": len(tools or []),
+        "kv_tools_hash": _short_hash(tools_text),
+        "kv_prefix_8k_hash": _short_hash(serialized[:8192]),
+        "kv_prefix_16k_hash": _short_hash(serialized[:16384]),
+        "kv_prefix_24k_hash": _short_hash(serialized[:24576]),
+        "kv_has_send_receipt": "<send_receipt" in joined_content,
+        "kv_has_recent_group_messages": "<recent_group_messages" in joined_content,
+        "kv_has_rag": "<retrieved_conversation_context" in joined_content,
+    }
+    return diag
+
+
+def _short_hash(text: str) -> str:
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]

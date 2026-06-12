@@ -32,12 +32,17 @@ models:
     context_length: 128000
 
   # === Embedding 模型（用于 RAG 向量检索） ===
-  - id: doubao-embedding-vision-251215
-    display_name: 豆包 Embedding Vision（RAG 默认 · 图文多模态向量）
+  - id: doubao-embedding-text-240515
+    display_name: 豆包 Embedding Text（RAG 推荐）
     capabilities: [embedding]
     context_length: 0
 
   - id: doubao-embedding-text-01
-    display_name: 豆包 Embedding Text（纯文本向量）
+    display_name: 豆包 Embedding Text（旧版）
+    capabilities: [embedding]
+    context_length: 0
+
+  - id: doubao-embedding-vision-251215
+    display_name: 豆包 Embedding Vision（多模态向量）
     capabilities: [embedding]
     context_length: 0

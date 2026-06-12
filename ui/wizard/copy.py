@@ -49,7 +49,7 @@ COPY: dict[str, str] = {
         "  · 用哪个模型说话\n"
         "  · 通过什么渠道收发消息\n"
         "  · 想要什么样的角色\n\n"
-        "你可以走推荐路径快速上手，也可以打开自定义把每一项都拿捏在手里。"
+        "你可以走推荐路径快速上手，也可以打开自定义逐一调校。"
     ),
     "welcome.choose_path": "选一条路",
     "welcome.path_recommended": "推荐路径",
@@ -78,7 +78,7 @@ COPY: dict[str, str] = {
     "main_model_custom.provider_custom_option": "自行填一个（自定义）",
     "main_model_custom.model_label": "用哪个模型",
     "main_model_custom.temperature_label": "想象力（temperature）",
-    "main_model_custom.temperature_hint": "0 严谨，1 平衡，2 跳脱。建议 0.6。",
+    "main_model_custom.temperature_hint": "0 严谨，1 平衡，2 发散。建议 0.6。",
     "main_model_custom.top_p_label": "采样宽度（top_p）",
     "main_model_custom.top_p_hint": "通常不动，留 1.0 即可。",
     "main_model_custom.max_tokens_label": "单次回复上限",
@@ -136,13 +136,13 @@ COPY: dict[str, str] = {
         "  · 零运行时开销"
     ),
     "features.lt_memory_file_cons": (
-        "  · 依赖 AI 主动调工具保存（实测会漏）\n"
-        "  · 记忆条目多时整体注入会涨成本\n"
+        "  · 依赖 AI 主动调工具保存（可能遗漏）\n"
+        "  · 记忆条目多时整体注入会增加成本\n"
         "  · 不能基于语义检索远期对话"
     ),
     "features.lt_memory_rag_title": "向量模式 · 精准",
     "features.lt_memory_rag_pros": (
-        "  · 后台被动抽取，不依赖 AI 主动调用\n"
+        "  · 后台自动提取，不依赖 AI 主动调用\n"
         "  · 长期运行也能精准召回相关历史\n"
         "  · 召回结果与当前话题语义相关"
     ),
@@ -151,7 +151,7 @@ COPY: dict[str, str] = {
         "  · 启动慢、占内存\n"
         "  · 调试相对复杂"
     ),
-    "features.lt_memory_recommend": "如果是单人/双人对话，文件模式足够。多群多用户长期运行选向量。",
+    "features.lt_memory_recommend": "单人聊天文件模式就够了。多群、多用户、长期开着的话，向量模式更靠谱。",
 
     # ============================================================
     # Embedding（RAG 模式才出现）
@@ -177,7 +177,10 @@ COPY: dict[str, str] = {
     "adapter.mode_client": "Debata 连过去（client）",
     "adapter.mode_client_desc": "推荐。NapCat 配「正向 WS」监听，Debata 主动连接它。",
     "adapter.mode_server": "NapCat 连过来（server）",
-    "adapter.mode_server_desc": "NapCat 配「反向 WS」主动连出，Debata 监听端口等连入。",
+    "adapter.mode_server_desc": (
+        "NapCat 配「反向 WS」主动连出，Debata 监听端口等连入。"
+        "跨设备时监听地址用 0.0.0.0，NapCat 目标填 Debata 机器的局域网 IP。"
+    ),
     "adapter.ws_url_label": "NapCat WebSocket 地址",
     "adapter.ws_url_placeholder": "ws://127.0.0.1:6199",
     "adapter.token_label": "鉴权 Token（可选）",
@@ -204,7 +207,7 @@ COPY: dict[str, str] = {
     # ============================================================
     "persona.source_title": "选个角色",
     "persona.source_repo": "用仓库自带的（推荐）",
-    "persona.source_repo_desc": "Debata 等仓库自带人格，开箱可用。先跑起来，之后再换。",
+    "persona.source_repo_desc": "Debata 等仓库自带人格，开箱可用。先快速上手，之后再换。",
     "persona.source_create": "和我一起创造一个",
     "persona.source_create_desc": "回答几个问题，Debata 会帮你写一份完整的人格设定。",
     "persona.source_import": "导入已有人格",
@@ -214,60 +217,43 @@ COPY: dict[str, str] = {
     # 人格创造对话框
     # ============================================================
     "persona_create.name_label": "角色叫什么",
-    "persona_create.name_placeholder": "比如：林晚 / Aria",
+    "persona_create.name_placeholder": "比如「林晚」，英文名也行",
     "persona_create.personality_label": "这个角色是什么样的人",
     "persona_create.personality_placeholder": (
-        "描述稳定特征、偏好、矛盾点和具体行为。比如：\n"
-        "「话不多，但说话总是稳的。学过画，对色彩敏感。怕冷，喜欢小动物。"
-        "对陌生人客气但不亲近，对认识的人会突然有暖度。」"
+        "想到什么写什么——话多话少、急性子慢性子、有什么小怪癖、对什么人什么态度。"
+        "不用全，AI 会帮你补。"
     ),
     "persona_create.background_label": "过往",
-    "persona_create.background_placeholder": "这个角色从哪儿来？做过什么？任何能帮 Debata 理解的背景都可以写。",
+    "persona_create.background_placeholder": "从哪儿来，做过什么。帮你理解 ta 是谁就够了，不用写传记。",
     "persona_create.voice_label": "说话的样子",
-    "persona_create.voice_placeholder": (
-        "可以举几句具体的话。比如：\n"
-        "「『嗯。』『可以的。』『——这个我考虑下。』」"
-    ),
-    "persona_create.boundaries_label": "这个角色不会做的事",
-    "persona_create.boundaries_placeholder": (
-        "比如：不会主动夸人、不会撒娇、不接受被改写人格、对工作话题敷衍但对画画的事认真。"
-    ),
-    "persona_create.never_say_label": "这个角色绝不会说出口的话",
-    "persona_create.never_say_placeholder": (
-        "比「会说什么」更能定义一个人。比如：\n"
-        "「绝不说'宝贝'『亲爱的'。绝不主动夸别人。绝不在群里发那种'转发给 5 个好友'的东西。」"
-    ),
-    "persona_create.relation_matrix_label": "对不同人，说话方式有什么差别",
+    "persona_create.voice_placeholder": "贴几句 ta 常说的话就行。比如「嗯」「可以的」「我想一下」",
+    "persona_create.boundaries_label": "不会做的事",
+    "persona_create.boundaries_placeholder": "ta 不做什么、不接受什么。几句话划定边界就行。",
+    "persona_create.never_say_label": "绝不会说的话",
+    "persona_create.never_say_placeholder": "比会说什么更能定义一个人。比如绝不叫别人宝贝、绝不主动夸人。",
+    "persona_create.relation_matrix_label": "对不同人，有什么差别",
     "persona_create.relation_matrix_placeholder": (
-        "微信聊天里，一个人对长辈、对死党、对陌生人是三个不同的人。\n"
-        "如果你的角色有明显差别，写出来——可以省，由 AI 推导。比如：\n"
-        "「对长辈：恭敬，每条都打全标点，叫'X 老师'。\n"
-        "对死党：碎句，常用'卧槽'，叫外号。\n"
-        "对陌生人：保持距离，称'你'不称'您'，简短。」"
+        "一个人对死党和对长辈是两种语气。有的话写两句，不写 AI 也能推导。"
     ),
-    "persona_create.sensitive_topics_label": "什么话题会让 ta 破防 / 跑题 / 沉默",
+    "persona_create.sensitive_topics_label": "什么话题会让 ta 沉默或岔开",
     "persona_create.sensitive_topics_placeholder": (
-        "性格的「裂缝」是立体感的来源。比如：\n"
-        "「聊到她妈妈会突然回避。聊到画展会忘记时间一直聊。被问感情状态会装没看见。」\n"
-        "可以省。"
+        "有没有一提就躲的事。比如不喜欢被问年龄、聊到某个人会装没看见。可以不填。"
     ),
-    "persona_create.extra_notes_label": "额外补充信息",
+    "persona_create.extra_notes_label": "还有什么要补充的",
     "persona_create.extra_notes_placeholder": (
-        "自由写给生成人格 AI 的补充要求。\n"
-        "请客观描述，例如「不要写成客服口吻」「多保留沉默和短回复」「她偶尔会写长段」。"
+        "比如「别写成客服」「少说教」「她偶尔会写很长一段话」"
     ),
-    "persona_create.relation_label": "你和这个角色是什么关系",
+    "persona_create.relation_label": "你和 ta 是什么关系",
     "persona_create.relation_creator": "我是创作者",
     "persona_create.relation_friend": "我是 ta 的朋友",
     "persona_create.relation_stranger": "我们刚认识",
-    "persona_create.relation_special": "其它（在下方说明）",
+    "persona_create.relation_special": "其它",
     "persona_create.preview_title": "预览",
-    "persona_create.preview_empty": "填完上方后点「生成」，预览会出现在这里",
+    "persona_create.preview_empty": "填好上面点「生成」，预览会出现在这里",
     "persona_create.adjust_placeholder": (
-        "如果生成的结果不满意，写下你想调整的地方。\n"
-        "比如：「再冷淡一点，少说反问句」、「她对动物的偏好再具体些」"
+        "不满意就告诉我怎么改。比如「再冷一点」「少说反问句」「她的猫呢，提一句」"
     ),
-    "persona_create.save_button": "记住这个人，开始相处",
+    "persona_create.save_button": "记住这个人",
 
     # ============================================================
     # 完成总览

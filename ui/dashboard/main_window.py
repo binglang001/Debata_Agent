@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -17,13 +17,15 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from app_config.loader import save_config
 
-from ..theme import Spacing, build_qss, palette_for_theme, resolve_theme_name
+from ..theme import Spacing, cached_qss, palette_for_theme, resolve_theme_name
 from .chats_page import ChatsPage
 from .copy import DASHBOARD_COPY
 from .layout import DEFAULT_LAYOUT, NAV_ITEMS, STATUS_BADGE_MAP
@@ -48,6 +50,7 @@ class DashboardWindow(QMainWindow):
         self.setWindowTitle(DASHBOARD_COPY["window.title"])
         self.setMinimumSize(DEFAULT_LAYOUT.min_width, DEFAULT_LAYOUT.min_height)
         self.resize(DEFAULT_LAYOUT.default_width, DEFAULT_LAYOUT.default_height)
+        self._apply_icon()
 
         # 无边框 + 自定义标题栏 + 透明 root 让 WindowFrame 的圆角 QSS 生效
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
@@ -57,6 +60,7 @@ class DashboardWindow(QMainWindow):
         self._runtime = runtime
         self._theme_choice = self._configured_theme()
         self._current_theme = resolve_theme_name(self._theme_choice)
+        self._applied_theme: str | None = None
 
         # 整窗用 WindowFrame 包一层：QSS 里 QFrame#WindowFrame 设了 border-radius
         root = QFrame()
@@ -90,16 +94,24 @@ class DashboardWindow(QMainWindow):
         content_lay.setSpacing(0)
 
         # stack 包 ScrollArea，仅在当前页溢出时滚动（AutoSizeStack 让 sizeHint 跟当前页走）
-        from PySide6.QtWidgets import QScrollArea
-
         from ..widgets import AutoSizeStack
         self._stack = AutoSizeStack()
+        self._stack.setMaximumWidth(DEFAULT_LAYOUT.page_max_width)
+        self._stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._scroll.setWidget(self._stack)
+        self._scroll.viewport().installEventFilter(self)
+        scroll_content = QWidget()
+        scroll_lay = QHBoxLayout(scroll_content)
+        scroll_lay.setContentsMargins(0, 0, 0, 0)
+        scroll_lay.setSpacing(0)
+        scroll_lay.addStretch(1)
+        scroll_lay.addWidget(self._stack, 0)
+        scroll_lay.addStretch(1)
+        self._scroll.setWidget(scroll_content)
         content_lay.addWidget(self._scroll, 1)
 
         right_lay.addWidget(content_wrap, 1)
@@ -140,6 +152,7 @@ class DashboardWindow(QMainWindow):
         self._status_timer.start()
         self._refresh_topbar()
         self._apply_theme(self._theme_choice)
+        QTimer.singleShot(0, self._sync_content_width)
         QTimer.singleShot(800, self._show_feature_failures)
 
     # ============================================================
@@ -219,12 +232,39 @@ class DashboardWindow(QMainWindow):
     # 导航 / 状态
     # ============================================================
 
+    def eventFilter(self, obj: object, event: QEvent) -> bool:  # noqa: N802
+        scroll = getattr(self, "_scroll", None)
+        if (
+            scroll is not None
+            and obj is scroll.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._sync_content_width()
+        return super().eventFilter(obj, event)
+
+    def _sync_content_width(self) -> None:
+        """Keep dashboard pages centered without letting layout stretch squeeze them."""
+        scroll = getattr(self, "_scroll", None)
+        stack = getattr(self, "_stack", None)
+        if scroll is None or stack is None:
+            return
+        viewport_width = scroll.viewport().width()
+        if viewport_width <= 0:
+            return
+        width = min(viewport_width, DEFAULT_LAYOUT.page_max_width)
+        if stack.minimumWidth() == width and stack.maximumWidth() == width:
+            return
+        stack.setMinimumWidth(width)
+        stack.setMaximumWidth(width)
+        stack.updateGeometry()
+
     def _switch_to(self, key: str) -> None:
         page = self._pages.get(key)
         if page is None:
             return
         self._stack.setCurrentWidget(page)
         self._animate_current_page(page)
+        self._sync_content_width()
         self._scroll.verticalScrollBar().setValue(0)  # 切页回顶
         if hasattr(page, "refresh"):
             try:
@@ -300,6 +340,15 @@ class DashboardWindow(QMainWindow):
         target = "dark" if self._current_theme == "light" else "light"
         self._on_theme_changed(target)
 
+    @staticmethod
+    def _apply_icon() -> None:
+        from pathlib import Path
+
+        from PySide6.QtGui import QIcon
+        icon_path = Path(__file__).parent.parent / "icon.png"
+        if icon_path.exists():
+            QApplication.instance().setWindowIcon(QIcon(str(icon_path)))
+
     def _configured_theme(self) -> str:
         try:
             return self._runtime.config.app.theme
@@ -310,16 +359,22 @@ class DashboardWindow(QMainWindow):
         self._persist_theme(target)
         self._apply_theme(target)
         settings = getattr(self, "_pages", {}).get("settings")
-        if settings is not None and hasattr(settings, "refresh"):
+        if (
+            settings is not None
+            and hasattr(settings, "refresh")
+            and self._stack.currentWidget() is settings
+        ):
             settings.refresh()
 
     def _apply_theme(self, target: str) -> None:
         palette = palette_for_theme(target)
+        resolved = resolve_theme_name(target)
         app = QApplication.instance()
-        if app:
-            app.setStyleSheet(build_qss(palette))
+        if app and self._applied_theme != resolved:
+            app.setStyleSheet(cached_qss(palette))
+            self._applied_theme = resolved
         self._theme_choice = target
-        self._current_theme = resolve_theme_name(target)
+        self._current_theme = resolved
         self._theme_btn.setText("☀" if self._current_theme == "dark" else "☾")
         self._theme_btn.setToolTip(
             f"{DASHBOARD_COPY['topbar.theme_toggle']}（当前：{'跟随系统' if target == 'auto' else target}）"

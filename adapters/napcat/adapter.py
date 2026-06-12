@@ -48,6 +48,21 @@ from .process import NapCatProcessManager
 logger = logging.getLogger(__name__)
 
 
+_LOOPBACK_HOSTS = {"", "localhost", "127.0.0.1", "::1"}
+
+
+def _server_bind_host(host: str) -> str:
+    """server 模式监听地址。
+
+    这里的 host 是 Debata 监听的本机地址，不是 NapCat 设备地址。
+    用户在反向 WS 场景里容易填 localhost；跨设备时这会导致 NapCat 永远连不进来。
+    """
+    raw = (host or "").strip()
+    if raw.lower() in _LOOPBACK_HOSTS:
+        return "0.0.0.0"
+    return raw
+
+
 class NapCatAdapter(IAdapter):
     """OneBot V11 协议的 NapCat 实现。"""
 
@@ -112,6 +127,7 @@ class NapCatAdapter(IAdapter):
         if cfg.mode == "client":
             # 程序作为 WS 客户端，连 ws://{host}:{port}{path}（NapCat = 正向 WS 服务端）
             ws_url = f"ws://{cfg.host}:{cfg.port}{cfg.path}"
+            logger.info("NapCat 配置：client 模式，连接 %s", ws_url)
             connection: NapCatConnection = ReverseWSConnection(
                 ws_url=ws_url,
                 access_token=access_token,
@@ -127,8 +143,22 @@ class NapCatAdapter(IAdapter):
             )
         else:  # mode == "server"
             # 程序作为 WS 服务端，监听 {host}:{port}{path} 等 NapCat 反向连入
+            bind_host = _server_bind_host(cfg.host)
+            if bind_host != cfg.host:
+                logger.warning(
+                    "NapCat server 模式配置 host=%r 只能接受本机连接；"
+                    "已改为监听 %s。跨设备时 NapCat 反向 WS 目标请填程序所在机器的局域网 IP。",
+                    cfg.host,
+                    bind_host,
+                )
+            logger.info(
+                "NapCat 配置：server 模式，监听 ws://%s:%s%s",
+                bind_host,
+                cfg.port,
+                cfg.path,
+            )
             connection = ForwardWSConnection(
-                host=cfg.host,
+                host=bind_host,
                 port=cfg.port,
                 path=cfg.path,
                 access_token=access_token,
@@ -421,6 +451,38 @@ class NapCatAdapter(IAdapter):
                 break
         if last_error is not None:
             logger.warning(f"获取文件 URL 失败 file_id={file_id}: {last_error}")
+        return None
+
+    async def get_image_url(self, file_id: str) -> str | None:
+        if file_id and Path(file_id).exists():
+            return file_id
+        last_error: Exception | None = None
+        for params in (
+            {"file": file_id},
+            {"file_id": file_id},
+        ):
+            try:
+                data = await self._api.call("get_image", params)
+                value = (
+                    data.get("file")
+                    or data.get("file_path")
+                    or data.get("path")
+                    or data.get("url")
+                    or None
+                )
+                if value:
+                    return str(value)
+            except AdapterAPIError as e:
+                last_error = e
+                msg = str(e).lower()
+                if "no such file" in msg or "not found" in msg or "不存在" in msg:
+                    break
+                continue
+            except asyncio.TimeoutError as e:
+                last_error = e
+                break
+        if last_error is not None:
+            logger.warning(f"获取图片文件失败 file_id={file_id}: {last_error}")
         return None
 
     async def upload_file(

@@ -44,6 +44,13 @@ def test_minimal_valid_config():
     assert budgets["get_recent_chat_messages"].artifact_threshold_tokens == 3000
 
 
+def test_napcat_adapter_path_normalizes_legacy_values():
+    assert NapCatAdapterConfig(path=None).path == "/"  # type: ignore[arg-type]
+    assert NapCatAdapterConfig(path="").path == "/"
+    assert NapCatAdapterConfig(path="onebot").path == "/onebot"
+    assert NapCatAdapterConfig(path="/onebot").path == "/onebot"
+
+
 def test_tool_result_budget_config_accepts_custom_values():
     cfg = _minimal_config()
     cfg.behavior.context.tool_result_budgets["read_file"] = ToolResultBudgetConfig(
@@ -76,6 +83,11 @@ def test_legacy_tool_result_overrides_still_load():
     assert cfg.behavior.context.tool_result_soft_limit_tokens == 700
     assert cfg.behavior.context.tool_result_hard_cap_tokens == 1600
     assert cfg.behavior.context.tool_result_soft_overrides["read_file"] == 900
+
+
+def test_proactive_context_budget_defaults_to_4k():
+    cfg = _minimal_config()
+    assert cfg.behavior.proactive_context_token_budget == 4096
 
 
 def test_agent_provider_must_exist():

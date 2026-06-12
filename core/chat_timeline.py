@@ -19,7 +19,6 @@ from adapters.types import IncomingMessage, MediaSegment, MediaType
 from utils import get_time
 
 _PARAM_SPLIT_RE = re.compile(r",(?=\w+=)")
-_CQ_RE = re.compile(r"\[CQ:(?P<body>[^\]]+)\]")
 
 
 @dataclass(slots=True)
@@ -35,6 +34,7 @@ class ChatTimelineMessage:
     msg_id: str | None
     text: str
     raw_message: str
+    reply_to: str | None = None
     cq_segments: list[dict[str, Any]] = field(default_factory=list)
     attachments: list[dict[str, Any]] = field(default_factory=list)
     source: Literal["qq"] = "qq"
@@ -75,6 +75,7 @@ class ChatTimelineStore:
                 target_id=event.group_id if event.is_group() else event.user_id,
                 group_id=event.group_id,
                 msg_id=event.message_id,
+                reply_to=event.reply_to,
                 text=text,
                 raw_message=raw_message,
                 cq_segments=_parse_cq_segments(raw_message),
@@ -109,6 +110,7 @@ class ChatTimelineStore:
                 target_id=target_id,
                 group_id=target_id if target_scope == "group" else None,
                 msg_id=str(msg_id) if msg_id is not None else None,
+                reply_to=None,
                 text=label,
                 raw_message=raw_message,
                 cq_segments=_parse_cq_segments(raw_message),
@@ -137,11 +139,17 @@ class ChatTimelineStore:
         messages: list[ChatTimelineMessage],
         *,
         include_raw: bool = False,
+        compact: bool = True,
     ) -> str:
         lines: list[str] = []
         for message in messages:
-            content = _timeline_content(message)
-            suffix = f" [msg_id={message.msg_id}]" if message.msg_id else ""
+            content = _timeline_content(message, compact=compact)
+            refs: list[str] = []
+            if message.reply_to:
+                refs.append(f"reply_to={message.reply_to}")
+            if message.msg_id:
+                refs.append(f"msg_id={message.msg_id}")
+            suffix = f" [{' '.join(refs)}]" if refs else ""
             lines.append(
                 f"{message.time_text} {message.sender_name}({message.sender_id})："
                 f"{content}{suffix}"
@@ -178,21 +186,22 @@ def _items_since_msg_id(
     return items
 
 
-def _timeline_content(message: ChatTimelineMessage) -> str:
+def _timeline_content(message: ChatTimelineMessage, *, compact: bool = True) -> str:
     text = (message.text or "").strip()
+    rendered_text = _compact_text_attachments(text) if compact and text else text
     if message.attachments:
         attachment_texts = [
             rendered
             for item in message.attachments
-            if (rendered := _format_attachment_if_missing(item, text))
+            if (rendered := _format_attachment_if_missing(item, rendered_text, compact=compact))
         ]
-        if text and attachment_texts:
-            return f"{text} {' '.join(attachment_texts)}"
-        if text:
-            return text
-        return " ".join(_format_attachment(item) for item in message.attachments)
-    if text:
-        return text
+        if rendered_text and attachment_texts:
+            return f"{rendered_text} {' '.join(attachment_texts)}"
+        if rendered_text:
+            return rendered_text
+        return " ".join(_format_attachment(item, compact=compact) for item in message.attachments)
+    if rendered_text:
+        return rendered_text
     return "(空消息)"
 
 
@@ -265,6 +274,7 @@ def _attachment_from_params(
         ("url", "url"),
         ("file", "file"),
         ("file_id", "file"),
+        ("workspace", "workspace"),
         ("id", "id"),
         ("name", "name"),
     ):
@@ -279,13 +289,13 @@ def _parse_cq_segments(raw_message: str) -> list[dict[str, Any]]:
     if not raw_message:
         return []
     segments: list[dict[str, Any]] = []
-    for match in _CQ_RE.finditer(raw_message):
-        body = match.group("body")
+    for segment_match in _iter_cq_segments(raw_message):
+        body = segment_match["body"]
         if "," in body:
             cq_type, params_str = body.split(",", 1)
         else:
             cq_type, params_str = body, ""
-        raw = match.group(0)
+        raw = segment_match["raw"]
         segments.append(
             {
                 "type": cq_type,
@@ -293,6 +303,33 @@ def _parse_cq_segments(raw_message: str) -> list[dict[str, Any]]:
                 "raw": raw,
             }
         )
+    return segments
+
+
+def _iter_cq_segments(raw_message: str) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    i = 0
+    while True:
+        start = raw_message.find("[CQ:", i)
+        if start < 0:
+            break
+        pos = start + 4
+        while True:
+            end = raw_message.find("]", pos)
+            if end < 0:
+                return segments
+            tail = raw_message[end + 1 :]
+            if not re.match(r"^,\w+=", tail):
+                break
+            pos = end + 1
+        raw = raw_message[start : end + 1]
+        segments.append(
+            {
+                "body": raw_message[start + 4 : end],
+                "raw": raw,
+            }
+        )
+        i = end + 1
     return segments
 
 
@@ -310,7 +347,7 @@ def _parse_cq_params(params_str: str) -> dict[str, str]:
 
 def _dedupe_attachments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for item in items:
         key = (
             str(item.get("type") or ""),
@@ -318,15 +355,21 @@ def _dedupe_attachments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             str(item.get("file") or ""),
             str(item.get("forward_id") or item.get("id") or ""),
         )
-        if key in seen:
+        existing = seen.get(key)
+        if existing is not None:
+            for field, value in item.items():
+                if value and not existing.get(field):
+                    existing[field] = value
             continue
-        seen.add(key)
+        seen[key] = item
         result.append(item)
     return result
 
 
-def _format_attachment(item: dict[str, Any]) -> str:
+def _format_attachment(item: dict[str, Any], *, compact: bool = False) -> str:
     item_type = str(item.get("type") or "unknown")
+    if compact:
+        return _format_attachment_compact(item, item_type)
     parts = [item_type]
     for key in ("summary", "url", "file", "forward_id", "name", "id"):
         value = item.get(key)
@@ -335,8 +378,65 @@ def _format_attachment(item: dict[str, Any]) -> str:
     return "[" + " ".join(parts) + "]"
 
 
-def _format_attachment_if_missing(item: dict[str, Any], text: str) -> str:
+def _format_attachment_compact(item: dict[str, Any], item_type: str) -> str:
+    if item_type == "image":
+        workspace = item.get("workspace")
+        name = item.get("name")
+        if workspace:
+            return f"[图片 workspace={workspace}]"
+        if name:
+            return f"[图片 name={name}]"
+        return "[图片]"
+    if item_type == "face":
+        face_id = item.get("id") or item.get("file")
+        return f"[表情{face_id}]" if face_id else "[表情]"
+    if item_type == "forward":
+        forward_id = item.get("forward_id") or item.get("id")
+        return f"[合并转发 id={forward_id}]" if forward_id else "[合并转发]"
+    if item_type in {"file", "voice", "record", "video"}:
+        name = item.get("name") or item.get("file")
+        return f"[{item_type} {name}]" if name else f"[{item_type}]"
+    return f"[{item_type}]"
+
+
+def _compact_text_attachments(text: str) -> str:
+    """压缩正文里已经展开的图片/转发 CQ 可读文本，保留可操作字段。"""
+    text = re.sub(
+        r"\[图片[^\]]*\]",
+        lambda m: (
+            f"[图片 workspace={workspace.group(1)}]"
+            if (workspace := re.search(r"workspace=([^\]\s]+)", m.group(0)))
+            else "[图片]"
+        ),
+        text,
+    )
+    text = re.sub(
+        r"\[image summary=[^\]]*\]",
+        "[图片]",
+        text,
+    )
+    text = re.sub(
+        r"\[合并转发[^\]]*?id=([^\]\s]+)[^\]]*\]",
+        r"[合并转发 id=\1]",
+        text,
+    )
+    return text
+
+
+def _format_attachment_if_missing(
+    item: dict[str, Any],
+    text: str,
+    *,
+    compact: bool = True,
+) -> str:
     """只补充正文里没有体现的关键附件信息，避免重复刷屏。"""
+    if compact:
+        compacted = _format_attachment(item, compact=True)
+        if compacted == "[图片]" and "[图片" in text:
+            return ""
+        if compacted and compacted not in text:
+            return compacted
+        return ""
     for key in ("url", "file", "forward_id", "id"):
         value = item.get(key)
         if value and str(value) not in text:

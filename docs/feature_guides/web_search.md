@@ -1,17 +1,13 @@
 # 联网搜索（Web Search）
 
-## 先做
+AI 需要实时信息时自动上网搜。走 DuckDuckGo，免费用，不折腾。
 
-1. 设置页 / 向导里打开 Web Search。
-2. 默认使用 [DuckDuckGo](https://duckduckgo.com/)，不需要 API Key。
-3. 建议 `max_results` 保持 5，超时时间保持 10 秒。
+## 操作
 
-## 依赖
-
-项目依赖使用 [`ddgs`](https://pypi.org/project/ddgs/)。如果启动时报缺依赖，请重新安装项目依赖。
+设置页 → 功能 →「联网搜索」卡片，打开开关。没有额外配置项。
 
 ## 注意
 
-- DuckDuckGo 在部分网络环境下不可达，搜索会超时。
-- 搜索结果会占上下文，结果数不要开太大。
-- AI 只会在需要实时信息时调用搜索，不会每条消息都查。
+- DuckDuckGo 部分网络可能不可达，搜索会超时——不影响其他功能
+- AI 只在需要的时候搜，不是每次回复都搜
+- 依赖 `ddgs` 包，装不上就 `pip install ddgs`

@@ -17,6 +17,8 @@ def test_completion_result_defaults():
     assert r.tool_calls == []
     assert r.reasoning_content == ""
     assert isinstance(r.usage, Usage)
+    assert r.usage.cached_tokens == 0
+    assert r.usage.cache_creation_tokens == 0
     assert not r.has_tool_calls()
 
 

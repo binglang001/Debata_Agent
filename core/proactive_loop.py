@@ -37,6 +37,13 @@ _ROUTER_TOOL_SHRINK_CTX = SimpleNamespace(
 )
 _ROUTER_TEXT_LIMIT_TOKENS = 256
 _ROUTER_TOOL_LIMIT_TOKENS = 96
+_OUT_OF_BAND_DENIED_TOOLS = frozenset(
+    {
+        "start_agent_task",
+        "summarize_conversation",
+        "summarize_chat_history",
+    }
+)
 _INTERNAL_ID_KEYS = {
     "msg_id",
     "msg_ids",
@@ -56,10 +63,20 @@ _ROLE_LABELS = {
 _ROUTER_SUMMARY_DROP_MARKERS = (
     "<send_receipt",
     "</send_receipt>",
+    "<send_status",
+    "</send_status>",
+    "<task_context",
+    "</task_context>",
     "错误：未调用工具",
     "send_private_messages",
     "send_group_message",
     "no_action",
+)
+_ROUTER_RUNTIME_CONTEXT_KINDS = frozenset(
+    {
+        "task_context_snapshot",
+        "send_done_snapshot",
+    }
 )
 _ROLE_PREFIX_PATTERN = re.compile(r"\[(?:assistant|tool|system)\]\s*", re.IGNORECASE)
 
@@ -69,6 +86,8 @@ def _format_proactive_router_history(records: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     tool_names: dict[str, str] = {}
     for record in records:
+        if _is_runtime_context_record(record):
+            continue
         role = str(record.get("role") or "unknown")
 
         if role == "assistant":
@@ -113,6 +132,14 @@ def _format_proactive_router_history(records: list[dict[str, Any]]) -> str:
         + "\n".join(lines)
         + "\n</recent_context>"
     )
+
+
+def _is_runtime_context_record(record: dict[str, Any]) -> bool:
+    meta = record.get("metadata")
+    if isinstance(meta, dict) and meta.get("kind") in _ROUTER_RUNTIME_CONTEXT_KINDS:
+        return True
+    content = str(record.get("content") or "")
+    return any(marker in content for marker in _ROUTER_SUMMARY_DROP_MARKERS)
 
 
 def _summarize_router_tool_result(tool_name: str, content: str) -> str:
@@ -344,14 +371,22 @@ class ProactiveLoop:
                     important_memory = await self.pipeline._important_memory_text(
                         None,
                         query=router_history_text,
-                        token_budget=2048,
+                        token_budget=self.behavior_cfg.proactive_context_token_budget,
                     )
                     if important_memory:
-                        router_context_parts.append(
-                            '<long_term_memory priority="medium">\n'
-                            f"{_clean_router_text(important_memory)}\n"
-                            "</long_term_memory>"
-                        )
+                        if self.pipeline.features_cfg.long_term_memory.mode == "rag":
+                            router_context_parts.append(
+                                '<retrieved_conversation_context priority="medium" source="rag">\n'
+                                "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不是新的用户消息。\n"
+                                f"{_clean_router_text(important_memory)}\n"
+                                "</retrieved_conversation_context>"
+                            )
+                        else:
+                            router_context_parts.append(
+                                '<long_term_memory priority="medium">\n'
+                                f"{_clean_router_text(important_memory)}\n"
+                                "</long_term_memory>"
+                            )
                     rolling_summary = self.pipeline._rolling_summary_text()
                     if rolling_summary:
                         rolling_summary = _clean_router_summary(rolling_summary)
@@ -368,6 +403,8 @@ class ProactiveLoop:
                             f"现在是{now}。后台主动思考触发。"
                             "如果最近用户明确要求你在“下次主动思考”时发消息、提醒用户或执行明确操作，"
                             "本轮就是那个时机。"
+                            "如果距上次自然互动较久、存在用户先前提过的自然由头，或当前时间点适合问候，"
+                            "也可以主动找对方聊；但必须给出具体理由，给不出理由就 NO_ACTIONS。"
 
                     )
                     router_messages = build_messages(
@@ -383,7 +420,9 @@ class ProactiveLoop:
                         ),
                         memory_mode=self.pipeline.features_cfg.long_term_memory.mode,
                     )
-                    needs_action = await self.proactive_agent.should_act(router_messages)
+                    needs_action, action_reason = await self.proactive_agent.should_act(
+                        router_messages
+                    )
                 except Exception as e:
                     logger.exception(f"主动路由判断失败: {e}，本次不主动发言")
                     self.pipeline.mark_activity()
@@ -392,17 +431,35 @@ class ProactiveLoop:
                     logger.info("主动路由：本次跳过")
                     self.pipeline.mark_activity()
                     return
+            else:
+                action_reason = "后台空闲，按合适时机判断是否主动联系"
+
+            reason_text = (
+                action_reason.strip()
+                if isinstance(action_reason, str) and action_reason.strip()
+                else "后台空闲，按合适时机判断是否主动联系"
+            )
 
             task_context = (
-                "<proactive_turn priority=\"critical\">\n"
                 f"现在是{now}。本轮由系统后台主动思考触发，不是用户刚发来的新消息。\n"
+                "近期上下文、重要记忆、滚动摘要和未完成事项已在历史与上下文中提供。"
+            )
+            user_event = (
+                "[系统事件 · 非用户消息] 后台主动思考触发，不是用户新消息。\n"
+                f"触发理由：{reason_text}\n"
                 "请根据近期上下文、重要记忆、滚动摘要和未完成事项判断是否需要主动行动。\n"
                 "如果有人要求你在之后、下次空闲或下次主动思考时执行某事，本轮就是可执行时机；"
                 "只处理仍未完成且仍有意义的事项。\n"
-                "需要联系用户就调用发送工具；没有需要执行的事就调用 no_action。\n"
-                "</proactive_turn>"
+                "如果这是合适的主动问候时机，可以按系统提示中的自然开场习惯起一个话头。\n"
+                "不要延续或重复最近对话里已经完成的话题；需要联系用户就调用发送工具，没有合适的事就调用 no_action。"
             )
-            await self.pipeline.run_one_turn(task_context, lock_already_held=True)
+            await self.pipeline.run_one_turn(
+                task_context,
+                user_event=user_event,
+                lock_already_held=True,
+                history_conversation_id="system:proactive",
+                tool_denylist=_OUT_OF_BAND_DENIED_TOOLS,
+            )
         finally:
             self.pipeline.reply_lock.release()
 

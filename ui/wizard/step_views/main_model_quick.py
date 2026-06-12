@@ -170,7 +170,15 @@ class MainModelQuickStepView(BaseStepView):
         QDesktopServices.openUrl(QUrl("https://platform.deepseek.com/api_keys"))
 
     def _open_tutorial(self) -> None:
+        from pathlib import Path
+
         from ..components import TutorialDialog
 
-        dlg = TutorialDialog("DeepSeek API 密钥获取教程", _DEEPSEEK_TUTORIAL_MD, self)
+        docs_dir = Path(__file__).resolve().parent.parent.parent.parent / "docs"
+        dlg = TutorialDialog(
+            "DeepSeek API 密钥获取教程",
+            _DEEPSEEK_TUTORIAL_MD,
+            self,
+            base_dir=docs_dir,
+        )
         dlg.exec()

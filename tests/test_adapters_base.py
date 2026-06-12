@@ -402,6 +402,8 @@ async def test_optional_methods_default_raise():
     with pytest.raises(NotImplementedError):
         await a.get_file_url("f")
     with pytest.raises(NotImplementedError):
+        await a.get_image_url("img")
+    with pytest.raises(NotImplementedError):
         await a.upload_file(
             Target(adapter="min", scope="private", target_id="1"),
             Path("/tmp/x"),

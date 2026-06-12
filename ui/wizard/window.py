@@ -14,7 +14,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QFrame,
@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -49,6 +51,7 @@ from app_config.schema import (
     WhitelistConfig,
 )
 
+from ..dashboard.layout import DEFAULT_LAYOUT
 from ..theme import Spacing
 from .components import WhitelistState
 from .context import WizardContext
@@ -62,6 +65,15 @@ from .flow import (
     progress,
 )
 from .persona_creator import PersonaCreatorStepView
+from .persona_render import (
+    admin_entries as _admin_entries,
+)
+from .persona_render import (
+    admin_entries_from_brief as _admin_entries_from_brief,
+)
+from .persona_render import (
+    render_minimal_persona as _render_minimal_persona,
+)
 from .step_views import (
     AdapterStepView,
     EmbeddingStepView,
@@ -98,6 +110,14 @@ class WizardWindow(QMainWindow):
         self.setMinimumSize(960, 720)
         self.resize(1080, 800)
 
+        # 窗口图标
+        from pathlib import Path
+
+        from PySide6.QtGui import QIcon
+        icon = Path(__file__).parent.parent / "icon.png"
+        if icon.exists():
+            self.setWindowIcon(QIcon(str(icon)))
+
         self._paths = paths
         self._secrets = secrets
         self._context = WizardContext()
@@ -122,9 +142,10 @@ class WizardWindow(QMainWindow):
         root_layout.addWidget(topbar)
 
         # 中间：step 视图栈包 ScrollArea，仅在当前 step 溢出时滚动
-        from PySide6.QtWidgets import QScrollArea
         self._active_view: QWidget | None = None
         self._page_host = QWidget()
+        self._page_host.setMaximumWidth(DEFAULT_LAYOUT.page_max_width)
+        self._page_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._page_lay = QVBoxLayout(self._page_host)
         self._page_lay.setContentsMargins(0, 0, 0, 0)
         self._page_lay.setSpacing(0)
@@ -134,7 +155,15 @@ class WizardWindow(QMainWindow):
         self._wizard_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._wizard_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._wizard_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._wizard_scroll.setWidget(self._page_host)
+        self._wizard_scroll.viewport().installEventFilter(self)
+        scroll_content = QWidget()
+        scroll_lay = QHBoxLayout(scroll_content)
+        scroll_lay.setContentsMargins(0, 0, 0, 0)
+        scroll_lay.setSpacing(0)
+        scroll_lay.addStretch(1)
+        scroll_lay.addWidget(self._page_host, 0)
+        scroll_lay.addStretch(1)
+        self._wizard_scroll.setWidget(scroll_content)
 
         wrap = QWidget()
         wrap_lay = QVBoxLayout(wrap)
@@ -174,6 +203,7 @@ class WizardWindow(QMainWindow):
                 v.request_advance.connect(self._on_next)
 
         self._jump_to(StepId.WELCOME)
+        QTimer.singleShot(0, self._sync_page_width)
 
     # ============================================================
     # UI 构造
@@ -250,6 +280,32 @@ class WizardWindow(QMainWindow):
     # 流转
     # ============================================================
 
+    def eventFilter(self, obj: object, event: QEvent) -> bool:  # noqa: N802
+        scroll = getattr(self, "_wizard_scroll", None)
+        if (
+            scroll is not None
+            and obj is scroll.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._sync_page_width()
+        return super().eventFilter(obj, event)
+
+    def _sync_page_width(self) -> None:
+        """Keep wizard pages centered without letting layout stretch squeeze them."""
+        scroll = getattr(self, "_wizard_scroll", None)
+        host = getattr(self, "_page_host", None)
+        if scroll is None or host is None:
+            return
+        viewport_width = scroll.viewport().width()
+        if viewport_width <= 0:
+            return
+        width = min(viewport_width, DEFAULT_LAYOUT.page_max_width)
+        if host.minimumWidth() == width and host.maximumWidth() == width:
+            return
+        host.setMinimumWidth(width)
+        host.setMaximumWidth(width)
+        host.updateGeometry()
+
     def _jump_to(self, step: StepId) -> None:
         if step not in self._views:
             return
@@ -269,6 +325,7 @@ class WizardWindow(QMainWindow):
             view.refresh()
         self._update_topbar()
         self._update_buttons()
+        self._sync_page_width()
         self._sync_scroll_height()
 
     def _sync_scroll_height(self) -> None:
@@ -454,7 +511,11 @@ class WizardWindow(QMainWindow):
         tts_key_id = None
         if c.tts.enabled:
             textra = c.tts.extra or {}
-            if textra.get("type") == "api" and textra.get("api_key"):
+            if (
+                textra.get("type") == "api"
+                and textra.get("provider") != "edge"
+                and textra.get("api_key")
+            ):
                 tts_provider = textra.get("provider") or "api"
                 tts_key_id = f"tts_{tts_provider}"
                 self._secrets.set(tts_key_id, textra["api_key"])
@@ -643,9 +704,9 @@ class WizardWindow(QMainWindow):
             textra = c.tts.extra or {}
             features.tts = TTSFeatureConfig(
                 enabled=True,
-                type=textra.get("type", "local"),
+                type=textra.get("type", "api"),
                 local_model=textra.get("local_model", "voxcpm2"),
-                provider=textra.get("provider") or None,
+                provider=textra.get("provider") or "edge",
                 api_key_id=tts_key_id,
                 extra_credentials=textra.get("extra_credentials", {}),
                 reference_audio=textra.get("reference_audio", ""),
@@ -841,52 +902,5 @@ class WizardWindow(QMainWindow):
             event.accept()
         else:
             event.ignore()
-
-
-def _admin_entries(admin_qq: str, admin_name: str) -> list[dict[str, object]]:
-    if not admin_qq:
-        return []
-    entry: dict[str, object] = {"qq": int(admin_qq), "role": "owner"}
-    if admin_name:
-        entry["name"] = admin_name
-    return [entry]
-
-
-def _admin_entries_from_brief(brief) -> list[dict[str, object]]:
-    entries: list[dict[str, object]] = []
-    for item in getattr(brief, "admins", []) or []:
-        qq = str(item.get("qq", "")).strip()
-        name = str(item.get("name", "")).strip()
-        relation = str(item.get("relation", "")).strip()
-        if not qq:
-            continue
-        entry: dict[str, object] = {"qq": int(qq), "role": "owner"}
-        if name:
-            entry["name"] = name
-        if relation:
-            entry["relation"] = relation
-        entries.append(entry)
-    if entries:
-        return entries
-    return _admin_entries(getattr(brief, "admin_qq", ""), getattr(brief, "admin_name", ""))
-
-
-def _render_minimal_persona(name: str, xml: str, admins: list[dict[str, object]] | None = None) -> str:
-    import json
-
-    safe = xml.replace("'''", "\\'\\'\\'")
-    admins_text = json.dumps(admins or [], ensure_ascii=False, indent=4)
-    admins_text = "\n".join("    " + line for line in admins_text.splitlines())
-    return (
-        '"""自动生成的人格档案。"""\n\n'
-        "PERSONA_PROMPT = '''\n"
-        f"{safe}\n"
-        "'''\n\n"
-        "PERSONA_VARS = {\n"
-        f"    \"name\": \"{name}\",\n"
-        f"    \"admins\": {admins_text},\n"
-        "}\n"
-    )
-
 
 __all__ = ["WizardWindow"]

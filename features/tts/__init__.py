@@ -54,22 +54,16 @@ class ITTSService(ABC):
 __all__ = [
     "TTSError",
     "ITTSService",
-    "BaiduTTSService",
+    "EdgeTTSService",
     "iFlytekTTSService",
-    "VolcengineTTSService",
 ]
 
 
-def _get_baidu_service():
-    from .baidu_service import BaiduTTSService
-    return BaiduTTSService
+def _get_edge_service():
+    from .edge_service import EdgeTTSService
+    return EdgeTTSService
 
 
 def _get_iflytek_service():
     from .iflytek_service import iFlytekTTSService
     return iFlytekTTSService
-
-
-def _get_volcengine_service():
-    from .volcengine_service import VolcengineTTSService
-    return VolcengineTTSService

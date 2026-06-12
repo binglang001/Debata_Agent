@@ -8,12 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from adapters.types import Target
 from utils import get_time
 
 from .base import ToolContext, tool
-from .message_builder import build_message, contains_forbidden, typing_delay
+from .message_builder import (
+    MessageBuildError,
+    build_message_action,
+    contains_forbidden,
+    typing_delay,
+)
 from .schemas import (
     RecallMessageArgs,
     SendGroupArgs,
@@ -32,22 +38,15 @@ def _mark_activity(ctx: ToolContext) -> None:
 def _send_result(
     *,
     sent: list[dict],
-    sent_messages: list[dict],
     errors: list[str],
     action_count: int,
 ) -> dict:
     result: dict = {
         "ok": bool(sent) or not action_count,
         "status": "sent",
-        "brief": (
-            f"已发送 {len(sent)} 条消息，QQ 可见。"
-            if sent
-            else "发送尝试完成，但没有消息发出。"
-        ),
         "qq_visible": bool(sent),
         "count": len(sent),
         "sent": sent,
-        "sent_messages": sent_messages,
     }
     if errors:
         result["errors"] = errors
@@ -81,6 +80,21 @@ def _sent_message_item(
     return item
 
 
+async def _send_action_direct(ctx: ToolContext, target: Target, action: dict) -> str | None:
+    kind = str(action.get("kind") or "text")
+    if kind in {"emoji", "image"}:
+        return await ctx.adapter.send_image(  # type: ignore[union-attr]
+            target,
+            image_path=(
+                Path(str(action.get("image_path")))
+                if action.get("image_path")
+                else None
+            ),
+            image_url=str(action.get("image_url") or "") or None,
+        )
+    return await ctx.adapter.send_text(target, str(action.get("content") or ""))  # type: ignore[union-attr]
+
+
 # ============================================================
 # send_private_messages
 # ============================================================
@@ -89,7 +103,7 @@ def _sent_message_item(
 @tool(
     name="send_private_messages",
     description=(
-        "向 QQ 用户发送私聊消息。可混合文字/图片，按 order 排序，delay 控制间隔。"
+        "向 QQ 用户发送私聊消息。可混合文字/表情包/图片，按 order 排序，delay 控制间隔。"
         "可在 content 开头加 [CQ:reply,id=消息ID] 引用回复。"
         "send_only=true 则正常发送后直接结束。"
     ),
@@ -108,10 +122,17 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
     sorted_targets = sorted(args.targets, key=lambda t: t.order)
 
     for t in sorted_targets:
-        msg, label = await build_message(t.content, t.image, ctx.emoji_dir)
-        if msg is None:
+        try:
+            message_action = build_message_action(
+                t.content,
+                t.emoji,
+                t.image,
+                ctx.emoji_dir,
+                ctx.workspace_dir,
+            )
+        except MessageBuildError as e:
             errors.append(
-                f"target_qq={t.target_qq}: 内容为空或表情包不存在"
+                f"target_qq={t.target_qq}: {e}"
             )
             continue
         if t.content and contains_forbidden(t.content):
@@ -122,7 +143,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
 
         delay = t.delay
         if delay is None:
-            # 文本按长度估算延迟；纯图片走 0.5 秒
+            # 文本按长度估算延迟；表情包/图片走 0.5 秒
             delay = typing_delay(
                 t.content or "",
                 chars_per_second=ctx.typing_chars_per_second,
@@ -134,10 +155,8 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
                 "order": t.order,
                 "target_scope": "private",
                 "target_id": str(t.target_qq),
-                "content": msg,
-                "label": label or "",
                 "delay": delay,
-                "kind": "text",
+                **message_action,
             }
         )
 
@@ -148,7 +167,6 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
         return result
 
     sent: list[dict[str, str | int | None]] = []
-    sent_messages: list[dict] = []
     for i, action in enumerate(actions):
         target = Target(
             adapter=ctx.adapter.name,
@@ -156,7 +174,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
             target_id=str(action["target_id"]),
         )
         try:
-            msg_id = await ctx.adapter.send_text(target, str(action["content"]))
+            msg_id = await _send_action_direct(ctx, target, action)
             _mark_activity(ctx)
         except Exception as e:  # noqa: BLE001
             logger.exception(f"send_private_messages 发送失败 target={target.target_id}: {e}")
@@ -164,13 +182,6 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
             continue
 
         sent.append(
-            {
-                "order": int(action["order"]),
-                "target_qq": target.target_id,
-                "msg_id": str(msg_id) if msg_id is not None else None,
-            }
-        )
-        sent_messages.append(
             _sent_message_item(
                 target_type="private",
                 target_id=target.target_id,
@@ -187,7 +198,6 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
 
     return _send_result(
         sent=sent,
-        sent_messages=sent_messages,
         errors=errors,
         action_count=len(actions),
     )
@@ -201,7 +211,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
 @tool(
     name="send_group_message",
     description=(
-        "向 QQ 群发送消息。可混合文字/图片，按 order 排序，delay 控制间隔。"
+        "向 QQ 群发送消息。可混合文字/表情包/图片，按 order 排序，delay 控制间隔。"
         "可在 content 开头加 [CQ:reply,id=msg_id] 引用；@人用 [CQ:at,qq=QQ号]。"
         "send_only=true 则正常发送后直接结束。"
     ),
@@ -219,9 +229,16 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
     sorted_targets = sorted(args.targets, key=lambda t: t.order)
 
     for t in sorted_targets:
-        msg, label = await build_message(t.content, t.image, ctx.emoji_dir)
-        if msg is None:
-            errors.append("内容为空或表情包不存在")
+        try:
+            message_action = build_message_action(
+                t.content,
+                t.emoji,
+                t.image,
+                ctx.emoji_dir,
+                ctx.workspace_dir,
+            )
+        except MessageBuildError as e:
+            errors.append(str(e))
             continue
         if t.content and contains_forbidden(t.content):
             errors.append("内容含禁止标签")
@@ -240,10 +257,8 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
                 "order": t.order,
                 "target_scope": "group",
                 "target_id": str(args.group_id),
-                "content": msg,
-                "label": label or "",
                 "delay": delay,
-                "kind": "text",
+                **message_action,
             }
         )
 
@@ -254,7 +269,6 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
         return result
 
     sent: list[dict[str, str | int | None]] = []
-    sent_messages: list[dict] = []
     for i, action in enumerate(actions):
         target = Target(
             adapter=ctx.adapter.name,
@@ -262,7 +276,7 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
             target_id=str(action["target_id"]),
         )
         try:
-            msg_id = await ctx.adapter.send_text(target, str(action["content"]))
+            msg_id = await _send_action_direct(ctx, target, action)
             _mark_activity(ctx)
         except Exception as e:  # noqa: BLE001
             logger.exception(f"send_group_message 发送失败 group={target.target_id}: {e}")
@@ -270,13 +284,6 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
             continue
 
         sent.append(
-            {
-                "order": int(action["order"]),
-                "group_id": target.target_id,
-                "msg_id": str(msg_id) if msg_id is not None else None,
-            }
-        )
-        sent_messages.append(
             _sent_message_item(
                 target_type="group",
                 target_id=target.target_id,
@@ -293,7 +300,6 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
 
     return _send_result(
         sent=sent,
-        sent_messages=sent_messages,
         errors=errors,
         action_count=len(actions),
     )

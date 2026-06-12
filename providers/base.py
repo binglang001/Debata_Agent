@@ -54,6 +54,8 @@ class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     reasoning_tokens: int = 0
+    cached_tokens: int = 0
+    cache_creation_tokens: int = 0
     total_tokens: int = 0
 
 

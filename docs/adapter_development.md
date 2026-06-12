@@ -57,8 +57,8 @@ async def call_api(self, action: str, **params) -> dict
 
 ```python
 async def fetch_voice_text(self, message_id) -> str
-async def send_voice(self, target, audio_path) -> str | None
 async def get_file_url(self, file_id) -> str | None
+async def get_image_url(self, file_id) -> str | None
 async def upload_file(self, target, file_path, *, display_name=None)
 async def get_forward_msg(self, forward_id) -> list[dict]
 async def get_group_history(self, group_id, count=100) -> list[dict]

@@ -10,12 +10,13 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ...theme import Spacing
+from ...widgets.model_combo import ModelComboBox
 from ..components import ApiKeyInput, SectionCard
 from ..context import BaseStepView, WizardContext
 from ..copy import COPY
@@ -60,14 +61,23 @@ class _SubAgentBlock(QWidget):
             self._provider.addItem(info["display"], preset)
         form.addRow(QLabel("提供商"), self._provider)
 
-        self._model = QLineEdit()
+        model_row = QHBoxLayout()
+        model_row.setSpacing(Spacing.SM)
+        self._model = ModelComboBox()
         self._model.setPlaceholderText("模型 ID")
-        form.addRow(QLabel("模型"), self._model)
+        model_row.addWidget(self._model, 1)
+        self._fetch_models_btn = QPushButton("获取模型")
+        self._fetch_models_btn.setProperty("role", "secondary")
+        self._fetch_models_btn.clicked.connect(self._on_fetch_models)
+        model_row.addWidget(self._fetch_models_btn)
+        model_wrap = QWidget()
+        model_wrap.setLayout(model_row)
+        form.addRow(QLabel("模型"), model_wrap)
 
         self._key = ApiKeyInput(placeholder="API 密钥")
         form.addRow(QLabel("密钥"), self._key)
         self._provider.currentIndexChanged.connect(lambda *_: self._key.set_test_state("idle"))
-        self._model.textChanged.connect(lambda *_: self._key.set_test_state("idle"))
+        self._model.currentTextChanged.connect(lambda *_: self._key.set_test_state("idle"))
         self._key.test_requested.connect(self._on_test)
 
         outer.addWidget(self._detail)
@@ -99,7 +109,7 @@ class _SubAgentBlock(QWidget):
             "use_main": self._use_main.isChecked(),
             "enabled": self._enabled.isChecked(),
             "preset": self._provider.currentData(),
-            "model": self._model.text().strip(),
+            "model": self._model.current_model_id(),
             "api_key": self._key.text(),
             "reasoning_enabled": self._reasoning_check.isChecked(),
             "reasoning_budget": self._budget_combo.currentData() if self._reasoning_check.isChecked() else None,
@@ -118,7 +128,7 @@ class _SubAgentBlock(QWidget):
 
     async def _test_current(self) -> tuple[bool, str]:
         preset = self._provider.currentData()
-        model = self._model.text().strip()
+        model = self._model.current_model_id()
         key = self._key.text().strip()
         if not model:
             return False, "请先填模型 ID"
@@ -158,6 +168,52 @@ class _SubAgentBlock(QWidget):
             self._key.set_test_state("success" if ok else "error", message)
 
         loop.create_task(_do_test())
+
+    def _on_fetch_models(self) -> None:
+        preset = self._provider.currentData()
+        key = self._key.text().strip()
+        if not key:
+            self._key.set_test_state("error", "请先填 API 密钥")
+            return
+        self._fetch_models_btn.setEnabled(False)
+        self._fetch_models_btn.setText("获取中...")
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self._fetch_models_btn.setEnabled(True)
+            self._fetch_models_btn.setText("获取模型")
+            self._key.set_test_state("error", "事件循环未就绪")
+            return
+
+        async def _do_fetch() -> None:
+            try:
+                from providers.model_fetcher import fetch_model_infos
+                from providers.registry import normalize_base_url
+
+                presets = _load_presets()
+                info = presets.get(preset, {})
+                protocol = info.get("protocol", "anthropic" if preset == "anthropic" else "openai_compat")
+                base_url = normalize_base_url(info.get("url", ""), protocol)
+                models = await fetch_model_infos(
+                    base_url,
+                    key,
+                    protocol,
+                    provider_id=str(preset or ""),
+                    timeout=8.0,
+                )
+                self._model.set_models(
+                    [m.id for m in models],
+                    provider_id=str(preset or ""),
+                    current=self._model.current_model_id(),
+                )
+                self._key.set_test_state("success", f"已获取 {len(models)} 个模型")
+            except Exception as e:
+                self._key.set_test_state("error", f"获取失败：{e}")
+            finally:
+                self._fetch_models_btn.setEnabled(True)
+                self._fetch_models_btn.setText("获取模型")
+
+        loop.create_task(_do_fetch())
 
     def set_state(self, choice) -> None:
         self._enabled.setChecked(choice.enabled)

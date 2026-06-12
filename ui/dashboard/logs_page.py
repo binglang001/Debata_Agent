@@ -14,6 +14,7 @@ from collections import deque
 from typing import Any
 
 from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..theme import Spacing
+from ..theme import Spacing, palette_for_theme, resolve_theme_name
 from ..widgets import FramelessDialog, show_message
 from .copy import DASHBOARD_COPY
 
@@ -184,14 +185,15 @@ class LogsPage(QWidget):
         item = QListWidgetItem(text)
         item.setData(Qt.ItemDataRole.UserRole, record)
         # 等级染色
+        palette = palette_for_theme(resolve_theme_name("auto"))
         if record.levelno >= logging.ERROR:
-            item.setForeground(Qt.GlobalColor.red)
+            item.setForeground(QColor(palette.error))
         elif record.levelno >= logging.WARNING:
-            item.setForeground(Qt.GlobalColor.darkYellow)
+            item.setForeground(QColor(palette.warning))
         elif record.levelno >= logging.INFO:
             pass
         else:
-            item.setForeground(Qt.GlobalColor.gray)
+            item.setForeground(QColor(palette.text_secondary))
         self._list.addItem(item)
 
     def _refilter(self, *_: Any) -> None:

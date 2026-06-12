@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+from html import unescape
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -126,8 +127,8 @@ def _extract_media(segments: list[Any]) -> list[MediaSegment]:
             out.append(
                 MediaSegment(
                     type=MediaType.IMAGE,
-                    url=data.get("url") or data.get("file"),
-                    file_id=data.get("file"),
+                    url=_clean_cq_value(data.get("url") or data.get("file")),
+                    file_id=_clean_cq_value(data.get("file")),
                     extra={k: v for k, v in data.items() if k not in ("url", "file")},
                 )
             )
@@ -135,22 +136,22 @@ def _extract_media(segments: list[Any]) -> list[MediaSegment]:
             out.append(
                 MediaSegment(
                     type=MediaType.VOICE,
-                    file_id=data.get("file"),
-                    url=data.get("url"),
+                    file_id=_clean_cq_value(data.get("file")),
+                    url=_clean_cq_value(data.get("url")),
                 )
             )
         elif seg_type == "video":
             out.append(
                 MediaSegment(
                     type=MediaType.VIDEO,
-                    file_id=data.get("file"),
-                    url=data.get("url"),
+                    file_id=_clean_cq_value(data.get("file")),
+                    url=_clean_cq_value(data.get("url")),
                 )
             )
         elif seg_type == "file":
-            url = data.get("url") or data.get("path") or data.get("file_path")
-            file_id = data.get("file_id") or data.get("file")
-            name = data.get("file_name") or data.get("name") or _basename(url or file_id)
+            url = _clean_cq_value(data.get("url") or data.get("path") or data.get("file_path"))
+            file_id = _clean_cq_value(data.get("file_id") or data.get("file"))
+            name = _clean_cq_value(data.get("file_name") or data.get("name")) or _basename(url or file_id)
             out.append(
                 MediaSegment(
                     type=MediaType.FILE,
@@ -163,7 +164,7 @@ def _extract_media(segments: list[Any]) -> list[MediaSegment]:
             out.append(
                 MediaSegment(
                     type=MediaType.FORWARD,
-                    file_id=data.get("id"),
+                    file_id=_clean_cq_value(data.get("id")),
                 )
             )
     return out
@@ -236,8 +237,14 @@ def _parse_cq_params(params_str: str) -> dict[str, str]:
     for part in _PARAM_SPLIT_RE.split(params_str):
         if "=" in part:
             key, value = part.split("=", 1)
-            params[key] = value
+            params[key] = unescape(value)
     return params
+
+
+def _clean_cq_value(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return unescape(str(value))
 
 
 def _basename(value: str | None) -> str | None:

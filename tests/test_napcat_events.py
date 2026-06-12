@@ -102,6 +102,36 @@ def test_parse_message_with_image():
     assert event.media[0].url == "http://x/y.jpg"
 
 
+def test_parse_raw_cq_image_url_unescapes_html_entities():
+    raw = {
+        "post_type": "message",
+        "message_type": "private",
+        "message_id": 1,
+        "user_id": 1001,
+        "self_id": 9999,
+        "time": 1,
+        "raw_message": (
+            "[CQ:image,file=abc.jpg,"
+            "url=https://multimedia.nt.qq.com.cn/download?"
+            "appid=1407&amp;fileid=x&amp;rkey=y]"
+        ),
+        "message": (
+            "[CQ:image,file=abc.jpg,"
+            "url=https://multimedia.nt.qq.com.cn/download?"
+            "appid=1407&amp;fileid=x&amp;rkey=y]"
+        ),
+        "sender": {"user_id": 1001, "nickname": "Alice"},
+    }
+
+    event = parse_napcat_event("nc", raw)
+
+    assert event is not None
+    assert event.media[0].type == MediaType.IMAGE
+    assert event.media[0].url == (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=x&rkey=y"
+    )
+
+
 def test_parse_message_with_voice_and_file():
     raw = {
         "post_type": "message",

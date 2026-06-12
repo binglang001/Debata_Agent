@@ -6,8 +6,13 @@
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-431%20passing-brightgreen.svg)](#)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](https://github.com/binglang001/Debata_Agent/actions/workflows/test.yml)
 [![GUI](https://img.shields.io/badge/UI-PySide6-blueviolet.svg)](#)
+[![Stars](https://img.shields.io/github/stars/binglang001/Debata_Agent?style=social)](https://github.com/binglang001/Debata_Agent)
+
+<br>
+
+<img src="https://raw.githubusercontent.com/binglang001/Debata_Agent/main/ui/icon.png" width="128" alt="Debata">
 
 </div>
 
@@ -16,6 +21,14 @@
 > 「想让虚拟角色不只是个会回复消息的程序，而是一个**会发牢骚、会跑题、会忘事、会半夜突然问你在不在**的人。」
 
 Debata_Agent 不绑定任何特定角色——你给它一个人格，它就活成那个人。框架名取自项目第一个被实现的角色 Debata。
+
+<div align="center">
+<img src="https://raw.githubusercontent.com/binglang001/Debata_Agent/main/personas/debata/角色人设主图.png" width="600" alt="Debata 人设图">
+
+*Debata —— 17 岁，短黑发，炭灰卫衣。独立，有主见，对亲近的人毒舌但心里在意。*
+</div>
+
+- [差异](#与一般-ai-机器人的差异) · [功能](#功能) · [快速开始](#快速开始) · [部署指南](#部署指南) · [项目结构](#项目结构) · [文档](#文档) · [设计决策](#设计决策) · [License](#license)
 
 ## 与一般 AI 机器人的差异
 
@@ -29,18 +42,55 @@ Debata_Agent 不绑定任何特定角色——你给它一个人格，它就活�
 | 主动性 | 被动回复 | 自主判断要不要开口 |
 | 配置 | 改代码 | **图形向导 + 设置页即时保存** |
 
-## 核心特性
+## 功能
 
-- **真人聊天方法论** — 读了 30+ 段真实微信记录提炼的硬规则
-- **关系矩阵** — 同角色对不同关系切换 4 种语气
-- **真人不完美合法** — 允许跑题/改口/忘事/不回
-- **十余家 LLM 提供商** — OpenAI / Anthropic Claude / DeepSeek / 智谱 GLM / 通义千问 / 火山方舟 / Gemini / Moonshot / 硅基流动 / OpenRouter
-- **多渠道适配器** — 当前 NapCat (QQ)，可扩展 Discord/Telegram
-- **每 Agent 独立配置** — 主聊天/主动思考/总结分别用不同模型与思考深度
-- **可选高级能力** — 视觉 / ASR / TTS / 天气 / 联网搜索 / **RAG 长期记忆**
-- **AES-256-GCM + RSA-2048** 加密密钥，存系统 keyring，无需密码
-- **AI 辅助人格生成** — 向导引导，流式预览，多轮调整
-- **现代 GUI** — 无边框圆角窗口，深浅主题，10 步配置向导，7 页仪表盘，设置页即时保存
+### 真人聊天，不是客服
+
+Debata 的聊天风格来自 30 多段真实微信记录。它会把一段话拆成 3-7 条短消息瀑布式发出去——60% 的消息不超过 12 个字。不打句号、不说再见、聊完就停。对不同的人自动切换语气：对死党毒舌互损，对长辈恭敬，对陌生人礼貌但有距离。允许跑题、改口、忘事、已读不回——这不是 bug，是体感。
+
+### 表情包
+
+把你的表情包放进 `data/emoji/` 目录，AI 会按对话情绪自动选图发送。文件名就是 AI 看到的名字，建议起容易懂的（比如「笑哭」而不是 `emoji_0142`）。设置页提供拖放添加、缩略图预览、重命名和删除。
+
+### 长期记忆
+
+Debata 会记住你在对话中告诉它的事——承诺、约定、偏好、身份信息。每条记忆带 scope（全局 / 某个人 / 某个群）和 pinned 标记。支持两种模式：
+
+- **文件模式**：直接写 JSON，零配置，完全透明。单人聊天够用。
+- **RAG 向量模式**：后台自动提取记忆做语义检索，长期多群运行更准。
+
+记忆页可以查看、编辑、手动添加、导入导出。
+
+### 可选模块
+
+| 模块 | 做什么 | 需要什么 |
+|------|--------|---------|
+| 视觉识别 | 看懂图片、提取文字、分析表情 | 多模态模型（GLM-4V / Qwen-VL 等） |
+| 语音合成 | 用声音回复 | 本地 VoxCPM2 或云端 TTS |
+| 天气查询 | 查实时天气和预报 | 和风天气 API Key |
+| 联网搜索 | 搜实时信息 | 免费，走 DuckDuckGo |
+
+ASR 不需要自己配——QQ 语音转写走 NapCat 内置功能。
+
+### 多 Agent 协作
+
+框架内部跑着三个 Agent，可以分别绑不同的模型：
+
+- **主聊天**：处理每条消息，调用工具，跑多轮工具循环
+- **主动思考**：后台定时判断要不要主动开口，用小模型省成本
+- **历史总结**：定期把老对话压成摘要存进长期记忆
+
+### 13 家 LLM 提供商
+
+OpenAI / Anthropic Claude / DeepSeek / 智谱 GLM / 通义千问 / 火山方舟 / Gemini / Moonshot / 硅基流动 / OpenRouter / Groq / Together / xAI。新增 provider 只需写一个 preset.yaml，无需写代码。
+
+### 安全
+
+API 密钥用 AES-256-GCM + RSA-2048 加密，存系统 keyring，不需要记密码。配置文件即时保存，大部分改动不需要重启。
+
+### GUI
+
+无边框圆角窗口，深浅主题。图形化配置向导（推荐路径 7 步、自定义最多 9 步），7 页仪表盘，设置页实时保存。托盘常驻，左键打开仪表盘，右键菜单。
 
 ## 快速开始
 
@@ -73,20 +123,12 @@ python main.py --no-gui   # 纯 CLI 模式
 ### 首次配置（图形向导）
 
 启动后会按顺序问你：
-1. 选主模型（推荐路径 5 步 / 自定义路径 10 步）
+1. 选主模型（推荐路径 7 步 / 自定义路径最多 9 步）
 2. 可选功能（视觉 / 天气 / 联网搜索 / RAG 长期记忆 …）
 3. 接入 NapCat（地址 + token + 白名单）
 4. 选/创建角色（内置 debata 或调 AI 现场生成）
 
 完成后进入仪表盘——一切配置都能在设置页改，无需再跑向导。
-
-## 它能做什么
-
-- 接管 QQ 账号在群里 / 私聊里聊天，**看起来像本人在打字**
-- 记住你告诉它的承诺（"下周记得提醒我交报告"）
-- 看图、查天气、网上搜东西（按需开启）
-- 长期对话自动归档总结 + 带 scope / pinned 的重要记忆注入与 RAG 召回
-- 主动找你聊（"在干嘛？" — 但只在合理时刻）
 
 ## 项目结构
 
@@ -97,36 +139,79 @@ Debata_Agent/
 ├── agents/          主聊天 / 主动思考 / 总结 / 人格生成
 ├── memory/          历史 + 重要记忆（文件 + RAG 向量）
 ├── tools/           AI 工具 + 装饰器注册
-├── features/        视觉 / ASR / TTS / 天气 / 搜索 / Embedding
+├── features/        视觉 / TTS / 天气 / 搜索 / Embedding
 ├── core/            事件总线 / 消息管道 / Runtime 生命周期
 ├── app_config/      配置 + AES/RSA 加密密钥
 ├── ui/              PySide6 GUI（向导 + 7 页仪表盘 + 托盘）
+├── plugins/         本地模型插件（TTS / Embedding）
 ├── personas/        人格目录（debata 入 git，其他 gitignore）
 ├── utils/           CQ 解析 / KV 缓存测量 / 时间
 ├── docs/            开发者文档
-├── tests/           431 个单元 / 集成测试
+├── tests/           单元 / 集成测试
 └── main.py          入口
 ```
 
 ## 文档
 
+- [图文教程](docs/getting_started.md) — 从零开始，截图指引每一步
 - [角色编写指南](docs/persona_writing_guide.md) — 怎么写出会"活"的人格
-- [UI 风格指南](docs/ui_style_guide.md) — 中国风现代极简的设计原则
-- [适配器开发](docs/adapter_development.md) — 接新的聊天平台
-- [提供商开发](docs/provider_development.md) — 接新的 LLM
 - [架构总览](docs/architecture.md) — 模块依赖 + KV 缓存设计
 - [KV 缓存基准](docs/kv_cache_benchmark.md) — 真实命中率数据
+- [提供商开发](docs/provider_development.md) — 接新的 LLM
+- [适配器开发](docs/adapter_development.md) — 接新的聊天平台
+- [UI 风格指南](docs/ui_style_guide.md) — 设计原则与组件规范
 
-## 开发状态
+## 部署指南
 
-| Phase | 状态 | 说明 |
-|------|------|------|
-| 1.0~1.9 基础架构 / 适配器 / 提供商 / 记忆 / Agent / 工具 / 集成测试 | ✅ | |
-| 2 PySide6 GUI（向导 + 仪表盘 + 托盘） | ✅ | 圆角窗口 / 即时保存 / 主题切换 |
-| 3 本地模型可选插件（VoxCPM2 / 本地 embedding / ASR 预留） | 🚧 | VoxCPM2 与本地 embedding 已接入；Whisper 本地 ASR 仍待插件实装 |
-| 4 文档完善 + 开源发布（CHANGELOG / CI / 模板） | 🚧 | CHANGELOG / CI / Issue 模板已就位 |
+### Windows 桌面
 
-当前全量测试覆盖 RAG / KV 缓存 / 跨模块集成 / 上下文重构链路；具体命令见归档测试流程文档。
+```bash
+git clone https://github.com/binglang001/Debata_Agent.git
+cd Debata_Agent
+python -m venv venv
+venv\Scripts\activate
+pip install -e ".[gui]"
+python main.py
+```
+
+首次启动进入配置向导。之后每次启动直接进仪表盘，托盘常驻。
+
+### Linux 服务器（无头）
+
+```bash
+git clone https://github.com/binglang001/Debata_Agent.git
+cd Debata_Agent
+python -m venv venv
+source venv/bin/activate
+pip install -e .              # 跳过 GUI 依赖
+python main.py --no-gui
+```
+
+systemd 服务（`/etc/systemd/system/debata.service`）：
+
+```ini
+[Unit]
+Description=Debata Agent
+After=network.target
+
+[Service]
+Type=simple
+User=debata
+WorkingDirectory=/opt/Debata_Agent
+ExecStart=/opt/Debata_Agent/venv/bin/python main.py --no-gui
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 常见问题
+
+- **NapCat 连不上**：确认 NapCat 已启动，WS 地址和端口正确。设置页「测试连接」可诊断。
+- **API 密钥无效**：确认复制完整（sk- 开头），账户余额充足。
+- **没收到消息**：检查白名单模式——切到「管理员审核」试试。
+- **日志刷屏**：设置页 → 日志与诊断 → 日志级别切到 INFO。
 
 ## 一份默认人格的快速演示
 
@@ -162,6 +247,6 @@ Debata_Agent/
 
 <div align="center">
 
-**「砚台旁有墨，纸上有空」**
+如果这个项目对你有用，欢迎给个 [Star](https://github.com/binglang001/Debata_Agent) ⭐
 
 </div>

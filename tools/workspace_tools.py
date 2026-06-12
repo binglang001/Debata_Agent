@@ -405,8 +405,14 @@ async def write_file(args: WriteFileArgs, ctx: ToolContext) -> dict:
 
     return {
         "ok": True,
+        "status": "done",
+        "brief": f"已写入文件 {relative_to_workspace(path, ctx.workspace_dir)}。",
         "path": relative_to_workspace(path, ctx.workspace_dir),  # type: ignore[arg-type]
         "bytes": len(args.content.encode("utf-8")),
+        "data": {
+            "path": relative_to_workspace(path, ctx.workspace_dir),  # type: ignore[arg-type]
+            "bytes": len(args.content.encode("utf-8")),
+        },
     }
 
 
@@ -447,7 +453,18 @@ async def edit_file(args: EditFileArgs, ctx: ToolContext) -> dict:
         await asyncio.to_thread(path.write_text, new_text, encoding="utf-8")
     except OSError as e:
         return {"ok": False, "error": f"写入失败：{e}"}
-    return {"ok": True}
+    rel_path = relative_to_workspace(path, ctx.workspace_dir)  # type: ignore[arg-type]
+    return {
+        "ok": True,
+        "status": "done",
+        "brief": f"已编辑文件 {rel_path}。",
+        "path": rel_path,
+        "data": {
+            "path": rel_path,
+            "old_length": len(args.old),
+            "new_length": len(args.new),
+        },
+    }
 
 
 @tool(
@@ -549,7 +566,14 @@ async def delete_file(args: DeleteFileArgs, ctx: ToolContext) -> dict:
         await asyncio.to_thread(path.unlink)
     except OSError as e:
         return {"ok": False, "error": f"删除失败：{e}"}
-    return {"ok": True}
+    rel_path = relative_to_workspace(path, ctx.workspace_dir)  # type: ignore[arg-type]
+    return {
+        "ok": True,
+        "status": "done",
+        "brief": f"已删除文件 {rel_path}。",
+        "path": rel_path,
+        "data": {"path": rel_path},
+    }
 
 
 @tool(

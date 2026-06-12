@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...theme import Spacing
+from ...widgets.model_combo import ModelComboBox
 from ..components import ApiKeyInput, SectionCard, open_feature_guide
 from ..context import BaseStepView, WizardContext
 from .features import (
@@ -35,8 +36,8 @@ from .main_model_custom import _PRESET_DEFAULTS
 
 _EMBEDDING_PRESETS: dict[str, dict[str, str]] = {
     "volcengine": {
-        "display": "火山方舟 · 独立 Embedding（推荐 · 图文多模态向量）",
-        "model": "doubao-embedding-vision-251215",
+        "display": "火山方舟 · 独立 Embedding（推荐 · 文本向量）",
+        "model": "doubao-embedding-text-240515",
     },
     "openai": {
         "display": "OpenAI · 独立 Embedding",
@@ -154,8 +155,8 @@ class EmbeddingStepView(BaseStepView):
         self._api_base_url.setPlaceholderText("https://api.example.com/v1")
         form.addRow(QLabel("Base URL"), self._api_base_url)
 
-        self._api_model = QLineEdit()
-        self._api_model.setPlaceholderText("如 text-embedding-v4 / embedding-3 / doubao-embedding-vision-251215")
+        self._api_model = ModelComboBox()
+        self._api_model.setPlaceholderText("如 text-embedding-v4 / embedding-3 / doubao-embedding-text-240515")
         form.addRow(QLabel("模型 ID"), self._api_model)
 
         self._api_key = ApiKeyInput(
@@ -225,14 +226,17 @@ class EmbeddingStepView(BaseStepView):
         choices: list[tuple[str, str]] = []
 
         main_id = f"{self.context.main.preset}_main"
-        choices.append((f"existing:{main_id}", f"复用主模型 · {self.context.main.display_name or self.context.main.preset}"))
+        if self._agent_provider_supports_embedding(self.context.main.preset, self.context.main.model):
+            choices.append((f"existing:{main_id}", f"复用主模型 provider · {self.context.main.display_name or self.context.main.preset}"))
 
         if self.context.proactive.enabled and not self.context.proactive.use_main:
             pid = f"{self.context.proactive.preset}_proactive"
-            choices.append((f"existing:{pid}", f"复用主动思考 · {self.context.proactive.preset}"))
+            if self._agent_provider_supports_embedding(self.context.proactive.preset, self.context.proactive.model):
+                choices.append((f"existing:{pid}", f"复用主动思考 provider · {self.context.proactive.preset}"))
         if self.context.summary.enabled and not self.context.summary.use_main:
             pid = f"{self.context.summary.preset}_summary"
-            choices.append((f"existing:{pid}", f"复用历史总结 · {self.context.summary.preset}"))
+            if self._agent_provider_supports_embedding(self.context.summary.preset, self.context.summary.model):
+                choices.append((f"existing:{pid}", f"复用历史总结 provider · {self.context.summary.preset}"))
 
         for preset, info in _EMBEDDING_PRESETS.items():
             if preset != "custom" and preset not in _PRESET_DEFAULTS:
@@ -253,8 +257,10 @@ class EmbeddingStepView(BaseStepView):
             elif self.context.embedding_provider:
                 target = f"existing:{self.context.embedding_provider}"
             else:
-                target = f"existing:{main_id}"
+                target = f"new:{self._recommended_embedding_preset()}"
         idx = self._api_provider.findData(target)
+        if idx < 0:
+            idx = self._api_provider.findData(f"new:{self._recommended_embedding_preset()}")
         if idx >= 0:
             self._api_provider.setCurrentIndex(idx)
         self._on_provider_changed()
@@ -265,9 +271,28 @@ class EmbeddingStepView(BaseStepView):
         _set_form_field_visible(self._form, self._api_base_url, self._rb_rag.isChecked() and self._type_combo.currentData() == "api" and is_custom)
         if value.startswith("new:"):
             preset = value.split(":", 1)[1]
-            default_model = _EMBEDDING_PRESETS.get(preset, {}).get("model", "")
-            if default_model and not self._api_model.text().strip():
+            default_model = self._recommended_embedding_model(preset)
+            if default_model and not self._api_model.current_model_id():
                 self._api_model.setText(default_model)
+            known = self._known_embedding_models(preset)
+            if known:
+                self._api_model.set_models(
+                    known,
+                    provider_id=preset,
+                    current=self._api_model.current_model_id() or default_model,
+                )
+        elif value.startswith("existing:"):
+            preset = self._preset_for_existing_source(value)
+            default_model = self._recommended_embedding_model(preset)
+            if default_model and not self._api_model.current_model_id():
+                self._api_model.setText(default_model)
+            known = self._known_embedding_models(preset)
+            if known:
+                self._api_model.set_models(
+                    known,
+                    provider_id=preset,
+                    current=self._api_model.current_model_id() or default_model,
+                )
 
     def _refresh_visibility(self, *_args) -> None:
         is_rag = self._rb_rag.isChecked()
@@ -291,7 +316,58 @@ class EmbeddingStepView(BaseStepView):
             self._hint.setText("切到下一页前会检查模型目录。未就绪时可查看安装指引。")
             self._check_local_model()
         else:
-            self._hint.setText("可复用已有 provider；若主模型不提供 embedding，选择独立 Embedding provider 并填写其密钥。")
+            self._hint.setText("RAG 只能使用支持 embedding 的模型。若已有聊天 provider 不支持 embedding，请选择独立 Embedding provider 并填写其密钥。")
+
+    def _agent_provider_supports_embedding(self, preset: str, model: str) -> bool:
+        try:
+            from providers.model_capabilities import model_supports, recommended_model
+
+            return bool(
+                model_supports(preset, model, "embedding")
+                or recommended_model(preset, "embedding")
+            )
+        except Exception:
+            return False
+
+    def _recommended_embedding_preset(self) -> str:
+        try:
+            from providers.model_capabilities import recommended_provider
+
+            provider = recommended_provider("embedding")
+            if provider and provider.id in _EMBEDDING_PRESETS:
+                return provider.id
+        except Exception:
+            pass
+        return "volcengine"
+
+    def _recommended_embedding_model(self, preset: str) -> str:
+        try:
+            from providers.model_capabilities import recommended_model
+
+            model = recommended_model(preset, "embedding")
+            if model:
+                return model.id
+        except Exception:
+            pass
+        return _EMBEDDING_PRESETS.get(preset, {}).get("model", "")
+
+    def _known_embedding_models(self, preset: str) -> list[str]:
+        try:
+            from providers.model_capabilities import known_model_ids
+
+            return known_model_ids(preset, capability="embedding")
+        except Exception:
+            return []
+
+    def _preset_for_existing_source(self, source: str) -> str:
+        provider_id = source.split(":", 1)[1] if ":" in source else source
+        if provider_id == f"{self.context.main.preset}_main":
+            return self.context.main.preset
+        if provider_id == f"{self.context.proactive.preset}_proactive":
+            return self.context.proactive.preset
+        if provider_id == f"{self.context.summary.preset}_summary":
+            return self.context.summary.preset
+        return provider_id.removeprefix("embedding_")
 
     def _on_quality_changed(self, *_args) -> None:
         current = self._local_dir.text().strip()
@@ -344,7 +420,7 @@ class EmbeddingStepView(BaseStepView):
 
     async def _test_api_current(self) -> tuple[bool, str]:
         source = self._api_provider.currentData() or ""
-        model = self._api_model.text().strip()
+        model = self._api_model.current_model_id()
         key = self._api_key.text().strip()
         if not source:
             return False, "请先选择 Embedding provider"
@@ -472,7 +548,7 @@ class EmbeddingStepView(BaseStepView):
 
         if self._type_combo.currentData() == "api":
             source = self._api_provider.currentData() or ""
-            model = self._api_model.text().strip()
+            model = self._api_model.current_model_id()
             if not source:
                 self.invalid_input.emit("RAG API 模式需要选择一个 provider")
                 return False

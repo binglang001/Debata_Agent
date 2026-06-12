@@ -17,8 +17,13 @@ import base64
 import hashlib
 import logging
 import mimetypes
+import re
+from html import unescape
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+import httpx
 
 from adapters.types import Target
 from utils.token_budget import TokenEstimator
@@ -49,6 +54,7 @@ logger = logging.getLogger(__name__)
 )
 async def describe_image(args: DescribeImageArgs, ctx: ToolContext) -> dict:
     if ctx.vision is None:
+        ctx.extras["vision_unavailable_this_turn"] = "未启用图像理解功能"
         return {
             "ok": False,
             "status": "failed",
@@ -57,16 +63,23 @@ async def describe_image(args: DescribeImageArgs, ctx: ToolContext) -> dict:
         }
 
     try:
-        image_url = _normalize_image_input(args.image_url, ctx)
+        image_url = await _normalize_image_input(args.image_url, ctx)
         question = (args.question or args.prompt or "").strip()
         raw = await ctx.vision.describe(image_url, question)
     except Exception as e:
-        logger.warning(f"describe_image 失败: {e}")
+        short_error = _short_image_error(e)
+        ctx.extras["vision_unavailable_this_turn"] = short_error
+        logger.warning("describe_image 失败: %s", short_error)
         return {
             "ok": False,
             "status": "failed",
-            "brief": f"图片理解失败：{e}",
-            "error": str(e),
+            "brief": "图片理解失败。",
+            "error": short_error,
+            "summary": "图片识别失败",
+            "data": {
+                "image_ref": _compact_image_ref(args.image_url),
+                "question": (args.question or args.prompt or "").strip() or None,
+            },
         }
 
     parsed = _vision_result(raw)
@@ -109,29 +122,112 @@ async def describe_image(args: DescribeImageArgs, ctx: ToolContext) -> dict:
     return result
 
 
-def _normalize_image_input(image_url: str, ctx: ToolContext) -> str:
+async def _normalize_image_input(image_url: str, ctx: ToolContext) -> str:
     """把 workspace 图片路径转换成视觉模型可接受的 data URL。"""
-    value = (image_url or "").strip()
-    if "workspace=" in value:
-        value = value.split("workspace=", 1)[1].split("]", 1)[0].strip()
+    value = _image_ref_value(image_url)
     if value.startswith(("http://", "https://", "data:")):
+        if _should_localize_remote_image(value):
+            downloaded = await _download_image_as_data_url(value)
+            if downloaded:
+                return downloaded
+            raise ValueError("图片链接下载失败")
         return value
-    if value.startswith("workspace="):
-        value = value.split("=", 1)[1].strip()
 
     from .workspace import WorkspaceError, resolve_in_workspace
 
     try:
         path = resolve_in_workspace(value, ctx.workspace_dir)
     except WorkspaceError:
-        return image_url
+        return value or image_url
     if not path.is_file():
-        return image_url
+        return value or image_url
 
     mime = mimetypes.guess_type(str(path))[0] or "image/png"
     raw = path.read_bytes()
     encoded = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{encoded}"
+
+
+_IMAGE_REF_FIELD_RE = re.compile(r"(?:^|[\s\[])(workspace|url)=([^\]\s]+)")
+
+
+def _image_ref_value(image_url: str) -> str:
+    value = unescape((image_url or "").strip())
+    if not value:
+        return ""
+    fields = {m.group(1): m.group(2) for m in _IMAGE_REF_FIELD_RE.finditer(value)}
+    if fields.get("workspace"):
+        return fields["workspace"].strip()
+    if fields.get("url"):
+        return fields["url"].strip()
+    if value.startswith("workspace="):
+        return value.split("=", 1)[1].strip()
+    if value.startswith("url="):
+        return value.split("=", 1)[1].strip()
+    return value.strip("[] ")
+
+
+def _should_localize_remote_image(value: str) -> bool:
+    """QQ 临时图片链接外部 provider 常下载失败，先本地化再送视觉模型。"""
+    try:
+        host = (urlparse(value).hostname or "").lower()
+    except ValueError:
+        return False
+    return (
+        host == "multimedia.nt.qq.com.cn"
+        or host.endswith(".nt.qq.com.cn")
+        or host == "gchat.qpic.cn"
+        or host.endswith(".qpic.cn")
+    )
+
+
+async def _download_image_as_data_url(image_url: str) -> str | None:
+    image_url = unescape((image_url or "").strip())
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(12.0, connect=5.0),
+        ) as client:
+            response = await client.get(image_url)
+            response.raise_for_status()
+    except (httpx.HTTPError, httpx.TimeoutException) as e:
+        logger.warning(f"下载远程图片失败: {_short_image_error(e)}")
+        return None
+
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip()
+    mime = content_type if content_type.startswith("image/") else "image/png"
+    raw = response.content
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _short_image_error(error: Exception) -> str:
+    text = str(error)
+    lowered = text.lower()
+    if "图片链接下载失败" in text:
+        return "图片链接下载失败"
+    if "error while downloading" in lowered or "image_url" in lowered:
+        return "视觉服务无法读取图片链接"
+    if "timeout" in lowered or "timed out" in lowered or "超时" in text:
+        return "图片理解超时"
+    if "401" in text or "403" in text or "认证失败" in text:
+        return "视觉服务认证失败"
+    if "429" in text or "限流" in text:
+        return "视觉服务限流"
+    if "400" in text or "badrequest" in lowered or "invalidparameter" in lowered:
+        return "视觉服务拒绝了图片参数"
+    return "视觉服务调用失败"
+
+
+def _compact_image_ref(image_ref: str) -> str:
+    value = _image_ref_value(image_ref)
+    if value.startswith(("http://", "https://")):
+        try:
+            host = urlparse(value).hostname or "remote"
+        except ValueError:
+            host = "remote"
+        return f"{host}/..."
+    return value
 
 
 def _vision_result(raw: Any) -> dict[str, str]:

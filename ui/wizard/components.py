@@ -15,11 +15,14 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
+from urllib.parse import unquote
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QDialogButtonBox,
@@ -673,11 +676,15 @@ class TutorialDialog(FramelessDialog):
         title: str,
         markdown: str,
         parent: QWidget | None = None,
+        *,
+        base_dir: Path | str | None = None,
     ) -> None:
         super().__init__(title, parent)
         self.setMinimumSize(620, 480)
         self.resize(700, 560)
         self.setModal(True)
+        project_root = _project_root()
+        base_path = Path(base_dir).resolve() if base_dir is not None else project_root
 
         layout = self.body_layout()
         layout.setContentsMargins(18, 12, 18, 14)
@@ -686,6 +693,15 @@ class TutorialDialog(FramelessDialog):
         browser = QTextBrowser()
         browser.setObjectName("TutorialBrowser")
         browser.setOpenExternalLinks(True)
+        browser.setSearchPaths(
+            [
+                str(base_path),
+                str(project_root),
+                str(project_root / "docs"),
+                str(project_root / "docs" / "images"),
+            ]
+        )
+        browser.document().setBaseUrl(QUrl.fromLocalFile(str(base_path) + "/"))
         browser.document().setDocumentMargin(12)
         browser.document().setDefaultStyleSheet(
             """
@@ -699,7 +715,12 @@ class TutorialDialog(FramelessDialog):
             a { color: #6FA39A; }
             """
         )
-        browser.setMarkdown(_strip_leading_h1(markdown))
+        markdown = _localize_tutorial_markdown(
+            _strip_leading_h1(markdown),
+            base_dir=base_path,
+            project_root=project_root,
+        )
+        browser.setMarkdown(markdown)
         f = browser.font()
         f.setPointSize(11)
         browser.setFont(f)
@@ -724,15 +745,70 @@ def _strip_leading_h1(markdown: str) -> str:
     return "\n".join(lines).strip()
 
 
+_MARKDOWN_IMAGE_RE = re.compile(r"(!\[[^\]]*]\()([^)\n]+)(\))")
+_HTML_IMAGE_SRC_RE = re.compile(r"(<img\b[^>]*\bsrc=[\"'])([^\"']+)([\"'])", re.IGNORECASE)
+_RAW_DOC_IMAGE_PREFIXES = (
+    "https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/",
+    "https://raw.githubusercontent.com/binglang001/Debata_Agent/refs/heads/main/docs/images/",
+)
+
+
+def _project_root() -> Path:
+    # ui/wizard/components.py -> ui/wizard -> ui -> project root
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def _localize_tutorial_markdown(
+    markdown: str,
+    *,
+    base_dir: Path | str | None = None,
+    project_root: Path | str | None = None,
+) -> str:
+    """把教程里的仓库图片链接改为本地文件 URL，保证 QTextBrowser 能加载。"""
+    root = Path(project_root).resolve() if project_root is not None else _project_root()
+    base = Path(base_dir).resolve() if base_dir is not None else root
+
+    def replace_markdown(match: re.Match[str]) -> str:
+        return f"{match.group(1)}{_local_image_target(match.group(2), base, root)}{match.group(3)}"
+
+    def replace_html(match: re.Match[str]) -> str:
+        return f"{match.group(1)}{_local_image_target(match.group(2), base, root)}{match.group(3)}"
+
+    markdown = _MARKDOWN_IMAGE_RE.sub(replace_markdown, markdown)
+    return _HTML_IMAGE_SRC_RE.sub(replace_html, markdown)
+
+
+def _local_image_target(target: str, base_dir: Path, project_root: Path) -> str:
+    raw = target.strip()
+    if not raw:
+        return target
+
+    for prefix in _RAW_DOC_IMAGE_PREFIXES:
+        if raw.startswith(prefix):
+            local = project_root / "docs" / "images" / unquote(raw[len(prefix):])
+            if local.exists():
+                return local.as_uri()
+            return raw
+
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", raw):
+        return raw
+
+    candidate = (base_dir / unquote(raw)).resolve()
+    if candidate.exists():
+        return candidate.as_uri()
+    candidate = (project_root / unquote(raw)).resolve()
+    if candidate.exists():
+        return candidate.as_uri()
+    return raw
+
+
 def open_feature_guide(guide_name: str, parent: QWidget | None = None) -> None:
     """打开 docs/feature_guides/{name}.md 教程。
 
     找不到文件时显示一个友好的占位。
     """
-    from pathlib import Path
-
     # docs 在项目根：ui/wizard/components.py → ui → 项目根 → docs/
-    project_root = Path(__file__).resolve().parent.parent.parent
+    project_root = _project_root()
     md_path = project_root / "docs" / "feature_guides" / f"{guide_name}.md"
     if not md_path.exists():
         markdown = (
@@ -750,7 +826,7 @@ def open_feature_guide(guide_name: str, parent: QWidget | None = None) -> None:
                 title = line[2:].strip()
                 break
 
-    dlg = TutorialDialog(title, markdown, parent=parent)
+    dlg = TutorialDialog(title, markdown, parent=parent, base_dir=md_path.parent)
     dlg.exec()
 
 

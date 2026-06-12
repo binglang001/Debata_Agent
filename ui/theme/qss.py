@@ -89,9 +89,9 @@ class Spacing:
 
 
 class Radius:
-    SMALL = 6
-    DEFAULT = 12
-    LARGE = 18
+    SMALL = 4
+    DEFAULT = 8
+    LARGE = 12
     PILL = 999
 
 
@@ -194,7 +194,7 @@ QMainWindow[frameless="true"], QDialog[frameless="true"] {{
 QFrame#WindowFrame {{
     background-color: {p.bg_primary};
     border: 1px solid {p.border};
-    border-radius: 12px;
+    border-radius: {Radius.LARGE}px;
 }}
 
 /* ============================================================
@@ -210,6 +210,27 @@ QFrame#SectionCard {{
     background-color: {p.bg_card};
     border: 1px solid {p.border};
     border-radius: {Radius.DEFAULT}px;
+}}
+
+QFrame#SectionCard[selected="true"] {{
+    border: 2px solid {p.accent_primary};
+}}
+
+QFrame#EmojiTile {{
+    background-color: {p.bg_card};
+    border: 1px solid {p.border};
+    border-radius: {Radius.SMALL}px;
+}}
+
+QLabel#EmojiDropHint {{
+    border: 2px dashed {p.text_disabled};
+    border-radius: {Radius.DEFAULT}px;
+    padding: {Spacing.LG}px;
+}}
+
+QLabel#EmojiPreview {{
+    border: 1px solid {p.border};
+    border-radius: {Radius.SMALL}px;
 }}
 
 QFrame#Sidebar {{
@@ -256,7 +277,7 @@ QPushButton[role="primary"]:pressed {{
     background-color: {pressed_primary};
 }}
 QPushButton[role="primary"]:focus {{
-    border: 2px solid {p.bg_primary};
+    border: 2px solid {_lighten(p.accent_primary, 0.22)};
     outline: none;
 }}
 QPushButton[role="primary"]:disabled {{
@@ -324,6 +345,57 @@ QPushButton[role="text"]:disabled {{
     background-color: transparent;
 }}
 
+QPushButton[role="ghost"] {{
+    background-color: transparent;
+    color: {p.text_secondary};
+    border: none;
+    border-radius: {Radius.SMALL}px;
+    padding: 4px 8px;
+    min-height: 28px;
+}}
+QPushButton[role="ghost"]:hover {{
+    background-color: {selected_fill};
+    color: {p.text_primary};
+}}
+QPushButton[role="ghost"]:pressed {{
+    background-color: {p.bg_hover};
+    color: {p.accent_primary};
+}}
+QPushButton[role="ghost"]:focus {{
+    border: 1px solid {p.accent_primary};
+    outline: none;
+}}
+QPushButton[role="ghost"]:disabled {{
+    color: {p.text_disabled};
+    background-color: transparent;
+}}
+
+QPushButton[role="collapse-toggle"] {{
+    background-color: transparent;
+    color: {p.text_secondary};
+    border: 1px solid {p.border};
+    border-radius: {Radius.SMALL}px;
+    padding: 0px;
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 30px;
+    max-height: 30px;
+    font-size: {FontSize.BODY}px;
+    font-weight: 600;
+}}
+QPushButton[role="collapse-toggle"]:hover {{
+    background-color: {p.bg_hover};
+    color: {p.text_primary};
+}}
+QPushButton[role="collapse-toggle"]:pressed {{
+    background-color: {_darken(p.bg_hover, 0.05)};
+    color: {p.accent_primary};
+}}
+QPushButton[role="collapse-toggle"]:focus {{
+    border-color: {p.accent_primary};
+    outline: none;
+}}
+
 /* ============================================================
  * 危险按钮（朱砂红填充，仅用于不可逆操作）
  * ============================================================ */
@@ -343,7 +415,7 @@ QPushButton[role="danger"]:pressed {{
     background-color: {pressed_error};
 }}
 QPushButton[role="danger"]:focus {{
-    border: 2px solid {p.bg_primary};
+    border: 2px solid {_lighten(p.error, 0.22)};
     outline: none;
 }}
 QPushButton[role="danger"]:disabled {{
@@ -421,6 +493,10 @@ QPushButton[role="win"]:hover {{
 QPushButton[role="win"]:pressed {{
     background-color: {_darken(p.bg_hover, 0.05)};
 }}
+QPushButton[role="win"]:focus {{
+    border: 1px solid {p.accent_primary};
+    outline: none;
+}}
 
 QPushButton[role="win-close"] {{
     background-color: transparent;
@@ -437,6 +513,10 @@ QPushButton[role="win-close"]:hover {{
 QPushButton[role="win-close"]:pressed {{
     background-color: {_darken(p.error, 0.1)};
     color: white;
+}}
+QPushButton[role="win-close"]:focus {{
+    border: 1px solid {p.error};
+    outline: none;
 }}
 
 QFrame#DialogTitleBar {{
@@ -719,6 +799,10 @@ QLabel[role="secondary"] {{
     font-size: {FontSize.SECONDARY}px;
     color: {p.text_secondary};
 }}
+QLabel[role="small"] {{
+    font-size: {FontSize.SMALL}px;
+    color: {p.text_secondary};
+}}
 QLabel[role="caption"] {{
     font-size: {FontSize.SMALL}px;
     color: {p.text_disabled};
@@ -742,6 +826,12 @@ QLabel[role="mono"] {{
     font-family: {mono};
     font-size: {FontSize.CODE}px;
     color: {p.text_primary};
+}}
+
+QFrame[role="muted-block"] {{
+    background-color: {p.bg_hover};
+    border: 1px solid {p.border};
+    border-radius: {Radius.DEFAULT}px;
 }}
 
 /* ============================================================
@@ -768,6 +858,8 @@ QListWidget::item:selected, QListView::item:selected {{
     border-left: 3px solid {p.accent_primary};
 }}
 QListWidget::item:focus, QListView::item:focus {{
+    border-left: 3px solid {p.accent_primary};
+    background-color: {_rgba(p.accent_primary, 0.06)};
     outline: none;
 }}
 
@@ -795,6 +887,9 @@ QScrollBar::handle:vertical {{
 QScrollBar::handle:vertical:hover {{
     background: {p.text_disabled};
 }}
+QScrollBar::handle:vertical:pressed {{
+    background: {p.text_secondary};
+}}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0;
     background: transparent;
@@ -816,8 +911,15 @@ QScrollBar::handle:horizontal {{
 QScrollBar::handle:horizontal:hover {{
     background: {p.text_disabled};
 }}
+QScrollBar::handle:horizontal:pressed {{
+    background: {p.text_secondary};
+}}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
     width: 0;
+    background: transparent;
+}}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+    background: transparent;
 }}
 QScrollArea {{
     background: transparent;
@@ -1083,6 +1185,18 @@ def palette_for_theme(theme: str | None) -> Palette:
     return DARK if resolve_theme_name(theme) == "dark" else LIGHT
 
 
+_QSS_CACHE: dict[str, str] = {}
+
+
+def cached_qss(palette: Palette) -> str:
+    """返回已生成的主题 QSS，避免切换主题时重复拼接整份样式表。"""
+    cached = _QSS_CACHE.get(palette.name)
+    if cached is None:
+        cached = build_qss(palette)
+        _QSS_CACHE[palette.name] = cached
+    return cached
+
+
 # ============================================================
 # 默认导出
 # ============================================================
@@ -1101,6 +1215,7 @@ __all__ = [
     "ThemeName",
     "font_family",
     "build_qss",
+    "cached_qss",
     "palette_for_theme",
     "resolve_theme_name",
     "system_theme_name",

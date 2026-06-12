@@ -88,7 +88,7 @@ class PluginMeta:
     字段约定：
         name              —— 唯一标识，小写英文（voxcpm2 / bge-zh）
         display_name      —— UI 显示名
-        kind              —— 'asr' | 'tts' | 'embedding'
+        kind              —— 'tts' | 'embedding'
         model_dir         —— 模型文件目录（绝对路径或相对项目 data/models 的子目录）
         size_mb           —— 模型大致体积（MB），UI 提示用
         description       —— 中文简述，给 UI 详情页用
@@ -247,6 +247,8 @@ class PluginManager:
             p = _default_models_root() / p
         if not p.exists():
             return PluginStatus.NOT_INSTALLED
+        if meta.kind == "embedding" and _looks_like_sentence_transformer_dir(p):
+            return PluginStatus.INSTALLED
         if meta.download_sources:
             required = [s for s in meta.download_sources if s.required]
             if required and all((p / s.dest_filename).is_file() for s in required):
@@ -397,5 +399,26 @@ class PluginManager:
         return self._records.get(name)
 
     def by_kind(self, kind: str) -> list[PluginRecord]:
-        """按类型筛（'asr' | 'tts' | 'embedding'）。"""
+        """按类型筛（'tts' | 'embedding'）。"""
         return [r for r in self._records.values() if r.meta.kind == kind]
+
+
+def _looks_like_sentence_transformer_dir(path: Path) -> bool:
+    """识别可被 SentenceTransformer 直接加载的 HuggingFace 模型目录。"""
+    required = (
+        "config.json",
+        "modules.json",
+        "sentence_bert_config.json",
+        "tokenizer_config.json",
+        "vocab.txt",
+        "1_Pooling/config.json",
+    )
+    if not all((path / item).is_file() for item in required):
+        return False
+    return any(
+        (path / item).is_file()
+        for item in (
+            "model.safetensors",
+            "pytorch_model.bin",
+        )
+    )

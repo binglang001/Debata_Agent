@@ -42,7 +42,6 @@ from .workspace import relative_to_workspace
 logger = logging.getLogger(__name__)
 
 _SAFE_PATH_RE = re.compile(r"[^A-Za-z0-9_.-]+")
-_CQ_RE = re.compile(r"\[CQ:(?P<body>[^\]]+)\]")
 _PARAM_SPLIT_RE = re.compile(r",(?=\w+=)")
 
 
@@ -650,12 +649,12 @@ def _segment_from_onebot(segment: Any) -> dict[str, Any]:
 def _segments_from_raw(raw_message: str) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
     pos = 0
-    for match in _CQ_RE.finditer(raw_message):
-        if match.start() > pos:
-            text = raw_message[pos : match.start()]
+    for segment_match in _iter_cq_segments(raw_message):
+        if segment_match["start"] > pos:
+            text = raw_message[pos : segment_match["start"]]
             if text:
                 segments.append({"type": "text", "text": unescape(text)})
-        body = match.group("body")
+        body = segment_match["body"]
         if "," in body:
             cq_type, params_str = body.split(",", 1)
         else:
@@ -666,20 +665,55 @@ def _segments_from_raw(raw_message: str) -> list[dict[str, Any]]:
                 {
                     "type": "forward",
                     "forward_id": params.get("id") or "",
-                    "raw": match.group(0),
+                    "raw": segment_match["raw"],
                 }
             )
         elif cq_type in {"image", "face", "file", "record", "voice", "video"}:
-            segments.append(_media_segment(cq_type, params, raw=match.group(0)))
+            segments.append(_media_segment(cq_type, params, raw=segment_match["raw"]))
         else:
-            segments.append({"type": cq_type, "data": params, "raw": match.group(0)})
-        pos = match.end()
+            segments.append({"type": cq_type, "data": params, "raw": segment_match["raw"]})
+        pos = int(segment_match["end"])
     if pos < len(raw_message):
         text = raw_message[pos:]
         if text:
             segments.append({"type": "text", "text": unescape(text)})
     if not segments and raw_message:
         segments.append({"type": "text", "text": unescape(raw_message)})
+    return segments
+
+
+def _iter_cq_segments(raw_message: str) -> list[dict[str, Any]]:
+    """扫描 CQ 段，容忍参数值里未转义的 `]`。
+
+    OneBot 正常会把 summary 里的方括号转义成 HTML 实体，但 NapCat/转发
+    内容里偶尔会出现 `summary=[图片]` 这种未转义值。结束 `]` 后若紧跟
+    `,key=`，说明它仍属于参数值，不应提前截断。
+    """
+    segments: list[dict[str, Any]] = []
+    i = 0
+    while True:
+        start = raw_message.find("[CQ:", i)
+        if start < 0:
+            break
+        pos = start + 4
+        while True:
+            end = raw_message.find("]", pos)
+            if end < 0:
+                return segments
+            tail = raw_message[end + 1 :]
+            if not re.match(r"^,\w+=", tail):
+                break
+            pos = end + 1
+        raw = raw_message[start : end + 1]
+        segments.append(
+            {
+                "start": start,
+                "end": end + 1,
+                "body": raw_message[start + 4 : end],
+                "raw": raw,
+            }
+        )
+        i = end + 1
     return segments
 
 
@@ -978,13 +1012,12 @@ _DEFAULT_SUMMARIZE_PROMPT = (
 @tool(
     name="summarize_chat_history",
     description=(
-        "从 NapCat/QQ 服务器侧拉取指定群的近期群消息，并启动后台子 Agent 整理。"
-        "工具会先返回 task_id；完成后系统会把结果文件作为一次新请求回传。"
+        "从 NapCat/QQ 服务器侧拉取指定群的近期群消息，并用子 Agent 整理。"
+        "工具会等待子 Agent 完成，并在本次工具结果中返回摘要内容和结果文件路径。"
         "只适合补充本地归档之外的群聊近期历史；必须知道 group_id，不支持私聊。"
     ),
     args_model=SummarizeChatArgs,
     category="platform",
-    no_feedback=True,
 )
 async def summarize_chat_history(args: SummarizeChatArgs, ctx: ToolContext) -> dict:
     if ctx.adapter is None:
@@ -1037,12 +1070,11 @@ _DEFAULT_LOCAL_SUMMARY_GOAL = (
     name="summarize_conversation",
     description=(
         "启动后台子 Agent 总结本地永久归档和当前活跃历史中的对话，私聊和群聊都可用。"
-        "工具会先返回 task_id；完成后系统会把结果文件作为一次新请求回传。"
+        "工具会等待子 Agent 完成，并在本次工具结果中返回摘要内容和结果文件路径。"
         "当用户要总结过去对话、查本地归档、或总结私聊历史时优先使用。"
     ),
     args_model=SummarizeConversationArgs,
     category="platform",
-    no_feedback=True,
 )
 async def summarize_conversation(args: SummarizeConversationArgs, ctx: ToolContext) -> dict:
     if ctx.archive is None:

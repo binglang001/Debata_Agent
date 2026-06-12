@@ -114,7 +114,7 @@ SendActionsCallback = Callable[
 """发送类工具的 Phase 0 队列回调：(actions, source_tool) -> result。"""
 
 AgentTaskCallback = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
-"""后台子 Agent 任务回调：(payload) -> queued result。"""
+"""子 Agent 任务回调：(payload) -> in-band tool result。"""
 
 
 # ============================================================
@@ -162,7 +162,7 @@ class ToolContext:
     None 表示禁用文件类工具（read/write/edit/list/delete/upload_file/run_python）。"""
 
     emoji_dir: Path | None = None
-    """表情包目录（send_* 工具通过 image 参数引用文件名时用）。"""
+    """表情包目录（send_* 工具通过 emoji 参数按名称引用时用）。"""
 
     default_history_fetch_count: int = 100
     """summarize_chat_history 工具拉取群历史的默认 count 参数。"""
@@ -478,9 +478,6 @@ DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "set_friend_add_request",
     "set_group_add_request",
     "schedule_wakeup",
-    "start_agent_task",
-    "summarize_chat_history",
-    "summarize_conversation",
 }
 """与 agents.runner.DEFAULT_NO_FEEDBACK_TOOLS 对齐。
 ToolRegistry.get_no_feedback_names() 是更准的来源（按实际启用工具）；

@@ -74,7 +74,7 @@ class NapCatProcessManager:
             logger.info("正在终止 NapCat 进程")
             try:
                 if sys.platform == "win32":
-                    self._process.terminate()
+                    await self._terminate_windows_tree(force=False)
                 else:
                     self._process.send_signal(signal.SIGTERM)
             except ProcessLookupError:
@@ -87,7 +87,10 @@ class NapCatProcessManager:
             except asyncio.TimeoutError:
                 logger.warning(f"NapCat 未在 {self.graceful_shutdown_timeout}s 内退出，强制 kill")
                 try:
-                    self._process.kill()
+                    if sys.platform == "win32":
+                        await self._terminate_windows_tree(force=True)
+                    else:
+                        self._process.kill()
                     await self._process.wait()
                 except ProcessLookupError:
                     pass
@@ -102,6 +105,25 @@ class NapCatProcessManager:
 
         self._process = None
         logger.info("NapCat 进程已停止")
+
+    async def _terminate_windows_tree(self, *, force: bool) -> None:
+        """Windows 下终止由 bat/cmd 拉起的整棵 NapCat 进程树。"""
+        if self._process is None or self._process.pid is None:
+            return
+        cmd = ["taskkill", "/PID", str(self._process.pid), "/T"]
+        if force:
+            cmd.insert(1, "/F")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+        text = out.decode("utf-8", errors="replace").strip()
+        if proc.returncode not in (0, 128):
+            logger.warning("taskkill NapCat 进程树失败 rc=%s: %s", proc.returncode, text)
+        elif text:
+            logger.debug("taskkill NapCat 进程树完成: %s", text)
 
     async def _spawn_once(self) -> None:
         """启动一次进程（不带重启逻辑）。"""

@@ -318,6 +318,10 @@ class AnthropicProvider(IProvider):
         if usage_obj is not None:
             usage.prompt_tokens = int(getattr(usage_obj, "input_tokens", 0) or 0)
             usage.completion_tokens = int(getattr(usage_obj, "output_tokens", 0) or 0)
+            usage.cached_tokens = int(getattr(usage_obj, "cache_read_input_tokens", 0) or 0)
+            usage.cache_creation_tokens = int(
+                getattr(usage_obj, "cache_creation_input_tokens", 0) or 0
+            )
             usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
 
         return CompletionResult(
@@ -342,6 +346,8 @@ class AnthropicProvider(IProvider):
         finish_reason = ""
         prompt_tokens = 0
         completion_tokens = 0
+        cached_tokens = 0
+        cache_creation_tokens = 0
 
         current_tool_index = 0
 
@@ -407,12 +413,26 @@ class AnthropicProvider(IProvider):
                 usage = getattr(ev, "usage", None)
                 if usage:
                     completion_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+                    cached_tokens = int(
+                        getattr(usage, "cache_read_input_tokens", 0) or cached_tokens
+                    )
+                    cache_creation_tokens = int(
+                        getattr(usage, "cache_creation_input_tokens", 0)
+                        or cache_creation_tokens
+                    )
             elif ev_type == "message_start":
                 msg = getattr(ev, "message", None)
                 if msg:
                     usage = getattr(msg, "usage", None)
                     if usage:
                         prompt_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+                        cached_tokens = int(
+                            getattr(usage, "cache_read_input_tokens", 0) or cached_tokens
+                        )
+                        cache_creation_tokens = int(
+                            getattr(usage, "cache_creation_input_tokens", 0)
+                            or cache_creation_tokens
+                        )
 
         return CompletionResult(
             content="".join(text_parts),
@@ -437,6 +457,8 @@ class AnthropicProvider(IProvider):
             usage=Usage(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+                cache_creation_tokens=cache_creation_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
             ),
             model=model,
