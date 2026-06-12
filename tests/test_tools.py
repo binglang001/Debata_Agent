@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -16,6 +17,7 @@ from tools import (
     DEFAULT_NO_FEEDBACK_TOOLS,
     FEATURE_TOOL_FEATURES,
     MEMORY_FILE_TOOLS,
+    STUB_SCHEMA_TOOLS,
     ToolContext,
     ToolRegistry,
     build_default_registry,
@@ -85,6 +87,12 @@ def _timeline_message(message_id: str, text: str) -> ChatTimelineMessage:
     )
 
 
+def _approve_stub_tools(ctx: ToolContext, *names: str) -> None:
+    approved = ctx.extras.setdefault("tool_search_approved_tools", set())
+    assert isinstance(approved, set)
+    approved.update(names)
+
+
 class FakeSendAdapter:
     name = "fake"
 
@@ -92,6 +100,7 @@ class FakeSendAdapter:
         self.sent: list[tuple[object, str]] = []
         self.sent_images: list[dict[str, object]] = []
         self.voice_sent: list[tuple[object, Path]] = []
+        self.api_calls: list[tuple[str, dict]] = []
         self._next_msg_id = 100
 
     async def send_text(self, target, content: str) -> str:
@@ -189,6 +198,23 @@ class FullFakeAdapter(FakeSendAdapter):
     async def upload_file(self, target, file_path: Path, *, display_name: str | None = None) -> None:
         self.uploaded = {"target": target, "file_path": file_path, "display_name": display_name}
 
+    async def call_api(self, action: str, **params: Any) -> dict:
+        self.api_calls.append((action, params))
+        if action == "get_group_member_info":
+            return {
+                "group_id": params.get("group_id"),
+                "user_id": params.get("user_id"),
+                "role": "admin",
+            }
+        if action == "get_msg":
+            return {
+                "message_id": params.get("message_id"),
+                "group_id": 456,
+                "user_id": 1001,
+                "raw_message": "单条消息内容",
+            }
+        return {"ok": True, "action": action}
+
 
 class FakeVision:
     async def describe(self, image_url: str, prompt: str = ""):
@@ -228,7 +254,7 @@ def test_send_private_schema_derivation():
     assert schema["type"] == "function"
     fn = schema["function"]
     assert fn["name"] == "send_private_messages"
-    assert "send_only" in fn["parameters"]["properties"]
+    assert "send_only" not in fn["parameters"]["properties"]
     assert "targets" in fn["parameters"]["properties"]
     assert "targets" in fn["parameters"]["required"]
     target_props = fn["parameters"]["properties"]["targets"]["items"]["properties"]
@@ -299,12 +325,17 @@ def test_strip_pydantic_metadata_removes_title():
 def test_all_expected_tools_registered():
     """检查核心工具都已通过装饰器注册到全局列表。"""
     expected = {
-        "send_private_messages", "send_group_message", "recall_message", "upload_file",
-        "save_important_memory", "delete_important_memory",
+        "send_private_messages", "send_group_message", "commit_send_attempt",
+        "recall_message", "upload_file",
+        "save_important_memory", "update_important_memory", "delete_important_memory",
         "list_contacts", "get_user_info", "get_forward_msg", "get_recent_chat_messages",
+        "get_msg", "send_poke", "set_msg_emoji_like",
+        "get_group_self_role", "set_group_kick", "set_group_ban",
+        "set_group_whole_ban", "set_group_leave",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
         "summarize_conversation", "recall_history", "start_agent_task",
         "no_action", "schedule_wakeup",
+        "tool_search",
         "describe_image", "web_search", "get_weather",
         "send_voice_message",
         # workspace tools
@@ -397,21 +428,22 @@ def test_registry_file_mode_includes_memory_tools():
     cfg = _make_config(memory_mode="file")
     reg = build_default_registry(cfg)
     assert "save_important_memory" in reg
+    assert "update_important_memory" in reg
     assert "delete_important_memory" in reg
 
 
-def test_registry_rag_mode_excludes_memory_tools():
+def test_registry_rag_mode_includes_memory_tools():
     cfg = _make_config(memory_mode="rag")
     reg = build_default_registry(cfg)
     for name in MEMORY_FILE_TOOLS:
-        assert name not in reg, f"RAG 模式下不应注册 {name}"
+        assert name in reg, f"RAG 模式下也应注册 {name}"
 
 
-def test_registry_feature_disabled_excludes_tool():
+def test_registry_feature_disabled_keeps_schema_stable():
     cfg = _make_config(vision_enabled=False, weather_enabled=False)
     reg = build_default_registry(cfg)
     for name in ("describe_image", "get_weather"):
-        assert name not in reg
+        assert name in reg
 
 
 def test_registry_feature_enabled_includes_tool():
@@ -436,10 +468,84 @@ def test_registry_messaging_always_enabled():
     assert "recall_message" in reg
 
 
-def test_registry_upload_file_can_be_disabled():
+def test_registry_upload_file_is_stub_schema():
     cfg = _make_config()
-    reg = build_default_registry(cfg, include_upload_file=False)
-    assert "upload_file" not in reg
+    reg = build_default_registry(cfg)
+    schema_by_name = {
+        schema["function"]["name"]: schema["function"]
+        for schema in reg.get_schemas()
+    }
+    assert "upload_file" in reg
+    assert set(schema_by_name["upload_file"]["parameters"]["properties"]) == {
+        "_tool_search_required"
+    }
+
+
+def test_registry_stub_and_full_schema_modes_are_stable():
+    cfg = _make_config(vision_enabled=False, web_search_enabled=False, weather_enabled=False)
+    reg_disabled = build_default_registry(cfg)
+    cfg_enabled = _make_config(vision_enabled=True, web_search_enabled=True, weather_enabled=True)
+    reg_enabled = build_default_registry(cfg_enabled)
+
+    assert reg_disabled.names() == reg_enabled.names()
+    schema_by_name = {
+        schema["function"]["name"]: schema["function"]
+        for schema in reg_disabled.get_schemas()
+    }
+    for name in STUB_SCHEMA_TOOLS:
+        assert name in schema_by_name
+        props = schema_by_name[name]["parameters"]["properties"]
+        assert set(props) == {"_tool_search_required"}
+    assert "targets" in schema_by_name["send_private_messages"]["parameters"]["properties"]
+    assert "tool_name" in schema_by_name["tool_search"]["parameters"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_stub_tool_requires_tool_search_before_execution(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    file_path = workspace / "x.txt"
+    file_path.write_text("x", encoding="utf-8")
+    adapter = _FakeAdapter()
+    ctx = ToolContext(adapter=adapter, workspace_dir=workspace)
+    executor = reg.get_executor(ctx)
+
+    blocked = await executor(
+        "upload_file",
+        {"target_type": "group", "target_id": 1, "file_path": "x.txt"},
+    )
+    assert blocked["ok"] is False
+    assert blocked["status"] == "need_tool_search"
+
+    details = await executor("tool_search", {"tool_name": "upload_file", "intent": "发送文件"})
+    assert details["ok"] is True
+    assert details["status"] == "found"
+    assert details["tool_name"] == "upload_file"
+    assert "file_path" in details["parameters_schema"]["properties"]
+    assert "file_path" in details["required_fields"]
+
+    sent = await executor(
+        "upload_file",
+        {"target_type": "group", "target_id": 1, "file_path": "x.txt"},
+    )
+    assert sent["ok"] is True
+    assert sent["status"] == "done"
+    assert len(adapter.uploaded) == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_search_reports_unknown_tool_candidates():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext())
+
+    result = await executor("tool_search", {"tool_name": "send"})
+
+    assert result["ok"] is False
+    assert result["status"] == "not_found"
+    assert "send_private_messages" in result["candidates"]
 
 
 @pytest.mark.asyncio
@@ -475,6 +581,9 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     )
     important = ImportantMemoryManager(tmp_path / "important.json")
     await important.load()
+    await important.replace_all(
+        [{"timestamp": "mem-existing", "content": "用户喜欢绿茶"}]
+    )
 
     timeline = ChatTimelineStore()
     timeline.append(_timeline_message("m1", "最近消息"))
@@ -505,8 +614,15 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "summary": "子 Agent 结果",
         }
 
-    async def fake_send_actions(actions, source_tool):
-        sent_actions.append({"source_tool": source_tool, "actions": actions})
+    async def fake_send_actions(actions, source_tool, *, metadata=None):
+        sent_actions.append({"source_tool": source_tool, "actions": actions, "metadata": metadata})
+        if source_tool == "commit_send_attempt":
+            return {
+                "ok": True,
+                "status": "already_committed",
+                "send_attempt_id": (metadata or {}).get("commit_send_attempt_id"),
+                "qq_visible": False,
+            }
         return {
             "ok": True,
             "status": "sent",
@@ -543,6 +659,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "chat_timeline": timeline,
             "default_reply_target": {"target_type": "private", "target_id": 123},
             "latest_user_message": "帮我测试工具",
+            "self_id": "999",
         },
     )
     reg = ToolRegistry(get_default_specs())
@@ -572,15 +689,22 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "prompt": "年轻女性，自然口语",
         },
         "save_important_memory": {"memory_text": "用户喜欢红茶"},
+        "update_important_memory": {
+            "memory_id": "mem-existing",
+            "memory_text": "用户喜欢红茶和乌龙茶",
+        },
         "delete_important_memory": {"keyword": "红茶"},
         "send_private_messages": {
             "targets": [{"target_qq": 123, "content": "你好", "order": 1}],
-            "send_only": True,
         },
         "send_group_message": {
             "group_id": 456,
             "targets": [{"content": "群消息", "order": 1}],
-            "send_only": True,
+        },
+        "commit_send_attempt": {
+            "send_attempt_id": "attempt-test",
+            "reviewed_until_seq": 1,
+            "delivery_interrupt_policy": "interrupt_priority",
         },
         "recall_message": {"message_id": 100},
         "upload_file": {
@@ -592,12 +716,45 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         "get_user_info": {"user_id": 1001},
         "get_forward_msg": {"forward_id": "root", "recursive": True, "max_depth": 2},
         "get_recent_chat_messages": {"conversation_id": "private:123", "limit": 10},
+        "get_msg": {"message_id": 321},
+        "send_poke": {
+            "user_id": 1001,
+            "group_id": 456,
+            "reason": "用户明确要求戳一戳",
+        },
+        "set_msg_emoji_like": {
+            "message_id": 321,
+            "emoji_id": "76",
+            "set": True,
+            "reason": "用表情轻量回应",
+        },
         "set_friend_add_request": {"flag": "friend-flag", "approve": True, "remark": "A"},
         "set_group_add_request": {
             "flag": "group-flag",
             "sub_type": "add",
             "approve": False,
             "reason": "拒绝",
+        },
+        "get_group_self_role": {"group_id": 456},
+        "set_group_kick": {
+            "group_id": 456,
+            "user_id": 1002,
+            "reason": "管理员明确要求测试",
+        },
+        "set_group_ban": {
+            "group_id": 456,
+            "user_id": 1002,
+            "duration_seconds": 600,
+            "reason": "管理员明确要求测试",
+        },
+        "set_group_whole_ban": {
+            "group_id": 456,
+            "enable": True,
+            "reason": "管理员明确要求测试",
+        },
+        "set_group_leave": {
+            "group_id": 456,
+            "reason": "管理员明确要求测试",
         },
         "summarize_chat_history": {"group_id": 456, "custom_prompt": "总结"},
         "summarize_conversation": {
@@ -612,6 +769,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         "list_files": {"path": ".", "pattern": "*.txt", "limit": 20},
         "delete_file": {"path": "delete-me.txt"},
         "run_python": {"code": "print('ok')", "timeout_seconds": 5},
+        "tool_search": {"tool_name": "upload_file", "intent": "测试工具详情查询"},
     }
     assert set(calls) == {spec.name for spec in get_default_specs()}
 
@@ -642,6 +800,8 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["get_recent_chat_messages"]["content"].count("最近消息") == 1
     assert results["get_recent_chat_messages"]["data"]["range"] == "continuous"
     assert results["get_recent_chat_messages"]["data"]["last_msg_id"] == "m1"
+    assert results["get_msg"]["content"] == "单条消息内容"
+    assert results["get_msg"]["data"]["conversation_id"] == "group:456"
 
     assert results["read_file"]["data"]["range"] == "continuous_page"
     assert "old line" in results["read_file"]["content"]
@@ -669,9 +829,13 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["send_voice_message"]["status"] == "sent"
     assert results["send_private_messages"]["status"] == "sent"
     assert results["send_group_message"]["status"] == "sent"
+    non_commit_sends = [
+        item for item in sent_actions if item["source_tool"] != "commit_send_attempt"
+    ]
     assert [
-        item["source_tool"] for item in sent_actions
+        item["source_tool"] for item in non_commit_sends
     ] == ["send_voice_message", "send_private_messages", "send_group_message"]
+    assert results["commit_send_attempt"]["status"] == "already_committed"
     assert sent_actions[0]["actions"][0]["kind"] == "voice"
     assert sent_actions[1]["actions"][0]["target_scope"] == "private"
     assert sent_actions[1]["actions"][0]["content"] == "你好"
@@ -680,7 +844,8 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
 
     assert results["save_important_memory"]["saved"] is True
     assert results["save_important_memory"]["scope"] == "user:123"
-    assert results["delete_important_memory"]["deleted"] == 1
+    assert results["update_important_memory"]["updated"] is True
+    assert results["delete_important_memory"]["deleted"] == 2
     assert important.items() == []
 
     assert results["recall_message"]["data"]["message_id"] == "100"
@@ -688,11 +853,18 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["upload_file"]["data"]["target_type"] == "private"
     assert adapter.uploaded["file_path"] == upload_path
     assert adapter.uploaded["display_name"] == "report.md"
+    assert results["tool_search"]["status"] == "found"
+    assert results["tool_search"]["tool_name"] == "upload_file"
+    assert "file_path" in results["tool_search"]["parameters_schema"]["properties"]
 
     assert results["list_contacts"]["data"]["scope"] == "friends"
     assert results["list_contacts"]["friends"][0]["nickname"] == "Alice"
     assert results["get_user_info"]["data"]["user_id"] == "1001"
     assert results["get_user_info"]["info"]["nickname"] == "Alice"
+    assert results["send_poke"]["status"] == "done"
+    assert results["send_poke"]["data"]["group_id"] == "456"
+    assert results["set_msg_emoji_like"]["status"] == "done"
+    assert results["set_msg_emoji_like"]["data"]["emoji_id"] == "76"
     assert adapter.friend_request == {"flag": "friend-flag", "approve": True, "remark": "A"}
     assert adapter.group_request == {
         "flag": "group-flag",
@@ -700,6 +872,14 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         "approve": False,
         "reason": "拒绝",
     }
+    assert results["get_group_self_role"]["role"] == "admin"
+    assert results["set_group_kick"]["status"] == "done"
+    assert results["set_group_ban"]["status"] == "done"
+    assert results["set_group_whole_ban"]["status"] == "done"
+    assert results["set_group_leave"]["status"] == "done"
+    assert [call[0] for call in adapter.api_calls].count("set_group_ban") == 1
+    assert [call[0] for call in adapter.api_calls].count("send_poke") == 1
+    assert [call[0] for call in adapter.api_calls].count("set_msg_emoji_like") == 1
 
     assert results["summarize_chat_history"]["task_id"] == "agent-test"
     assert agent_tasks[1]["output_name"] == "group_456_summary.md"
@@ -729,15 +909,18 @@ def test_registry_no_feedback_names_includes_known():
     assert "no_action" in names
     assert "save_important_memory" in names
     assert "schedule_wakeup" in names
+    assert "send_poke" in names
+    assert "set_msg_emoji_like" in names
 
 
-def test_registry_rag_no_feedback_names_excludes_memory_tools():
+def test_registry_rag_no_feedback_names_includes_memory_tools():
     cfg = _make_config(memory_mode="rag")
     reg = build_default_registry(cfg)
     names = reg.get_no_feedback_names()
     assert "no_action" in names
-    assert "save_important_memory" not in names
-    assert "delete_important_memory" not in names
+    assert "save_important_memory" in names
+    assert "update_important_memory" in names
+    assert "delete_important_memory" in names
 
 
 def test_registry_duplicate_spec_raises():
@@ -1819,6 +2002,7 @@ async def test_recall_history_writes_complete_artifact(tmp_path):
             }
         },
     )
+    _approve_stub_tools(ctx, "recall_history")
     executor = reg.get_executor(ctx)
 
     result = await executor(
@@ -1906,6 +2090,8 @@ class _FakeAdapter:
         self.recalled: list[str] = []
         self.friend_requests: list[tuple[str, bool, str]] = []
         self.group_requests: list[tuple[str, str, bool, str]] = []
+        self.api_calls: list[tuple[str, dict]] = []
+        self.member_role = "admin"
 
     async def upload_file(self, target, file_path, *, display_name=None):
         self.uploaded.append((target, file_path, display_name))
@@ -1920,6 +2106,25 @@ class _FakeAdapter:
     async def handle_group_request(self, flag, sub_type, approve, reason=""):
         self.group_requests.append((flag, sub_type, approve, reason))
 
+    async def call_api(self, action, **params):
+        self.api_calls.append((action, params))
+        if action == "get_group_member_info":
+            return {
+                "group_id": params.get("group_id"),
+                "user_id": params.get("user_id"),
+                "role": self.member_role,
+            }
+        if action == "get_msg":
+            return {
+                "message_id": params.get("message_id"),
+                "user_id": 123,
+                "message": [
+                    {"type": "text", "data": {"text": "你好"}},
+                    {"type": "face", "data": {"id": "76"}},
+                ],
+            }
+        return {"ok": True, "action": action}
+
 
 @pytest.mark.asyncio
 async def test_upload_file_outside_whitelist_rejected(tmp_path):
@@ -1931,6 +2136,7 @@ async def test_upload_file_outside_whitelist_rejected(tmp_path):
     outside.write_text("x")
 
     ctx = ToolContext(adapter=_FakeAdapter(), workspace_dir=allowed)
+    _approve_stub_tools(ctx, "upload_file")
     executor = reg.get_executor(ctx)
     result = await executor(
         "upload_file",
@@ -1953,6 +2159,7 @@ async def test_upload_file_inside_whitelist_ok(tmp_path):
 
     fake = _FakeAdapter()
     ctx = ToolContext(adapter=fake, workspace_dir=allowed)
+    _approve_stub_tools(ctx, "upload_file")
     executor = reg.get_executor(ctx)
     result = await executor(
         "upload_file",
@@ -1971,6 +2178,7 @@ async def test_upload_file_no_adapter():
     cfg = _make_config()
     reg = build_default_registry(cfg)
     ctx = ToolContext()  # 没 adapter
+    _approve_stub_tools(ctx, "upload_file")
     executor = reg.get_executor(ctx)
     result = await executor(
         "upload_file",
@@ -1979,6 +2187,195 @@ async def test_upload_file_no_adapter():
     assert result["ok"] is False
     assert result["status"] == "failed"
     assert "未连接适配器" in result["brief"]
+
+
+# ============================================================
+# QQ group admin tools
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_get_group_self_role_uses_current_group_and_self_id():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(
+        adapter=adapter,
+        conversation_id="group:42",
+        extras={"self_id": "999"},
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor("get_group_self_role", {})
+
+    assert result["ok"] is True
+    assert result["role"] == "admin"
+    assert result["group_id"] == "42"
+    assert adapter.api_calls == [
+        (
+            "get_group_member_info",
+            {"group_id": 42, "user_id": 999, "no_cache": True},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_group_admin_stub_requires_tool_search_before_execution():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(adapter=adapter, extras={"self_id": "999"})
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_group_ban",
+        {
+            "group_id": 42,
+            "user_id": 123,
+            "duration_seconds": 600,
+            "reason": "管理员明确要求测试",
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "need_tool_search"
+    assert adapter.api_calls == []
+
+    details = await executor("tool_search", {"tool_name": "set_group_ban"})
+    assert details["ok"] is True
+    assert details["risk_level"] == "high"
+    assert "duration_seconds" in details["parameters_schema"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_group_ban_requires_bot_admin_role():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    adapter.member_role = "member"
+    ctx = ToolContext(adapter=adapter, extras={"self_id": "999"})
+    _approve_stub_tools(ctx, "set_group_ban")
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_group_ban",
+        {
+            "group_id": 42,
+            "user_id": 123,
+            "duration_seconds": 600,
+            "reason": "管理员明确要求测试",
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "insufficient_permission"
+    assert [call[0] for call in adapter.api_calls] == ["get_group_member_info"]
+
+
+@pytest.mark.asyncio
+async def test_group_ban_calls_napcat_api_when_admin():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(adapter=adapter, extras={"self_id": "999"})
+    _approve_stub_tools(ctx, "set_group_ban")
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_group_ban",
+        {
+            "group_id": 42,
+            "user_id": 123,
+            "duration_seconds": 600,
+            "reason": "管理员明确要求测试",
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert adapter.api_calls == [
+        (
+            "get_group_member_info",
+            {"group_id": 42, "user_id": 999, "no_cache": True},
+        ),
+        (
+            "set_group_ban",
+            {"group_id": 42, "user_id": 123, "duration": 600},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_group_leave_only_allows_current_group():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(
+        adapter=adapter,
+        conversation_id="group:42",
+        extras={"self_id": "999"},
+    )
+    _approve_stub_tools(ctx, "set_group_leave")
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_group_leave",
+        {"group_id": 43, "reason": "用户明确要求退群"},
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "target_mismatch"
+    assert adapter.api_calls == []
+
+
+@pytest.mark.asyncio
+async def test_group_whole_ban_calls_napcat_api_when_admin():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(adapter=adapter, extras={"self_id": "999"})
+    _approve_stub_tools(ctx, "set_group_whole_ban")
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_group_whole_ban",
+        {"group_id": 42, "enable": True, "reason": "管理员明确要求全员禁言"},
+    )
+
+    assert result["ok"] is True
+    assert adapter.api_calls[-1] == (
+        "set_group_whole_ban",
+        {"group_id": 42, "enable": True},
+    )
+
+
+@pytest.mark.asyncio
+async def test_qq_action_tools_call_napcat_api():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(adapter=adapter, conversation_id="group:42")
+    executor = reg.get_executor(ctx)
+
+    msg = await executor("get_msg", {"message_id": 123})
+    poke = await executor("send_poke", {"user_id": 456})
+    emoji = await executor(
+        "set_msg_emoji_like",
+        {"message_id": 123, "emoji_id": "76", "set": False},
+    )
+
+    assert msg["ok"] is True
+    assert msg["content"] == "你好[face]"
+    assert msg["data"]["conversation_id"] == "private:123"
+    assert poke["ok"] is True
+    assert poke["data"]["group_id"] == "42"
+    assert emoji["ok"] is True
+    assert emoji["data"]["set"] is False
+    assert adapter.api_calls[-3:] == [
+        ("get_msg", {"message_id": 123}),
+        ("send_poke", {"user_id": 456, "group_id": 42}),
+        ("set_msg_emoji_like", {"message_id": 123, "emoji_id": "76", "set": False}),
+    ]
 
 
 @pytest.mark.asyncio
@@ -2251,6 +2648,61 @@ async def test_save_memory_explicit_scope_and_pinned(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_update_memory_with_manager(tmp_path):
+    from memory import ImportantMemoryManager
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+    await im.replace_all([{"timestamp": "mem-1", "content": "张三是朋友"}])
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(important=im)
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "update_important_memory",
+        {
+            "memory_id": "mem-1",
+            "memory_text": "张三是朋友，生日是7月8日",
+            "reason": "补充生日",
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["updated"] is True
+    assert im.items()[0]["content"] == "张三是朋友，生日是7月8日"
+
+
+@pytest.mark.asyncio
+async def test_update_memory_exact_duplicate_returns_existing_id(tmp_path):
+    from memory import ImportantMemoryManager
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+    await im.replace_all(
+        [
+            {"timestamp": "mem-1", "content": "张三是朋友"},
+            {"timestamp": "mem-2", "content": "李四是朋友"},
+        ]
+    )
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(important=im)
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "update_important_memory",
+        {"memory_id": "mem-2", "memory_text": "张三是朋友"},
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "exact_duplicate"
+    assert result["updated"] is False
+    assert result["existing_id"] == "mem-1"
+    assert im.items()[1]["content"] == "李四是朋友"
+
+
+@pytest.mark.asyncio
 async def test_delete_memory_with_manager(tmp_path):
     from memory import ImportantMemoryManager
 
@@ -2306,6 +2758,7 @@ async def test_summarize_conversation_starts_agent_task(tmp_path):
         agent_task_cb=fake_agent_task,
         conversation_id="group:42",
     )
+    _approve_stub_tools(ctx, "summarize_conversation")
     executor = reg.get_executor(ctx)
 
     result = await executor(
@@ -2339,7 +2792,9 @@ async def test_start_agent_task_requires_prompt_and_calls_runtime():
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
-    executor = reg.get_executor(ToolContext(agent_task_cb=fake_agent_task))
+    ctx = ToolContext(agent_task_cb=fake_agent_task)
+    _approve_stub_tools(ctx, "start_agent_task")
+    executor = reg.get_executor(ctx)
 
     result = await executor(
         "start_agent_task",
@@ -2370,7 +2825,9 @@ async def test_start_agent_task_rejects_image_ref_without_vision_service():
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
-    executor = reg.get_executor(ToolContext(agent_task_cb=fake_agent_task))
+    ctx = ToolContext(agent_task_cb=fake_agent_task)
+    _approve_stub_tools(ctx, "start_agent_task")
+    executor = reg.get_executor(ctx)
 
     result = await executor(
         "start_agent_task",
@@ -2397,7 +2854,9 @@ async def test_start_agent_task_rejects_image_workspace_path_without_vision_serv
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
-    executor = reg.get_executor(ToolContext(agent_task_cb=fake_agent_task))
+    ctx = ToolContext(agent_task_cb=fake_agent_task)
+    _approve_stub_tools(ctx, "start_agent_task")
+    executor = reg.get_executor(ctx)
 
     result = await executor(
         "start_agent_task",
@@ -2429,6 +2888,7 @@ async def test_start_agent_task_rejects_image_retry_after_describe_image_failure
     cfg = _make_config(vision_enabled=True)
     reg = build_default_registry(cfg)
     ctx = ToolContext(vision=FailingVision(), agent_task_cb=fake_agent_task)
+    _approve_stub_tools(ctx, "start_agent_task")
     executor = reg.get_executor(ctx)
 
     image_result = await executor(

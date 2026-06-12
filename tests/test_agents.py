@@ -126,6 +126,7 @@ def test_list_available_personas(tmp_paths):
 def test_tool_use_protocol_file_mode():
     s = build_tool_use_protocol("file")
     assert "save_important_memory" in s
+    assert "update_important_memory" in s
     assert "必须主动保存" in s
     assert "自动管理" not in s
 
@@ -135,8 +136,9 @@ def test_tool_use_protocol_rag_mode():
     assert "RAG 会话向量检索" in s
     assert "retrieved_conversation_context" in s
     assert "save_important_memory" in s
-    assert "没有 save_important_memory" in s
-    assert "必须主动保存" not in s
+    assert "update_important_memory" in s
+    assert "没有 save_important_memory" not in s
+    assert "不能指望 RAG 一定召回" in s
 
 
 def test_tool_use_protocol_default_is_file():
@@ -166,8 +168,9 @@ def test_tool_trigger_policy_in_protocol():
     assert "describe_image" in s
     assert "get_forward_msg" in s
     assert "read_file" in s
-    assert "stale" in s
-    assert "stale / interrupted" in s
+    assert "needs_review" in s
+    assert "needs_review / interrupted" in s
+    assert "commit_send_attempt" in s
 
 
 def test_group_relevance_uses_clear_addressee_rules():
@@ -227,6 +230,9 @@ def test_kv_prompt_diagnostics_do_not_emit_temp_fields():
 
     assert "kv_message_count" in diag
     assert "kv_prefix_8k_hash" in diag
+    assert diag["kv_user_char_count"] == len("<task_context>ctx</task_context>")
+    assert diag["kv_task_context_block_count"] == 1
+    assert diag["kv_task_context_char_count"] == len("<task_context>ctx</task_context>")
     assert not any(key.startswith("kv_temp") for key in diag)
 
 
@@ -251,6 +257,39 @@ def test_kv_prompt_diagnostics_scan_runtime_user_context():
     assert diag["kv_has_send_receipt"] is True
     assert diag["kv_has_recent_group_messages"] is True
     assert diag["kv_has_rag"] is True
+    assert diag["kv_send_receipt_block_count"] == 1
+    assert diag["kv_rag_block_count"] == 1
+
+
+def test_kv_prompt_diagnostics_counts_stub_tools():
+    diag = _kv_prompt_diagnostics(
+        [{"role": "system", "content": "x"}],
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "stub_tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"_tool_search_required": {"type": "boolean"}},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "full_tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        loop=1,
+    )
+
+    assert diag["kv_tools_count"] == 2
+    assert diag["kv_tools_stub_count"] == 1
+    assert diag["kv_tools_full_count"] == 1
+    assert diag["kv_tools_char_count"] > 0
 
 
 def test_behavior_prompt_does_not_hardcode_persona_replies():
@@ -316,16 +355,18 @@ def test_build_combined_system_prompt_memory_mode_default():
     assert "必须主动保存" in sys  # 文件模式默认
 
 
-def test_build_combined_system_prompt_rag_mode_no_active_save():
+def test_build_combined_system_prompt_rag_mode_keeps_important_memory():
     p = _persona()
     sys = build_combined_system_prompt(p, important_memory_text="历史片段", memory_mode="rag")
     assert "RAG 会话向量检索" in sys
     assert "<retrieved_conversation_context" in sys
+    assert "</retrieved_conversation_context>" not in sys
     assert "历史片段" in sys
-    assert "<long_term_memory" not in sys
+    assert "<long_term_memory" in sys
     assert "save_important_memory" in sys
-    assert "没有 save_important_memory" in sys
-    assert "必须主动保存" not in sys
+    assert "update_important_memory" in sys
+    assert "没有 save_important_memory" not in sys
+    assert "不能指望 RAG 一定召回" in sys
 
 
 def test_build_combined_system_prompt_with_important_memory():
@@ -473,14 +514,16 @@ def test_build_messages_rag_memory_is_tail_context_for_cache_stability():
     first = build_messages(
         p,
         history,
-        important_memory_text="RAG 片段 A",
+        important_memory_text="重要记忆",
+        rag_context_text="RAG 片段 A",
         current_context="现在是 10:00",
         memory_mode="rag",
     )
     second = build_messages(
         p,
         history,
-        important_memory_text="RAG 片段 B",
+        important_memory_text="重要记忆",
+        rag_context_text="RAG 片段 B",
         current_context="现在是 10:00",
         memory_mode="rag",
     )
@@ -488,6 +531,8 @@ def test_build_messages_rag_memory_is_tail_context_for_cache_stability():
     assert first[0]["content"] == second[0]["content"]
     assert "RAG 片段 A" not in first[0]["content"]
     assert "RAG 片段 B" not in second[0]["content"]
+    assert "重要记忆" in first[0]["content"]
+    assert "<long_term_memory" in first[0]["content"]
     assert [m["role"] for m in first] == ["system", "user", "user", "user"]
     assert "旧消息" in first[1]["content"]
     assert "task_context" in first[2]["content"]
@@ -654,19 +699,21 @@ async def test_important_force_save_custom_keywords(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_important_force_save_bypasses_dedup(tmp_path):
-    """强制保存不应被去重检查阻止（直接写入）。"""
+async def test_important_force_save_blocks_exact_duplicate(tmp_path):
+    """关键词强制保存也只拦截完全相同文本。"""
     from memory import ImportantMemoryManager
 
     im = ImportantMemoryManager(tmp_path / "imp.json")
     await im.load()
-    await im.force_save_from_keyword("记住第一条")
-    await im.force_save_from_keyword("记住第一条")  # 相同内容
-    # 两条都被保存
-    assert len(im.items()) == 2
-    # 都标记了来源
-    for item in im.items():
-        assert item.get("source", "").startswith("keyword:")
+    first = await im.force_save_from_keyword("记住第一条")
+    second = await im.force_save_from_keyword("记住第一条")
+
+    assert first["saved"] is True
+    assert second["saved"] is False
+    assert second["duplicate"] is True
+    assert second["duplicate_type"] == "exact"
+    assert len(im.items()) == 1
+    assert im.items()[0].get("source", "").startswith("keyword:")
 
 
 # ============================================================
@@ -887,15 +934,21 @@ async def test_runner_failed_no_action_does_not_finish_tool_loop():
                     finish_reason="tool_calls",
                     usage=Usage(prompt_tokens=5),
                 )
-            assert "policy_rejected" in messages[-1]["content"]
+            if len(self.calls) == 2:
+                assert "policy_rejected" in messages[-1]["content"]
+                return CompletionResult(
+                    tool_calls=[
+                        ToolCall(
+                            id="tc-send",
+                            name="send_private_messages",
+                            arguments='{"targets": [{"target_qq": 123, "content": "已处理"}]}',
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                    usage=Usage(prompt_tokens=6),
+                )
             return CompletionResult(
-                tool_calls=[
-                    ToolCall(
-                        id="tc-send",
-                        name="send_private_messages",
-                        arguments='{"send_only": true, "targets": [{"target_qq": 123, "content": "已处理"}]}',
-                    )
-                ],
+                tool_calls=[ToolCall(id="tc-na-ok", name="no_action", arguments="{}")],
                 finish_reason="tool_calls",
                 usage=Usage(prompt_tokens=6),
             )
@@ -903,8 +956,14 @@ async def test_runner_failed_no_action_does_not_finish_tool_loop():
         async def aclose(self) -> None:
             pass
 
+    no_action_calls = 0
+
     async def executor(name, _args):
+        nonlocal no_action_calls
         if name == "no_action":
+            no_action_calls += 1
+            if no_action_calls > 1:
+                return {"ok": True, "status": "done"}
             return {"ok": False, "status": "policy_rejected"}
         if name == "send_private_messages":
             return {"ok": True, "status": "sent"}
@@ -939,8 +998,8 @@ async def test_runner_failed_no_action_does_not_finish_tool_loop():
         tool_executor=executor,
     )
 
-    assert result.finish_reason == "send_only_complete"
-    assert len(provider.calls) == 2
+    assert result.finish_reason == "no_action"
+    assert len(provider.calls) == 3
 
 
 @pytest.mark.asyncio

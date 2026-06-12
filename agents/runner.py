@@ -8,17 +8,18 @@
 
 循环退出条件（保留 V1 语义）：
     1. AI 调用了 no_action → finish_reason='no_action'
-    2. AI 全部调用 send_* 且 send_only=True 且全部成功 → 'send_only_complete'
-    3. AI 调用的全是 no_feedback 类工具且全部成功 → 'all_no_feedback'
-    4. AI 未调用工具，提示重试后仍不调用 → 'no_tool_after_retry'
-    5. 达到 max_loops → 'max_loops'，随后追加一次无工具收尾，让模型说明部分结果
+    2. AI 调用的全是 no_feedback 类工具且全部成功 → 'all_no_feedback'
+    3. AI 未调用工具，提示重试后仍不调用 → 'no_tool_after_retry'
+    4. 达到 max_loops → 'max_loops'，随后追加一次无工具收尾，让模型说明部分结果
 """
 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -43,14 +44,17 @@ logger = logging.getLogger(__name__)
 # 调用完直接结束循环
 DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "save_important_memory",
+    "update_important_memory",
     "delete_important_memory",
     "no_action",
+    "send_poke",
+    "set_msg_emoji_like",
     "set_friend_add_request",
     "set_group_add_request",
     "schedule_wakeup",
 }
 
-# 发送类工具：send_only=True 时同样算作终止信号
+# 发送类工具需要把结果回填给模型；发送成功不等于本轮结束。
 SEND_TOOL_NAMES: set[str] = {
     "send_private_messages",
     "send_group_message",
@@ -102,7 +106,6 @@ class AgentRunner:
         prompt_tokens_total = 0
         effective_max_loops = max(1, int(max_loops or self.cfg.max_loops))
         refocus_interval = self.cfg.refocus_interval
-        has_pending_send_actions = False
 
         reasoning = self._to_provider_reasoning(self.cfg.reasoning)
         tool_names_dbg = [t["function"]["name"] for t in tools] if tools else []
@@ -144,7 +147,7 @@ class AgentRunner:
                     "content": (
                         f"[本轮焦点提醒] {task_contract}\n"
                         f"已执行 {loop_count - 1} 轮。检查当前操作是否仍在为这个目标服务，"
-                        f"若已完成请用 send_only=true 或 no_action 收尾。"
+                        f"若已完成请用 no_action 收尾。"
                     ),
                 }
                 msgs.append(refocus)
@@ -250,11 +253,6 @@ class AgentRunner:
             if not result.tool_calls:
                 if await append_pending_context() and loop_count < effective_max_loops:
                     continue
-                content = (result.content or "").strip()
-                if has_pending_send_actions:
-                    final_content = content
-                    finish_reason = "send_only_complete"
-                    break
                 if loop_count < effective_max_loops:
                     # 还有下一轮：丢弃纯文本草稿，只插入系统纠正后继续。
                     # 不能把无效 assistant 文本放回上下文，否则下一轮可能把
@@ -288,11 +286,6 @@ class AgentRunner:
                 tool_names=[tc.name for tc in result.tool_calls],
             )
             tc_results = await self._execute_tools(result.tool_calls, tool_executor)
-            if any(
-                r["name"] in SEND_TOOL_NAMES and r["result"].get("ok", True)
-                for r in tc_results
-            ):
-                has_pending_send_actions = True
             for tcr in tc_results:
                 tool_record = {
                     "role": "tool",
@@ -519,7 +512,10 @@ class AgentRunner:
                 continue
 
             try:
-                result = await executor(name, args)
+                if _executor_accepts_tool_call_id(executor):
+                    result = await executor(name, args, tool_call_id=tc.id)
+                else:
+                    result = await executor(name, args)
                 if not isinstance(result, dict):
                     result = {"ok": True, "value": result}
             except Exception as e:
@@ -535,12 +531,8 @@ class AgentRunner:
             name = r["name"]
             ok = r["result"].get("ok", True)
             if name in SEND_TOOL_NAMES:
-                if name == "send_voice_message":
-                    if not ok:
-                        return False
-                elif not r["args"].get("send_only", False) or not ok:
-                    return False
-            elif name in self.no_feedback_tools:
+                return False
+            if name in self.no_feedback_tools:
                 if not ok:
                     return False
             else:
@@ -549,9 +541,6 @@ class AgentRunner:
 
     @staticmethod
     def _classify_no_feedback(tc_results: list[dict[str, Any]]) -> FinishReason:
-        for r in tc_results:
-            if r["name"] in SEND_TOOL_NAMES:
-                return "send_only_complete"
         return "all_no_feedback"
 
 
@@ -573,6 +562,12 @@ def _kv_prompt_diagnostics(
     )
     roles = [str(m.get("role") or "") for m in normalized]
     joined_content = "\n".join(str(m.get("content") or "") for m in normalized)
+    role_char_counts: dict[str, int] = {}
+    for message in normalized:
+        role = str(message.get("role") or "")
+        role_char_counts[role] = role_char_counts.get(role, 0) + len(
+            str(message.get("content") or "")
+        )
     tools_text = json.dumps(
         tools or [],
         ensure_ascii=False,
@@ -580,6 +575,7 @@ def _kv_prompt_diagnostics(
         separators=(",", ":"),
         default=str,
     )
+    tool_schema_modes = _tool_schema_mode_counts(tools or [])
     diag: dict[str, Any] = {
         "kv_loop": int(loop),
         "kv_message_count": len(normalized),
@@ -587,14 +583,40 @@ def _kv_prompt_diagnostics(
         "kv_system_count": sum(1 for role in roles if role == "system"),
         "kv_assistant_count": sum(1 for role in roles if role == "assistant"),
         "kv_tool_count": sum(1 for role in roles if role == "tool"),
+        "kv_user_count": sum(1 for role in roles if role == "user"),
+        "kv_content_char_count": len(joined_content),
+        "kv_serialized_char_count": len(serialized),
+        "kv_system_char_count": role_char_counts.get("system", 0),
+        "kv_user_char_count": role_char_counts.get("user", 0),
+        "kv_assistant_char_count": role_char_counts.get("assistant", 0),
+        "kv_tool_char_count": role_char_counts.get("tool", 0),
         "kv_tools_count": len(tools or []),
         "kv_tools_hash": _short_hash(tools_text),
+        "kv_tools_char_count": len(tools_text),
+        "kv_tools_full_count": tool_schema_modes["full"],
+        "kv_tools_stub_count": tool_schema_modes["stub"],
         "kv_prefix_8k_hash": _short_hash(serialized[:8192]),
         "kv_prefix_16k_hash": _short_hash(serialized[:16384]),
         "kv_prefix_24k_hash": _short_hash(serialized[:24576]),
         "kv_has_send_receipt": "<send_receipt" in joined_content,
+        "kv_send_receipt_block_count": joined_content.count("<send_receipt"),
+        "kv_send_receipt_char_count": _tagged_block_char_count(
+            joined_content,
+            "send_receipt",
+        ),
+        "kv_task_context_block_count": joined_content.count("<task_context"),
+        "kv_task_context_char_count": _tagged_block_char_count(
+            joined_content,
+            "task_context",
+        ),
         "kv_has_recent_group_messages": "<recent_group_messages" in joined_content,
+        "kv_recent_group_message_line_count": joined_content.count(" msg_id="),
         "kv_has_rag": "<retrieved_conversation_context" in joined_content,
+        "kv_rag_block_count": joined_content.count("<retrieved_conversation_context"),
+        "kv_rag_char_count": _tagged_block_char_count(
+            joined_content,
+            "retrieved_conversation_context",
+        ),
     }
     return diag
 
@@ -603,3 +625,43 @@ def _short_hash(text: str) -> str:
     if not text:
         return ""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _tool_schema_mode_counts(tools: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"full": 0, "stub": 0}
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        parameters = function.get("parameters") if isinstance(function, dict) else None
+        properties = parameters.get("properties") if isinstance(parameters, dict) else None
+        if isinstance(properties, dict) and "_tool_search_required" in properties:
+            counts["stub"] += 1
+        else:
+            counts["full"] += 1
+    return counts
+
+
+def _tagged_block_char_count(text: str, tag_name: str) -> int:
+    pattern = re.compile(
+        rf"<{re.escape(tag_name)}(?:\s[^>]*)?>.*?</{re.escape(tag_name)}>",
+        re.DOTALL,
+    )
+    return sum(len(match.group(0)) for match in pattern.finditer(text))
+
+
+def _executor_accepts_tool_call_id(executor: ToolExecutor) -> bool:
+    try:
+        signature = inspect.signature(executor)
+    except (TypeError, ValueError):
+        return False
+    positional_count = 0
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "tool_call_id":
+            return True
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_count += 1
+    return positional_count >= 3

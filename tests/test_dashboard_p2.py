@@ -35,9 +35,18 @@ from app_config.schema import (
 from memory.important import ImportantMemoryManager
 from memory.rag_store import RagEntry
 from ui.dashboard.chats_page import (
+    DEFAULT_VISIBLE_RECORD_LIMIT,
+    ChatsPage,
+    _build_render_items,
+    _compact_inline_tokens,
     _conversation_list_signature,
+    _filter_visible_records,
+    _format_send_receipt_summary,
     _format_tool_call_for_display,
     _group_records_by_conversation,
+    _load_chat_page_records,
+    _render_record_bubbles,
+    _render_record_html,
     _scrollbar_near_bottom,
 )
 from ui.dashboard.layout import DEFAULT_LAYOUT
@@ -72,6 +81,19 @@ def _minimal_root_config() -> RootConfig:
 class _EmptyHistory:
     async def records(self):
         return []
+
+
+class _StaticRecordStore:
+    def __init__(self, records):
+        self._records = records
+
+    async def records(self):
+        return list(self._records)
+
+
+class _FailingRecordStore:
+    async def records(self):
+        raise RuntimeError("boom")
 
 
 class _EmptyImportant:
@@ -190,6 +212,38 @@ def test_chats_unknown_assistant_without_context_does_not_attach_to_previous_cha
     assert by_key["private:10001"]["records"][0]["content"] == "hi"
 
 
+@pytest.mark.asyncio
+async def test_chats_loads_archive_before_active_history(tmp_paths):
+    rt = _dashboard_runtime(tmp_paths)
+    rt.archive = _StaticRecordStore([{"role": "user", "content": "归档旧消息"}])
+    rt.history = _StaticRecordStore([{"role": "assistant", "content": "活跃新消息"}])
+
+    records = await _load_chat_page_records(rt)
+
+    assert [item["content"] for item in records] == ["归档旧消息", "活跃新消息"]
+
+
+@pytest.mark.asyncio
+async def test_chats_load_records_without_archive(tmp_paths):
+    rt = _dashboard_runtime(tmp_paths)
+    rt.history = _StaticRecordStore([{"role": "user", "content": "活跃消息"}])
+
+    records = await _load_chat_page_records(rt)
+
+    assert [item["content"] for item in records] == ["活跃消息"]
+
+
+@pytest.mark.asyncio
+async def test_chats_falls_back_to_history_when_archive_fails(tmp_paths):
+    rt = _dashboard_runtime(tmp_paths)
+    rt.archive = _FailingRecordStore()
+    rt.history = _StaticRecordStore([{"role": "user", "content": "活跃消息"}])
+
+    records = await _load_chat_page_records(rt)
+
+    assert [item["content"] for item in records] == ["活跃消息"]
+
+
 def test_chats_conversation_signature_tracks_visible_list_changes():
     conversations = [
         {"key": "group:1", "records": [{"content": "a"}], "preview": "a"},
@@ -217,6 +271,464 @@ def test_chats_formats_send_tool_call_readably():
     )
 
     assert text == "在群 1039163467 发送消息：好好好 不说了（0.5s）；那我先待机（0.6s）"
+
+
+def test_chats_render_record_uses_speaker_names_not_ambiguous_pronouns():
+    user_html = _render_record_html(
+        {
+            "role": "user",
+            "content": "【2026-05-27 12:00:00 群聊 20002 Bob(30003) msg_id=9】群消息",
+        },
+        persona_name="玖",
+    )
+    assistant_html = _render_record_html(
+        {"role": "assistant", "content": "收到"},
+        persona_name="玖",
+    )
+
+    assert "Bob(30003)" in user_html
+    assert "群消息" in user_html
+    assert "玖" in assistant_html
+    assert "chat-bubble chat-user" in user_html
+    assert "chat-bubble chat-assistant" in assistant_html
+    assert ">你<" not in user_html + assistant_html
+    assert ">她<" not in user_html + assistant_html
+
+
+def test_chats_runtime_and_tool_results_are_readable_and_collapsed():
+    receipt = (
+        "<send_receipt>\n"
+        "系统说明：运行时发送状态。\n"
+        '{"status":"stale","sent":[],"attempted_messages":[{"content":"嗯"}],'
+        '"new_messages":[{"text":"新消息"}],"note":"模型思考期间当前会话来了新消息"}'
+        "\n</send_receipt>"
+    )
+    tool_html = _render_record_html(
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"ok":false,"status":"stale","attempted_messages":[{}],"new_visible_messages":[{}]}',
+        },
+        persona_name="玖",
+    )
+
+    assert _format_send_receipt_summary(receipt) == (
+        "状态 stale；待发送/尝试 1 条；新消息 1 条；模型思考期间当前会话来了新消息"
+    )
+    assert "工具结果 · call-1" in tool_html
+    assert "chat-event chat-event-tool" in tool_html
+    assert "chat-bubble" not in tool_html
+    assert "状态 stale" in tool_html
+    assert "展开原文" in tool_html
+
+
+def test_chats_send_receipt_renders_only_visible_sent_as_outbound_bubble():
+    receipt_html = _render_record_html(
+        {
+            "role": "user",
+            "content": (
+                "<send_receipt>\n"
+                '{"sent":[{"content":"真正发出","msg_id":"100","qq_visible":true}],'
+                '"attempted_messages":[{"content":"未确认草稿"}],'
+                '"unsent":[{"content":"未发"}]}\n'
+                "</send_receipt>"
+            ),
+        },
+        persona_name="玖",
+    )
+
+    assert "系统 · 发送回执" in receipt_html
+    assert "玖" in receipt_html
+    assert "真正发出" in receipt_html
+    assert "已发送 · msg_id=100" in receipt_html
+    assert "未确认草稿" not in receipt_html.split("chat-bubble chat-assistant")[-1]
+    assert "未发" not in receipt_html.split("chat-bubble chat-assistant")[-1]
+
+
+def test_chats_stale_attempted_receipt_does_not_render_outbound_bubble():
+    receipt_html = _render_record_html(
+        {
+            "role": "user",
+            "content": (
+                "<send_receipt>\n"
+                '{"status":"stale","attempted_messages":[{"content":"不要当成已发送"}],'
+                '"new_messages":[{"text":"新消息"}]}\n'
+                "</send_receipt>"
+            ),
+        },
+        persona_name="玖",
+    )
+
+    assert "系统 · 发送回执" in receipt_html
+    assert "待发送/尝试 1 条" in receipt_html
+    assert "chat-bubble chat-assistant" not in receipt_html
+
+
+def test_chats_runtime_and_system_records_are_events_not_bubbles():
+    runtime_html = _render_record_html(
+        {
+            "role": "user",
+            "content": (
+                "<task_context priority=\"medium\">\n"
+                "现在是2026-06-07 01:20:21。\n"
+                "当前会话：group:497686077。\n"
+                "<recent_group_messages></recent_group_messages>\n"
+                "</task_context>"
+            ),
+        },
+        persona_name="玖",
+    )
+    system_html = _render_record_html(
+        {"role": "system", "content": "主动思考：本次跳过"},
+        persona_name="玖",
+    )
+
+    assert "系统 · 运行时上下文" in runtime_html
+    assert "chat-event chat-event-system" in runtime_html
+    assert "chat-bubble" not in runtime_html
+    assert "系统" in system_html
+    assert "chat-event chat-event-system" in system_html
+    assert "chat-bubble" not in system_html
+
+
+def test_chats_renders_assistant_tool_calls_as_separate_bubble():
+    bubbles = _render_record_bubbles(
+        {
+            "role": "assistant",
+            "content": "准备发",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "send_private_messages",
+                        "arguments": '{"targets":[{"target_qq":123,"content":"你好"}]}',
+                    }
+                }
+            ],
+        },
+        persona_name="玖",
+    )
+
+    assert len(bubbles) == 2
+    assert "准备发" in bubbles[0]
+    assert "chat-assistant" in bubbles[0]
+    assert "工具调用" not in bubbles[0]
+    assert "chat-tool" in bubbles[1]
+    assert "chat-bubble" in bubbles[1]
+    assert "向 123 发送消息：你好" in bubbles[1]
+
+
+def test_chats_filters_assistant_text_and_tool_bubbles_independently():
+    record = {
+        "role": "assistant",
+        "content": "准备发",
+        "tool_calls": [
+            {
+                "function": {
+                    "name": "send_private_messages",
+                    "arguments": '{"targets":[{"target_qq":123,"content":"你好"}]}',
+                }
+            }
+        ],
+    }
+
+    text_only = _render_record_bubbles(
+        record,
+        persona_name="玖",
+        show_chat=True,
+        show_tools=False,
+    )
+    tool_only = _render_record_bubbles(
+        record,
+        persona_name="玖",
+        show_chat=False,
+        show_tools=True,
+    )
+
+    assert len(text_only) == 1
+    assert "准备发" in text_only[0]
+    assert "工具调用" not in text_only[0]
+    assert len(tool_only) == 1
+    assert "准备发" not in tool_only[0]
+    assert "向 123 发送消息：你好" in tool_only[0]
+
+
+def test_chats_attaches_tool_results_to_matching_tool_calls():
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {
+                        "name": "send_private_messages",
+                        "arguments": '{"targets":[{"target_qq":123,"content":"你好"}]}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"status":"accepted","send_id":"send-1"}',
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "orphan",
+            "content": '{"status":"done"}',
+        },
+    ]
+
+    items = _build_render_items(
+        records,
+        search_text="",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+    )
+
+    assert len(items) == 2
+    assert items[0][0] is records[0]
+    assert items[0][1] == {"call-1": [records[1]]}
+    assert items[1][0] is records[2]
+
+    html = "".join(
+        bubble
+        for record, attached in items
+        for bubble in _render_record_bubbles(
+            record,
+            persona_name="玖",
+            attached_tool_results=attached,
+        )
+    )
+
+    assert "向 123 发送消息：你好" in html
+    assert "工具结果 · call-1" in html
+    assert "send_id=send-1" in html
+    assert "工具结果 · orphan" in html
+    assert html.count("工具结果 · call-1") == 1
+
+
+def test_chats_tool_result_search_keeps_parent_tool_call_visible():
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {
+                        "name": "send_group_message",
+                        "arguments": '{"group_id":1,"targets":[{"content":"普通"}]}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"status":"accepted","send_id":"needle-send"}',
+        },
+    ]
+
+    items = _build_render_items(
+        records,
+        search_text="needle-send",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+    )
+
+    assert len(items) == 1
+    assert items[0][0] is records[0]
+    assert items[0][1] == {"call-1": [records[1]]}
+
+
+def test_chats_media_filter_keeps_only_image_and_file_records():
+    records = [
+        {"role": "user", "content": "普通聊天"},
+        {"role": "user", "content": "[图片 workspace=incoming/img_1.jpg]"},
+        {"role": "user", "content": "报告在 C:\\Users\\admin\\Desktop\\report.pdf"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-upload",
+                    "function": {
+                        "name": "upload_file",
+                        "arguments": '{"file_path":"report.md"}',
+                    },
+                }
+            ],
+        },
+    ]
+
+    filtered = _filter_visible_records(
+        records,
+        search_text="",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+        media_only=True,
+    )
+
+    assert filtered == records[1:]
+
+
+def test_chats_media_filter_keeps_parent_for_media_tool_result():
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {
+                        "name": "get_recent_chat_messages",
+                        "arguments": '{"limit":5}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"ok":true,"content":"[CQ:image,file=a.png,url=https://example.com/a.png]"}',
+        },
+    ]
+
+    items = _build_render_items(
+        records,
+        search_text="",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+        media_only=True,
+    )
+
+    assert len(items) == 1
+    assert items[0][0] is records[0]
+    assert items[0][1] == {"call-1": [records[1]]}
+
+
+def test_chats_filter_visible_records_searches_metadata_and_categories():
+    records = [
+        {
+            "role": "user",
+            "content": "普通聊天",
+            "metadata": {"messages": [{"nickname": "Alice"}]},
+        },
+        {"role": "system", "content": "系统事件"},
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"status":"accepted"}',
+        },
+    ]
+
+    assert _filter_visible_records(
+        records,
+        search_text="Alice",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+    ) == [records[0]]
+    assert _filter_visible_records(
+        records,
+        search_text="",
+        show_chat=True,
+        show_system=False,
+        show_tools=False,
+    ) == [records[0]]
+    assert _filter_visible_records(
+        records,
+        search_text="accepted",
+        show_chat=False,
+        show_system=False,
+        show_tools=True,
+    ) == [records[2]]
+
+
+def test_chats_compacts_long_links_and_paths():
+    long_url = "https://multimedia.nt.qq.com.cn/download?" + ("a" * 120)
+    long_path = "C:\\Users\\admin\\.qq-chat-exporter\\exports\\" + ("x" * 100) + ".txt"
+
+    compact = _compact_inline_tokens(f"{long_url} {long_path}")
+
+    assert "[URL multimedia.nt.qq.com.cn/" in compact
+    assert "[路径 " in compact
+    assert long_url not in compact
+    assert long_path not in compact
+
+
+def test_chats_render_conversation_paginates_without_dropping_history(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {"role": "user", "content": f"消息 {i}", "conversation_id": "group:1"}
+            for i in range(DEFAULT_VISIBLE_RECORD_LIMIT + 5)
+        ],
+    }
+
+    html = page._render_conversation(conv)
+
+    assert f"已显示 {DEFAULT_VISIBLE_RECORD_LIMIT} / 共 {DEFAULT_VISIBLE_RECORD_LIMIT + 5} 条" in html
+    assert "还有 5 条更早记录未显示" in html
+    assert "显示全部" in html
+    assert "消息 0" not in html
+    assert f"消息 {DEFAULT_VISIBLE_RECORD_LIMIT + 4}" in html
+
+
+def test_chats_show_all_current_displays_full_conversation(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {"role": "user", "content": f"消息 {i}", "conversation_id": "group:1"}
+            for i in range(DEFAULT_VISIBLE_RECORD_LIMIT + 5)
+        ],
+    }
+    page._conversations = [conv]
+    page._current_key = "group:1"
+
+    page._show_all_current()
+    html = page._render_conversation(conv)
+
+    assert f"已显示 {DEFAULT_VISIBLE_RECORD_LIMIT + 5} / 共 {DEFAULT_VISIBLE_RECORD_LIMIT + 5} 条" in html
+    assert "消息 0" in html
+    assert "还有 5 条更早记录未显示" not in html
+
+
+def test_chats_render_conversation_applies_search_and_filters(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {"role": "user", "content": "alpha 聊天", "conversation_id": "group:1"},
+            {"role": "system", "content": "alpha 系统", "conversation_id": "group:1"},
+            {
+                "role": "tool",
+                "tool_call_id": "call-alpha",
+                "content": '{"status":"accepted","detail":"alpha 工具"}',
+                "conversation_id": "group:1",
+            },
+        ],
+    }
+    page._search_input.setText("alpha")
+    page._show_system_cb.setChecked(False)
+    page._show_tools_cb.setChecked(False)
+
+    html = page._render_conversation(conv)
+
+    assert "alpha 聊天" in html
+    assert "alpha 系统" not in html
+    assert "alpha 工具" not in html
+    assert "当前过滤后 1 条" in html
 
 
 def test_chats_scrollbar_bottom_threshold():

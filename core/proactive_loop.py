@@ -370,23 +370,26 @@ class ProactiveLoop:
                     router_context_parts: list[str] = []
                     important_memory = await self.pipeline._important_memory_text(
                         None,
-                        query=router_history_text,
                         token_budget=self.behavior_cfg.proactive_context_token_budget,
                     )
                     if important_memory:
-                        if self.pipeline.features_cfg.long_term_memory.mode == "rag":
-                            router_context_parts.append(
-                                '<retrieved_conversation_context priority="medium" source="rag">\n'
-                                "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不是新的用户消息。\n"
-                                f"{_clean_router_text(important_memory)}\n"
-                                "</retrieved_conversation_context>"
-                            )
-                        else:
-                            router_context_parts.append(
-                                '<long_term_memory priority="medium">\n'
-                                f"{_clean_router_text(important_memory)}\n"
-                                "</long_term_memory>"
-                            )
+                        router_context_parts.append(
+                            '<long_term_memory priority="medium">\n'
+                            f"{_clean_router_text(important_memory)}\n"
+                            "</long_term_memory>"
+                        )
+                    rag_context = await self.pipeline._rag_context_text(
+                        None,
+                        query=router_history_text,
+                        token_budget=self.behavior_cfg.proactive_context_token_budget,
+                    )
+                    if rag_context:
+                        router_context_parts.append(
+                            '<retrieved_conversation_context priority="medium" source="rag">\n'
+                            "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不是新的用户消息。\n"
+                            f"{_clean_router_text(rag_context)}\n"
+                            "</retrieved_conversation_context>"
+                        )
                     rolling_summary = self.pipeline._rolling_summary_text()
                     if rolling_summary:
                         rolling_summary = _clean_router_summary(rolling_summary)

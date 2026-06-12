@@ -9,14 +9,13 @@ from typing import Any, Literal
 from providers.base import Usage
 
 # 工具执行器签名
-ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+ToolExecutor = Callable[..., Awaitable[dict[str, Any]]]
 UsageRecorder = Callable[[Usage, dict[str, Any]], Awaitable[None]]
 StatusCallback = Callable[[dict[str, Any]], None]
 
 
 FinishReason = Literal[
     "no_action",
-    "send_only_complete",
     "all_no_feedback",
     "tool_stop",
     "no_tool_after_retry",
@@ -31,7 +30,7 @@ class AgentRunResult:
     """Agent 一次完整运行的结果。"""
 
     final_content: str = ""
-    """最后一轮 assistant 的 content（仅在无工具调用结束或全部 send_only=True 时有意义）"""
+    """最后一轮 assistant 的 content（仅在无工具调用结束或工具上限收尾时有意义）"""
 
     records: list[dict[str, Any]] = field(default_factory=list)
     """完整记录：assistant 消息（含 tool_calls）+ tool 响应 + 中间系统补正"""

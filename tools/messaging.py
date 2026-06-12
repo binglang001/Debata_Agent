@@ -21,6 +21,7 @@ from .message_builder import (
     typing_delay,
 )
 from .schemas import (
+    CommitSendAttemptArgs,
     RecallMessageArgs,
     SendGroupArgs,
     SendPrivateArgs,
@@ -80,6 +81,55 @@ def _sent_message_item(
     return item
 
 
+def _send_metadata_from_args(args: SendPrivateArgs | SendGroupArgs) -> dict:
+    responding_ids = [
+        str(item).strip()
+        for item in getattr(args, "responding_to_message_ids", [])
+        if str(item).strip()
+    ]
+    reply_to = str(getattr(args, "reply_to_message_id", "") or "").strip()
+    if reply_to and reply_to not in responding_ids:
+        responding_ids.append(reply_to)
+    return {
+        "reviewed_until_seq": getattr(args, "reviewed_until_seq", None),
+        "review_policy": getattr(args, "review_policy", "review_priority"),
+        "delivery_interrupt_policy": getattr(
+            args,
+            "delivery_interrupt_policy",
+            "interrupt_priority",
+        ),
+        "responding_to_message_ids": responding_ids,
+        "reply_to_message_id": reply_to or None,
+        "reason": getattr(args, "reason", None),
+    }
+
+
+def _inject_context_tool_call_id(metadata: dict, ctx: ToolContext) -> dict:
+    result = dict(metadata)
+    value = ctx.extras.get("tool_call_id")
+    if value:
+        result["tool_call_id"] = str(value)
+    else:
+        result.pop("tool_call_id", None)
+    return result
+
+
+def _apply_reply_to_first_text(actions: list[dict], reply_to_message_id: str | None) -> None:
+    reply_to = str(reply_to_message_id or "").strip()
+    if not reply_to:
+        return
+    prefix = f"[CQ:reply,id={reply_to}]"
+    for action in actions:
+        if action.get("kind", "text") != "text":
+            continue
+        content = str(action.get("content") or "")
+        if content.startswith("[CQ:reply,"):
+            return
+        action["content"] = f"{prefix}{content}"
+        action["label"] = str(action.get("label") or content)
+        return
+
+
 async def _send_action_direct(ctx: ToolContext, target: Target, action: dict) -> str | None:
     kind = str(action.get("kind") or "text")
     if kind in {"emoji", "image"}:
@@ -105,7 +155,7 @@ async def _send_action_direct(ctx: ToolContext, target: Target, action: dict) ->
     description=(
         "向 QQ 用户发送私聊消息。可混合文字/表情包/图片，按 order 排序，delay 控制间隔。"
         "可在 content 开头加 [CQ:reply,id=消息ID] 引用回复。"
-        "send_only=true 则正常发送后直接结束。"
+        "发送后如本轮已结束，继续调用 no_action 收尾。"
     ),
     args_model=SendPrivateArgs,
     category="messaging",
@@ -156,16 +206,26 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
                 "target_scope": "private",
                 "target_id": str(t.target_qq),
                 "delay": delay,
+                "interrupt_policy": args.delivery_interrupt_policy,
                 **message_action,
             }
         )
 
     if ctx.send_actions_cb is not None:
-        result = await ctx.send_actions_cb(actions, "send_private_messages")
+        _apply_reply_to_first_text(actions, args.reply_to_message_id)
+        result = await ctx.send_actions_cb(
+            actions,
+            "send_private_messages",
+            metadata=_inject_context_tool_call_id(
+                _send_metadata_from_args(args),
+                ctx,
+            ),
+        )
         if errors:
             result["errors"] = [*result.get("errors", []), *errors]
         return result
 
+    _apply_reply_to_first_text(actions, args.reply_to_message_id)
     sent: list[dict[str, str | int | None]] = []
     for i, action in enumerate(actions):
         target = Target(
@@ -213,7 +273,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
     description=(
         "向 QQ 群发送消息。可混合文字/表情包/图片，按 order 排序，delay 控制间隔。"
         "可在 content 开头加 [CQ:reply,id=msg_id] 引用；@人用 [CQ:at,qq=QQ号]。"
-        "send_only=true 则正常发送后直接结束。"
+        "发送后如本轮已结束，继续调用 no_action 收尾。"
     ),
     args_model=SendGroupArgs,
     category="messaging",
@@ -258,16 +318,26 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
                 "target_scope": "group",
                 "target_id": str(args.group_id),
                 "delay": delay,
+                "interrupt_policy": args.delivery_interrupt_policy,
                 **message_action,
             }
         )
 
     if ctx.send_actions_cb is not None:
-        result = await ctx.send_actions_cb(actions, "send_group_message")
+        _apply_reply_to_first_text(actions, args.reply_to_message_id)
+        result = await ctx.send_actions_cb(
+            actions,
+            "send_group_message",
+            metadata=_inject_context_tool_call_id(
+                _send_metadata_from_args(args),
+                ctx,
+            ),
+        )
         if errors:
             result["errors"] = [*result.get("errors", []), *errors]
         return result
 
+    _apply_reply_to_first_text(actions, args.reply_to_message_id)
     sent: list[dict[str, str | int | None]] = []
     for i, action in enumerate(actions):
         target = Target(
@@ -302,6 +372,36 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
         sent=sent,
         errors=errors,
         action_count=len(actions),
+    )
+
+
+@tool(
+    name="commit_send_attempt",
+    description=(
+        "确认提交发送工具返回的 send_attempt。仅在 send_* 返回 needs_review 后使用；"
+        "同一个 send_attempt_id 只能提交一次。可用 reply_to_message_id 给第一条文本补引用。"
+    ),
+    args_model=CommitSendAttemptArgs,
+    category="messaging",
+)
+async def commit_send_attempt(args: CommitSendAttemptArgs, ctx: ToolContext) -> dict:
+    if ctx.send_actions_cb is None:
+        return {
+            "ok": False,
+            "status": "unsupported",
+            "error": "当前运行环境不支持 send_attempt 提交",
+        }
+    return await ctx.send_actions_cb(
+        [],
+        "commit_send_attempt",
+        metadata={
+            "commit_send_attempt_id": args.send_attempt_id,
+            "reviewed_until_seq": args.reviewed_until_seq,
+            "delivery_interrupt_policy": args.delivery_interrupt_policy,
+            "reply_to_message_id": args.reply_to_message_id,
+            "reason": args.reason,
+            "tool_call_id": str(ctx.extras.get("tool_call_id") or ""),
+        },
     )
 
 

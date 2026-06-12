@@ -64,8 +64,10 @@ def build_combined_system_prompt(
 
     Args:
         persona: 已加载的人格
-        important_memory_text: 已按当前会话 scope / RAG 规则选出的重要记忆文本
-        memory_mode: "file" = 文件模式（默认）；"rag" = 自动会话向量检索
+        important_memory_text: 已按当前会话 scope 选出的重要记忆文本。
+            这始终来自 ImportantMemoryManager，不受 RAG 开关影响。
+        memory_mode: "file" = 文件模式（默认）；"rag" = 自动会话向量检索。
+            这里只影响工具协议说明，不决定 important_memory_text 是否注入。
 
     稳定性递减顺序：
         critical: core_rules（永不变）
@@ -75,7 +77,7 @@ def build_combined_system_prompt(
         high:     conversation_protocol（场景规则）
         reference: qq_format（格式参考，不变）
         medium:   self_reflection（行为约束）
-        medium:   memory（变化时整体替换）
+        medium:   memory（重要记忆，变化时整体替换）
     """
     parts: list[str] = []
 
@@ -102,15 +104,14 @@ def build_combined_system_prompt(
     # 7. QQ 格式参考（最末，方便模型查询）
     parts.append(QQ_FORMAT_REFERENCE.strip())
 
-    # 8. 文件模式重要记忆（较稳定，可留在 system 前缀）。
-    # RAG 召回每轮按 query 变化，不能放在稳定前缀；build_messages 会把它追加到尾部。
+    # 8. 重要记忆（较稳定，可留在 system 前缀）。RAG 召回每轮按 query 变化，
+    # 不能放在稳定前缀；build_messages 会把它作为尾部运行时上下文追加。
     if important_memory_text:
-        if memory_mode == "file":
-            parts.append(
-                f'<long_term_memory priority="medium">\n'
-                f"{important_memory_text.strip()}\n"
-                f"</long_term_memory>"
-            )
+        parts.append(
+            f'<long_term_memory priority="medium">\n'
+            f"{important_memory_text.strip()}\n"
+            f"</long_term_memory>"
+        )
 
     return "\n\n".join(parts)
 
@@ -162,6 +163,7 @@ def build_messages(
     current_context_record: dict[str, Any] | None = None,
     system_override: str | None = None,
     *,
+    rag_context_text: str = "",
     memory_mode: Literal["file", "rag"] = "file",
     user_event: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -170,7 +172,10 @@ def build_messages(
     Args:
         persona: 已加载的人格
         history: 历史对话（来自 HistoryManager）
-        important_memory_text: 已按当前会话 scope / RAG 规则选出的重要记忆文本
+        important_memory_text: 已按当前会话 scope 选出的重要记忆文本。
+            始终注入 <long_term_memory>，不受 memory_mode 是否为 rag 影响。
+        rag_context_text: RAG 从历史对话向量索引中召回的相关片段。
+            只作为尾部 <retrieved_conversation_context> 注入，避免污染稳定前缀。
         current_context: 本次调用的临时上下文（时间、表情包等）
         current_context_record: 已持久化的 task_context 运行时上下文记录。主回复路径用它
             保证下一轮重建 history 时字节前缀与上一轮请求一致。
@@ -195,7 +200,7 @@ def build_messages(
 
     system_content = build_combined_system_prompt(
         persona,
-        important_memory_text if memory_mode == "file" else "",
+        important_memory_text,
         memory_mode=memory_mode,
     )
     messages = [{"role": "system", "content": system_content}]
@@ -232,7 +237,7 @@ def build_messages(
         if task_ctx:
             messages.append({"role": "user", "content": task_ctx})
 
-    if memory_mode == "rag" and important_memory_text:
+    if rag_context_text:
         messages.append(
             {
                 "role": "user",
@@ -240,7 +245,7 @@ def build_messages(
                     '<retrieved_conversation_context priority="medium" source="rag">\n'
                     f"{RUNTIME_CONTEXT_NOTICE}\n"
                     "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不代表新的用户消息。\n"
-                    f"{important_memory_text.strip()}\n"
+                    f"{rag_context_text.strip()}\n"
                     "</retrieved_conversation_context>"
                 ),
             }

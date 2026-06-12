@@ -15,6 +15,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+SendInterruptPolicy = Literal["interrupt_all", "interrupt_priority", "atomic"]
+SendReviewPolicy = Literal["review_all", "review_priority"]
+
 
 class _ToolArgs(BaseModel):
     """所有工具 args 的基类。
@@ -70,9 +73,40 @@ class SendPrivateArgs(_ToolArgs):
     targets: list[PrivateMessageTarget] = Field(
         ..., description="要发送的目标列表，至少 1 项"
     )
-    send_only: bool = Field(
-        default=False,
-        description="True 则正常发送后直接结束本轮（不等待 LLM 反思）。",
+    reviewed_until_seq: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "发送前复核锚点：表示这次待发送内容基于已看到的最新入站 seq。"
+            "不填时使用当前模型轮开始时的 seen_seq；收到 needs_review 后再次发送或 commit 应填返回的 latest_seq。"
+        ),
+    )
+    review_policy: SendReviewPolicy = Field(
+        default="review_priority",
+        description=(
+            "发送前复核策略。review_priority=只因未见高优先级消息暂停；"
+            "review_all=目标会话有任何未见新消息都暂停复核。"
+        ),
+    )
+    delivery_interrupt_policy: SendInterruptPolicy = Field(
+        default="interrupt_all",
+        description=(
+            "发送被系统接收后的中断策略。interrupt_all=同会话新消息都会阻断发送或使旧回复 stale；"
+            "interrupt_priority=只被确定性高优先级事件阻断，如私聊新消息、同触发用户追问、撤回；"
+            "atomic=普通新消息不阻断，只适合固定通知/命令结果，不要用来逃避频繁打断。"
+        ),
+    )
+    responding_to_message_ids: list[str] = Field(
+        default_factory=list,
+        description="可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；不确定不要编造。",
+    )
+    reply_to_message_id: str | None = Field(
+        default=None,
+        description="可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用。",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么这样发送以及为什么选择该复核/中断策略。用于日志和自检，不会发给 QQ。",
     )
 
 
@@ -115,8 +149,71 @@ class SendGroupArgs(_ToolArgs):
     targets: list[GroupMessageTarget] = Field(
         ..., description="要发送的消息列表，至少 1 项"
     )
-    send_only: bool = Field(
-        default=False, description="True 则正常发送后直接结束本轮。"
+    reviewed_until_seq: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "发送前复核锚点：表示这次待发送内容基于已看到的最新入站 seq。"
+            "不填时使用当前模型轮开始时的 seen_seq；收到 needs_review 后再次发送或 commit 应填返回的 latest_seq。"
+        ),
+    )
+    review_policy: SendReviewPolicy = Field(
+        default="review_priority",
+        description=(
+            "发送前复核策略。review_priority=只因未见高优先级消息暂停；"
+            "review_all=目标群有任何未见新消息都暂停复核。"
+        ),
+    )
+    delivery_interrupt_policy: SendInterruptPolicy = Field(
+        default="interrupt_priority",
+        description=(
+            "发送被系统接收后的中断策略。interrupt_priority=推荐，普通群聊插话不阻断，"
+            "但同触发用户追问、@机器人、撤回等确定性高优先级事件会阻断；"
+            "interrupt_all=长回复/多段解释时使用，任何同会话新消息都阻断；"
+            "atomic=普通新消息不阻断，只适合固定通知/命令结果，不要用来逃避频繁打断。"
+        ),
+    )
+    responding_to_message_ids: list[str] = Field(
+        default_factory=list,
+        description="可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；不确定不要编造。",
+    )
+    reply_to_message_id: str | None = Field(
+        default=None,
+        description="可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用，适合旧回复被新消息隔开后锚定上下文。",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么这样发送以及为什么选择该复核/中断策略。用于日志和自检，不会发给 QQ。",
+    )
+
+
+class CommitSendAttemptArgs(_ToolArgs):
+    """commit_send_attempt 工具参数。"""
+
+    send_attempt_id: str = Field(
+        ...,
+        min_length=1,
+        description="要确认提交的 send_attempt_id，来自发送工具返回的 needs_review。只能提交一次。",
+    )
+    reviewed_until_seq: int | None = Field(
+        default=None,
+        ge=0,
+        description="复核后已看到的最新入站 seq。通常填 needs_review 返回的 latest_seq。",
+    )
+    delivery_interrupt_policy: SendInterruptPolicy = Field(
+        default="interrupt_priority",
+        description=(
+            "确认发送被系统接收后的中断策略。短低风险回复用 interrupt_priority；"
+            "长回复/多段解释用 interrupt_all；atomic 只用于固定通知/命令结果。"
+        ),
+    )
+    reply_to_message_id: str | None = Field(
+        default=None,
+        description="可选：确认发送时给第一条文本消息补引用，避免被中间新消息隔开后串话。",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么复核后仍提交旧内容；用于日志和自检，不会发给 QQ。",
     )
 
 
@@ -144,6 +241,145 @@ class UploadFileArgs(_ToolArgs):
     )
     file_name: str | None = Field(
         default=None, description="发给 QQ 时显示的文件名。可选；不填时自动使用 file_path 的文件名。"
+    )
+
+
+class GetMsgArgs(_ToolArgs):
+    """get_msg 工具参数。"""
+
+    message_id: int = Field(
+        ...,
+        description="要读取的 QQ 消息 ID。只能使用上下文中真实出现过的 msg_id，不要猜。",
+    )
+
+
+class SendPokeArgs(_ToolArgs):
+    """send_poke 工具参数。"""
+
+    user_id: int = Field(..., description="要戳一戳的目标 QQ 号，必须明确。")
+    group_id: int | None = Field(
+        default=None,
+        description=(
+            "群号。群聊戳一戳时填写；私聊戳一戳不填。"
+            "不填且当前会话是群聊时，程序会自动使用当前群号。"
+        ),
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么戳一戳。用于日志和自检，不会发给 QQ。",
+    )
+
+
+class SetMsgEmojiLikeArgs(_ToolArgs):
+    """set_msg_emoji_like 工具参数。"""
+
+    message_id: int = Field(
+        ...,
+        description="要添加或取消表情回复的消息 ID。必须是真实消息 ID，不要猜。",
+    )
+    emoji_id: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "QQ 表情 ID。必须使用已知 ID；不确定时不要猜。"
+            "常见 ID 可来自上下文、文档或用户明确给出的表情。"
+        ),
+    )
+    set: bool = Field(
+        default=True,
+        description="true=添加表情回复，false=取消这个表情回复。",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么设置表情回复。用于日志和自检，不会发给 QQ。",
+    )
+
+
+class ToolSearchArgs(_ToolArgs):
+    """tool_search 工具参数。"""
+
+    tool_name: str = Field(
+        ...,
+        min_length=1,
+        description="要查询完整说明和真实参数 schema 的工具名。",
+    )
+    intent: str | None = Field(
+        default=None,
+        description="可选：你为什么需要这个工具。用于返回更贴合的风险提醒，不会发给 QQ。",
+    )
+
+
+# ============================================================
+# QQ 群管理 / 权限查询
+# ============================================================
+
+
+class GetGroupSelfRoleArgs(_ToolArgs):
+    """get_group_self_role 工具参数。"""
+
+    group_id: int | None = Field(
+        default=None,
+        description="群号。不填时使用当前群聊；私聊或无法推断当前群时必须填写。",
+    )
+
+
+class SetGroupKickArgs(_ToolArgs):
+    """set_group_kick 工具参数。"""
+
+    group_id: int = Field(..., description="群号")
+    user_id: int = Field(..., description="要踢出的 QQ 号，必须明确，不要猜")
+    reject_add_request: bool = Field(
+        default=False,
+        description="是否拒绝该用户再次加群。默认 false；只有用户明确要求拉黑/拒绝再加时才设 true。",
+    )
+    reason: str = Field(
+        ...,
+        min_length=2,
+        description="为什么执行踢人。用于日志和自检，不会发给 QQ；必须来自明确用户请求。",
+    )
+
+
+class SetGroupBanArgs(_ToolArgs):
+    """set_group_ban 工具参数。"""
+
+    group_id: int = Field(..., description="群号")
+    user_id: int = Field(..., description="要禁言的 QQ 号，必须明确，不要猜")
+    duration_seconds: int = Field(
+        ...,
+        ge=1,
+        le=2_592_000,
+        description="禁言时长，单位秒。必须明确；例如 600=10分钟，1800=30分钟。",
+    )
+    reason: str = Field(
+        ...,
+        min_length=2,
+        description="为什么执行禁言。用于日志和自检，不会发给 QQ；必须来自明确用户请求。",
+    )
+
+
+class SetGroupWholeBanArgs(_ToolArgs):
+    """set_group_whole_ban 工具参数。"""
+
+    group_id: int = Field(..., description="群号")
+    enable: bool = Field(..., description="true=开启全员禁言，false=关闭全员禁言")
+    reason: str = Field(
+        ...,
+        min_length=2,
+        description="为什么执行全员禁言。用于日志和自检，不会发给 QQ；必须来自明确用户请求。",
+    )
+
+
+class SetGroupLeaveArgs(_ToolArgs):
+    """set_group_leave 工具参数。"""
+
+    group_id: int | None = Field(
+        default=None,
+        description="要退出的群号。不填时使用当前群聊；必须是当前群，不能让机器人跨群退群。",
+    )
+    reason: str = Field(
+        ...,
+        min_length=2,
+        description="为什么退群。用于日志和自检，不会发给 QQ；必须来自明确用户请求。",
     )
 
 
@@ -182,6 +418,36 @@ class DeleteMemoryArgs(_ToolArgs):
         ...,
         min_length=1,
         description="要删除的记忆关键词，模糊匹配包含此关键词的条目",
+    )
+
+
+class UpdateMemoryArgs(_ToolArgs):
+    """update_important_memory 工具参数。"""
+
+    memory_id: str = Field(
+        ...,
+        min_length=1,
+        description="要更新的重要记忆 ID。通常来自 long_term_memory 中的记忆标识或工具返回的 existing_id。",
+    )
+    memory_text: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "覆写后的完整记忆正文。必须客观、完整、有明确主语；不要只写补丁片段。"
+            "例如写“张三的生日是7月8日”，不要写“你生日七月八号”。"
+        ),
+    )
+    scope: str | None = Field(
+        default=None,
+        description="可选：同时更新记忆适用范围。可填 global、user:QQ号 或 group:群号；不填则保留原 scope。",
+    )
+    pinned: bool | None = Field(
+        default=None,
+        description="可选：同时更新是否置顶。不填则保留原 pinned。",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="简短说明为什么更新旧记忆，而不是新增一条。只用于日志和自检。",
     )
 
 

@@ -8,7 +8,7 @@
     runner              —— 通用工具循环 + Task Contract 重注入
     chat_agent          —— 主聊天 Agent
     proactive_agent     —— 主动思考路由（小模型）
-    summary_agent       —— 历史总结 + 去重判定
+    summary_agent       —— 历史总结
 """
 
 from .base import AgentRunResult, FinishReason, ToolExecutor
@@ -38,7 +38,7 @@ from .persona_loader import (
 )
 from .proactive_agent import ProactiveRouterAgent
 from .runner import DEFAULT_NO_FEEDBACK_TOOLS, SEND_TOOL_NAMES, AgentRunner
-from .summary_agent import DuplicateChecker, SummaryAgent
+from .summary_agent import SummaryAgent
 
 __all__ = [
     # base
@@ -69,7 +69,6 @@ __all__ = [
     "ChatAgent",
     "ProactiveRouterAgent",
     "SummaryAgent",
-    "DuplicateChecker",
     "PersonaGenAgent",
     "PersonaBrief",
     "DEFAULT_NO_FEEDBACK_TOOLS",

@@ -247,6 +247,20 @@ async def test_important_save_and_read(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_important_save_exact_duplicate_skip(tmp_path):
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+    await im.save("张三是朋友")
+
+    result = await im.save("  张三是朋友  ")
+
+    assert result["saved"] is False
+    assert result["duplicate"] is True
+    assert result["duplicate_type"] == "exact"
+    assert len(im.items()) == 1
+
+
+@pytest.mark.asyncio
 async def test_important_persists(tmp_path):
     im1 = ImportantMemoryManager(tmp_path / "imp.json")
     await im1.load()
@@ -258,16 +272,52 @@ async def test_important_persists(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_important_duplicate_check_skip(tmp_path):
+async def test_important_update_rewrites_content_and_metadata(tmp_path):
+    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=lambda: "T2")
+    await im.load()
+    await im.replace_all(
+        [
+            {
+                "timestamp": "T1",
+                "content": "张三是朋友",
+                "scope": "user:1",
+                "pinned": False,
+            }
+        ]
+    )
+
+    result = await im.update(
+        "T1",
+        "张三是朋友，生日是7月8日",
+        scope="group:42",
+        pinned=True,
+    )
+
+    assert result["updated"] is True
+    item = im.items()[0]
+    assert item["content"] == "张三是朋友，生日是7月8日"
+    assert item["scope"] == "group:42"
+    assert item["pinned"] is True
+    assert item["updated_at"] == "T2"
+
+
+@pytest.mark.asyncio
+async def test_important_update_exact_duplicate_skip_other_item(tmp_path):
     im = ImportantMemoryManager(tmp_path / "imp.json")
     await im.load()
-    await im.save("张三的QQ是123")
+    await im.replace_all(
+        [
+            {"timestamp": "T1", "content": "张三是朋友"},
+            {"timestamp": "T2", "content": "李四是朋友"},
+        ]
+    )
 
-    async def checker(items, new_text):
-        return any("张三" in m["content"] for m in items)
+    result = await im.update("T2", "张三是朋友")
 
-    result = await im.save("张三确实存在", check_dup=checker)
-    assert result == {"saved": False, "duplicate": True}
+    assert result["updated"] is False
+    assert result["duplicate"] is True
+    assert result["existing_id"] == "T1"
+    assert im.items()[1]["content"] == "李四是朋友"
 
 
 @pytest.mark.asyncio
