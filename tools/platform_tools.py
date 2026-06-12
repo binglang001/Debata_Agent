@@ -9,6 +9,7 @@
     - set_group_add_request: 处理加群请求
     - summarize_chat_history: 拉取 NapCat/QQ 服务器侧近期群历史并启动后台子 Agent
     - summarize_conversation: 用后台子 Agent 总结本地归档和活跃历史
+    - filter_archive_records: 从永久归档筛选候选短 ID
     - recall_history: 从本地永久归档检索较早上下文
 """
 
@@ -22,11 +23,13 @@ from dataclasses import asdict, is_dataclass
 from html import unescape
 from typing import Any
 
+from memory.archive import real_chat_archive_records
 from utils.token_budget import TokenEstimator
 
 from .base import ToolContext, tool
 from .result_shrink import tool_budget
 from .schemas import (
+    FilterArchiveRecordsArgs,
     GetForwardMsgArgs,
     GetRecentChatMessagesArgs,
     GetUserInfoArgs,
@@ -915,7 +918,7 @@ async def set_friend_add_request(args: SetFriendRequestArgs, ctx: ToolContext) -
             "error": "未连接适配器",
         }
     try:
-        await ctx.adapter.handle_friend_request(
+        handled = await ctx.adapter.handle_friend_request(
             flag=args.flag,
             approve=args.approve,
             remark=args.remark or "",
@@ -928,16 +931,71 @@ async def set_friend_add_request(args: SetFriendRequestArgs, ctx: ToolContext) -
             "error": str(e),
         }
     action = "同意" if args.approve else "拒绝"
+    handled_data = handled if isinstance(handled, dict) else {}
+    status = str(handled_data.get("status") or "done")
+    if handled_data.get("ok") is False:
+        return {
+            "ok": False,
+            "status": status,
+            "brief": str(handled_data.get("brief") or "处理好友请求失败。"),
+            "error": str(handled_data.get("error") or handled_data),
+            "data": handled_data,
+        }
+    user_id = handled_data.get("user_id")
+    if status in {"done", "already_friend", "already_handled"}:
+        _remove_pending_request(ctx, args.flag)
+    if user_id is not None and (
+        args.approve or status in {"already_friend", "already_handled"}
+    ):
+        _inject_friend_whitelist(ctx, str(user_id))
+    if status in {"already_friend", "already_handled"}:
+        return {
+            "ok": True,
+            "status": status,
+            "brief": "好友请求已由 QQ/NapCat 自动处理，对方已是好友。",
+            "data": {
+                "flag": args.flag,
+                "approve": args.approve,
+                "remark": args.remark or "",
+                "user_id": str(user_id) if user_id is not None else None,
+                "already_handled": True,
+            },
+        }
     return {
         "ok": True,
-        "status": "done",
+        "status": status,
         "brief": f"已{action}好友请求。",
         "data": {
             "flag": args.flag,
             "approve": args.approve,
             "remark": args.remark or "",
+            "user_id": str(user_id) if user_id is not None else None,
         },
     }
+
+
+def _remove_pending_request(ctx: ToolContext, flag: str) -> None:
+    store = ctx.extras.get("pending_requests")
+    remove = getattr(store, "remove", None)
+    if callable(remove):
+        remove(flag)
+
+
+def _inject_friend_whitelist(ctx: ToolContext, user_id: str) -> None:
+    normalized = str(user_id or "").strip()
+    if not normalized:
+        return
+
+    cache = ctx.extras.get("friend_whitelist_cache")
+    if isinstance(cache, set):
+        cache.add(normalized)
+
+    limiter = ctx.extras.get("rate_limiter")
+    if limiter is None:
+        return
+    remember_friend = getattr(limiter, "remember_friend", None)
+    if callable(remember_friend):
+        remember_friend(normalized)
 
 
 # ============================================================
@@ -1107,8 +1165,40 @@ async def summarize_conversation(args: SummarizeConversationArgs, ctx: ToolConte
 
 
 # ============================================================
-# recall_history
+# archive filter / recall_history
 # ============================================================
+
+
+@tool(
+    name="filter_archive_records",
+    description=(
+        "从本地永久归档按关键词、时间、会话、发送者和消息类型筛选候选记录。"
+        "返回短 ID 和轻量内容；需要完整上下文时再把 ID 交给 recall_history。"
+    ),
+    args_model=FilterArchiveRecordsArgs,
+    category="platform",
+    schema_mode="stub",
+    short_description="低频归档筛选工具。调用前先用 tool_search 查询完整参数。",
+    search_tags=["platform", "archive", "history", "recall"],
+)
+async def filter_archive_records(args: FilterArchiveRecordsArgs, ctx: ToolContext) -> dict:
+    if ctx.archive is None:
+        return {"ok": False, "error": "未配置本地历史归档"}
+
+    result = await ctx.archive.filter_records(args)
+    result["status"] = "inline"
+    result["brief"] = (
+        f"筛出 {result.get('count', 0)} 条候选归档记录"
+        f"（总命中 {result.get('total', 0)} 条）。"
+    )
+    result["data"] = {
+        "count": result.get("count", 0),
+        "total": result.get("total", 0),
+        "limit": result.get("limit"),
+        "offset": result.get("offset"),
+        "order": result.get("order"),
+    }
+    return result
 
 
 @tool(
@@ -1125,31 +1215,56 @@ async def recall_history(args: RecallHistoryArgs, ctx: ToolContext) -> dict:
     if ctx.archive is None:
         return {"ok": False, "error": "未配置本地历史归档"}
 
-    records = await ctx.archive.search(
-        conversation_id=args.conversation_id,
-        keyword=args.keyword,
-        time_range=args.time_range,
-        limit=args.limit,
-    )
-    if ctx.history is not None:
-        for record in await ctx.history.records():
-            if _history_record_matches(
-                record,
-                conversation_id=args.conversation_id,
-                keyword=args.keyword,
-                time_range=args.time_range,
-            ):
+    missing_ids: list[str] = []
+    if args.archive_ids:
+        records = []
+        seen: set[str] = set()
+        for archive_id in args.archive_ids:
+            context_records = await ctx.archive.context_around(
+                archive_id,
+                args.context_before,
+                args.context_after,
+            )
+            if not context_records:
+                missing_ids.append(archive_id)
+                continue
+            for record in context_records:
+                key = str(record.get("archive_id") or id(record))
+                if key in seen:
+                    continue
+                seen.add(key)
                 records.append(record)
+    else:
+        records = await ctx.archive.search(
+            conversation_id=args.conversation_id,
+            keyword=args.keyword,
+            time_range=args.time_range,
+            limit=args.limit,
+        )
+    if not args.archive_ids and ctx.history is not None:
+        for record in await ctx.history.records():
+            for chat_record in real_chat_archive_records(record):
+                if _history_record_matches(
+                    chat_record,
+                    conversation_id=args.conversation_id,
+                    keyword=args.keyword,
+                    time_range=args.time_range,
+                ):
+                    records.append(chat_record)
         records = records[-args.limit:]
 
     markdown = _format_history_recall_markdown(records)
     snippets = [_history_recall_snippet(record) for record in records]
     meta = {
         "count": len(records),
+        "archive_ids": list(args.archive_ids),
+        "missing_archive_ids": missing_ids,
+        "context_before": args.context_before,
+        "context_after": args.context_after,
         "conversation_id": args.conversation_id,
         "keyword": args.keyword,
         "time_range": args.time_range,
-        "range": "continuous_result_order",
+        "range": "archive_id_context" if args.archive_ids else "continuous_result_order",
     }
     inline_result = {
         "ok": True,
@@ -1192,7 +1307,7 @@ async def recall_history(args: RecallHistoryArgs, ctx: ToolContext) -> dict:
             "count": len(records),
         },
         "count": len(snippets),
-        "results": snippets[:5],
+        "results": _compact_history_recall_snippets(snippets, limit=3),
         "data": meta,
         "next": "需要分析完整历史时，把 artifact.path 交给 start_agent_task 或用 read_file 分页读取。",
     }
@@ -1231,6 +1346,8 @@ def _format_history_recall_markdown(records: list[dict[str, Any]]) -> str:
 
 def _format_history_recall_record(record: dict[str, Any]) -> list[str]:
     timestamp = _summary_timestamp(record) or "-"
+    archive_id = str(record.get("archive_id") or record.get("id") or "").strip()
+    id_part = f"#{archive_id} " if archive_id else ""
     conversation_id = str(record.get("conversation_id") or "-")
     role = str(record.get("role") or "-")
     sender = _history_recall_sender(record, role)
@@ -1238,10 +1355,10 @@ def _format_history_recall_record(record: dict[str, Any]) -> list[str]:
     if not content:
         content = "(空内容)"
     lines = [
-        f"{timestamp} [{conversation_id}] {sender}({role})：{line}"
+        f"{timestamp} {id_part}[{conversation_id}] {sender}({role})：{line}"
         for line in content.splitlines()
     ]
-    return lines or [f"{timestamp} [{conversation_id}] {sender}({role})：(空内容)"]
+    return lines or [f"{timestamp} {id_part}[{conversation_id}] {sender}({role})：(空内容)"]
 
 
 def _history_recall_sender(record: dict[str, Any], role: str) -> str:
@@ -1271,11 +1388,26 @@ def _history_recall_sender(record: dict[str, Any], role: str) -> str:
 def _history_recall_snippet(record: dict[str, Any]) -> dict[str, Any]:
     content = str(record.get("content") or "")
     return {
+        "id": record.get("archive_id") or record.get("id"),
         "role": record.get("role"),
         "conversation_id": record.get("conversation_id"),
         "timestamp": _summary_timestamp(record) or None,
+        "sender": _history_recall_sender(record, str(record.get("role") or "")),
         "content": content[:160],
     }
+
+
+def _compact_history_recall_snippets(
+    snippets: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for item in snippets[:limit]:
+        copied = dict(item)
+        copied["content"] = str(copied.get("content") or "")[:80]
+        compacted.append(copied)
+    return compacted
 
 
 def _write_history_recall_artifact(
@@ -1321,14 +1453,15 @@ async def _local_summary_records(
                 records.append(copied)
     if ctx.history is not None:
         for record in await ctx.history.records():
-            if _summary_record_matches(
-                record,
-                conversation_id=conversation_id,
-                range_hint=range_hint,
-            ):
-                copied = dict(record)
-                copied["_source"] = "active"
-                records.append(copied)
+            for chat_record in real_chat_archive_records(record):
+                if _summary_record_matches(
+                    chat_record,
+                    conversation_id=conversation_id,
+                    range_hint=range_hint,
+                ):
+                    copied = dict(chat_record)
+                    copied["_source"] = "active"
+                    records.append(copied)
     return records
 
 

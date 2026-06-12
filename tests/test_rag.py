@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from pathlib import Path
 
 import httpx
@@ -418,20 +419,97 @@ async def test_rag_memory_strips_media_urls_and_workspace_noise(tmp_path: Path):
     await asyncio.wait_for(service._queue.join(), timeout=1.0)
 
     indexed = "\n".join(entry.text for entry in store.all_entries())
-    assert "猫猫截图 [图片]" in indexed
-    assert "猫相关文件 [文件]" in indexed
-    assert "[音频消息: 猫叫转录文本]" in indexed
+    assert "猫猫截图 [图片 workspace=incoming/img_1.jpg]" in indexed
+    assert "猫相关文件 [文件 workspace=incoming/猫.txt]" in indexed
+    assert "[音频消息: 猫叫转录文本 workspace=incoming/voice.amr]" in indexed
     assert "猫资料链接 [链接]" in indexed
     assert "https://" not in indexed
     assert "multimedia.nt.qq.com.cn" not in indexed
-    assert "workspace=" not in indexed
     assert "url=" not in indexed
     assert "D:\\QQ_data" not in indexed
 
     out = await service.retrieve_for_query("猫", conversation_id="private:1")
     assert "猫叫转录文本" in out
     assert "https://" not in out
-    assert "workspace=" not in out
+    assert "workspace=incoming/voice.amr" in out
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_rag_bootstrap_reads_real_chat_from_archive_sqlite(tmp_path: Path):
+    from memory import ArchiveStore
+
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
+    await archive.append_many(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "猫猫截图 [图片 workspace=incoming/cat.jpg "
+                    "url=https://multimedia.nt.qq.com.cn/download?rkey=secret]"
+                ),
+                "conversation_id": "private:1",
+                "metadata": {"timestamp": "2026-06-01 10:00:00"},
+            },
+            {
+                "role": "system",
+                "content": "系统 runtime 猫噪声不进 RAG",
+                "conversation_id": "private:1",
+            },
+            {
+                "role": "assistant",
+                "content": "工具调用猫噪声不进 RAG",
+                "tool_calls": [{"id": "tc", "function": {"name": "no_action"}}],
+                "conversation_id": "private:1",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "tc-send",
+                "content": json.dumps(
+                    {
+                        "ok": True,
+                        "status": "sent",
+                        "qq_visible": True,
+                        "send_id": "send-1",
+                        "sent": [
+                            {
+                                "conversation_id": "private:1",
+                                "target_type": "private",
+                                "target_id": "1",
+                                "msg_id": "bot-1",
+                                "content": "真实回复里提到猫",
+                                "time": "2026-06-01 10:01:00",
+                                "qq_visible": True,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                "conversation_id": "private:1",
+            },
+        ]
+    )
+
+    bootstrap_records = await archive.rag_records()
+    assert len(bootstrap_records) == 2
+    assert "multimedia.nt.qq.com.cn" not in "\n".join(
+        record["content"] for record in bootstrap_records
+    )
+
+    embedding = _FakeEmbedding()
+    store = SqliteVectorStore(tmp_path / "rag.sqlite3")
+    await store.load()
+    service = RagMemoryService(embedding=embedding, store=store, top_k=5)
+    await service.load()
+    await service.enqueue_records(bootstrap_records)
+    await asyncio.wait_for(service._queue.join(), timeout=1.0)
+
+    indexed = "\n".join(entry.text for entry in store.all_entries())
+    assert "猫猫截图 [图片 workspace=incoming/cat.jpg]" in indexed
+    assert "真实回复里提到猫" in indexed
+    assert "系统 runtime 猫噪声" not in indexed
+    assert "工具调用猫噪声" not in indexed
+    assert "https://" not in indexed
     await service.shutdown()
 
 

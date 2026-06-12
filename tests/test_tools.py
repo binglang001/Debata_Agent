@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from adapters.types import FriendInfo, GroupInfo, GroupMemberInfo, UserInfo
 from core.chat_timeline import ChatTimelineMessage, ChatTimelineStore
+from core.state import RateLimiter
 from features.vision.vision_service import VisionService
 from providers.base import ProviderError
 from tools import (
@@ -263,6 +264,22 @@ def test_send_private_schema_derivation():
     assert "不是表情包" in target_props["image"]["description"]
 
 
+def test_non_no_action_schemas_expose_finish_after_success():
+    specs = {s.name: s for s in get_default_specs()}
+
+    for spec in specs.values():
+        schema_props = spec.to_openai_schema()["function"]["parameters"].get(
+            "properties", {}
+        )
+        full_props = spec.full_parameters_schema().get("properties", {})
+        if spec.name == "no_action":
+            assert "finish_after_success" not in schema_props
+            assert "finish_after_success" not in full_props
+            continue
+        assert schema_props["finish_after_success"]["default"] is False
+        assert full_props["finish_after_success"]["default"] is False
+
+
 def test_schema_no_refs_in_output():
     """派生出的 schema 不应包含 $ref / $defs（OpenAI 不支持）。"""
     specs = {s.name: s for s in get_default_specs()}
@@ -271,6 +288,44 @@ def test_schema_no_refs_in_output():
         text = str(schema)
         assert "$ref" not in text, f"{spec_name}: schema 含 $ref"
         assert "$defs" not in text, f"{spec_name}: schema 含 $defs"
+
+
+def test_send_schemas_expose_review_policy_and_ignore_review_interrupts():
+    specs = {s.name: s for s in get_default_specs()}
+    for spec_name in (
+        "send_private_messages",
+        "send_group_message",
+        "send_voice_message",
+    ):
+        schema = specs[spec_name].full_parameters_schema()
+        props = schema["properties"]
+        required = schema.get("required", [])
+
+        assert "ignore_review_interrupts" in props
+        assert props["ignore_review_interrupts"]["default"] is False
+        assert "系统接受后" in props["ignore_review_interrupts"]["description"]
+        assert "不能绕过发送前 needs_review" in props["ignore_review_interrupts"]["description"]
+        assert "ignore_review_interrupts" not in required
+
+    for spec_name in ("send_private_messages", "send_group_message"):
+        schema = specs[spec_name].to_openai_schema()
+        props = schema["function"]["parameters"]["properties"]
+        required = schema["function"]["parameters"].get("required", [])
+        assert "review_policy" in props
+        assert set(props["review_policy"]["enum"]) == {"review_priority", "review_all"}
+        assert props["review_policy"]["default"] == "review_priority"
+        assert "review_priority" in props["review_policy"]["description"]
+        assert "review_all" in props["review_policy"]["description"]
+        assert "review_policy" not in required
+
+
+def test_commit_send_attempt_schema_exposes_ignore_review_interrupts():
+    specs = {s.name: s for s in get_default_specs()}
+    schema = specs["commit_send_attempt"].to_openai_schema()
+    props = schema["function"]["parameters"]["properties"]
+
+    assert props["ignore_review_interrupts"]["default"] is False
+    assert "send_attempt_id" in props
 
 
 def test_schema_no_title_field():
@@ -333,7 +388,8 @@ def test_all_expected_tools_registered():
         "get_group_self_role", "set_group_kick", "set_group_ban",
         "set_group_whole_ban", "set_group_leave",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
-        "summarize_conversation", "recall_history", "start_agent_task",
+        "summarize_conversation", "filter_archive_records", "recall_history",
+        "start_agent_task",
         "no_action", "schedule_wakeup",
         "tool_search",
         "describe_image", "web_search", "get_weather",
@@ -372,6 +428,17 @@ def test_schedule_wakeup_schema_explains_delayed_wakeup():
     assert "固定消息正文" in props["message_text"]["description"]
     assert "target_type" in props
     assert "target_id" in props
+
+
+def test_delete_memory_schema_prefers_memory_id():
+    specs = {s.name: s for s in get_default_specs()}
+    schema = specs["delete_important_memory"].to_openai_schema()["function"]
+    props = schema["parameters"]["properties"]
+
+    assert "memory_id" in props
+    assert "keyword" in props
+    assert "推荐使用 memory_id" in schema["description"]
+    assert "旧版兼容" in props["keyword"]["description"]
 
 
 # ============================================================
@@ -477,7 +544,8 @@ def test_registry_upload_file_is_stub_schema():
     }
     assert "upload_file" in reg
     assert set(schema_by_name["upload_file"]["parameters"]["properties"]) == {
-        "_tool_search_required"
+        "_tool_search_required",
+        "finish_after_success",
     }
 
 
@@ -495,9 +563,31 @@ def test_registry_stub_and_full_schema_modes_are_stable():
     for name in STUB_SCHEMA_TOOLS:
         assert name in schema_by_name
         props = schema_by_name[name]["parameters"]["properties"]
-        assert set(props) == {"_tool_search_required"}
+        assert set(props) == {"_tool_search_required", "finish_after_success"}
+    filter_archive_spec = reg_disabled.get_spec("filter_archive_records")
+    assert filter_archive_spec is not None
+    assert {"archive", "history", "recall"}.issubset(filter_archive_spec.search_tags)
     assert "targets" in schema_by_name["send_private_messages"]["parameters"]["properties"]
     assert "tool_name" in schema_by_name["tool_search"]["parameters"]["properties"]
+
+
+def test_registry_excludes_sensitive_and_unused_napcat_apis():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    forbidden = {
+        "call_api",
+        "add_friend",
+        "delete_friend",
+        "get_credentials",
+        "get_cookies",
+        "get_csrf_token",
+        "mark_private_msg_as_read",
+        "mark_group_msg_as_read",
+        "get_ai_record",
+        "send_group_ai_record",
+    }
+
+    assert forbidden.isdisjoint(set(reg.names()))
 
 
 @pytest.mark.asyncio
@@ -567,7 +657,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         metadata={"timestamp": "2026-06-01 12:00:00"},
         conversation_id="private:123",
     )
-    archive = ArchiveStore(tmp_path / "archive.jsonl")
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
     await archive.load()
     await archive.append_many(
         [
@@ -582,7 +672,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     important = ImportantMemoryManager(tmp_path / "important.json")
     await important.load()
     await important.replace_all(
-        [{"timestamp": "mem-existing", "content": "用户喜欢绿茶"}]
+        [{"id": "mem-existing", "timestamp": "T0", "content": "用户喜欢绿茶"}]
     )
 
     timeline = ChatTimelineStore()
@@ -662,6 +752,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "self_id": "999",
         },
     )
+    _approve_stub_tools(ctx, "filter_archive_records")
     reg = ToolRegistry(get_default_specs())
     executor = reg.get_executor(ctx)
 
@@ -687,13 +778,14 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "target_id": 123,
             "text": "语音测试",
             "prompt": "年轻女性，自然口语",
+            "ignore_review_interrupts": True,
         },
         "save_important_memory": {"memory_text": "用户喜欢红茶"},
         "update_important_memory": {
             "memory_id": "mem-existing",
             "memory_text": "用户喜欢红茶和乌龙茶",
         },
-        "delete_important_memory": {"keyword": "红茶"},
+        "delete_important_memory": {"memory_id": "mem-existing"},
         "send_private_messages": {
             "targets": [{"target_qq": 123, "content": "你好", "order": 1}],
         },
@@ -762,6 +854,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "range_hint": "2026-06-01",
             "goal": "总结",
         },
+        "filter_archive_records": {"keywords": ["keyword"], "limit": 5},
         "recall_history": {"conversation_id": "private:123", "keyword": "keyword", "limit": 5},
         "read_file": {"path": "note.txt", "max_lines": 10},
         "write_file": {"path": "created.txt", "content": "created"},
@@ -837,16 +930,19 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     ] == ["send_voice_message", "send_private_messages", "send_group_message"]
     assert results["commit_send_attempt"]["status"] == "already_committed"
     assert sent_actions[0]["actions"][0]["kind"] == "voice"
+    assert sent_actions[0]["metadata"]["ignore_review_interrupts"] is True
     assert sent_actions[1]["actions"][0]["target_scope"] == "private"
     assert sent_actions[1]["actions"][0]["content"] == "你好"
     assert sent_actions[2]["actions"][0]["target_scope"] == "group"
     assert sent_actions[2]["actions"][0]["target_id"] == "456"
 
     assert results["save_important_memory"]["saved"] is True
+    assert results["save_important_memory"]["memory_id"].startswith("mem_")
     assert results["save_important_memory"]["scope"] == "user:123"
     assert results["update_important_memory"]["updated"] is True
-    assert results["delete_important_memory"]["deleted"] == 2
-    assert important.items() == []
+    assert results["delete_important_memory"]["deleted"] == 1
+    assert len(important.items()) == 1
+    assert important.items()[0]["id"] == results["save_important_memory"]["memory_id"]
 
     assert results["recall_message"]["data"]["message_id"] == "100"
     assert adapter.recalled == "100"
@@ -887,6 +983,8 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["summarize_conversation"]["task_id"] == "agent-test"
     assert agent_tasks[2]["output_name"] == "conversation_summary.md"
     assert agent_tasks[2]["sources"][0]["conversation_id"] == "private:123"
+    assert results["filter_archive_records"]["count"] == 1
+    assert results["filter_archive_records"]["results"][0]["id"] == "a1"
     assert results["recall_history"]["count"] == 1
     assert "归档消息 keyword" in results["recall_history"]["content"]
 
@@ -964,6 +1062,39 @@ async def test_executor_invalid_args():
     result = await executor("save_important_memory", {})
     assert result["ok"] is False
     assert "无效" in result["error"] or "memory_text" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_executor_finish_after_success_is_control_arg():
+    class _Args(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        value: int
+
+    @tool(name="_finish_after_success_test", description="finish", args_model=_Args)
+    async def _finish_after_success_test(args, ctx):
+        return {"ok": True, "status": "done", "value": args.value}
+
+    new_spec = next(
+        s for s in get_default_specs() if s.name == "_finish_after_success_test"
+    )
+    try:
+        reg = ToolRegistry([new_spec])
+        executor = reg.get_executor(ToolContext())
+        result = await executor(
+            "_finish_after_success_test",
+            {"value": 1, "finish_after_success": True},
+        )
+        assert result["ok"] is True
+        assert result["value"] == 1
+        assert result["turn_completion"]["allowed"] is True
+        assert result["turn_completion"]["reason"] == "finish_after_success"
+    finally:
+        from tools.base import _DEFAULT_REGISTRY
+
+        _DEFAULT_REGISTRY[:] = [
+            s for s in _DEFAULT_REGISTRY if s.name != "_finish_after_success_test"
+        ]
 
 
 @pytest.mark.asyncio
@@ -1977,7 +2108,7 @@ async def test_recall_history_writes_complete_artifact(tmp_path):
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    archive = ArchiveStore(tmp_path / "archive.jsonl")
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
     await archive.append_many(
         [
             {
@@ -2092,6 +2223,7 @@ class _FakeAdapter:
         self.group_requests: list[tuple[str, str, bool, str]] = []
         self.api_calls: list[tuple[str, dict]] = []
         self.member_role = "admin"
+        self.friend_request_result: dict[str, Any] | None = None
 
     async def upload_file(self, target, file_path, *, display_name=None):
         self.uploaded.append((target, file_path, display_name))
@@ -2102,6 +2234,7 @@ class _FakeAdapter:
 
     async def handle_friend_request(self, flag, approve, remark=""):
         self.friend_requests.append((flag, approve, remark))
+        return self.friend_request_result
 
     async def handle_group_request(self, flag, sub_type, approve, reason=""):
         self.group_requests.append((flag, sub_type, approve, reason))
@@ -2379,6 +2512,27 @@ async def test_qq_action_tools_call_napcat_api():
 
 
 @pytest.mark.asyncio
+async def test_send_poke_rate_limited_in_same_context():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = _FakeAdapter()
+    ctx = ToolContext(
+        adapter=adapter,
+        conversation_id="group:42",
+        extras={"now_monotonic": 10.0},
+    )
+    executor = reg.get_executor(ctx)
+
+    first = await executor("send_poke", {"user_id": 456})
+    second = await executor("send_poke", {"user_id": 456})
+
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert second["status"] == "rate_limited"
+    assert [call[0] for call in adapter.api_calls] == ["send_poke"]
+
+
+@pytest.mark.asyncio
 async def test_recall_message_result_envelope():
     cfg = _make_config()
     reg = build_default_registry(cfg)
@@ -2588,6 +2742,47 @@ async def test_request_action_tools_result_envelope():
     assert fake.group_requests == [("g1", "invite", False, "暂不加入")]
 
 
+@pytest.mark.asyncio
+async def test_friend_request_already_friend_clears_pending_and_whitelist_cache():
+    class Pending:
+        def __init__(self):
+            self.removed: list[str] = []
+
+        def remove(self, flag: str) -> None:
+            self.removed.append(flag)
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    fake = _FakeAdapter()
+    fake.friend_request_result = {
+        "ok": True,
+        "status": "already_friend",
+        "already_handled": True,
+        "user_id": "1001",
+    }
+    pending = Pending()
+    limiter = RateLimiter(window_seconds=60, max_messages=0)
+    limiter.remember_friend("old")
+    ctx = ToolContext(
+        adapter=fake,
+        extras={"pending_requests": pending, "rate_limiter": limiter},
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "set_friend_add_request",
+        {"flag": "f1", "approve": False, "remark": "熟人"},
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "already_friend"
+    assert result["data"]["already_handled"] is True
+    assert pending.removed == ["f1"]
+    assert limiter._whitelist_cache == {"old", "1001"}
+    assert await limiter.check_and_log("1001") is False
+    assert fake.friend_requests == [("f1", False, "熟人")]
+
+
 # ============================================================
 # memory 工具：依赖注入
 # ============================================================
@@ -2619,9 +2814,20 @@ async def test_save_memory_with_manager(tmp_path):
     )
     assert result["ok"] is True
     assert result["saved"] is True
+    assert result["memory_id"].startswith("mem_")
+    assert result["data"]["memory_id"] == result["memory_id"]
     assert result["scope"] == "user:123"
     assert len(im.items()) == 1
+    assert im.items()[0]["id"] == result["memory_id"]
     assert im.items()[0]["scope"] == "user:123"
+
+    duplicate = await executor(
+        "save_important_memory", {"memory_text": "记住张三是朋友"}
+    )
+    assert duplicate["ok"] is True
+    assert duplicate["status"] == "exact_duplicate"
+    assert duplicate["saved"] is False
+    assert duplicate["existing_id"] == result["memory_id"]
 
 
 @pytest.mark.asyncio
@@ -2653,7 +2859,7 @@ async def test_update_memory_with_manager(tmp_path):
 
     im = ImportantMemoryManager(tmp_path / "imp.json")
     await im.load()
-    await im.replace_all([{"timestamp": "mem-1", "content": "张三是朋友"}])
+    await im.replace_all([{"id": "mem-1", "timestamp": "T1", "content": "张三是朋友"}])
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
@@ -2670,6 +2876,7 @@ async def test_update_memory_with_manager(tmp_path):
 
     assert result["ok"] is True
     assert result["updated"] is True
+    assert result["memory_id"] == "mem-1"
     assert im.items()[0]["content"] == "张三是朋友，生日是7月8日"
 
 
@@ -2681,8 +2888,8 @@ async def test_update_memory_exact_duplicate_returns_existing_id(tmp_path):
     await im.load()
     await im.replace_all(
         [
-            {"timestamp": "mem-1", "content": "张三是朋友"},
-            {"timestamp": "mem-2", "content": "李四是朋友"},
+            {"id": "mem-1", "timestamp": "T1", "content": "张三是朋友"},
+            {"id": "mem-2", "timestamp": "T2", "content": "李四是朋友"},
         ]
     )
 
@@ -2708,6 +2915,36 @@ async def test_delete_memory_with_manager(tmp_path):
 
     im = ImportantMemoryManager(tmp_path / "imp.json")
     await im.load()
+    saved = await im.save("张三是朋友")
+    await im.save("张三喜欢咖啡")
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(important=im)
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "delete_important_memory", {"memory_id": saved["id"], "keyword": ""}
+    )
+    assert result["ok"] is True
+    assert result["deleted"] == 1
+    assert result["memory_id"] == saved["id"]
+    assert "张三是朋友" not in im.text()
+    assert "张三喜欢咖啡" in im.text()
+
+    missing = await executor(
+        "delete_important_memory", {"memory_id": "mem_missing"}
+    )
+    assert missing["ok"] is False
+    assert missing["status"] == "not_found"
+    assert missing["deleted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_keyword_legacy_compat(tmp_path):
+    from memory import ImportantMemoryManager
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
     await im.save("张三是朋友")
     await im.save("李四是同事")
 
@@ -2716,17 +2953,53 @@ async def test_delete_memory_with_manager(tmp_path):
     ctx = ToolContext(important=im)
     executor = reg.get_executor(ctx)
     result = await executor(
-        "delete_important_memory", {"keyword": "张三"}
+        "delete_important_memory", {"memory_id": "", "keyword": "张三"}
     )
+
     assert result["ok"] is True
+    assert result["status"] == "legacy_keyword"
     assert result["deleted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rag_mode_memory_tools_execute_with_manager(tmp_path):
+    from memory import ImportantMemoryManager
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+
+    cfg = _make_config(memory_mode="rag")
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(important=im, conversation_id="group:42")
+    executor = reg.get_executor(ctx)
+
+    saved = await executor(
+        "save_important_memory",
+        {"memory_text": "测试群42有固定茶会", "scope": "group:42"},
+    )
+    item_id = saved["memory_id"]
+    updated = await executor(
+        "update_important_memory",
+        {
+            "memory_id": item_id,
+            "memory_text": "测试群42有固定茶会，时间是周五",
+            "reason": "补充时间",
+        },
+    )
+    deleted = await executor("delete_important_memory", {"memory_id": item_id})
+
+    assert saved["saved"] is True
+    assert updated["updated"] is True
+    assert updated["memory_id"] == item_id
+    assert deleted["deleted"] == 1
+    assert im.items() == []
 
 
 @pytest.mark.asyncio
 async def test_summarize_conversation_starts_agent_task(tmp_path):
     from memory import ArchiveStore, HistoryManager
 
-    archive = ArchiveStore(tmp_path / "archive.jsonl")
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
     history = HistoryManager(tmp_path / "history.jsonl")
     await archive.append_many(
         [

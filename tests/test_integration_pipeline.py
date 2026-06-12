@@ -262,7 +262,7 @@ def build_pipeline(tmp_path):
         persona = _make_persona()
         history = HistoryManager(tmp_path / "history.jsonl")
         important = ImportantMemoryManager(tmp_path / "important.json")
-        archive = ArchiveStore(tmp_path / "archive.jsonl")
+        archive = ArchiveStore(tmp_path / "archive.sqlite3")
         rolling_summary = RollingSummaryStore(tmp_path / "rolling_summary.json")
         await history.load()
         await important.load()
@@ -437,7 +437,9 @@ async def test_main_reply_persists_task_context_snapshot_for_kv_prefix(build_pip
 
 
 @pytest.mark.asyncio
-async def test_group_task_context_includes_recent_real_chat_window(build_pipeline):
+async def test_group_task_context_uses_lookup_hint_instead_of_recent_real_chat_window(
+    build_pipeline,
+):
     pipeline, provider, _, _, _ = await build_pipeline([_ai_no_action()])
 
     await pipeline.enqueue(_msg(user_id="a", group_id="5555", text="前一句", message_id="g1"))
@@ -451,12 +453,16 @@ async def test_group_task_context_includes_recent_real_chat_window(build_pipelin
         for m in second_call
         if m.get("role") == "user" and "<task_context" in str(m.get("content") or "")
     )
-    assert "<recent_group_messages" in task_context
-    assert 'limit="10"' in task_context
-    assert "前一句" in task_context
-    assert "接一句" in task_context
-    assert "msg_id=g1" in task_context
-    assert "msg_id=g2" in task_context
+    assert "<recent_group_messages" not in task_context
+    assert 'limit="10"' not in task_context
+    assert "前一句" not in task_context
+    assert "接一句" not in task_context
+    assert "msg_id=g1" not in task_context
+    assert "msg_id=g2" not in task_context
+    assert "<conversation_context_hint" in task_context
+    assert "get_recent_chat_messages" in task_context
+    assert "recall_history" in task_context
+    assert "当前会话：group:5555" in task_context
 
 
 @pytest.mark.asyncio
@@ -473,6 +479,59 @@ async def test_private_task_context_does_not_include_group_window(build_pipeline
         if m.get("role") == "user" and "<task_context" in str(m.get("content") or "")
     )
     assert "<recent_group_messages" not in task_context
+
+
+def test_tool_registry_stub_schema_reduces_exposed_tool_schema_size():
+    registry = build_default_registry(_make_root_config())
+    for name in ("upload_file", "start_agent_task"):
+        spec = registry.get_spec(name)
+        assert spec is not None
+        stub_text = json.dumps(spec.to_openai_schema(), ensure_ascii=False)
+        full_text = json.dumps(
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.full_parameters_schema(),
+                },
+            },
+            ensure_ascii=False,
+        )
+
+        assert "_tool_search_required" in stub_text
+        assert len(stub_text) < len(full_text)
+
+
+@pytest.mark.asyncio
+async def test_slash_hash_group_messages_are_not_explicit_batch_triggers(build_pipeline):
+    pipeline, _, _, _, _ = await build_pipeline([])
+    events = [
+        _msg(user_id="111", group_id="5555", text="/other", message_id="m-slash"),
+        _msg(user_id="222", group_id="5555", text="#topic", message_id="m-hash"),
+        _msg(user_id="333", group_id="5555", text="普通接话", message_id="m-normal"),
+    ]
+    items = [
+        PendingMessageItem(
+            message_id=event.message_id,
+            user_id=event.user_id,
+            nickname=event.nickname,
+            location=f"群聊 {event.group_id}",
+            text=event.text,
+            conversation_id=f"group:{event.group_id}",
+            inbound_seq=index,
+            received_at=1.0,
+            raw_event=event,
+            keyword_saved=False,
+        )
+        for index, event in enumerate(events, start=1)
+    ]
+
+    trigger_ids = pipeline._batch_trigger_message_ids(items)
+    focus_ids = pipeline._batch_focus_user_ids(items, trigger_ids)
+
+    assert trigger_ids == ["m-normal"]
+    assert focus_ids == ["333"]
 
 
 @pytest.mark.asyncio
@@ -1277,7 +1336,7 @@ async def test_agent_task_max_loops_returns_partial_result(build_pipeline, tmp_p
     assert result["ok"] is True
     assert result["status"] == "partial"
     assert result["result_file"] == "agent_tasks/task-partial/result.md"
-    assert "工具循环上限" in result["error"]
+    assert "工具循环最终收尾条件" in result["error"]
     assert "content" in result and "部分结果" in result["content"]
 
 
@@ -1645,6 +1704,19 @@ async def test_chat_timeline_records_real_inbound_and_successful_outbound(build_
 
 
 @pytest.mark.asyncio
+async def test_pipeline_tool_context_injects_pending_requests_and_rate_limiter(
+    build_pipeline,
+):
+    limiter = RateLimiter(window_seconds=60, max_messages=1)
+    pipeline, _, _, _, _ = await build_pipeline([], rate_limiter=limiter)
+
+    ctx = pipeline._build_tool_context(conversation_id="private:456")
+
+    assert ctx.extras["pending_requests"] is pipeline.pending_requests
+    assert ctx.extras["rate_limiter"] is limiter
+
+
+@pytest.mark.asyncio
 async def test_send_private_with_delay_returns_accepted_pending(build_pipeline):
     """多条且存在正 delay 时，工具先返回 accepted，后台仍按原拆条发完。"""
     args = {
@@ -1961,6 +2033,60 @@ async def test_same_conversation_message_while_model_thinking_needs_review(build
 
 
 @pytest.mark.asyncio
+async def test_other_private_message_while_model_thinking_does_not_review_current_send(
+    build_pipeline,
+):
+    """A 私聊思考时 B 私聊来消息，不应让 A 私聊发送 needs_review。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    send_args = {
+        "targets": [{"target_qq": 123, "content": "A回复", "order": 1}],
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline([])
+    call_count = 0
+
+    async def blocking_chat_completion(messages, *, model, tools=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        provider.calls.append({"messages": messages, "model": model, "tools": tools})
+        if call_count == 1:
+            started.set()
+            await release.wait()
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_private_messages",
+                        arguments=json.dumps(send_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return _ai_no_action()
+
+    provider.chat_completion = blocking_chat_completion  # type: ignore[method-assign]
+
+    await pipeline.enqueue(_msg(user_id="123", text="A先问", message_id="a-old"))
+    await started.wait()
+    await pipeline.enqueue(_msg(user_id="456", text="B插话", message_id="b-new"))
+    release.set()
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert [content for _, content in adapter.sent] == ["A回复"]
+    records = await history.records()
+    joined = "\n".join(str(r.get("content", "")) for r in records)
+    assert "B插话" in joined
+    assert '"status": "needs_review"' not in joined
+    send_results = [
+        json.loads(r["content"])
+        for r in records
+        if r.get("role") == "tool" and r.get("tool_call_id") == "tc-send"
+    ]
+    assert send_results[-1]["status"] == "sent"
+    assert call_count == 3
+
+
+@pytest.mark.asyncio
 async def test_unrelated_group_message_while_model_thinking_does_not_stale_send(build_pipeline):
     """模型思考时普通群聊插话不应让默认群短回应饿死。"""
     started = asyncio.Event()
@@ -2108,6 +2234,468 @@ async def test_group_focus_user_followup_needs_review_before_send(build_pipeline
     ]
     assert results[-1]["status"] == "needs_review"
     assert results[-1]["priority_interrupts"][0]["priority_reasons"] == ["focus_user"]
+
+
+@pytest.mark.asyncio
+async def test_slash_hash_group_text_does_not_trigger_priority_review(build_pipeline):
+    """群聊 /xxx、#xxx 普通文本不再天然视为高优先级打断。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    send_args = {
+        "group_id": 5555,
+        "targets": [{"content": "短回", "order": 1}],
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline([])
+    call_count = 0
+
+    async def blocking_chat_completion(messages, *, model, tools=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        provider.calls.append({"messages": messages, "model": model, "tools": tools})
+        if call_count == 1:
+            started.set()
+            await release.wait()
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_group_message",
+                        arguments=json.dumps(send_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return _ai_no_action()
+
+    provider.chat_completion = blocking_chat_completion  # type: ignore[method-assign]
+
+    await pipeline.enqueue(_msg(user_id="123", group_id="5555", text="先问", message_id="m-old"))
+    await started.wait()
+    await pipeline.enqueue(_msg(user_id="456", group_id="5555", text="/other", message_id="m-slash"))
+    await pipeline.enqueue(_msg(user_id="789", group_id="5555", text="#topic", message_id="m-hash"))
+    release.set()
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert [content for _, content in adapter.sent] == ["短回"]
+    records = await history.records()
+    joined = "\n".join(str(r.get("content", "")) for r in records)
+    assert '"status": "needs_review"' not in joined
+    assert "command_message" not in joined
+
+
+@pytest.mark.asyncio
+async def test_atomic_delivery_policy_does_not_bypass_preflight_review(build_pipeline):
+    """atomic 只影响接收后的投递中断，不能绕过发送前 focus 用户复核。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    send_args = {
+        "group_id": 5555,
+        "delivery_interrupt_policy": "atomic",
+        "targets": [{"content": "短回", "order": 1}],
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline([])
+    call_count = 0
+
+    async def blocking_chat_completion(messages, *, model, tools=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        provider.calls.append({"messages": messages, "model": model, "tools": tools})
+        if call_count == 1:
+            started.set()
+            await release.wait()
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_group_message",
+                        arguments=json.dumps(send_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return _ai_no_action()
+
+    provider.chat_completion = blocking_chat_completion  # type: ignore[method-assign]
+
+    await pipeline.enqueue(_msg(user_id="123", group_id="5555", text="先问", message_id="m-old"))
+    await started.wait()
+    await pipeline.enqueue(_msg(user_id="123", group_id="5555", text="等下", message_id="m-new"))
+    release.set()
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert adapter.sent == []
+    records = await history.records()
+    results = [
+        json.loads(r["content"])
+        for r in records
+        if r.get("role") == "tool" and r.get("tool_call_id") == "tc-send"
+    ]
+    assert results[-1]["status"] == "needs_review"
+    assert results[-1]["priority_interrupts"][0]["priority_reasons"] == ["focus_user"]
+
+
+@pytest.mark.asyncio
+async def test_needs_review_again_reuses_attempt_and_increments_revision(build_pipeline):
+    """commit 前再次出现高优先级未见消息时，复用原 attempt 并递增 revision。"""
+    first_started = asyncio.Event()
+    first_release = asyncio.Event()
+    commit_started = asyncio.Event()
+    commit_release = asyncio.Event()
+    send_args = {
+        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline([])
+    call_count = 0
+
+    async def blocking_chat_completion(messages, *, model, tools=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        provider.calls.append({"messages": copy.deepcopy(messages), "model": model, "tools": tools})
+        if call_count == 1:
+            first_started.set()
+            await first_release.wait()
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_private_messages",
+                        arguments=json.dumps(send_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        if call_count == 2:
+            commit_started.set()
+            await commit_release.wait()
+            tool_records = [m for m in messages if m.get("role") == "tool"]
+            attempt = json.loads(tool_records[-1]["content"])["send_attempt_id"]
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-commit",
+                        name="commit_send_attempt",
+                        arguments=json.dumps(
+                            {
+                                "send_attempt_id": attempt,
+                                "reviewed_until_seq": 2,
+                                "delivery_interrupt_policy": "interrupt_priority",
+                            }
+                        ),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return _ai_no_action()
+
+    provider.chat_completion = blocking_chat_completion  # type: ignore[method-assign]
+
+    await pipeline.enqueue(_msg(user_id="123", text="先问", message_id="m-old"))
+    await first_started.wait()
+    await pipeline.enqueue(_msg(user_id="123", text="我改口", message_id="m-new"))
+    first_release.set()
+    await commit_started.wait()
+    await pipeline.enqueue(_msg(user_id="123", text="再补一句", message_id="m-third"))
+    commit_release.set()
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert adapter.sent == []
+    records = await history.records()
+    results = [
+        json.loads(r["content"])
+        for r in records
+        if r.get("role") == "tool" and r.get("tool_call_id") in {"tc-send", "tc-commit"}
+    ]
+    initial = next(item for item in results if item["status"] == "needs_review")
+    again = next(item for item in results if item["status"] == "needs_review_again")
+    assert again["send_attempt_id"] == initial["send_attempt_id"]
+    assert initial["attempt_revision"] == 1
+    assert again["attempt_revision"] == 2
+    assert again["revision"] == 2
+    assert again["latest_seq"] == 3
+    assert again["unseen_messages"][0]["text"] == "再补一句"
+
+
+@pytest.mark.asyncio
+async def test_ignore_review_interrupts_forces_soft_preflight_review(build_pipeline):
+    """ignore_review_interrupts=true 可提交软复核打断，并返回 forced_unseen_messages。"""
+    first_started = asyncio.Event()
+    first_release = asyncio.Event()
+    commit_started = asyncio.Event()
+    commit_release = asyncio.Event()
+    send_args = {
+        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline([])
+    call_count = 0
+
+    async def blocking_chat_completion(messages, *, model, tools=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        provider.calls.append({"messages": copy.deepcopy(messages), "model": model, "tools": tools})
+        if call_count == 1:
+            first_started.set()
+            await first_release.wait()
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_private_messages",
+                        arguments=json.dumps(send_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        if call_count == 2:
+            commit_started.set()
+            await commit_release.wait()
+            tool_records = [m for m in messages if m.get("role") == "tool"]
+            attempt = json.loads(tool_records[-1]["content"])["send_attempt_id"]
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-commit",
+                        name="commit_send_attempt",
+                        arguments=json.dumps(
+                            {
+                                "send_attempt_id": attempt,
+                                "reviewed_until_seq": 2,
+                                "delivery_interrupt_policy": "interrupt_priority",
+                                "ignore_review_interrupts": True,
+                            }
+                        ),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return _ai_no_action()
+
+    provider.chat_completion = blocking_chat_completion  # type: ignore[method-assign]
+
+    await pipeline.enqueue(_msg(user_id="123", text="先问", message_id="m-old"))
+    await first_started.wait()
+    await pipeline.enqueue(_msg(user_id="123", text="我改口", message_id="m-new"))
+    first_release.set()
+    await commit_started.wait()
+    await pipeline.enqueue(_msg(user_id="123", text="再补一句", message_id="m-third"))
+    commit_release.set()
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert [content for _, content in adapter.sent] == ["旧回复"]
+    records = await history.records()
+    result = next(
+        json.loads(r["content"])
+        for r in records
+        if r.get("role") == "tool" and r.get("tool_call_id") == "tc-commit"
+    )
+    assert result["status"] == "accepted"
+    assert result["delivery"] == "pending"
+    assert result["ignored_review_interrupts"] is True
+    assert result["forced_unseen_messages"][0]["text"] == "再补一句"
+    assert "不要重复提交同一批" in result["next"]
+
+
+@pytest.mark.asyncio
+async def test_send_ignore_review_interrupts_does_not_bypass_preflight_review(
+    build_pipeline,
+):
+    """send_* 的 ignore_review_interrupts=true 不能绕过首次发送前 preflight。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    send_args = {
+        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+        "ignore_review_interrupts": True,
+    }
+    pipeline, provider, adapter, history, _ = await build_pipeline([])
+    call_count = 0
+
+    async def blocking_chat_completion(messages, *, model, tools=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        provider.calls.append({"messages": copy.deepcopy(messages), "model": model, "tools": tools})
+        if call_count == 1:
+            started.set()
+            await release.wait()
+            return CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_private_messages",
+                        arguments=json.dumps(send_args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return _ai_no_action()
+
+    provider.chat_completion = blocking_chat_completion  # type: ignore[method-assign]
+
+    await pipeline.enqueue(_msg(user_id="123", text="先问", message_id="m-old"))
+    await started.wait()
+    await pipeline.enqueue(_msg(user_id="123", text="我改口", message_id="m-new"))
+    release.set()
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert adapter.sent == []
+    records = await history.records()
+    results = [
+        json.loads(r["content"])
+        for r in records
+        if r.get("role") == "tool" and r.get("tool_call_id") == "tc-send"
+    ]
+    assert results[-1]["status"] == "needs_review"
+    assert results[-1]["unseen_messages"][0]["text"] == "我改口"
+
+
+@pytest.mark.asyncio
+async def test_send_ignore_review_interrupts_prevents_post_send_soft_interrupt(
+    build_pipeline,
+):
+    """发送被 accepted 后，ignore_review_interrupts=true 会忽略后续普通入站软打断。"""
+    args = {
+        "targets": [
+            {"target_qq": 123, "content": "第一条", "order": 1, "delay": 0.2},
+            {"target_qq": 123, "content": "第二条", "order": 2, "delay": 0.2},
+        ],
+        "ignore_review_interrupts": True,
+    }
+    pipeline, _, adapter, history, _ = await build_pipeline(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_private_messages",
+                        arguments=json.dumps(args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            _ai_no_action(),
+            _ai_no_action(),
+        ]
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="开始", message_id="m-old"))
+    await _wait_until(lambda: len(adapter.sent) == 1, max_wait=1.0)
+    await pipeline.enqueue(_msg(user_id="123", text="发送期间的新消息", message_id="m-new"))
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert [content for _, content in adapter.sent] == ["第一条", "第二条"]
+    records = await history.records()
+    joined = "\n".join(str(r.get("content", "")) for r in records)
+    assert "发送期间的新消息" in joined
+    assert '"interrupted": true' not in joined
+    assert '"status": "needs_review"' not in joined
+    assert '"status": "needs_review_again"' not in joined
+    assert "<send_receipt>" not in joined
+
+
+@pytest.mark.asyncio
+async def test_send_ignore_review_interrupts_does_not_hide_interrupt_from_queued_send(
+    build_pipeline,
+):
+    """第一批发送后 ignore 只保护当前 job，不能吞掉后续默认发送的中断。"""
+    first_args = {
+        "targets": [
+            {"target_qq": 123, "content": "第一批1", "order": 1, "delay": 0.2},
+            {"target_qq": 123, "content": "第一批2", "order": 2, "delay": 0.2},
+        ],
+        "ignore_review_interrupts": True,
+    }
+    second_args = {
+        "targets": [{"target_qq": 123, "content": "第二批", "order": 1}],
+    }
+    pipeline, _, adapter, history, _ = await build_pipeline(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-first",
+                        name="send_private_messages",
+                        arguments=json.dumps(first_args),
+                    ),
+                    ToolCall(
+                        id="tc-second",
+                        name="send_private_messages",
+                        arguments=json.dumps(second_args),
+                    ),
+                ],
+                finish_reason="tool_calls",
+            ),
+            _ai_no_action(),
+        ]
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="开始", message_id="m-old"))
+    await _wait_until(lambda: len(adapter.sent) == 1, max_wait=1.0)
+    await pipeline.enqueue(_msg(user_id="123", text="发送期间的新消息", message_id="m-new"))
+    await _drain_pipeline(pipeline, max_wait=3.0)
+
+    assert [content for _, content in adapter.sent] == ["第一批1", "第一批2"]
+    records = await history.records()
+    joined = "\n".join(str(r.get("content", "")) for r in records)
+    assert "发送期间的新消息" in joined
+    assert "<send_receipt>" in joined
+    assert '"interrupted": true' in joined
+    assert '"content": "第二批"' in joined
+    assert '"send_id": "' in joined
+
+
+@pytest.mark.asyncio
+async def test_send_ignore_review_interrupts_does_not_ignore_recall_during_send(
+    build_pipeline,
+):
+    """撤回是硬边界，send_* 的 ignore_review_interrupts=true 不能忽略。"""
+    args = {
+        "targets": [
+            {"target_qq": 123, "content": "第一条", "order": 1, "delay": 0.2},
+            {"target_qq": 123, "content": "第二条", "order": 2, "delay": 0.2},
+        ],
+        "ignore_review_interrupts": True,
+    }
+    pipeline, _, adapter, history, _ = await build_pipeline(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="tc-send",
+                        name="send_private_messages",
+                        arguments=json.dumps(args),
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            _ai_no_action(),
+        ]
+    )
+    recall = RecallHandler(
+        pipeline=pipeline,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="马上撤", message_id="m-old"))
+    await _wait_until(lambda: len(adapter.sent) == 1, max_wait=1.0)
+    await recall.on_notice(
+        IncomingNotice(
+            adapter="fake",
+            timestamp=1.1,
+            self_id="999",
+            notice_type=NoticeType.FRIEND_RECALL,
+            user_id="123",
+            message_id="m-old",
+        )
+    )
+    await _drain_pipeline(pipeline, max_wait=3.0)
+    await recall.shutdown()
+
+    assert [content for _, content in adapter.sent] == ["第一条"]
+    records = await history.records()
+    joined = "\n".join(str(r.get("content", "")) for r in records)
+    assert "<send_receipt>" in joined
+    assert '"interrupted": true' in joined
+    assert '"recalled_messages"' in joined
+    assert "m-old" in joined
+    assert '"content": "第二条"' in joined
 
 
 @pytest.mark.asyncio
@@ -2274,6 +2862,7 @@ async def test_commit_send_attempt_rejects_recalled_trigger_message(build_pipeli
             "send_attempt_id": attempt,
             "reviewed_until_seq": 2,
             "delivery_interrupt_policy": "interrupt_priority",
+            "ignore_review_interrupts": True,
         },
         tool_call_id="tc-direct-commit",
     )
@@ -2306,6 +2895,23 @@ async def test_same_content_from_different_tool_calls_is_allowed(build_pipeline)
     await _drain_pipeline(pipeline, max_wait=2.0)
 
     assert [content for _, content in adapter.sent] == ["嗯", "嗯"]
+
+
+@pytest.mark.asyncio
+async def test_same_tool_call_id_replay_does_not_send_twice(build_pipeline):
+    """同一个 tool_call_id 被重放时返回缓存结果，不重复真实发送。"""
+    pipeline, _, adapter, _, _ = await build_pipeline([])
+    ctx = pipeline._build_tool_context(conversation_id="private:123")
+    executor = pipeline.tool_registry.get_executor(ctx)
+    args = {
+        "targets": [{"target_qq": 123, "content": "嗯", "order": 1, "delay": 0}],
+    }
+
+    first = await executor("send_private_messages", args, tool_call_id="tc-replay")
+    second = await executor("send_private_messages", args, tool_call_id="tc-replay")
+
+    assert first == second
+    assert [content for _, content in adapter.sent] == ["嗯"]
 
 
 @pytest.mark.asyncio
@@ -2415,6 +3021,7 @@ async def test_recall_while_model_thinking_marks_send_stale(build_pipeline):
     release = asyncio.Event()
     send_args = {
         "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+        "ignore_review_interrupts": True,
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
     call_count = 0
@@ -2931,14 +3538,7 @@ async def test_voice_message_falls_back_to_adapter_when_asr_fails(
 
 @pytest.mark.asyncio
 async def test_multi_turn_tool_loop(build_pipeline):
-    """多轮：AI 第一次 save_important_memory（no_feedback），第二次 send_private（结束）。
-
-    验证 runner 不会在 save_important 后提前 finish——它属于 no_feedback，
-    单步 save 后应该继续等 send_private 或 no_action。
-
-    注意：当前 runner 的 _all_no_feedback 设计是「所有 tool_calls 都属于 no_feedback
-    才提前结束」，所以单个 save_important_memory 会让循环结束。这里实际验证的是
-    runner 的真实行为，不强求多轮。"""
+    """非 no_action 工具默认把结果回填给模型，不再因 no_feedback 隐式结束。"""
     # 工具参数字段名是 memory_text 不是 content（被集成测试抓出来的）
     save_args = {"memory_text": "用户喜欢咖啡"}
     save_tc = ToolCall(id="tc-s", name="save_important_memory", arguments=json.dumps(save_args))
@@ -2955,18 +3555,48 @@ async def test_multi_turn_tool_loop(build_pipeline):
 
 @pytest.mark.asyncio
 async def test_max_loops_reached_no_crash(build_pipeline):
-    """AgentRunner 在达到 max_loops 时优雅退出（不抛错），且不污染 adapter。"""
-    # 脚本：连续 3 次返回纯文本（无工具调用）—— runner 应在第 3 轮 give up
+    """AgentRunner 对无工具纯文本只做纠正重试，不把文本兜底发送。"""
+    # 脚本：连续返回纯文本（无工具调用）—— runner 应在一次纠正重试后 give up
     plain = CompletionResult(content="（纯文本）", finish_reason="stop")
     pipeline, provider, adapter, history, _ = await build_pipeline([plain, plain, plain])
 
-    await pipeline.enqueue(_msg(text="测试 max_loops"))
+    await pipeline.enqueue(_msg(text="测试无工具重试"))
     await _drain_pipeline(pipeline, max_wait=2.0)
 
     # 不应发出消息（runner 拒绝接受纯文本输出）
     assert adapter.sent == []
-    # provider 被调用了 max_loops 次（含前两次的"纠正消息"重试）
-    assert len(provider.calls) == 3
+    # provider 被调用 2 次：首次纯文本 + 一次纠正重试。
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_finalization_does_not_send_plain_text_to_qq(build_pipeline):
+    """工具循环无工具收尾只能写内部记录，不能绕过发送工具发 QQ。"""
+    save_args = {"memory_text": "循环中的中间结果"}
+    save_tc_1 = ToolCall(id="tc-save-1", name="save_important_memory", arguments=json.dumps(save_args))
+    save_tc_2 = ToolCall(id="tc-save-2", name="save_important_memory", arguments=json.dumps(save_args))
+    pipeline, provider, adapter, history, _ = await build_pipeline(
+        [
+            CompletionResult(tool_calls=[save_tc_1], finish_reason="tool_calls"),
+            CompletionResult(tool_calls=[save_tc_2], finish_reason="tool_calls"),
+            CompletionResult(content="内部最终说明，不应发送到 QQ。", finish_reason="stop"),
+        ]
+    )
+    pipeline.chat_agent.cfg.tool_loop_reminder_interval = 1
+    pipeline.chat_agent.cfg.tool_loop_final_warning_count = 1
+    pipeline.chat_agent.cfg.tool_loop_final_grace_loops = 1
+
+    await pipeline.enqueue(_msg(text="测试工具循环最终收尾"))
+    await _drain_pipeline(pipeline, max_wait=2.0)
+
+    assert adapter.sent == []
+    assert provider.calls[-1]["tools"] is None
+    records = await history.records()
+    assert any(
+        record.get("role") == "assistant"
+        and "内部最终说明" in str(record.get("content") or "")
+        for record in records
+    )
 
 
 @pytest.mark.asyncio

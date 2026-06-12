@@ -181,7 +181,7 @@ class Runtime:
         mem_dir.mkdir(parents=True, exist_ok=True)
         self.history = HistoryManager(mem_dir / "history.jsonl")
         self.important = ImportantMemoryManager(mem_dir / "important.json")
-        self.archive = ArchiveStore(mem_dir / "archive.jsonl")
+        self.archive = ArchiveStore(mem_dir / "archive.sqlite3")
         self.rolling_summary = RollingSummaryStore(mem_dir / "rolling_summary.json")
         await self.history.load()
         await self.important.load()
@@ -348,6 +348,10 @@ class Runtime:
                 window_seconds=self.config.behavior.rate_limit.window_seconds,
                 max_messages=self.config.behavior.rate_limit.max_messages,
                 whitelist_provider=self._friend_whitelist_provider,
+            )
+        if self.rate_limiter is not None:
+            self.adapter.set_friend_confirmed_callback(
+                self.rate_limiter.remember_friend
             )
 
         # ----- 10. WakeupScheduler（双向依赖：先用占位构造，pipeline 实例化后回填）-----
@@ -583,7 +587,7 @@ class Runtime:
                 )
                 await self.rag_memory.load()
                 self.history.on_append(self.rag_memory.enqueue_records)
-                archive_records = await self.archive.records()
+                archive_records = await self.archive.rag_records()
                 history_records = await self.history.records()
                 self.rag_memory.schedule_bootstrap([*archive_records, *history_records])
                 self._fire_warmup("embedding", self.embedding_service)
@@ -637,7 +641,7 @@ class Runtime:
                 )
                 await self.rag_memory.load()
                 self.history.on_append(self.rag_memory.enqueue_records)
-                archive_records = await self.archive.records()
+                archive_records = await self.archive.rag_records()
                 history_records = await self.history.records()
                 self.rag_memory.schedule_bootstrap([*archive_records, *history_records])
                 logger.info(

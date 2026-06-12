@@ -146,6 +146,9 @@ def _write_minimal_config(paths):
                 "temperature": 0.6,
                 "max_tokens": 1024,
                 "max_loops": 3,
+                "tool_loop_reminder_interval": 8,
+                "tool_loop_final_warning_count": 4,
+                "tool_loop_final_grace_loops": 2,
                 "refocus_interval": 0,
                 "first_token_timeout_seconds": 5.0,
             },
@@ -260,6 +263,33 @@ async def test_runtime_start_assembles_all_components(assembled_project):
         # 验证 pipeline 拿到了 summary_agent
         assert rt.pipeline.summary_agent is rt.summary_agent
 
+    finally:
+        await rt.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_binds_friend_confirmed_hook_to_rate_limiter(
+    assembled_project,
+):
+    project_root, paths = assembled_project
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data["behavior"]["rate_limit"] = {
+        "window_seconds": 60,
+        "max_messages": 0,
+        "enabled": True,
+    }
+    with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+
+        await rt.adapter._emit_friend_confirmed("1001")
+
+        assert await rt.rate_limiter.check_and_log("1001") is False
+        assert await rt.rate_limiter.check_and_log("2002") is True
     finally:
         await rt.shutdown()
 

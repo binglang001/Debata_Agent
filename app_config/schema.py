@@ -269,7 +269,16 @@ class AgentConfig(StrictModel):
     """首 token 超时（秒）。流式模式下，首字未到即超时重试。"""
 
     max_loops: int = 25
-    """工具循环最大轮次（仅 chat agent 用）。"""
+    """兼容旧配置；不再作为主 runner 的普通硬截断上限。"""
+
+    tool_loop_reminder_interval: int = Field(default=8, ge=1)
+    """连续多少个工具轮后触发一次普通提醒。"""
+
+    tool_loop_final_warning_count: int = Field(default=4, ge=1)
+    """普通提醒达到多少次后进入最终警告周期。"""
+
+    tool_loop_final_grace_loops: int = Field(default=2, ge=0)
+    """最终警告发出后还允许多少个工具轮。"""
 
     refocus_interval: int = Field(default=5, ge=0)
     """Task Contract 重注入间隔（轮）。0 = 禁用。"""
@@ -471,8 +480,8 @@ class LongTermMemoryConfig(StrictModel):
     """长期记忆配置。"""
 
     mode: Literal["file", "rag"] = "file"
-    """file = 纯文件模式（默认，零开销，AI 主动调 save_important_memory 工具触发）;
-    rag = 会话历史向量检索（需 features.embedding 启用，不使用 important.json）"""
+    """file = 不启用 RAG 历史召回，重要记忆仍保存并注入；
+    rag = 在重要记忆之外增加会话历史向量检索（需 features.embedding 启用）"""
 
     keyword_trigger_save: bool = True
     """命中关键词（"记住"/"约定"/"我叫"等）时强制保存为重要记忆，不依赖 AI 主动调用工具。"""
@@ -481,7 +490,7 @@ class LongTermMemoryConfig(StrictModel):
     """RAG 模式下每次召回的相关历史条目数（仅 mode=rag 生效）"""
 
     rag_extractor_interval: int = 15
-    """预留：被动结构化抽取触发间隔。当前 RAG 索引历史原文，不使用重要记忆抽取。"""
+    """预留：被动结构化抽取触发间隔。当前 RAG 索引历史原文，不替代重要记忆。"""
 
 
 class EmbeddingFeatureConfig(StrictModel):

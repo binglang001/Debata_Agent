@@ -40,18 +40,23 @@ async def save_important_memory(args: SaveMemoryArgs, ctx: ToolContext) -> dict:
     except RuntimeError as e:
         return {"ok": False, "error": str(e)}
 
+    saved = bool(result["saved"])
+    memory_id = result.get("id")
+    status = "done" if saved else "exact_duplicate"
     return {
         "ok": True,
-        "status": "done",
-        "brief": "已保存重要记忆。" if result["saved"] else "存在完全相同的重要记忆，未重复保存。",
-        "saved": result["saved"],
+        "status": status,
+        "brief": "已保存重要记忆。" if saved else "存在完全相同的重要记忆，未重复保存。",
+        "saved": saved,
+        "memory_id": memory_id,
         "duplicate": result.get("duplicate", False),
         "duplicate_type": result.get("duplicate_type"),
         "existing_id": result.get("existing_id"),
         "scope": scope,
         "pinned": args.pinned,
         "data": {
-            "saved": result["saved"],
+            "saved": saved,
+            "memory_id": memory_id,
             "duplicate": result.get("duplicate", False),
             "duplicate_type": result.get("duplicate_type"),
             "existing_id": result.get("existing_id"),
@@ -140,7 +145,9 @@ async def update_important_memory(args: UpdateMemoryArgs, ctx: ToolContext) -> d
     name="delete_important_memory",
     description=(
         "删除一条重要记忆。当记忆过时、重复、或不再需要时使用。"
-        "传入要删除的记忆关键词进行模糊匹配。"
+        "推荐使用 memory_id 精确删除，memory_id 必须来自重要记忆上下文中展示的 ID、"
+        "save_important_memory 返回的 memory_id，或 existing_id。"
+        "keyword 仅为旧版兼容的模糊删除参数；能看到 ID 时不要用 keyword，避免误删多条记忆。"
     ),
     args_model=DeleteMemoryArgs,
     category="memory",
@@ -150,18 +157,49 @@ async def delete_important_memory(args: DeleteMemoryArgs, ctx: ToolContext) -> d
     if ctx.important is None:
         return {"ok": False, "error": "重要记忆管理器未注入"}
 
+    if args.memory_id:
+        try:
+            deleted = await ctx.important.delete_by_id(args.memory_id)
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
+        if not deleted:
+            return {
+                "ok": False,
+                "status": "not_found",
+                "brief": "没有找到要删除的重要记忆。",
+                "memory_id": args.memory_id,
+                "deleted": 0,
+                "data": {
+                    "memory_id": args.memory_id,
+                    "deleted": 0,
+                },
+            }
+        return {
+            "ok": True,
+            "status": "done",
+            "brief": "已删除 1 条重要记忆。",
+            "memory_id": args.memory_id,
+            "deleted": 1,
+            "data": {
+                "memory_id": args.memory_id,
+                "deleted": 1,
+            },
+        }
+
+    keyword = args.keyword or ""
     try:
-        deleted = await ctx.important.delete_by_keyword(args.keyword)
+        deleted_count = await ctx.important.delete_by_keyword(keyword)
     except RuntimeError as e:
         return {"ok": False, "error": str(e)}
 
     return {
         "ok": True,
-        "status": "done",
-        "brief": f"已删除 {deleted} 条匹配的重要记忆。",
-        "deleted": deleted,
+        "status": "legacy_keyword",
+        "brief": f"已按旧版关键词兼容模式删除 {deleted_count} 条匹配的重要记忆。",
+        "deleted": deleted_count,
         "data": {
-            "keyword": args.keyword,
-            "deleted": deleted,
+            "keyword": keyword,
+            "deleted": deleted_count,
+            "legacy_keyword": True,
         },
     }

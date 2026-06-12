@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -21,6 +22,7 @@ QLabel = QtWidgets.QLabel
 QWidget = QtWidgets.QWidget
 Qt = QtCore.Qt
 
+from app_config.loader import load_config
 from app_config.schema import (
     AgentConfig,
     AgentsConfig,
@@ -37,7 +39,10 @@ from memory.rag_store import RagEntry
 from ui.dashboard.chats_page import (
     DEFAULT_VISIBLE_RECORD_LIMIT,
     ChatsPage,
+    DisplayItem,
+    _build_display_items,
     _build_render_items,
+    _chat_html_style,
     _compact_inline_tokens,
     _conversation_list_signature,
     _filter_visible_records,
@@ -48,6 +53,7 @@ from ui.dashboard.chats_page import (
     _render_record_bubbles,
     _render_record_html,
     _scrollbar_near_bottom,
+    normalize_history_records,
 )
 from ui.dashboard.layout import DEFAULT_LAYOUT
 from ui.dashboard.logs_page import _format_record
@@ -56,6 +62,7 @@ from ui.dashboard.memory_page import MemoryPage
 from ui.dashboard.overview_page import OverviewPage
 from ui.dashboard.personas_page import PersonasPage, _PersonaCreatorDialog
 from ui.dashboard.settings_page import SettingsPage
+from ui.theme import palette_for_theme
 from ui.widgets.model_combo import ModelComboBox
 from ui.widgets.window_chrome import _resize_edges_for_local_pos
 from ui.wizard.components import ApiKeyInput
@@ -89,6 +96,53 @@ class _StaticRecordStore:
 
     async def records(self):
         return list(self._records)
+
+
+class _PagedArchiveStore:
+    def __init__(self, records, *, page_size: int = 500):
+        self._records = list(records)
+        self.page_size = page_size
+        self.filter_calls = []
+        self.get_by_ids_calls = []
+        self.records_called = False
+
+    async def records(self):
+        self.records_called = True
+        raise AssertionError("archive.records should not be used when filter_records exists")
+
+    async def filter_records(self, query):
+        self.filter_calls.append(dict(query))
+        offset = int(query.get("offset") or 0)
+        limit = min(int(query.get("limit") or self.page_size), self.page_size)
+        selected = self._records[offset:offset + limit]
+        return {
+            "ok": True,
+            "count": len(selected),
+            "total": len(self._records),
+            "limit": limit,
+            "offset": offset,
+            "order": query.get("order") or "asc",
+            "results": [
+                {
+                    "id": item["archive_id"],
+                    "time": item.get("timestamp"),
+                    "conversation_id": item.get("conversation_id"),
+                    "sender": item.get("sender_name") or "-",
+                    "sender_id": item.get("sender_id"),
+                    "sender_name": item.get("sender_name"),
+                    "direction": item.get("direction") or "inbound",
+                    "kind": item.get("kind") or "text",
+                    "content": item.get("content") or "",
+                    "metadata": item.get("metadata") or {},
+                }
+                for item in selected
+            ],
+        }
+
+    async def get_by_ids(self, archive_ids):
+        self.get_by_ids_calls.append(list(archive_ids))
+        by_id = {item["archive_id"]: item for item in self._records}
+        return [dict(by_id[archive_id]) for archive_id in archive_ids if archive_id in by_id]
 
 
 class _FailingRecordStore:
@@ -224,6 +278,37 @@ async def test_chats_loads_archive_before_active_history(tmp_paths):
 
 
 @pytest.mark.asyncio
+async def test_chats_loads_archive_through_filter_records_pages(tmp_paths):
+    archived = [
+        {
+            "archive_id": f"a-{i}",
+            "role": "user",
+            "content": f"归档 {i}",
+            "conversation_id": "group:1",
+            "timestamp": f"2026-06-01 00:00:0{i}",
+            "sender_id": "100",
+            "sender_name": "Alice",
+        }
+        for i in range(3)
+    ]
+    rt = _dashboard_runtime(tmp_paths)
+    rt.archive = _PagedArchiveStore(archived, page_size=2)
+    rt.history = _StaticRecordStore([{"role": "assistant", "content": "活跃新消息"}])
+
+    records = await _load_chat_page_records(rt)
+
+    assert [item["content"] for item in records] == [
+        "归档 0",
+        "归档 1",
+        "归档 2",
+        "活跃新消息",
+    ]
+    assert rt.archive.records_called is False
+    assert [call["offset"] for call in rt.archive.filter_calls] == [0, 2]
+    assert rt.archive.get_by_ids_calls == [["a-0", "a-1"], ["a-2"]]
+
+
+@pytest.mark.asyncio
 async def test_chats_load_records_without_archive(tmp_paths):
     rt = _dashboard_runtime(tmp_paths)
     rt.history = _StaticRecordStore([{"role": "user", "content": "活跃消息"}])
@@ -256,6 +341,20 @@ def test_chats_conversation_signature_tracks_visible_list_changes():
     ]
 
 
+def test_chats_conversation_signature_uses_full_record_count():
+    conversations = [
+        {
+            "key": "group:1",
+            "records": [{"content": str(i)} for i in range(DEFAULT_VISIBLE_RECORD_LIMIT + 25)],
+            "preview": "latest",
+        }
+    ]
+
+    assert _conversation_list_signature(conversations) == [
+        ("group:1", DEFAULT_VISIBLE_RECORD_LIMIT + 25, "latest")
+    ]
+
+
 def test_chats_formats_send_tool_call_readably():
     text = _format_tool_call_for_display(
         {
@@ -282,15 +381,34 @@ def test_chats_render_record_uses_speaker_names_not_ambiguous_pronouns():
         persona_name="玖",
     )
     assistant_html = _render_record_html(
-        {"role": "assistant", "content": "收到"},
+        {"role": "assistant", "content": "收到", "direction": "outbound", "qq_visible": True},
+        persona_name="玖",
+    )
+    internal_html = _render_record_html(
+        {"role": "assistant", "content": "内部草稿"},
         persona_name="玖",
     )
 
     assert "Bob(30003)" in user_html
     assert "群消息" in user_html
     assert "玖" in assistant_html
-    assert "chat-bubble chat-user" in user_html
-    assert "chat-bubble chat-assistant" in assistant_html
+    assert "chat-record chat-message-table chat-side-right chat-peer" in user_html
+    assert "chat-record chat-message-table chat-side-left chat-bot" in assistant_html
+    assert "class='chat-message-cell' width='78%' align='right'" in user_html
+    assert "class='chat-message-cell' width='78%' align='left'" in assistant_html
+    assert "class='chat-bubble-frame' align='right'" in user_html
+    assert "class='chat-bubble-frame' align='left'" in assistant_html
+    assert "class='chat-name-line' align='right'>Bob(30003)" in user_html
+    assert "class='chat-name-line' align='left'>玖" in assistant_html
+    assert user_html.index("class='chat-spacer-cell'") < user_html.index("class='chat-message-cell'")
+    assert assistant_html.index("class='chat-message-cell'") < assistant_html.index("class='chat-spacer-cell'")
+    assert user_html.index("class='chat-name-line'") < user_html.index("class='chat-bubble'")
+    assert assistant_html.index("class='chat-name-line'") < assistant_html.index("class='chat-bubble'")
+    assert "chat-bubble" in user_html
+    assert "chat-bubble" in assistant_html
+    assert "chat-avatar" not in user_html + assistant_html
+    assert "玖 · 内部文本" in internal_html
+    assert "chat-bubble" not in internal_html
     assert ">你<" not in user_html + assistant_html
     assert ">她<" not in user_html + assistant_html
 
@@ -341,8 +459,9 @@ def test_chats_send_receipt_renders_only_visible_sent_as_outbound_bubble():
     assert "玖" in receipt_html
     assert "真正发出" in receipt_html
     assert "已发送 · msg_id=100" in receipt_html
-    assert "未确认草稿" not in receipt_html.split("chat-bubble chat-assistant")[-1]
-    assert "未发" not in receipt_html.split("chat-bubble chat-assistant")[-1]
+    assistant_bubble = receipt_html.split("chat-record chat-message-table chat-side-left chat-bot")[-1]
+    assert "未确认草稿" not in assistant_bubble
+    assert "未发" not in assistant_bubble
 
 
 def test_chats_stale_attempted_receipt_does_not_render_outbound_bubble():
@@ -382,6 +501,18 @@ def test_chats_runtime_and_system_records_are_events_not_bubbles():
         {"role": "system", "content": "主动思考：本次跳过"},
         persona_name="玖",
     )
+    send_status_html = _render_record_html(
+        {
+            "role": "user",
+            "content": (
+                "<send_status>\n"
+                "系统说明：以下内容由运行时系统提供，不是用户新发言。\n"
+                "2026-06-08 10:00:00 发送完成 send_id=send-1 msg_ids=[100]\n"
+                "</send_status>"
+            ),
+        },
+        persona_name="玖",
+    )
 
     assert "系统 · 运行时上下文" in runtime_html
     assert "chat-event chat-event-system" in runtime_html
@@ -389,9 +520,43 @@ def test_chats_runtime_and_system_records_are_events_not_bubbles():
     assert "系统" in system_html
     assert "chat-event chat-event-system" in system_html
     assert "chat-bubble" not in system_html
+    assert "系统 · 发送状态" in send_status_html
+    assert "send_id=send-1" in send_status_html
+    assert "chat-bubble" not in send_status_html
 
 
-def test_chats_renders_assistant_tool_calls_as_separate_bubble():
+def test_chats_event_records_do_not_use_qq_message_tables():
+    tool_html = _render_record_html(
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"status":"accepted"}',
+        },
+        persona_name="玖",
+    )
+    system_html = _render_record_html(
+        {"role": "system", "content": "主动思考：本次跳过"},
+        persona_name="玖",
+    )
+    reasoning_html = _render_record_html(
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "内部推理",
+            "conversation_id": "group:1",
+        },
+        persona_name="玖",
+    )
+
+    for html in (tool_html, system_html, reasoning_html):
+        assert "chat-event" in html
+        assert "chat-message-table" not in html
+        assert "chat-side-left" not in html
+        assert "chat-side-right" not in html
+        assert "chat-bubble" not in html
+
+
+def test_chats_renders_assistant_tool_calls_as_separate_event():
     bubbles = _render_record_bubbles(
         {
             "role": "assistant",
@@ -410,11 +575,356 @@ def test_chats_renders_assistant_tool_calls_as_separate_bubble():
 
     assert len(bubbles) == 2
     assert "准备发" in bubbles[0]
-    assert "chat-assistant" in bubbles[0]
+    assert "内部文本" in bubbles[0]
+    assert "chat-event" in bubbles[0]
     assert "工具调用" not in bubbles[0]
-    assert "chat-tool" in bubbles[1]
-    assert "chat-bubble" in bubbles[1]
+    assert "chat-event-tool" in bubbles[1]
+    assert "chat-bubble" not in bubbles[1]
+    assert "调用工具：send_private_messages" in bubbles[1]
     assert "向 123 发送消息：你好" in bubbles[1]
+
+
+def test_chats_formats_commit_send_attempt_call_without_raw_json():
+    text = _format_tool_call_for_display(
+        {
+            "function": {
+                "name": "commit_send_attempt",
+                "arguments": (
+                    '{"send_attempt_id":"attempt-1","reviewed_until_seq":8,'
+                    '"delivery_interrupt_policy":"interrupt_priority",'
+                    '"ignore_review_interrupts":true,'
+                    '"reason":"复核后确认旧回复仍适合"}'
+                ),
+            }
+        }
+    )
+
+    assert text == (
+        "提交发送尝试：send_attempt_id=attempt-1；已复核到 seq 8；"
+        "中断策略 interrupt_priority；忽略复核打断；原因：复核后确认旧回复仍适合"
+    )
+    assert "{" not in text
+    assert "ignore_review_interrupts" not in text
+
+
+def test_chats_tool_call_default_hides_raw_arguments():
+    html = _render_record_html(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-commit",
+                    "function": {
+                        "name": "commit_send_attempt",
+                        "arguments": (
+                            '{"send_attempt_id":"attempt-1","reviewed_until_seq":8,'
+                            '"delivery_interrupt_policy":"interrupt_priority",'
+                            '"ignore_review_interrupts":true,'
+                            '"reason":"复核后确认旧回复仍适合"}'
+                        ),
+                    },
+                }
+            ],
+        },
+        persona_name="玖",
+    )
+
+    assert "调用工具：commit_send_attempt" in html
+    assert "提交发送尝试：send_attempt_id=attempt-1" in html
+    assert "展开原始参数" in html
+    assert '"ignore_review_interrupts"' not in html
+    assert "chat-bubble" not in html
+
+
+def test_chats_tool_result_summarizes_long_unseen_lists_by_default(qapp, tmp_paths):
+    forced = [
+        {
+            "time": f"2026-06-08 10:{i:02d}:00",
+            "conversation_id": "group:1",
+            "sender_name": "Alice",
+            "text": f"新消息 {i}",
+        }
+        for i in range(11)
+    ]
+    content = {
+        "ok": True,
+        "status": "accepted",
+        "send_id": "send-1",
+        "sent": [{"content": "第一条"}, {"content": "第二条"}],
+        "ignored_review_interrupts": True,
+        "forced_unseen_messages": forced,
+    }
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {
+                "role": "tool",
+                "tool_call_id": "call-commit",
+                "content": json.dumps(content, ensure_ascii=False),
+                "conversation_id": "group:1",
+            }
+        ],
+    }
+
+    html = page._render_conversation(conv)
+
+    assert "状态 accepted" in html
+    assert "send_id=send-1" in html
+    assert "已发送 2 条" in html
+    assert "已忽略 11 条新打断" in html
+    assert "2026-06-08 10:00:00-2026-06-08 10:10:00" in html
+    assert "样例：Alice: 新消息 0" in html
+    assert "forced_unseen_messages" not in html
+    assert "新消息 10" not in html
+
+    page._expanded_item_ids.add("group:1\ncall-commit:tool_result")
+    expanded = page._render_conversation(conv)
+
+    assert "收起" in expanded
+    assert "forced_unseen_messages" in expanded
+    assert "新消息 10" in expanded
+
+
+def test_chats_single_message_expand_is_per_item(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {
+                "id": "msg-1",
+                "role": "user",
+                "content": '{"payload":[' + ",".join('"短预览"' for _ in range(20)) + '],"secret":"raw-only"}',
+                "conversation_id": "group:1",
+            },
+            {
+                "id": "msg-2",
+                "role": "user",
+                "content": '{"payload":[' + ",".join('"另一个"' for _ in range(20)) + '],"secret":"still-hidden"}',
+                "conversation_id": "group:1",
+            },
+        ],
+    }
+
+    html = page._render_conversation(conv)
+
+    assert "展开原文" in html
+    assert "raw-only" not in html
+    assert "still-hidden" not in html
+
+    page._conversations = [conv]
+    page._current_key = "group:1"
+    page._list.addItem("群聊 1")
+    page._list.item(0).setData(Qt.ItemDataRole.UserRole, "group:1")
+    page._list.setCurrentRow(0)
+    page._on_detail_anchor_clicked(QtCore.QUrl("diana-chat-toggle:group%3A1%0Amsg-1%3Ainbound"))
+    expanded = page._render_conversation(conv)
+
+    assert "收起" in expanded
+    assert "raw-only" in expanded
+    assert "still-hidden" not in expanded
+
+
+def test_chats_expand_state_is_scoped_by_conversation(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    private_conv = {
+        "key": "private:1",
+        "label": "私聊 1",
+        "records": [
+            {
+                "id": "same-msg",
+                "role": "user",
+                "content": '{"payload":[' + ",".join('"私聊预览"' for _ in range(20)) + '],"secret":"private-raw"}',
+                "conversation_id": "private:1",
+            }
+        ],
+    }
+    group_conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {
+                "id": "same-msg",
+                "role": "user",
+                "content": '{"payload":[' + ",".join('"群聊预览"' for _ in range(20)) + '],"secret":"group-raw"}',
+                "conversation_id": "group:1",
+            }
+        ],
+    }
+
+    page._expanded_item_ids.add("private:1\nsame-msg:inbound")
+
+    private_html = page._render_conversation(private_conv)
+    group_html = page._render_conversation(group_conv)
+
+    assert "private-raw" in private_html
+    assert "收起" in private_html
+    assert "group-raw" not in group_html
+    assert "展开原文" in group_html
+
+
+def test_chats_render_conversation_separates_messages_without_hr(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {"role": "user", "content": "你好", "conversation_id": "group:1"},
+            {
+                "role": "assistant",
+                "content": "收到",
+                "direction": "outbound",
+                "qq_visible": True,
+                "conversation_id": "group:1",
+            },
+        ],
+    }
+
+    html = page._render_conversation(conv)
+
+    assert html.count("class='chat-record chat-message-table") == 2
+    assert "<hr" not in html
+
+
+def test_chats_bubble_style_separates_light_and_dark_from_card_background():
+    light = _chat_html_style("light")
+    dark = _chat_html_style("dark")
+    light_palette = palette_for_theme("light")
+    dark_palette = palette_for_theme("dark")
+
+    assert f".chat-bot .chat-bubble{{background:{light_palette.bg_card};}}" not in light
+    assert f".chat-peer .chat-bubble{{background:{light_palette.bg_card};}}" not in light
+    assert f".chat-bot .chat-bubble{{background:{dark_palette.bg_card};}}" not in dark
+    assert f".chat-peer .chat-bubble{{background:{dark_palette.bg_card};}}" not in dark
+    assert ".chat-bot .chat-bubble{background:#F1E8D6;}" in light
+    assert ".chat-bot .chat-bubble{background:#302B26;}" in dark
+    assert f"color:{light_palette.text_primary};" in light
+    assert f"color:{dark_palette.text_primary};" in dark
+
+
+def test_chats_reasoning_is_collapsible_event(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {
+                "id": "turn-1",
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "内部推理 raw-only",
+                "conversation_id": "group:1",
+            }
+        ],
+    }
+
+    html = page._render_conversation(conv)
+
+    assert "思考过程" in html
+    assert "chat-event-reasoning" in html
+    assert "展开原文" in html
+    assert "内部推理 raw-only" not in html
+
+    page._expanded_item_ids.add("group:1\nturn-1:reasoning")
+    expanded = page._render_conversation(conv)
+
+    assert "收起" in expanded
+    assert "内部推理 raw-only" in expanded
+
+
+def test_chats_normalizes_records_to_display_items():
+    records = [
+        {
+            "role": "user",
+            "content": "【2026-05-27 12:00:00 群聊 20002 Bob(30003) msg_id=9】群消息",
+            "conversation_id": "group:20002",
+        },
+        {
+            "role": "assistant",
+            "content": "内部草稿",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {
+                        "name": "send_group_message",
+                        "arguments": '{"group_id":20002,"targets":[{"content":"发出"}]}',
+                    },
+                }
+            ],
+            "conversation_id": "group:20002",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"status":"accepted","delivery":"pending","qq_visible":"pending"}',
+            "conversation_id": "group:20002",
+        },
+        {
+            "role": "user",
+            "content": (
+                "<send_receipt>\n"
+                '{"status":"stale","attempted_messages":[{"content":"不要当成已发送"}]}\n'
+                "</send_receipt>"
+            ),
+            "conversation_id": "group:20002",
+        },
+    ]
+
+    items = normalize_history_records(records, persona_name="玖")
+
+    assert all(isinstance(item, DisplayItem) for item in items)
+    assert [item.kind for item in items] == [
+        "inbound_message",
+        "assistant_note",
+        "tool_call",
+        "runtime_receipt",
+    ]
+    assert items[0].speaker_label == "Bob(30003)"
+    assert items[1].speaker_label == "玖"
+    assert items[2].tool_results[0].kind == "tool_result"
+    assert "QQ 可见性待确认" in items[2].tool_results[0].summary
+    assert "outbound_message" not in [item.kind for item in items]
+
+
+def test_chats_build_display_items_keeps_tool_parent_when_result_matches():
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {
+                        "name": "get_recent_chat_messages",
+                        "arguments": '{"conversation_id":"group:1","limit":5}',
+                    },
+                }
+            ],
+            "conversation_id": "group:1",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"status":"artifact","content":"needle old message"}',
+            "conversation_id": "group:1",
+        },
+    ]
+
+    items = _build_display_items(
+        records,
+        persona_name="玖",
+        search_text="needle",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+    )
+
+    assert len(items) == 1
+    assert items[0].kind == "tool_call"
+    assert items[0].tool_results[0].related_tool_call_id == "call-1"
 
 
 def test_chats_filters_assistant_text_and_tool_bubbles_independently():
@@ -441,6 +951,7 @@ def test_chats_filters_assistant_text_and_tool_bubbles_independently():
         record,
         persona_name="玖",
         show_chat=False,
+        show_system=False,
         show_tools=True,
     )
 
@@ -653,13 +1164,33 @@ def test_chats_filter_visible_records_searches_metadata_and_categories():
 def test_chats_compacts_long_links_and_paths():
     long_url = "https://multimedia.nt.qq.com.cn/download?" + ("a" * 120)
     long_path = "C:\\Users\\admin\\.qq-chat-exporter\\exports\\" + ("x" * 100) + ".txt"
+    long_json = '{"status":"accepted","items":[' + ",".join('"x"' for _ in range(60)) + "]}"
 
     compact = _compact_inline_tokens(f"{long_url} {long_path}")
+    compact_json = _compact_inline_tokens(long_json)
 
     assert "[URL multimedia.nt.qq.com.cn/" in compact
     assert "[路径 " in compact
     assert long_url not in compact
     assert long_path not in compact
+    assert "[JSON对象" in compact_json
+    assert "已折叠" in compact_json
+    assert '"items"' not in compact_json
+
+
+def test_chats_tool_result_summary_shows_pending_state():
+    html = _render_record_html(
+        {
+            "role": "tool",
+            "tool_call_id": "call-pending",
+            "content": '{"status":"accepted","delivery":"pending","qq_visible":"pending"}',
+        },
+        persona_name="玖",
+    )
+
+    assert "状态 accepted" in html
+    assert "投递 pending" in html
+    assert "QQ 可见性待确认" in html
 
 
 def test_chats_render_conversation_paginates_without_dropping_history(qapp, tmp_paths):
@@ -680,6 +1211,78 @@ def test_chats_render_conversation_paginates_without_dropping_history(qapp, tmp_
     assert "显示全部" in html
     assert "消息 0" not in html
     assert f"消息 {DEFAULT_VISIBLE_RECORD_LIMIT + 4}" in html
+
+
+def test_chats_render_conversation_paginates_display_items_not_raw_records(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {
+                "role": "assistant",
+                "content": f"内部 {i}",
+                "tool_calls": [
+                    {
+                        "id": f"call-{i}",
+                        "function": {"name": "no_action", "arguments": "{}"},
+                    }
+                ],
+                "conversation_id": "group:1",
+            }
+            for i in range(200)
+        ],
+    }
+
+    html = page._render_conversation(conv)
+
+    assert "已显示 300 / 共 400 条" in html
+    assert "还有 100 条更早记录未显示" in html
+    assert "内部 0" not in html
+
+
+def test_chats_search_can_find_older_display_items(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    conv = {
+        "key": "group:1",
+        "label": "群聊 1",
+        "records": [
+            {"role": "user", "content": f"消息 {i}", "conversation_id": "group:1"}
+            for i in range(DEFAULT_VISIBLE_RECORD_LIMIT + 5)
+        ],
+    }
+    page._search_input.setText("消息 0")
+
+    html = page._render_conversation(conv)
+
+    assert "消息 0" in html
+    assert f"消息 {DEFAULT_VISIBLE_RECORD_LIMIT + 4}" not in html
+    assert "当前过滤后 1 条" in html
+
+
+def test_chats_load_more_current_increases_display_item_limit(qapp, tmp_paths):
+    page = ChatsPage(_dashboard_runtime(tmp_paths))
+    records = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": f"call-{i}",
+                    "function": {"name": "no_action", "arguments": "{}"},
+                }
+            ],
+            "conversation_id": "group:1",
+        }
+        for i in range(DEFAULT_VISIBLE_RECORD_LIMIT + 2)
+    ]
+    conv = {"key": "group:1", "label": "群聊 1", "records": records}
+    page._conversations = [conv]
+    page._current_key = "group:1"
+
+    page._load_more_current()
+
+    assert page._visible_record_limits["group:1"] == DEFAULT_VISIBLE_RECORD_LIMIT + 2
 
 
 def test_chats_show_all_current_displays_full_conversation(qapp, tmp_paths):
@@ -933,6 +1536,49 @@ def test_settings_page_uses_navigation_sections(qapp, tmp_paths):
     assert "表情包" not in labels
     assert "角色" not in labels
     assert "外观" not in labels
+
+
+def test_settings_page_tool_loop_reminder_replaces_legacy_max_loops(qapp, tmp_paths):
+    cfg = _minimal_root_config()
+    cfg.agents.chat.tool_loop_reminder_interval = 11
+    cfg.agents.chat.tool_loop_final_warning_count = 3
+    cfg.agents.chat.tool_loop_final_grace_loops = 2
+    runtime = _dashboard_runtime(tmp_paths, cfg)
+    page = SettingsPage(runtime)
+    try:
+        labels = "\n".join(label.text() for label in page.findChildren(QtWidgets.QLabel))
+        assert "工具循环提醒" in labels
+        assert "工具轮数提醒间隔" in labels
+        assert "最终警告前提醒次数" in labels
+        assert "最终警告后宽限轮数" in labels
+        assert "普通硬停止" in labels
+        assert "工具轮数上限" not in labels
+        assert "最大工具轮数" not in labels
+
+        interval = page.findChild(QtWidgets.QSpinBox, "toolLoopReminderIntervalSpin")
+        warning = page.findChild(QtWidgets.QSpinBox, "toolLoopFinalWarningCountSpin")
+        grace = page.findChild(QtWidgets.QSpinBox, "toolLoopFinalGraceLoopsSpin")
+        assert interval is not None
+        assert warning is not None
+        assert grace is not None
+        assert interval.value() == 11
+        assert warning.value() == 3
+        assert grace.value() == 2
+
+        interval.setValue(12)
+        interval.editingFinished.emit()
+        warning.setValue(4)
+        warning.editingFinished.emit()
+        grace.setValue(5)
+        grace.editingFinished.emit()
+
+        saved = load_config(tmp_paths)
+        assert saved.agents.chat.tool_loop_reminder_interval == 12
+        assert saved.agents.chat.tool_loop_final_warning_count == 4
+        assert saved.agents.chat.tool_loop_final_grace_loops == 5
+        assert saved.agents.chat.max_loops == 25
+    finally:
+        page.deleteLater()
 
 
 def test_settings_provider_health_status_refreshes_without_manual_test(qapp, tmp_paths):
@@ -1390,7 +2036,7 @@ def test_dashboard_theme_apply_short_circuits_same_resolved_theme(qapp, monkeypa
     assert page._current_theme == "dark"
 
 
-def test_memory_page_rag_mode_shows_index_view(qapp):
+def test_memory_page_rag_mode_keeps_important_memory_tab(qapp):
     class FakeImportant:
         def items(self):
             return [{"timestamp": "t1", "content": "用户喜欢红茶"}]
@@ -1424,12 +2070,85 @@ def test_memory_page_rag_mode_shows_index_view(qapp):
     try:
         page.refresh()
 
+        assert not page._tabs.isHidden()
+        assert page._tabs.tabText(0) == "重要记忆"
+        assert page._tabs.tabText(1) == "RAG 历史索引"
+        assert page._title.text() == "重要记忆"
+        assert "重要记忆始终启用" in page._rag_status.text()
+        assert page._list.count() == 1
+        assert "用户喜欢红茶" in page._list.item(0).text()
+        assert not page._add_row_widget.isHidden()
+        assert not page._action_row_widget.isHidden()
+
+        page._tabs.setCurrentIndex(1)
+        qapp.processEvents()
+
         assert page._title.text() == "RAG 历史向量索引"
         assert "索引 1 条" in page._rag_status.text()
+        assert "重要记忆仍单独保存和注入" in page._rag_status.text()
         assert page._list.count() == 1
         assert page._add_row_widget.isHidden()
         assert page._action_row_widget.isHidden()
         assert page._metadata_row_widget.isHidden()
+    finally:
+        page.deleteLater()
+
+
+def test_memory_page_rag_not_ready_copy_keeps_important_memory_enabled(qapp):
+    class FakeImportant:
+        def items(self):
+            return [{"timestamp": "t1", "content": "用户喜欢红茶"}]
+
+    cfg = _minimal_root_config()
+    cfg.features = FeaturesConfig(
+        long_term_memory=LongTermMemoryConfig(mode="rag")
+    )
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "important": FakeImportant(),
+            "rag_store": None,
+            "embedding_service": None,
+        },
+    )()
+    page = MemoryPage(runtime)
+    try:
+        page._tabs.setCurrentIndex(1)
+        page.refresh()
+
+        assert "重要记忆仍照常可用" in page._rag_status.text()
+        assert "不读写重要记忆文件" not in page._rag_status.text()
+    finally:
+        page.deleteLater()
+
+
+def test_settings_longterm_memory_copy_describes_rag_as_enhancement(qapp, tmp_paths):
+    cfg = _minimal_root_config()
+    cfg.features = FeaturesConfig(long_term_memory=LongTermMemoryConfig(mode="file"))
+    runtime = _dashboard_runtime(tmp_paths, cfg)
+    page = SettingsPage(runtime)
+    calls = []
+    page._save_now = lambda **kwargs: calls.append(kwargs)
+    try:
+        labels = [w.text() for w in page.findChildren(QtWidgets.QLabel)]
+        buttons = [w.text() for w in page.findChildren(QtWidgets.QAbstractButton)]
+        text = "\n".join(labels + buttons)
+
+        assert "重要记忆始终启用" in text
+        assert "RAG 历史召回增强" in text
+        assert "文件模式（默认" not in text
+        assert "RAG 向量检索" not in text
+
+        rag_button = next(
+            rb for rb in page.findChildren(QtWidgets.QRadioButton)
+            if "启用 RAG 历史召回增强" in rb.text()
+        )
+        rag_button.setChecked(True)
+
+        assert cfg.features.long_term_memory.mode == "rag"
+        assert calls[-1]["change_desc"] == "long_term_memory.mode=rag"
     finally:
         page.deleteLater()
 

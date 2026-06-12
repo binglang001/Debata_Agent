@@ -237,8 +237,7 @@ class ToolSpec:
     None 表示核心工具，永远启用。"""
 
     no_feedback: bool = False
-    """工具是否属于"调用成功后无需 LLM 反馈"的类别。
-    runner 据此判断是否提前终止循环。"""
+    """兼容旧调用方的工具元信息；runner 不再据此提前终止循环。"""
 
     schema_mode: ToolSchemaMode = ToolSchemaMode.FULL
     """对模型暴露 full schema 还是 stub schema。"""
@@ -267,6 +266,7 @@ class ToolSpec:
             return self.to_stub_openai_schema()
         raw_schema = self.args_model.model_json_schema()
         cleaned = _strip_pydantic_metadata(_inline_refs(raw_schema))
+        cleaned = _add_finish_after_success_parameter(cleaned, self.name)
         return {
             "type": "function",
             "function": {
@@ -285,24 +285,28 @@ class ToolSpec:
                     self.short_description
                     or f"{self.name} 是低频工具。调用前先用 tool_search 查询完整参数和约束。"
                 ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "_tool_search_required": {
-                            "type": "boolean",
-                            "description": (
-                                "这是占位参数。真实调用前必须先用 tool_search 查询完整参数。"
-                            ),
-                        }
+                "parameters": _add_finish_after_success_parameter(
+                    {
+                        "type": "object",
+                        "properties": {
+                            "_tool_search_required": {
+                                "type": "boolean",
+                                "description": (
+                                    "这是占位参数。真实调用前必须先用 tool_search 查询完整参数。"
+                                ),
+                            }
+                        },
+                        "additionalProperties": True,
                     },
-                    "additionalProperties": True,
-                },
+                    self.name,
+                ),
             },
         }
 
     def full_parameters_schema(self) -> dict[str, Any]:
         raw_schema = self.args_model.model_json_schema()
-        return _strip_pydantic_metadata(_inline_refs(raw_schema))
+        cleaned = _strip_pydantic_metadata(_inline_refs(raw_schema))
+        return _add_finish_after_success_parameter(cleaned, self.name)
 
     def tool_search_result(self) -> dict[str, Any]:
         parameters = self.full_parameters_schema()
@@ -412,7 +416,7 @@ class ToolRegistry:
     对外提供：
         - get_schemas(): 返回稳定工具 schema 列表
         - get_executor(ctx): 返回可直接传给 AgentRunner.run() 的 executor
-        - get_no_feedback_names(): 返回所有 no_feedback=True 的工具名集合
+        - get_no_feedback_names(): 返回所有 no_feedback=True 的工具名集合（兼容旧调用）
     """
 
     def __init__(self, specs: list[ToolSpec]) -> None:
@@ -442,7 +446,10 @@ class ToolRegistry:
         return [s.to_openai_schema() for s in self._specs.values()]
 
     def get_no_feedback_names(self) -> set[str]:
-        """返回所有 no_feedback=True 的工具名（供 AgentRunner 使用）。"""
+        """返回所有 no_feedback=True 的工具名。
+
+        仅保留给旧调用方做元信息兼容；AgentRunner 不再使用它提前结束。
+        """
         return {s.name for s in self._specs.values() if s.no_feedback}
 
     def get_executor(self, ctx: ToolContext):
@@ -464,6 +471,13 @@ class ToolRegistry:
             spec = self._specs.get(tool_name)
             if spec is None:
                 return {"ok": False, "error": f"unknown tool: {tool_name}"}
+            finish_after_success = (
+                tool_name != "no_action"
+                and raw_args.get("finish_after_success") is True
+            )
+            if tool_name != "no_action" and "finish_after_success" in raw_args:
+                raw_args = dict(raw_args)
+                raw_args.pop("finish_after_success", None)
             if (
                 spec.schema_mode == ToolSchemaMode.STUB
                 and tool_name not in ctx.extras.get("tool_search_approved_tools", set())
@@ -509,7 +523,14 @@ class ToolRegistry:
 
             from .result_shrink import shrink_tool_result
 
-            return shrink_tool_result(tool_name, result, ctx)
+            shrunk = shrink_tool_result(tool_name, result, ctx)
+            if finish_after_success and not _tool_result_blocks_completion(shrunk):
+                shrunk = dict(shrunk)
+                completion = dict(shrunk.get("turn_completion") or {})
+                completion["allowed"] = True
+                completion.setdefault("reason", "finish_after_success")
+                shrunk["turn_completion"] = completion
+            return shrunk
 
         return executor
 
@@ -525,6 +546,51 @@ def _tool_constraints(spec: ToolSpec) -> list[str]:
     if spec.category in {"messaging", "platform"}:
         constraints.append("QQ 操作类工具只按明确上下文执行，不因玩笑或情绪话误触发。")
     return constraints
+
+
+def _add_finish_after_success_parameter(
+    schema: dict[str, Any],
+    tool_name: str,
+) -> dict[str, Any]:
+    if tool_name == "no_action":
+        return schema
+    patched = dict(schema)
+    properties = dict(patched.get("properties") or {})
+    properties.setdefault(
+        "finish_after_success",
+        {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "仅当这个工具成功且没有失败/待处理状态时，允许本轮工具循环在成功后结束。"
+                "不确定是否还需要根据工具结果继续判断时保持 false。"
+            ),
+        },
+    )
+    patched["properties"] = properties
+    return patched
+
+
+def _tool_result_blocks_completion(result: dict[str, Any]) -> bool:
+    if result.get("ok") is False:
+        return True
+    if result.get("errors"):
+        return True
+    status = result.get("status")
+    pending_statuses = {
+        "needs_review",
+        "needs_review_again",
+        "stale",
+        "failed",
+        "partial",
+        "unsupported",
+        "need_tool_search",
+    }
+    if isinstance(status, str):
+        return status in pending_statuses
+    if isinstance(status, (list, tuple, set)):
+        return any(str(item) in pending_statuses for item in status)
+    return False
 
 
 # ============================================================
@@ -583,7 +649,7 @@ def _strip_pydantic_metadata(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 # ============================================================
-# 辅助：常用 no_feedback 工具默认集合（runner 不传时使用）
+# 辅助：常用 no_feedback 工具默认集合（兼容旧导出，不参与 runner 结束）
 # ============================================================
 
 
@@ -598,6 +664,4 @@ DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "set_group_add_request",
     "schedule_wakeup",
 }
-"""与 agents.runner.DEFAULT_NO_FEEDBACK_TOOLS 对齐。
-ToolRegistry.get_no_feedback_names() 是更准的来源（按实际启用工具）；
-runner 默认值只在 registry 未注入时兜底。"""
+"""与 agents.runner.DEFAULT_NO_FEEDBACK_TOOLS 对齐，仅作兼容元信息。"""

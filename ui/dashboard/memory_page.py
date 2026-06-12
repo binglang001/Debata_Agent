@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QTabBar,
     QVBoxLayout,
     QWidget,
 )
@@ -53,6 +54,14 @@ class MemoryPage(QWidget):
         self._rag_status.setProperty("role", "secondary")
         self._rag_status.setWordWrap(True)
         outer.addWidget(self._rag_status)
+
+        self._tabs = QTabBar()
+        self._tabs.setObjectName("MemoryModeTabs")
+        self._tabs.addTab("重要记忆")
+        self._tabs.addTab("RAG 历史索引")
+        self._tabs.currentChanged.connect(lambda *_: self.refresh())
+        outer.addWidget(self._tabs)
+        self._tabs.hide()
 
         self._list = QListWidget()
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
@@ -124,12 +133,18 @@ class MemoryPage(QWidget):
         if rt is None or rt.important is None:
             self._show_empty(True)
             return
-        if self._is_rag_mode():
+        is_rag = self._is_rag_mode()
+        self._tabs.setVisible(is_rag)
+        if is_rag and self._current_view() == "rag":
             self._refresh_rag_mode(rt)
             return
 
         self._title.setText(DASHBOARD_COPY["memory.important_section"])
-        self._rag_status.hide()
+        if is_rag:
+            self._rag_status.setText("重要记忆始终启用；RAG 历史索引可在旁边页签查看。")
+            self._rag_status.show()
+        else:
+            self._rag_status.hide()
         self._action_row_widget.show()
         self._add_row_widget.show()
         items = rt.important.items()
@@ -153,11 +168,11 @@ class MemoryPage(QWidget):
         entries = rag_store.all_entries() if rag_store is not None else []
         if rag_store is None or embedding is None:
             self._rag_status.setText(
-                "RAG 当前未就绪。RAG 模式使用历史向量检索，不会读写重要记忆文件。"
+                "RAG 当前未就绪。重要记忆仍照常可用；历史向量索引会在 embedding 服务就绪后显示。"
             )
         else:
             self._rag_status.setText(
-                f"按语义向量检索历史消息。索引 {len(entries)} 条。"
+                f"RAG 会按语义向量检索历史消息。索引 {len(entries)} 条；重要记忆仍单独保存和注入。"
             )
 
         if not entries:
@@ -174,17 +189,20 @@ class MemoryPage(QWidget):
         except Exception:
             return False
 
+    def _current_view(self) -> str:
+        return "rag" if self._is_rag_mode() and self._tabs.currentIndex() == 1 else "important"
+
     def _show_empty(self, on: bool) -> None:
         self._list.setVisible(not on)
-        if self._is_rag_mode():
+        if self._current_view() == "rag":
             self._action_row_widget.hide()
             self._add_row_widget.hide()
             self._metadata_row_widget.hide()
         else:
             self._delete_btn.setVisible(not on)
             self._metadata_row_widget.setVisible(not on)
-        self._empty.setVisible(on and not self._is_rag_mode())
-        self._rag_empty.setVisible(on and self._is_rag_mode())
+        self._empty.setVisible(on and self._current_view() != "rag")
+        self._rag_empty.setVisible(on and self._current_view() == "rag")
 
     def _add_memory_item(self, item: dict, *, rag_mode: bool = False) -> None:
         ts = item.get("timestamp", "")

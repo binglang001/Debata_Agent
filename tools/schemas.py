@@ -96,6 +96,15 @@ class SendPrivateArgs(_ToolArgs):
             "atomic=普通新消息不阻断，只适合固定通知/命令结果，不要用来逃避频繁打断。"
         ),
     )
+    ignore_review_interrupts: bool = Field(
+        default=False,
+        description=(
+            "发送工具调用被系统接受后，忽略后续普通新消息造成的软打断，"
+            "不把这次发送改成 interrupted/attempt。不能绕过发送前 needs_review，"
+            "也不能绕过撤回、权限变化、禁言、退群、发送失败等硬错误。"
+            "默认 false。"
+        ),
+    )
     responding_to_message_ids: list[str] = Field(
         default_factory=list,
         description="可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；不确定不要编造。",
@@ -173,6 +182,15 @@ class SendGroupArgs(_ToolArgs):
             "atomic=普通新消息不阻断，只适合固定通知/命令结果，不要用来逃避频繁打断。"
         ),
     )
+    ignore_review_interrupts: bool = Field(
+        default=False,
+        description=(
+            "发送工具调用被系统接受后，忽略后续普通新消息造成的软打断，"
+            "不把这次发送改成 interrupted/attempt。不能绕过发送前 needs_review，"
+            "也不能绕过撤回、权限变化、禁言、退群、发送失败等硬错误。"
+            "默认 false。"
+        ),
+    )
     responding_to_message_ids: list[str] = Field(
         default_factory=list,
         description="可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；不确定不要编造。",
@@ -210,6 +228,13 @@ class CommitSendAttemptArgs(_ToolArgs):
     reply_to_message_id: str | None = Field(
         default=None,
         description="可选：确认发送时给第一条文本消息补引用，避免被中间新消息隔开后串话。",
+    )
+    ignore_review_interrupts: bool = Field(
+        default=False,
+        description=(
+            "仅在确认旧 attempt 前忽略软复核打断并继续提交；"
+            "不能绕过撤回、权限变化、禁言、退群、发送失败等硬错误。默认 false。"
+        ),
     )
     reason: str | None = Field(
         default=None,
@@ -414,11 +439,30 @@ class SaveMemoryArgs(_ToolArgs):
 class DeleteMemoryArgs(_ToolArgs):
     """delete_important_memory 工具参数。"""
 
-    keyword: str = Field(
-        ...,
-        min_length=1,
-        description="要删除的记忆关键词，模糊匹配包含此关键词的条目",
+    memory_id: str | None = Field(
+        default=None,
+        description=(
+            "要删除的重要记忆 ID。推荐使用 memory_id；必须来自重要记忆上下文中展示的 ID、"
+            "save_important_memory 返回的 memory_id，或 existing_id。"
+        ),
     )
+    keyword: str | None = Field(
+        default=None,
+        description=(
+            "旧版兼容参数：按关键词模糊删除。新调用不要使用；能看到记忆 ID 时必须填 memory_id，"
+            "避免关键词误删多条记忆。"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_delete_target(self) -> DeleteMemoryArgs:
+        memory_id = (self.memory_id or "").strip()
+        keyword = (self.keyword or "").strip()
+        self.memory_id = memory_id or None
+        self.keyword = keyword or None
+        if self.memory_id is None and self.keyword is None:
+            raise ValueError("memory_id 或 keyword 至少填写一个；推荐使用 memory_id")
+        return self
 
 
 class UpdateMemoryArgs(_ToolArgs):
@@ -610,6 +654,22 @@ class SummarizeConversationArgs(_ToolArgs):
 class RecallHistoryArgs(_ToolArgs):
     """recall_history 工具参数。"""
 
+    archive_ids: list[str] = Field(
+        default_factory=list,
+        description="归档短 ID 列表；提供后优先按 ID 展开上下文。",
+    )
+    context_before: int = Field(
+        default=0,
+        ge=0,
+        le=20,
+        description="按 archive_ids 展开时，每个 ID 前取同会话多少条相邻记录。",
+    )
+    context_after: int = Field(
+        default=0,
+        ge=0,
+        le=20,
+        description="按 archive_ids 展开时，每个 ID 后取同会话多少条相邻记录。",
+    )
     conversation_id: str | None = Field(
         default=None,
         description=(
@@ -626,6 +686,83 @@ class RecallHistoryArgs(_ToolArgs):
         description="时间范围关键词，如 2026-05-30 / 凌晨 / 昨晚。Phase A 按原文和 metadata 做简单文本匹配。",
     )
     limit: int = Field(default=20, ge=1, le=100, description="最多返回多少条记录")
+
+
+class ArchiveTimeRange(_ToolArgs):
+    """归档筛选时间段。"""
+
+    start: str | None = Field(
+        default=None,
+        description="起始时间，如 2026-06-07 01:00；可只填 start。",
+    )
+    end: str | None = Field(
+        default=None,
+        description="结束时间，如 2026-06-07 02:00；可只填 end。",
+    )
+
+
+class FilterArchiveRecordsArgs(_ToolArgs):
+    """filter_archive_records 工具参数。"""
+
+    archive_ids: list[str] = Field(
+        default_factory=list,
+        description="可选：直接筛选这些归档短 ID。",
+    )
+    conversation_ids: list[str] = Field(
+        default_factory=list,
+        description="可选：会话范围，如 group:497686077 或 private:430666862。",
+    )
+    conversation_match: Literal["exact", "contains", "fuzzy"] = Field(
+        default="exact",
+        description="会话匹配方式。",
+    )
+    sender_ids: list[str] = Field(
+        default_factory=list,
+        description="可选：发送者 QQ/内部 ID 范围。",
+    )
+    sender_names: list[str] = Field(
+        default_factory=list,
+        description="可选：发送者昵称范围。",
+    )
+    sender_match: Literal["exact", "contains", "fuzzy"] = Field(
+        default="exact",
+        description="发送者昵称匹配方式。",
+    )
+    keywords: list[str] = Field(
+        default_factory=list,
+        description="可选：正文关键词列表。",
+    )
+    keyword_match: Literal["exact", "contains", "fuzzy"] = Field(
+        default="contains",
+        description="关键词匹配方式。",
+    )
+    keyword_operator: Literal["all", "any"] = Field(
+        default="all",
+        description="all=所有关键词都命中；any=任一关键词命中。",
+    )
+    time_ranges: list[ArchiveTimeRange] = Field(
+        default_factory=list,
+        description="可选：多个时间段，同字段内 OR。",
+    )
+    message_kinds: list[str] = Field(
+        default_factory=list,
+        description="可选：消息类型，如 text、image、file、audio、mixed。",
+    )
+    limit: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="最多返回多少条候选记录。",
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="分页偏移。",
+    )
+    order: Literal["asc", "desc"] = Field(
+        default="desc",
+        description="按时间/写入顺序升序或降序。",
+    )
 
 
 class AgentTaskSource(_ToolArgs):
@@ -853,6 +990,14 @@ class SendVoiceMessageArgs(_ToolArgs):
         description=(
             "必填：一句话描述语气/音色/节奏，如「年轻女性，轻松调侃，语速中等，尾音自然」。"
             "语气提示会显著影响 TTS 质量，不要省略。"
+        ),
+    )
+    ignore_review_interrupts: bool = Field(
+        default=False,
+        description=(
+            "语音发送被系统接受后，忽略后续普通新消息造成的软打断。"
+            "不能绕过发送前 needs_review，也不能绕过撤回、权限变化、禁言、退群、发送失败等硬错误。"
+            "默认 false。"
         ),
     )
 

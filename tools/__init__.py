@@ -181,6 +181,7 @@ STUB_SCHEMA_TOOLS: set[str] = {
     "start_agent_task",
     "summarize_chat_history",
     "summarize_conversation",
+    "filter_archive_records",
     "recall_history",
     "upload_file",
     "send_voice_message",
@@ -196,6 +197,7 @@ _STUB_SHORT_DESCRIPTIONS: dict[str, str] = {
     "start_agent_task": "低频资料整理工具。调用前先用 tool_search 查询完整 sources 参数和约束。",
     "summarize_chat_history": "低频群历史总结工具。调用前先用 tool_search 查询参数。",
     "summarize_conversation": "低频本地会话总结工具。调用前先用 tool_search 查询参数。",
+    "filter_archive_records": "低频归档筛选工具。调用前先用 tool_search 查询参数。",
     "recall_history": "低频归档检索工具。调用前先用 tool_search 查询参数。",
     "upload_file": "文件发送工具。涉及本地文件和 QQ 上传，调用前先用 tool_search 查询约束。",
     "send_voice_message": "语音发送工具。需要 TTS 与语气 prompt，调用前先用 tool_search 查询参数。",
@@ -248,7 +250,7 @@ def build_default_registry(config) -> ToolRegistry:
                 schema_mode=ToolSchemaMode.STUB,
                 short_description=_STUB_SHORT_DESCRIPTIONS.get(spec.name),
                 risk_level=_STUB_RISK_LEVELS.get(spec.name, "low"),
-                search_tags=[spec.category, spec.name],
+                search_tags=list(spec.search_tags) or [spec.category, spec.name],
             )
         elif spec.name in FULL_SCHEMA_TOOLS:
             configured = replace(spec, schema_mode=ToolSchemaMode.FULL)

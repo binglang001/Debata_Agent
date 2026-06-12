@@ -98,6 +98,9 @@ def _send_metadata_from_args(args: SendPrivateArgs | SendGroupArgs) -> dict:
             "delivery_interrupt_policy",
             "interrupt_priority",
         ),
+        "ignore_review_interrupts": bool(
+            getattr(args, "ignore_review_interrupts", False)
+        ),
         "responding_to_message_ids": responding_ids,
         "reply_to_message_id": reply_to or None,
         "reason": getattr(args, "reason", None),
@@ -399,6 +402,7 @@ async def commit_send_attempt(args: CommitSendAttemptArgs, ctx: ToolContext) -> 
             "reviewed_until_seq": args.reviewed_until_seq,
             "delivery_interrupt_policy": args.delivery_interrupt_policy,
             "reply_to_message_id": args.reply_to_message_id,
+            "ignore_review_interrupts": args.ignore_review_interrupts,
             "reason": args.reason,
             "tool_call_id": str(ctx.extras.get("tool_call_id") or ""),
         },

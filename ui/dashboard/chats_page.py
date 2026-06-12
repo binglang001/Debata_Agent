@@ -11,10 +11,11 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any
-from urllib.parse import urlsplit
+from dataclasses import dataclass, field
+from typing import Any, Literal
+from urllib.parse import quote, unquote, urlsplit
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -30,7 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..theme import Spacing
+from ..theme import Spacing, palette_for_theme, resolve_theme_name
 from ..wizard.components import EmptyState
 from .copy import DASHBOARD_COPY
 
@@ -38,8 +39,40 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_VISIBLE_RECORD_LIMIT = 300
 VISIBLE_RECORD_STEP = 300
+ARCHIVE_FETCH_PAGE_SIZE = 500
 COMPACT_TEXT_LIMIT = 1800
 INLINE_PREVIEW_LIMIT = 80
+
+DisplayKind = Literal[
+    "inbound_message",
+    "outbound_message",
+    "assistant_note",
+    "tool_call",
+    "tool_result",
+    "system_event",
+    "runtime_receipt",
+    "reasoning",
+]
+DisplaySeverity = Literal["normal", "info", "warning", "error"]
+
+
+@dataclass(slots=True)
+class DisplayItem:
+    item_id: str
+    conversation_id: str
+    timestamp: str | None
+    kind: DisplayKind
+    speaker_label: str | None
+    speaker_id: str | None
+    role_label: str
+    text: str
+    summary: str
+    raw: dict[str, Any]
+    related_tool_call_id: str | None = None
+    related_message_id: str | None = None
+    collapsed_by_default: bool = False
+    severity: DisplaySeverity = "normal"
+    tool_results: list[DisplayItem] = field(default_factory=list)
 
 
 class ChatsPage(QWidget):
@@ -55,6 +88,7 @@ class ChatsPage(QWidget):
         self._current_detail_html = ""
         self._visible_record_limits: dict[str, int] = {}
         self._search_text = ""
+        self._expanded_item_ids: set[str] = set()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -119,6 +153,8 @@ class ChatsPage(QWidget):
 
         self._detail = QTextBrowser()
         self._detail.setPlaceholderText("点选左侧某个会话查看")
+        self._detail.setOpenLinks(False)
+        self._detail.anchorClicked.connect(self._on_detail_anchor_clicked)
         splitter.addWidget(self._detail)
 
         splitter.setStretchFactor(0, 1)
@@ -263,7 +299,7 @@ class ChatsPage(QWidget):
             self._current_key,
             DEFAULT_VISIBLE_RECORD_LIMIT,
         )
-        total = len(conv.get("records") or [])
+        total = self._filtered_display_count(conv)
         self._visible_record_limits[self._current_key] = min(
             total,
             current + VISIBLE_RECORD_STEP,
@@ -277,13 +313,24 @@ class ChatsPage(QWidget):
         conv = next((c for c in self._conversations if c["key"] == self._current_key), None)
         if conv is None:
             return
-        total = len(conv.get("records") or [])
+        total = self._filtered_display_count(conv)
         self._visible_record_limits[self._current_key] = total
         self._current_detail_html = ""
         self._refresh_current_detail()
 
     def _on_filter_changed(self, *_args: Any) -> None:
         self._search_text = self._search_input.text().strip()
+        self._current_detail_html = ""
+        self._refresh_current_detail()
+
+    def _on_detail_anchor_clicked(self, url: QUrl) -> None:
+        item_id = _toggle_item_id_from_url(url)
+        if not item_id:
+            return
+        if item_id in self._expanded_item_ids:
+            self._expanded_item_ids.remove(item_id)
+        else:
+            self._expanded_item_ids.add(item_id)
         self._current_detail_html = ""
         self._refresh_current_detail()
 
@@ -295,7 +342,7 @@ class ChatsPage(QWidget):
             self._load_more_btn.setText("加载更早")
             self._show_all_btn.setEnabled(False)
             return
-        total = len(conv.get("records") or [])
+        total = self._filtered_display_count(conv)
         limit = self._visible_record_limits.get(
             str(conv.get("key") or ""),
             DEFAULT_VISIBLE_RECORD_LIMIT,
@@ -314,43 +361,45 @@ class ChatsPage(QWidget):
         else:
             bar.setValue(min(value, bar.maximum()))
 
-    def _render_conversation(self, conv: dict) -> str:
-        records = list(conv.get("records") or [])
-        limit = self._visible_record_limits.get(
-            str(conv.get("key") or ""),
-            DEFAULT_VISIBLE_RECORD_LIMIT,
-        )
-        visible = records[-limit:] if limit > 0 else records
-        hidden = max(0, len(records) - len(visible))
-        render_items = _build_render_items(
-            visible,
+    def _filtered_display_items_for_conversation(self, conv: dict) -> list[DisplayItem]:
+        return _build_display_items(
+            list(conv.get("records") or []),
+            persona_name=_runtime_persona_name(self._runtime),
             search_text=self._search_text,
             show_chat=self._show_chat_cb.isChecked(),
             show_system=self._show_system_cb.isChecked(),
             show_tools=self._show_tools_cb.isChecked(),
             media_only=self._media_only_cb.isChecked(),
         )
-        persona_name = _runtime_persona_name(self._runtime)
+
+    def _filtered_display_count(self, conv: dict) -> int:
+        return len(self._filtered_display_items_for_conversation(conv))
+
+    def _render_conversation(self, conv: dict) -> str:
+        records = list(conv.get("records") or [])
+        all_items = normalize_history_records(
+            records,
+            persona_name=_runtime_persona_name(self._runtime),
+        )
+        filtered_items = _filter_display_items(
+            all_items,
+            search_text=self._search_text,
+            show_chat=self._show_chat_cb.isChecked(),
+            show_system=self._show_system_cb.isChecked(),
+            show_tools=self._show_tools_cb.isChecked(),
+            media_only=self._media_only_cb.isChecked(),
+        )
+        limit = self._visible_record_limits.get(
+            str(conv.get("key") or ""),
+            DEFAULT_VISIBLE_RECORD_LIMIT,
+        )
+        visible = filtered_items[-limit:] if limit > 0 else filtered_items
+        hidden = max(0, len(filtered_items) - len(visible))
         parts = [
-            "<style>"
-            ".chat-record{margin:10px 0;}"
-            ".chat-bubble{padding:10px 12px;border-radius:8px;}"
-            ".chat-user{background:#F6F1E8;}"
-            ".chat-assistant{background:#EAF4F0;}"
-            ".chat-tool{background:#EEF4FA;}"
-            ".chat-event{padding:8px 10px;border-left:3px solid #C8C1BA;color:#5F5952;background:#F7F6F4;}"
-            ".chat-event-tool{border-color:#9DB9D3;background:#F5F8FB;}"
-            ".chat-event-system{border-color:#C8C1BA;background:#F7F6F4;}"
-            ".chat-head{font-weight:600;margin-bottom:6px;}"
-            ".chat-meta{color:#7A7168;font-size:12px;}"
-            ".chat-pre{white-space:pre-wrap;margin:6px 0 0 0;}"
-            ".chat-summary{color:#6B635A;}"
-            ".chat-tool-list{margin:6px 0 0 18px;}"
-            ".chat-tool-result{margin:8px 0 0 0;padding:8px 10px;border-left:3px solid #9DB9D3;background:#F8FBFD;}"
-            "</style>"
+            _chat_html_style(_runtime_theme_name(self._runtime)),
             f"<h3 style='margin:0 0 4px 0'>{_escape(conv['label'])}</h3>"
-            f"<div class='chat-meta'>已显示 {len(visible)} / 共 {len(records)} 条"
-            f"；当前过滤后 {len(render_items)} 条</div>"
+            f"<div class='chat-meta'>已显示 {len(visible)} / 共 {len(all_items)} 条"
+            f"；当前过滤后 {len(filtered_items)} 条</div>"
         ]
         if hidden:
             parts.append(
@@ -358,23 +407,14 @@ class ChatsPage(QWidget):
                 f"还有 {hidden} 条更早记录未显示。点击上方“加载更早”逐步展开，或“显示全部”查看完整记录。"
                 "</div>"
             )
-        if not render_items:
+        if not visible:
             parts.append(
                 "<div class='chat-record chat-event chat-event-system'>"
                 "当前搜索或过滤条件下没有可显示记录。"
                 "</div>"
             )
-        for rec, attached_tool_results in render_items:
-            for bubble in _render_record_bubbles(
-                rec,
-                persona_name=persona_name,
-                show_chat=self._show_chat_cb.isChecked(),
-                show_system=self._show_system_cb.isChecked(),
-                show_tools=self._show_tools_cb.isChecked(),
-                attached_tool_results=attached_tool_results,
-            ):
-                parts.append(bubble)
-                parts.append("<hr/>")
+        for item in visible:
+            parts.append(_render_display_item(item, expanded_item_ids=self._expanded_item_ids))
         return "".join(parts)
 
     def _render_record(self, rec: dict) -> str:
@@ -382,6 +422,83 @@ class ChatsPage(QWidget):
             rec,
             persona_name=_runtime_persona_name(self._runtime),
         )
+
+
+def _runtime_theme_name(runtime: Any) -> str:
+    cfg = getattr(runtime, "config", None)
+    app = getattr(cfg, "app", None)
+    theme = getattr(app, "theme", None)
+    if theme in {"light", "dark", "auto"}:
+        return resolve_theme_name(theme)
+    return resolve_theme_name("auto")
+
+
+def _chat_html_style(theme_name: str) -> str:
+    palette = palette_for_theme(theme_name)
+    if palette.name == "dark":
+        bot_bg = "#302B26"
+        peer_bg = "#213631"
+        event_bg = "#292522"
+        event_tool_bg = "#202832"
+        result_bg = "#1D252C"
+    else:
+        bot_bg = "#F1E8D6"
+        peer_bg = "#E8F1ED"
+        event_bg = "#F7F3EA"
+        event_tool_bg = "#F2F6FA"
+        result_bg = "#F8FBFD"
+    return (
+        "<style>"
+        ".chat-record{margin:10px 0;}"
+        ".chat-message-table{width:100%;border-collapse:collapse;margin:10px 0;}"
+        ".chat-message-cell{vertical-align:top;}"
+        ".chat-spacer-cell{font-size:1px;line-height:1px;}"
+        ".chat-bubble-frame{border-collapse:separate;}"
+        ".chat-name-line{font-weight:600;margin:0 0 4px 0;}"
+        ".chat-bubble{text-align:left;max-width:100%;"
+        "padding:10px 12px;border-radius:8px;"
+        f"border:1px solid {palette.border};color:{palette.text_primary};"
+        "overflow-wrap:anywhere;word-break:break-word;}"
+        f".chat-bot .chat-bubble{{background:{bot_bg};}}"
+        f".chat-peer .chat-bubble{{background:{peer_bg};}}"
+        ".chat-side-left .chat-name-line{text-align:left;}"
+        ".chat-side-right .chat-name-line{text-align:right;}"
+        ".chat-event{padding:8px 10px;border-left:3px solid;"
+        f"color:{palette.text_primary};background:{event_bg};"
+        f"border-color:{palette.border};"
+        "overflow-wrap:anywhere;word-break:break-word;}"
+        f".chat-event-tool{{border-color:{palette.accent_blue};background:{event_tool_bg};}}"
+        f".chat-event-system{{border-color:{palette.border};background:{event_bg};}}"
+        f".chat-event-reasoning{{border-color:{palette.accent_primary};background:{event_bg};}}"
+        ".chat-head{font-weight:600;margin-bottom:6px;}"
+        f".chat-meta{{color:{palette.text_secondary};font-size:12px;}}"
+        ".chat-pre{white-space:pre-wrap;margin:6px 0 0 0;"
+        "overflow-wrap:anywhere;word-break:break-word;}"
+        f".chat-summary{{color:{palette.text_secondary};}}"
+        f".chat-toggle{{color:{palette.accent_blue};text-decoration:none;}}"
+        ".chat-tool-list{margin:6px 0 0 18px;}"
+        ".chat-tool-result{margin:8px 0 0 0;padding:8px 10px;border-left:3px solid;"
+        f"border-color:{palette.accent_blue};background:{result_bg};"
+        "overflow-wrap:anywhere;word-break:break-word;}"
+        "</style>"
+    )
+
+
+def _toggle_item_id_from_url(url: QUrl) -> str | None:
+    raw = url.toString()
+    prefix = "diana-chat-toggle:"
+    if not raw.startswith(prefix):
+        return None
+    item_id = unquote(raw.removeprefix(prefix))
+    return item_id or None
+
+
+def _toggle_href(item_id: str) -> str:
+    return f"diana-chat-toggle:{quote(item_id, safe='')}"
+
+
+def _display_item_expand_id(item: DisplayItem) -> str:
+    return f"{item.conversation_id}\n{item.item_id}"
 
 
 _LEGACY_HEADER_RE = re.compile(
@@ -751,6 +868,681 @@ def _runtime_persona_name(runtime: Any) -> str:
     return "助手"
 
 
+def normalize_history_records(
+    records: list[dict],
+    *,
+    persona_name: str,
+    bot_user_id: str | None = None,
+) -> list[DisplayItem]:
+    """把 raw history 记录归一化成 UI 可显示项，并挂靠工具结果。"""
+    items: list[DisplayItem] = []
+    tool_calls: dict[str, DisplayItem] = {}
+    seen_ids: set[str] = set()
+    for record_index, record in enumerate(records):
+        for item in normalize_history_record(
+            record,
+            persona_name=persona_name,
+            bot_user_id=bot_user_id,
+        ):
+            item.item_id = _unique_item_id(item.item_id, record_index, seen_ids)
+            if item.kind == "tool_call" and item.related_tool_call_id:
+                tool_calls[item.related_tool_call_id] = item
+                items.append(item)
+                continue
+            if item.kind == "tool_result" and item.related_tool_call_id:
+                parent = tool_calls.get(item.related_tool_call_id)
+                if parent is not None:
+                    parent.tool_results.append(item)
+                    continue
+            items.append(item)
+    return items
+
+
+def normalize_history_record(
+    rec: dict[str, Any],
+    *,
+    persona_name: str,
+    bot_user_id: str | None = None,
+) -> list[DisplayItem]:
+    """把一条 history/archive 记录拆成一个或多个 DisplayItem。"""
+    role = _record_role(rec)
+    content = str(rec.get("content") or "")
+    conversation_id = _record_conversation_id_for_display(rec)
+    timestamp = _record_timestamp(rec)
+    base_id = _record_display_base_id(rec, conversation_id=conversation_id, role=role)
+    runtime = _runtime_event_summary(content)
+
+    if runtime is not None:
+        title, summary = runtime
+        items = [
+            DisplayItem(
+                item_id=f"{base_id}:runtime",
+                conversation_id=conversation_id,
+                timestamp=timestamp,
+                kind="runtime_receipt" if "<send_receipt" in content else "system_event",
+                speaker_label="系统",
+                speaker_id=None,
+                role_label="系统",
+                text=content,
+                summary=f"{title} · {summary}" if summary else title,
+                raw=rec,
+                collapsed_by_default=True,
+                severity=_runtime_severity(content),
+            )
+        ]
+        for index, sent in enumerate(_send_receipt_sent_items(content)):
+            msg_id = str(sent.get("msg_id") or "").strip() or None
+            items.append(
+                DisplayItem(
+                    item_id=f"{base_id}:sent:{index}",
+                    conversation_id=str(sent.get("conversation_id") or conversation_id),
+                    timestamp=str(sent.get("time") or timestamp or "") or None,
+                    kind="outbound_message",
+                    speaker_label=persona_name,
+                    speaker_id=bot_user_id,
+                    role_label="角色",
+                    text=str(sent.get("content") or sent.get("label") or "").strip(),
+                    summary=_sent_item_status(sent),
+                    raw=dict(sent),
+                    related_message_id=msg_id,
+                    collapsed_by_default=False,
+                )
+            )
+        return items
+
+    if role == "tool":
+        tool_call_id = str(rec.get("tool_call_id") or "").strip() or None
+        return [
+            DisplayItem(
+                item_id=f"{base_id}:tool_result",
+                conversation_id=conversation_id,
+                timestamp=timestamp,
+                kind="tool_result",
+                speaker_label="工具结果",
+                speaker_id=None,
+                role_label="工具结果",
+                text=content,
+                summary=_format_tool_result_summary(content),
+                raw=rec,
+                related_tool_call_id=tool_call_id,
+                collapsed_by_default=True,
+                severity=_tool_result_severity(content),
+            )
+        ]
+
+    if role == "user":
+        return [
+            DisplayItem(
+                item_id=f"{base_id}:inbound",
+                conversation_id=conversation_id,
+                timestamp=timestamp,
+                kind="inbound_message",
+                speaker_label=_user_record_label(rec),
+                speaker_id=_user_record_sender_id(rec),
+                role_label="成员",
+                text=_strip_legacy_header(content),
+                summary=_compact_inline_tokens(_first_nonempty_line(_strip_legacy_header(content))),
+                raw=rec,
+                related_message_id=_record_message_id(rec),
+            )
+        ]
+
+    if role == "assistant":
+        items: list[DisplayItem] = []
+        reasoning = str(rec.get("reasoning_content") or "")
+        if reasoning:
+            items.append(
+                DisplayItem(
+                    item_id=f"{base_id}:reasoning",
+                    conversation_id=conversation_id,
+                    timestamp=timestamp,
+                    kind="reasoning",
+                    speaker_label=persona_name,
+                    speaker_id=bot_user_id,
+                    role_label="思考",
+                    text=reasoning,
+                    summary="思考过程",
+                    raw=rec,
+                    collapsed_by_default=True,
+                )
+            )
+        if content.strip():
+            outbound = _record_is_qq_visible_outbound(rec)
+            items.append(
+                DisplayItem(
+                    item_id=f"{base_id}:assistant_text",
+                    conversation_id=conversation_id,
+                    timestamp=timestamp,
+                    kind="outbound_message" if outbound else "assistant_note",
+                    speaker_label=persona_name,
+                    speaker_id=bot_user_id,
+                    role_label="角色" if outbound else "助手内部",
+                    text=content,
+                    summary=_sent_item_status(rec) if outbound else _assistant_note_summary(content),
+                    raw=rec,
+                    related_message_id=_record_message_id(rec),
+                    collapsed_by_default=not outbound,
+                )
+            )
+        for index, tool_call in enumerate(rec.get("tool_calls") or []):
+            if not isinstance(tool_call, dict):
+                continue
+            tool_call_id = str(tool_call.get("id") or f"{base_id}:tool:{index}").strip()
+            items.append(
+                DisplayItem(
+                    item_id=f"{base_id}:tool_call:{index}",
+                    conversation_id=conversation_id,
+                    timestamp=timestamp,
+                    kind="tool_call",
+                    speaker_label=persona_name,
+                    speaker_id=bot_user_id,
+                    role_label="工具动作",
+                    text=json.dumps(tool_call, ensure_ascii=False, indent=2),
+                    summary=_format_tool_call_for_display(tool_call),
+                    raw={"record": rec, "tool_call": tool_call},
+                    related_tool_call_id=tool_call_id,
+                    collapsed_by_default=True,
+                    severity=_tool_call_severity(tool_call),
+                )
+            )
+        return items
+
+    return [
+        DisplayItem(
+            item_id=f"{base_id}:system",
+            conversation_id=conversation_id,
+            timestamp=timestamp,
+            kind="system_event",
+            speaker_label="系统",
+            speaker_id=None,
+            role_label="系统",
+            text=content,
+            summary=_compact_inline_tokens(_first_nonempty_line(content)) or "系统事件",
+            raw=rec,
+            collapsed_by_default=True,
+        )
+    ]
+
+
+def _unique_item_id(item_id: str, record_index: int, seen_ids: set[str]) -> str:
+    if item_id not in seen_ids:
+        seen_ids.add(item_id)
+        return item_id
+    unique = f"{item_id}:{record_index}"
+    suffix = 1
+    while unique in seen_ids:
+        suffix += 1
+        unique = f"{item_id}:{record_index}:{suffix}"
+    seen_ids.add(unique)
+    return unique
+
+
+def _build_display_items(
+    records: list[dict],
+    *,
+    persona_name: str,
+    search_text: str,
+    show_chat: bool,
+    show_system: bool,
+    show_tools: bool,
+    media_only: bool = False,
+) -> list[DisplayItem]:
+    return _filter_display_items(
+        normalize_history_records(records, persona_name=persona_name),
+        search_text=search_text,
+        show_chat=show_chat,
+        show_system=show_system,
+        show_tools=show_tools,
+        media_only=media_only,
+    )
+
+
+def _filter_display_items(
+    items: list[DisplayItem],
+    *,
+    search_text: str,
+    show_chat: bool,
+    show_system: bool,
+    show_tools: bool,
+    media_only: bool = False,
+) -> list[DisplayItem]:
+    query = search_text.strip().casefold()
+    return [
+        item
+        for item in items
+        if _display_item_matches_filters(
+            item,
+            query=query,
+            show_chat=show_chat,
+            show_system=show_system,
+            show_tools=show_tools,
+            media_only=media_only,
+        )
+    ]
+
+
+def _display_item_matches_filters(
+    item: DisplayItem,
+    *,
+    query: str,
+    show_chat: bool,
+    show_system: bool,
+    show_tools: bool,
+    media_only: bool,
+) -> bool:
+    categories = _display_item_categories(item)
+    if not show_chat and "chat" in categories:
+        categories.discard("chat")
+    if not show_system and "system" in categories:
+        categories.discard("system")
+    if not show_tools and "tool" in categories:
+        categories.discard("tool")
+    if not categories:
+        return False
+    if media_only and not _display_item_has_media_or_file(item):
+        return False
+    if not query:
+        return True
+    if query in _display_item_search_text(item).casefold():
+        return True
+    return item.kind == "tool_call" and any(
+        query in _display_item_search_text(result).casefold()
+        for result in item.tool_results
+    )
+
+
+def _display_item_categories(item: DisplayItem) -> set[str]:
+    if item.kind in {"inbound_message", "outbound_message"}:
+        return {"chat"}
+    if item.kind in {"tool_call", "tool_result"}:
+        return {"tool"}
+    return {"system"}
+
+
+def _display_item_has_media_or_file(item: DisplayItem) -> bool:
+    if _text_has_media_or_file(item.text) or _text_has_media_or_file(item.summary):
+        return True
+    if _text_has_media_or_file(json.dumps(item.raw, ensure_ascii=False, default=str)):
+        return True
+    return any(_display_item_has_media_or_file(result) for result in item.tool_results)
+
+
+def _display_item_search_text(item: DisplayItem) -> str:
+    parts = [
+        item.kind,
+        item.speaker_label or "",
+        item.speaker_id or "",
+        item.role_label,
+        item.text,
+        item.summary,
+        item.related_tool_call_id or "",
+        item.related_message_id or "",
+        json.dumps(item.raw, ensure_ascii=False, default=str),
+    ]
+    for result in item.tool_results:
+        parts.append(_display_item_search_text(result))
+    return "\n".join(parts)
+
+
+def _render_display_item(
+    item: DisplayItem,
+    *,
+    expanded_item_ids: set[str] | None = None,
+) -> str:
+    expanded_item_ids = expanded_item_ids or set()
+    expand_id = _display_item_expand_id(item)
+    if item.kind == "inbound_message":
+        return _render_chat_message_item(
+            item,
+            css="chat-peer",
+            side="right",
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
+    if item.kind == "outbound_message":
+        return _render_chat_message_item(
+            item,
+            css="chat-bot",
+            side="left",
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
+    if item.kind == "tool_call":
+        return _render_tool_call_item(item, expanded_item_ids=expanded_item_ids)
+    if item.kind == "tool_result":
+        head = f"工具结果 · {item.related_tool_call_id}" if item.related_tool_call_id else "工具结果"
+        return _render_event_record(
+            head,
+            _render_tool_result_content(
+                item.text,
+                toggle_id=expand_id,
+                expanded=expand_id in expanded_item_ids,
+            ),
+            event_class="chat-event-tool",
+        )
+    if item.kind == "runtime_receipt":
+        title, summary = _split_display_summary(item.summary)
+        head = f"系统 · {title}"
+        body = _render_collapsed_content(
+            summary,
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
+        return _render_event_record(head, body, event_class="chat-event-system")
+    if item.kind == "assistant_note":
+        head = f"{item.speaker_label or '助手'} · 内部文本"
+        body = _render_collapsed_content(
+            item.summary,
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
+        return _render_event_record(head, body, event_class="chat-event-system")
+    if item.kind == "reasoning":
+        head = f"{item.speaker_label or '助手'} · 思考过程"
+        body = _render_collapsed_content(
+            item.summary,
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
+        return _render_event_record(head, body, event_class="chat-event-reasoning")
+    if item.kind == "system_event" and item.speaker_label == "系统" and " · " in item.summary:
+        title, summary = _split_display_summary(item.summary)
+        head = f"系统 · {title}"
+        body = _render_collapsed_content(
+            summary,
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+        )
+        return _render_event_record(head, body, event_class="chat-event-system")
+    head = "系统"
+    body = _render_collapsed_content(
+        item.summary,
+        item.text,
+        toggle_id=expand_id,
+        expanded=expand_id in expanded_item_ids,
+    )
+    return _render_event_record(head, body, event_class="chat-event-system")
+
+
+def _render_chat_message_item(
+    item: DisplayItem,
+    *,
+    css: str,
+    side: Literal["left", "right"],
+    toggle_id: str,
+    expanded: bool,
+) -> str:
+    label = item.speaker_label or item.role_label
+    meta = _chat_item_meta(item)
+    side_class = f"chat-side-{side}"
+    align = side
+    spacer_cell = "<td class='chat-spacer-cell' width='22%'>&nbsp;</td>"
+    message_cell_parts = [
+        f"<td class='chat-message-cell' width='78%' align='{align}' valign='top'>",
+        f"<div class='chat-name-line' align='{align}'>{_escape(label)}",
+    ]
+    if meta:
+        message_cell_parts.append(f" <span class='chat-meta'>{_escape(meta)}</span>")
+    message_cell_parts.extend(
+        [
+            "</div>",
+            f"<table class='chat-bubble-frame' align='{align}' cellspacing='0' cellpadding='0' border='0'>",
+            "<tr><td class='chat-bubble'>",
+            _render_text_block(item.text or "(空消息)", toggle_id=toggle_id, expanded=expanded),
+            "</td></tr></table>",
+            "</td>",
+        ]
+    )
+    message_cell = "".join(message_cell_parts)
+    cells = f"{message_cell}{spacer_cell}" if side == "left" else f"{spacer_cell}{message_cell}"
+    return (
+        f"<table class='chat-record chat-message-table {side_class} {css}' "
+        "width='100%' cellspacing='0' cellpadding='0' border='0'>"
+        f"<tr>{cells}</tr></table>"
+    )
+
+
+def _render_tool_call_item(
+    item: DisplayItem,
+    *,
+    expanded_item_ids: set[str] | None = None,
+) -> str:
+    expanded_item_ids = expanded_item_ids or set()
+    expand_id = _display_item_expand_id(item)
+    tool_call = item.raw.get("tool_call") if isinstance(item.raw, dict) else None
+    tool_name = _tool_call_name(tool_call if isinstance(tool_call, dict) else {})
+    if tool_name == "no_action":
+        head = f"{item.speaker_label or '助手'} · 工具动作"
+        body = _render_collapsed_content(
+            "选择不发送消息",
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+            expand_label="展开原始参数",
+        )
+        return _render_event_record(head, body, event_class="chat-event-tool")
+
+    parts = [
+        "<div class='chat-record chat-event chat-event-tool'>",
+        f"<div class='chat-head'>{_escape(item.speaker_label or '助手')} · 工具动作</div>",
+        f"<div class='chat-summary'>调用工具：{_escape(tool_name or '未知工具')}</div>",
+        f"<div>{_escape(item.summary)}</div>",
+    ]
+    if item.tool_results:
+        for result in item.tool_results:
+            result_id = result.related_tool_call_id or item.related_tool_call_id or ""
+            result_expand_id = _display_item_expand_id(result)
+            result_body = _render_tool_result_content(
+                result.text,
+                toggle_id=result_expand_id,
+                expanded=result_expand_id in expanded_item_ids,
+            )
+            parts.append(
+                "<div class='chat-tool-result'>"
+                f"<div class='chat-head'>工具结果 · {_escape(result_id)}</div>"
+                f"{result_body}"
+                "</div>"
+            )
+    parts.append(
+        _render_collapsible_raw(
+            item.text,
+            toggle_id=expand_id,
+            expanded=expand_id in expanded_item_ids,
+            expand_label="展开原始参数",
+        )
+    )
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _split_display_summary(summary: str) -> tuple[str, str]:
+    if " · " not in summary:
+        return summary or "系统事件", summary or "系统事件"
+    title, detail = summary.split(" · ", 1)
+    return title or "系统事件", detail or title or "系统事件"
+
+
+def _chat_item_meta(item: DisplayItem) -> str:
+    parts = []
+    if item.timestamp:
+        parts.append(item.timestamp)
+    if item.speaker_id and item.speaker_id not in str(item.speaker_label or ""):
+        parts.append(item.speaker_id)
+    if item.summary and item.kind == "outbound_message":
+        parts.append(item.summary)
+    elif item.related_message_id:
+        parts.append(f"msg_id={item.related_message_id}")
+    return " · ".join(parts)
+
+
+def _record_role(rec: dict[str, Any]) -> str:
+    role = str(rec.get("role") or "").strip()
+    if role:
+        return role
+    direction = str(rec.get("direction") or "").strip()
+    if direction == "outbound":
+        return "assistant"
+    if direction == "inbound":
+        return "user"
+    if str(rec.get("conversation_id") or "").startswith("system:"):
+        return "system"
+    return "user"
+
+
+def _record_conversation_id_for_display(rec: dict[str, Any]) -> str:
+    direct = rec.get("conversation_id")
+    if isinstance(direct, str) and direct:
+        return direct
+    if _record_role(rec) == "user":
+        return _conversation_info(rec)["key"]
+    return "system:global" if _record_role(rec) in {"system", "tool"} else "unknown:history"
+
+
+def _record_timestamp(rec: dict[str, Any]) -> str | None:
+    for key in ("timestamp", "time", "created_at"):
+        value = rec.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    meta = rec.get("metadata")
+    if isinstance(meta, dict):
+        date = meta.get("date")
+        if isinstance(date, str) and date.strip():
+            return date.strip()
+    content = str(rec.get("content") or "")
+    match = _LEGACY_HEADER_RE.match(content)
+    if match:
+        return match.group("timestamp")
+    return None
+
+
+def _record_display_base_id(rec: dict[str, Any], *, conversation_id: str, role: str) -> str:
+    for key in ("archive_id", "id", "message_id", "msg_id", "tool_call_id"):
+        value = rec.get(key)
+        if value:
+            return str(value)
+    content = str(rec.get("content") or "")
+    return f"{conversation_id}:{role}:{_record_timestamp(rec) or ''}:{len(content)}"
+
+
+def _record_message_id(rec: dict[str, Any]) -> str | None:
+    for key in ("message_id", "msg_id", "original_msg_id"):
+        value = rec.get(key)
+        if value:
+            return str(value)
+    meta = rec.get("metadata")
+    if isinstance(meta, dict):
+        for key in ("original_msg_id", "message_id", "msg_id"):
+            value = meta.get(key)
+            if value:
+                return str(value)
+    content = str(rec.get("content") or "")
+    match = _LEGACY_HEADER_RE.match(content)
+    if match:
+        return match.group("message_id")
+    return None
+
+
+def _record_is_qq_visible_outbound(rec: dict[str, Any]) -> bool:
+    if str(rec.get("direction") or "") == "outbound":
+        return rec.get("qq_visible") is not False
+    if rec.get("qq_visible") is True:
+        return True
+    meta = rec.get("metadata")
+    if isinstance(meta, dict):
+        if str(meta.get("direction") or "") == "outbound":
+            return meta.get("qq_visible") is not False
+        if meta.get("qq_visible") is True:
+            return True
+    return False
+
+
+def _user_record_sender_id(rec: dict[str, Any]) -> str | None:
+    meta_messages = (rec.get("metadata") or {}).get("messages") or []
+    first = meta_messages[0] if meta_messages else None
+    if isinstance(first, dict):
+        value = first.get("user_id") or first.get("sender_id") or first.get("target_id")
+        return str(value) if value else None
+    for key in ("sender_id", "user_id"):
+        value = rec.get(key)
+        if value:
+            return str(value)
+    content = str(rec.get("content") or "")
+    match = _LEGACY_HEADER_RE.match(content)
+    if match:
+        return match.group("user_id")
+    return None
+
+
+def _sent_item_status(item: dict[str, Any]) -> str:
+    parts = []
+    status = item.get("status")
+    if status:
+        parts.append(_status_label(str(status)))
+    elif item.get("qq_visible") is True or item.get("direction") == "outbound":
+        parts.append("已发送")
+    if item.get("delivery"):
+        parts.append(f"投递 {item.get('delivery')}")
+    if item.get("qq_visible") == "pending":
+        parts.append("QQ 可见性待确认")
+    elif item.get("qq_visible") is False:
+        parts.append("未 QQ 可见")
+    if item.get("msg_id"):
+        parts.append(f"msg_id={item.get('msg_id')}")
+    return " · ".join(parts) or "已发送"
+
+
+def _status_label(status: str) -> str:
+    labels = {
+        "sent": "已发送",
+        "accepted": "已入队",
+        "queued": "排队中",
+        "pending": "等待确认",
+        "stale": "已过期",
+        "failed": "失败",
+        "needs_review": "等待复核",
+        "needs_review_again": "等待再次复核",
+    }
+    return labels.get(status, status)
+
+
+def _assistant_note_summary(content: str) -> str:
+    first = _compact_inline_tokens(_first_nonempty_line(content))
+    return first or "未发送文本"
+
+
+def _runtime_severity(content: str) -> DisplaySeverity:
+    summary = _format_send_receipt_summary(content) if "<send_receipt" in content else content
+    lowered = summary.casefold()
+    if any(token in lowered for token in ("failed", "失败", "stale", "过期")):
+        return "warning"
+    return "info"
+
+
+def _tool_result_severity(content: str) -> DisplaySeverity:
+    lowered = content.casefold()
+    if any(token in lowered for token in ("failed", '"ok": false', "error", "失败")):
+        return "warning"
+    return "info"
+
+
+def _tool_call_severity(tool_call: dict[str, Any]) -> DisplaySeverity:
+    name = _tool_call_name(tool_call)
+    if name in {"set_group_kick", "set_group_ban", "set_group_whole_ban", "set_group_leave"}:
+        return "warning"
+    return "info"
+
+
+def _tool_call_name(tool_call: dict[str, Any]) -> str:
+    func = tool_call.get("function") if isinstance(tool_call, dict) else None
+    if not isinstance(func, dict):
+        return ""
+    return str(func.get("name") or "")
+
+
 async def _load_chat_page_records(runtime: Any) -> list[dict]:
     history = getattr(runtime, "history", None)
     if history is None:
@@ -762,11 +1554,83 @@ async def _load_chat_page_records(runtime: Any) -> list[dict]:
         return list(history_records or [])
 
     try:
-        archive_records = await archive.records()
+        archive_records = await _load_archive_records_paged(archive)
     except Exception as e:
         logger.warning(f"加载 archive 失败，仅显示活跃 history: {e}")
         return list(history_records or [])
     return [*list(archive_records or []), *list(history_records or [])]
+
+
+async def _load_archive_records_paged(archive: Any) -> list[dict]:
+    filter_records = getattr(archive, "filter_records", None)
+    if not callable(filter_records):
+        return list(await archive.records() or [])
+
+    records: list[dict] = []
+    offset = 0
+    total: int | None = None
+    while total is None or offset < total:
+        page = await filter_records(
+            {
+                "limit": ARCHIVE_FETCH_PAGE_SIZE,
+                "offset": offset,
+                "order": "asc",
+            }
+        )
+        if not isinstance(page, dict):
+            break
+        raw_results = page.get("results") or []
+        results = [item for item in raw_results if isinstance(item, dict)]
+        if not results:
+            break
+        records.extend(await _full_archive_records_for_page(archive, results))
+        offset += len(results)
+        total_value = page.get("total")
+        total = int(total_value) if isinstance(total_value, int | str) and str(total_value).isdigit() else offset
+    return records
+
+
+async def _full_archive_records_for_page(archive: Any, results: list[dict]) -> list[dict]:
+    ids = [str(item.get("id") or "").strip() for item in results if item.get("id")]
+    get_by_ids = getattr(archive, "get_by_ids", None)
+    if ids and callable(get_by_ids):
+        try:
+            full_records = await get_by_ids(ids)
+        except Exception as e:
+            logger.warning(f"按归档 ID 还原完整记录失败，使用轻量记录: {e}")
+        else:
+            by_id = {
+                str(item.get("archive_id") or item.get("id") or ""): item
+                for item in full_records or []
+                if isinstance(item, dict)
+            }
+            ordered = [by_id[archive_id] for archive_id in ids if archive_id in by_id]
+            if len(ordered) == len(ids):
+                return ordered
+    return [_light_archive_result_to_record(item) for item in results]
+
+
+def _light_archive_result_to_record(item: dict[str, Any]) -> dict[str, Any]:
+    direction = str(item.get("direction") or "")
+    role = "assistant" if direction == "outbound" else "user"
+    conversation_id = item.get("conversation_id")
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    return {
+        "role": role,
+        "content": str(item.get("content") or ""),
+        "conversation_id": str(conversation_id) if conversation_id else None,
+        "archive_id": item.get("id"),
+        "timestamp": item.get("time"),
+        "direction": direction,
+        "sender_id": item.get("sender_id"),
+        "sender_name": item.get("sender_name"),
+        "metadata": {
+            **metadata,
+            "direction": direction,
+            "sender_id": item.get("sender_id"),
+            "sender_name": item.get("sender_name"),
+        },
+    }
 
 
 def _render_record_html(
@@ -796,101 +1660,25 @@ def _render_record_bubbles(
     show_tools: bool = True,
     attached_tool_results: dict[str, list[dict]] | None = None,
 ) -> list[str]:
-    role = rec.get("role", "?")
-    content = str(rec.get("content") or "")
-    reasoning = str(rec.get("reasoning_content") or "")
-    tool_calls = rec.get("tool_calls") or []
-    tool_call_id = str(rec.get("tool_call_id") or "")
-    runtime = _runtime_event_summary(content)
-
-    if role == "tool":
-        if not show_tools:
-            return []
-        head = f"工具结果 · {tool_call_id}" if tool_call_id else "工具结果"
-        body = _render_tool_result_content(content)
-        return [_render_event_record(head, body, event_class="chat-event-tool")]
-    elif runtime is not None:
-        bubbles: list[str] = []
-        if not show_system:
-            bubbles = []
-        else:
-            title, summary = runtime
-            head = f"系统 · {title}"
-            body = _render_collapsed_content(summary, content)
-            bubbles.append(_render_event_record(head, body, event_class="chat-event-system"))
-        if show_chat:
-            bubbles.extend(
-                _render_outbound_bubble(item, persona_name=persona_name)
-                for item in _send_receipt_sent_items(content)
-            )
-        return bubbles
-    elif role == "user":
-        if not show_chat:
-            return []
-        head = _user_record_label(rec)
-        css = "chat-user"
-        body = _render_text_block(_strip_legacy_header(content))
-    elif role == "assistant":
-        bubbles: list[str] = []
-        body = _render_text_block(content) if content else ""
-        if show_chat and (body or reasoning):
-            parts = [
-                "<div class='chat-record chat-bubble chat-assistant'>",
-                f"<div class='chat-head'>{_escape(persona_name)}</div>",
-            ]
-            if reasoning:
-                parts.append(
-                    "<details><summary class='chat-summary'>思考过程</summary>"
-                    f"<pre class='chat-pre'>{_escape(reasoning)}</pre></details>"
+    items = normalize_history_record(rec, persona_name=persona_name)
+    if attached_tool_results:
+        for item in items:
+            if item.kind != "tool_call" or not item.related_tool_call_id:
+                continue
+            result_records = attached_tool_results.get(item.related_tool_call_id, [])
+            for result_record in result_records:
+                result_items = normalize_history_record(result_record, persona_name=persona_name)
+                item.tool_results.extend(
+                    result for result in result_items if result.kind == "tool_result"
                 )
-            if body:
-                parts.append(body)
-            parts.append("</div>")
-            bubbles.append("".join(parts))
-        if show_tools and tool_calls:
-            bubbles.append(
-                _render_tool_call_bubble(
-                    tool_calls,
-                    persona_name=persona_name,
-                    attached_tool_results=attached_tool_results,
-                )
-            )
-        return bubbles
-    elif role == "system":
-        if not show_system:
-            return []
-        head = "系统"
-        body = _render_text_block(content)
-        return [_render_event_record(head, body, event_class="chat-event-system")]
-    else:
-        if not show_system:
-            return []
-        head = str(role or "记录")
-        body = _render_text_block(content)
-        return [_render_event_record(head, body, event_class="chat-event-system")]
-
-    parts = [
-        f"<div class='chat-record chat-bubble {css}'>",
-        f"<div class='chat-head'>{_escape(head)}</div>",
-    ]
-    if reasoning:
-        parts.append(
-            "<details><summary class='chat-summary'>思考过程</summary>"
-            f"<pre class='chat-pre'>{_escape(reasoning)}</pre></details>"
-        )
-    if body:
-        parts.append(body)
-    parts.append("</div>")
-    bubbles = ["".join(parts)]
-    if show_tools and tool_calls:
-        bubbles.append(
-            _render_tool_call_bubble(
-                tool_calls,
-                persona_name=persona_name,
-                attached_tool_results=attached_tool_results,
-            )
-        )
-    return bubbles
+    visible = _filter_display_items(
+        items,
+        search_text="",
+        show_chat=show_chat,
+        show_system=show_system,
+        show_tools=show_tools,
+    )
+    return [_render_display_item(item) for item in visible]
 
 
 def _render_event_record(head: str, body: str, *, event_class: str) -> str:
@@ -968,6 +1756,24 @@ def _user_record_label(rec: dict) -> str:
             return nickname
         if user_id:
             return f"用户 {user_id}"
+    sender_name = str(rec.get("sender_name") or "").strip()
+    sender_id = str(rec.get("sender_id") or "").strip()
+    if sender_name and sender_id:
+        return f"{sender_name}({sender_id})"
+    if sender_name:
+        return sender_name
+    if sender_id:
+        return f"用户 {sender_id}"
+    meta = rec.get("metadata")
+    if isinstance(meta, dict):
+        sender_name = str(meta.get("sender_name") or "").strip()
+        sender_id = str(meta.get("sender_id") or "").strip()
+        if sender_name and sender_id:
+            return f"{sender_name}({sender_id})"
+        if sender_name:
+            return sender_name
+        if sender_id:
+            return f"用户 {sender_id}"
 
     content = str(rec.get("content") or "")
     match = _LEGACY_HEADER_RE.match(content)
@@ -988,11 +1794,24 @@ def _runtime_event_summary(content: str) -> tuple[str, str] | None:
         return None
     if "<send_receipt_task" in content:
         return "发送回执任务", _compact_inline_tokens(_first_nonempty_line(content))
+    if "<send_status" in content:
+        return "发送状态", _format_send_status_summary(content)
     if "<send_receipt" in content:
         return "发送回执", _format_send_receipt_summary(content)
     if "<task_context" in content:
         return "运行时上下文", _format_task_context_summary(content)
     return None
+
+
+def _format_send_status_summary(content: str) -> str:
+    body = _extract_tag_text(content, "send_status") or content
+    lines = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip() and "不是用户新发言" not in line
+    ]
+    summary = lines[-1] if lines else _first_nonempty_line(body)
+    return _compact_inline_tokens(summary) or "发送状态"
 
 
 def _format_send_receipt_summary(content: str) -> str:
@@ -1017,10 +1836,18 @@ def _format_send_receipt_summary(content: str) -> str:
         parts.append(f"未发送 {len(unsent)} 条")
     if attempted:
         parts.append(f"待发送/尝试 {len(attempted)} 条")
+    accepted = payload.get("accepted") or payload.get("queued") or []
+    if accepted:
+        parts.append(f"排队/待确认 {len(accepted)} 条")
     if new_messages:
         parts.append(f"新消息 {len(new_messages)} 条")
     if recalled:
         parts.append(f"撤回 {len(recalled)} 条")
+    delivery = payload.get("delivery")
+    if delivery:
+        parts.append(f"投递 {delivery}")
+    if payload.get("qq_visible") == "pending":
+        parts.append("QQ 可见性待确认")
     note = str(payload.get("note") or payload.get("next") or "").strip()
     if note:
         parts.append(_compact_inline_tokens(note))
@@ -1069,9 +1896,26 @@ def _extract_tag_json(content: str, tag: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _render_tool_result_content(content: str) -> str:
+def _extract_tag_text(content: str, tag: str) -> str | None:
+    match = re.search(rf"<{tag}\b[^>]*>\s*(.*?)\s*</{tag}>", content, re.S)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _render_tool_result_content(
+    content: str,
+    *,
+    toggle_id: str | None = None,
+    expanded: bool = False,
+) -> str:
     summary = _format_tool_result_summary(content)
-    return _render_collapsed_content(summary, content)
+    return _render_collapsed_content(
+        summary,
+        content,
+        toggle_id=toggle_id,
+        expanded=expanded,
+    )
 
 
 def _format_tool_result_summary(content: str) -> str:
@@ -1090,30 +1934,172 @@ def _format_tool_result_summary(content: str) -> str:
         parts.append("成功" if payload.get("ok") else "失败")
     if payload.get("send_id"):
         parts.append(f"send_id={payload.get('send_id')}")
+    if payload.get("send_attempt_id"):
+        parts.append(f"send_attempt_id={payload.get('send_attempt_id')}")
     sent = payload.get("sent")
     if isinstance(sent, list):
         parts.append(f"已发送 {len(sent)} 条")
     attempted = payload.get("attempted_messages")
     if isinstance(attempted, list):
         parts.append(f"尝试 {len(attempted)} 条")
+    accepted = payload.get("accepted") or payload.get("queued")
+    if isinstance(accepted, list):
+        parts.append(f"排队/待确认 {len(accepted)} 条")
     new_messages = payload.get("new_messages") or payload.get("new_visible_messages")
     if isinstance(new_messages, list):
         parts.append(f"新消息 {len(new_messages)} 条")
+    delivery = payload.get("delivery")
+    if delivery:
+        parts.append(f"投递 {delivery}")
+    if payload.get("qq_visible") == "pending":
+        parts.append("QQ 可见性待确认")
+    elif payload.get("qq_visible") is False:
+        parts.append("未 QQ 可见")
+    if payload.get("ignored_review_interrupts") is True:
+        parts.append("已忽略复核打断")
+    forced = _format_message_list_summary(
+        payload.get("forced_unseen_messages"),
+        head="已忽略",
+        noun="新打断",
+    )
+    if forced:
+        parts.append(forced)
+    unseen = _format_message_list_summary(
+        payload.get("unseen_messages"),
+        head="发现",
+        noun="新打断",
+    )
+    if unseen:
+        parts.append(unseen)
+    priority = _format_message_list_summary(
+        payload.get("priority_interrupts"),
+        head="发现",
+        noun="高优先级打断",
+    )
+    if priority:
+        parts.append(priority)
+    if payload.get("latest_seq") is not None:
+        parts.append(f"latest_seq={payload.get('latest_seq')}")
+    if payload.get("attempt_revision") is not None:
+        parts.append(f"revision={payload.get('attempt_revision')}")
     next_hint = str(payload.get("next") or payload.get("note") or "").strip()
     if next_hint:
-        parts.append(_compact_inline_tokens(next_hint))
+        parts.append(_short_text(_compact_inline_tokens(next_hint), limit=96))
     return "；".join(parts) if parts else _compact_inline_tokens(content)
 
 
-def _render_collapsed_content(summary: str, content: str) -> str:
+def _format_message_list_summary(value: Any, *, head: str, noun: str) -> str:
+    if not isinstance(value, list) or not value:
+        return ""
+    details: list[str] = []
+    times = [
+        str(item.get("time") or item.get("timestamp") or item.get("created_at") or "").strip()
+        for item in value
+        if isinstance(item, dict)
+    ]
+    times = [item for item in times if item]
+    if times:
+        details.append(times[0] if times[0] == times[-1] else f"{times[0]}-{times[-1]}")
+    sources = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        source = str(
+            item.get("conversation_id")
+            or item.get("source")
+            or item.get("group_id")
+            or item.get("target_id")
+            or ""
+        ).strip()
+        if source and source not in sources:
+            sources.append(source)
+    if sources:
+        shown = "、".join(sources[:2])
+        if len(sources) > 2:
+            shown = f"{shown} 等 {len(sources)} 个来源"
+        details.append(f"来源 {shown}")
+    sample = _message_list_sample(value)
+    if sample:
+        details.append(f"样例：{sample}")
+    suffix = f"（{'；'.join(details)}）" if details else ""
+    return f"{head} {len(value)} 条{noun}{suffix}"
+
+
+def _message_list_sample(value: list[Any]) -> str:
+    first = next((item for item in value if isinstance(item, dict)), None)
+    if first is None:
+        return ""
+    sender = str(
+        first.get("sender_name")
+        or first.get("nickname")
+        or first.get("user_id")
+        or first.get("sender_id")
+        or ""
+    ).strip()
+    text = str(
+        first.get("text")
+        or first.get("content")
+        or first.get("message")
+        or first.get("raw_message")
+        or ""
+    ).strip()
+    text = _short_text(_compact_inline_tokens(text), limit=48)
+    if sender and text:
+        return f"{sender}: {text}"
+    return sender or text
+
+
+def _render_collapsed_content(
+    summary: str,
+    content: str,
+    *,
+    toggle_id: str | None = None,
+    expanded: bool = False,
+    expand_label: str = "展开原文",
+) -> str:
+    parts = [f"<div class='chat-summary'>{_escape(summary)}</div>"]
+    parts.append(
+        _render_collapsible_raw(
+            content,
+            toggle_id=toggle_id,
+            expanded=expanded,
+            expand_label=expand_label,
+        )
+    )
+    return "".join(parts)
+
+
+def _render_collapsible_raw(
+    content: str,
+    *,
+    toggle_id: str | None,
+    expanded: bool,
+    expand_label: str,
+) -> str:
+    if not content:
+        return ""
+    if toggle_id:
+        label = "收起" if expanded else expand_label
+        parts = [
+            "<div class='chat-summary'>"
+            f"<a class='chat-toggle' href='{_escape_attr(_toggle_href(toggle_id))}'>{_escape(label)}</a>"
+            "</div>"
+        ]
+        if expanded:
+            parts.append(f"<pre class='chat-pre'>{_escape(content)}</pre>")
+        return "".join(parts)
     return (
-        f"<div class='chat-summary'>{_escape(summary)}</div>"
-        "<details><summary class='chat-summary'>展开原文</summary>"
+        f"<details><summary class='chat-summary'>{_escape(expand_label)}</summary>"
         f"<pre class='chat-pre'>{_escape(content)}</pre></details>"
     )
 
 
-def _render_text_block(content: str) -> str:
+def _render_text_block(
+    content: str,
+    *,
+    toggle_id: str | None = None,
+    expanded: bool = False,
+) -> str:
     if not content:
         return ""
     compact = _compact_inline_tokens(content)
@@ -1121,20 +2107,60 @@ def _render_text_block(content: str) -> str:
     preview = compact
     if len(preview) > COMPACT_TEXT_LIMIT:
         preview = f"{preview[:COMPACT_TEXT_LIMIT]}..."
+    if should_collapse and expanded:
+        return (
+            _render_collapsible_raw(
+                content,
+                toggle_id=toggle_id,
+                expanded=True,
+                expand_label="展开原文",
+            )
+        )
     parts = [f"<pre class='chat-pre'>{_escape(preview)}</pre>"]
     if should_collapse:
         parts.append(
-            "<details><summary class='chat-summary'>展开原文</summary>"
-            f"<pre class='chat-pre'>{_escape(content)}</pre></details>"
+            _render_collapsible_raw(
+                content,
+                toggle_id=toggle_id,
+                expanded=False,
+                expand_label="展开原文",
+            )
         )
     return "".join(parts)
 
 
 def _compact_inline_tokens(content: str) -> str:
+    json_compact = _compact_json_blob(content)
+    if json_compact != content:
+        return json_compact
     compact = _URL_RE.sub(lambda m: _compact_url(m.group(0)), content)
     compact = _WINDOWS_PATH_RE.sub(lambda m: _compact_path(m.group(0)), compact)
     compact = _WORKSPACE_PATH_RE.sub(lambda m: _compact_workspace_path(m.group(0)), compact)
     return compact
+
+
+def _compact_json_blob(content: str) -> str:
+    stripped = content.strip()
+    if len(stripped) <= INLINE_PREVIEW_LIMIT:
+        return content
+    if not (
+        (stripped.startswith("{") and stripped.endswith("}"))
+        or (stripped.startswith("[") and stripped.endswith("]"))
+    ):
+        return content
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        return content
+    kind = "JSON对象" if isinstance(value, dict) else "JSON数组"
+    if isinstance(value, dict):
+        preview_keys = "、".join(str(key) for key in list(value)[:4])
+        suffix = f" · {preview_keys}" if preview_keys else ""
+    elif isinstance(value, list):
+        suffix = f" · {len(value)} 项"
+    else:
+        suffix = ""
+    return f"[{kind}{suffix} · {len(stripped)}字，已折叠]"
 
 
 def _compact_url(value: str) -> str:
@@ -1180,6 +2206,8 @@ def _format_tool_call_for_display(tool_call: dict) -> str:
         return _format_private_send_args(args)
     if name == "send_group_message":
         return _format_group_send_args(args)
+    if name == "commit_send_attempt":
+        return _format_commit_send_attempt_args(args)
     if name == "no_action":
         return "不发送消息"
     if name == "upload_file":
@@ -1203,7 +2231,7 @@ def _format_tool_call_for_display(tool_call: dict) -> str:
     if name == "run_python":
         code = str(args.get("code") or "").strip().replace("\n", " ")
         return f"运行 Python：{code[:80]}{'...' if len(code) > 80 else ''}"
-    return f"{name}：{json.dumps(args, ensure_ascii=False)}"
+    return _format_generic_tool_args(name, args)
 
 
 def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
@@ -1253,6 +2281,56 @@ def _message_with_delay(target: dict[str, Any]) -> str:
     return f"{content}（{delay}s）"
 
 
+def _format_commit_send_attempt_args(args: dict[str, Any]) -> str:
+    parts = []
+    attempt_id = str(args.get("send_attempt_id") or "").strip()
+    if attempt_id:
+        parts.append(f"send_attempt_id={attempt_id}")
+    if args.get("reviewed_until_seq") is not None:
+        parts.append(f"已复核到 seq {args.get('reviewed_until_seq')}")
+    policy = str(args.get("delivery_interrupt_policy") or "").strip()
+    if policy:
+        parts.append(f"中断策略 {policy}")
+    reply_to = str(args.get("reply_to_message_id") or "").strip()
+    if reply_to:
+        parts.append(f"引用 msg_id={reply_to}")
+    if args.get("ignore_review_interrupts") is True:
+        parts.append("忽略复核打断")
+    reason = str(args.get("reason") or "").strip()
+    if reason:
+        parts.append(f"原因：{_short_text(_compact_inline_tokens(reason), limit=60)}")
+    detail = "；".join(parts) if parts else "无参数"
+    return f"提交发送尝试：{detail}"
+
+
+def _format_generic_tool_args(name: str, args: dict[str, Any]) -> str:
+    if not args:
+        return f"{name}：无参数"
+    parts = []
+    for key, value in args.items():
+        parts.append(f"{key}={_format_tool_arg_value(value)}")
+        if len(parts) >= 5:
+            break
+    if len(args) > len(parts):
+        parts.append(f"另有 {len(args) - len(parts)} 项")
+    return f"{name}：{'；'.join(parts)}"
+
+
+def _format_tool_arg_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, list):
+        sample = _message_list_sample(value)
+        suffix = f"，样例：{sample}" if sample else ""
+        return f"{len(value)} 项{suffix}"
+    if isinstance(value, dict):
+        keys = "、".join(str(key) for key in list(value)[:4])
+        return f"对象({keys})" if keys else "对象"
+    return _short_text(_compact_inline_tokens(str(value)), limit=80)
+
+
 def _format_upload_args(args: dict[str, Any]) -> str:
     target_type = args.get("target_type") or "-"
     target_id = args.get("target_id") or "-"
@@ -1266,6 +2344,16 @@ def _escape(s: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def _escape_attr(s: str) -> str:
+    return _escape(s).replace('"', "&quot;").replace("'", "&#x27;")
+
+
+def _short_text(value: str, *, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}..."
 
 
 def _scrollbar_near_bottom(bar: Any, threshold: int = 24) -> bool:
