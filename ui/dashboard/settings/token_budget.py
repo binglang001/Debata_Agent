@@ -161,7 +161,7 @@ class SettingsTokenBudgetMixin:
 
         summary_section = CollapsibleSection(
             "滚动摘要压缩",
-            "按工作上下文百分比触发压缩，不再在界面暴露旧版显式 token 阈值。",
+            "按工作上下文百分比触发滚动摘要，并控制压缩后的活跃窗口目标。",
             expanded=False,
         )
         summary_form = QFormLayout()
@@ -178,7 +178,7 @@ class SettingsTokenBudgetMixin:
                 trigger_pct.value(),
             )
         )
-        summary_form.addRow(QLabel("触发压缩"), unit_spinbox(trigger_pct, "%"))
+        summary_form.addRow(QLabel("触发滚动摘要"), unit_spinbox(trigger_pct, "%"))
 
         target_pct = QSpinBox()
         target_pct.setObjectName("summarizeTargetContextPercentSpin")
@@ -191,13 +191,26 @@ class SettingsTokenBudgetMixin:
                 target_pct.value(),
             )
         )
-        summary_form.addRow(QLabel("压缩后目标"), unit_spinbox(target_pct, "%"))
+        summary_form.addRow(QLabel("活跃窗口目标"), unit_spinbox(target_pct, "%"))
+
+        retry_pct = QSpinBox()
+        retry_pct.setObjectName("summarizeRetryTargetContextPercentSpin")
+        retry_pct.setRange(5, 100)
+        retry_pct.setValue(b.summarize.retry_target_after_context_percent)
+        retry_pct.editingFinished.connect(
+            lambda: self._on_behavior_nested(
+                "summarize",
+                "retry_target_after_context_percent",
+                retry_pct.value(),
+            )
+        )
+        summary_form.addRow(QLabel("重试压缩目标"), unit_spinbox(retry_pct, "%"))
         summary_section.add_layout(summary_form)
         card.add_content(summary_section)
 
         advanced_context = CollapsibleSection(
             "上下文窗口高级",
-            "控制提示词开销估算、活跃历史保底和运行时记录保留数量。",
+            "控制提示词开销估算和自动预算推荐规则。",
             expanded=False,
         )
         advanced_form = QFormLayout()
@@ -285,52 +298,6 @@ class SettingsTokenBudgetMixin:
             1_000_000,
             "token",
             step=1024,
-        )
-        self._add_context_spin_row(
-            advanced_form,
-            "活跃历史保底",
-            "min_working_history_tokens",
-            b.context.min_working_history_tokens,
-            1024,
-            1_000_000,
-            "token",
-            step=1024,
-        )
-        self._add_context_spin_row(
-            advanced_form,
-            "当前会话保底记录",
-            "current_conversation_min_records",
-            b.context.current_conversation_min_records,
-            0,
-            1000,
-            "条",
-        )
-        self._add_context_spin_row(
-            advanced_form,
-            "运行时记录保留",
-            "runtime_record_keep_count",
-            b.context.runtime_record_keep_count,
-            0,
-            1000,
-            "条",
-        )
-        self._add_context_spin_row(
-            advanced_form,
-            "发送回执保留",
-            "send_receipt_keep_count",
-            b.context.send_receipt_keep_count,
-            0,
-            1000,
-            "条",
-        )
-        self._add_context_spin_row(
-            advanced_form,
-            "no_action 记录保留",
-            "no_action_keep_count",
-            b.context.no_action_keep_count,
-            0,
-            1000,
-            "条",
         )
         advanced_context.add_layout(advanced_form)
         card.add_content(advanced_context)

@@ -689,6 +689,11 @@ def test_settings_budget_panels_save_new_fields_from_ui(qapp, tmp_paths):
         assert "自动预算兜底" in labels
         assert "主动思考预算" in labels
         assert "人格编辑历史" not in labels
+        assert "活跃历史保底" not in labels
+        assert "当前会话保底记录" not in labels
+        assert "运行时记录保留" not in labels
+        assert "发送回执保留" not in labels
+        assert "no_action 记录保留" not in labels
 
         def spin(name: str) -> QtWidgets.QSpinBox:
             widget = page.findChild(QtWidgets.QSpinBox, name)
@@ -722,6 +727,9 @@ def test_settings_budget_panels_save_new_fields_from_ui(qapp, tmp_paths):
         target_pct = spin("summarizeTargetContextPercentSpin")
         target_pct.setValue(60)
         target_pct.editingFinished.emit()
+        retry_pct = spin("summarizeRetryTargetContextPercentSpin")
+        retry_pct.setValue(25)
+        retry_pct.editingFinished.emit()
         page._status.mark_restart_done()
 
         prompt_overhead = spin("context_prompt_overhead_estimate_tokens_spin")
@@ -760,6 +768,26 @@ def test_settings_budget_panels_save_new_fields_from_ui(qapp, tmp_paths):
             QtWidgets.QSpinBox,
             "behavior_persona_refine_history_turns_spin",
         ) is None
+        assert page.findChild(
+            QtWidgets.QSpinBox,
+            "context_min_working_history_tokens_spin",
+        ) is None
+        assert page.findChild(
+            QtWidgets.QSpinBox,
+            "context_current_conversation_min_records_spin",
+        ) is None
+        assert page.findChild(
+            QtWidgets.QSpinBox,
+            "context_runtime_record_keep_count_spin",
+        ) is None
+        assert page.findChild(
+            QtWidgets.QSpinBox,
+            "context_send_receipt_keep_count_spin",
+        ) is None
+        assert page.findChild(
+            QtWidgets.QSpinBox,
+            "context_no_action_keep_count_spin",
+        ) is None
 
         persona_max = spin("agentBudgetpersona_genMaxTokensSpin")
         persona_max.setValue(32_768)
@@ -786,6 +814,7 @@ def test_settings_budget_panels_save_new_fields_from_ui(qapp, tmp_paths):
         assert saved.behavior.context.max_context_tokens == 4_000_000
         assert saved.behavior.summarize.trigger_at_context_percent == 80
         assert saved.behavior.summarize.target_after_context_percent == 60
+        assert saved.behavior.summarize.retry_target_after_context_percent == 25
         assert saved.behavior.context.prompt_overhead_estimate_tokens == 16_000
         rec = saved.behavior.context.recommended_context_budget
         assert rec.model_name_budget_tokens["deepseek-v4-pro"] == 351_000

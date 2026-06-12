@@ -1,8 +1,8 @@
 """Inbound enqueue and batch scheduling helpers for MessagePipeline.
 
 This module is a mechanical split from ``core.message_pipeline``. Keep behavior
-equivalent; do not change whitelist, rate-limit, keyword-save, batching, or
-user-record formatting while moving methods.
+equivalent; do not change whitelist, rate-limit, batching, or user-record
+formatting while moving methods.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ import time
 from typing import Any
 
 from adapters.types import IncomingMessage, Target
-from tools import try_save_from_user
 from utils import get_time
 
 from .state import PendingMessageItem
@@ -76,17 +75,6 @@ class PipelineInboundMixin:
 
         conversation_id = self._conversation_id_from_event(event)
 
-        # 关键词强制保存（命中即写入重要记忆）
-        keyword_saved = False
-        if event.text:
-            keyword_result = await try_save_from_user(
-                event.text,
-                self.important,
-                enabled=self.features_cfg.long_term_memory.keyword_trigger_save,
-                scope=conversation_id,
-            )
-            keyword_saved = bool(keyword_result and keyword_result.get("saved"))
-
         # 重建可读文本（CQ 码 + 媒体）
         text = await self._build_readable_text(event)
         self._inbound_seq += 1
@@ -111,7 +99,6 @@ class PipelineInboundMixin:
             inbound_seq=inbound_seq,
             received_at=received_at,
             raw_event=event,
-            keyword_saved=keyword_saved,
         )
 
         self.chat_timeline.append_inbound_event(
@@ -129,11 +116,10 @@ class PipelineInboundMixin:
         await self.batch.append(item)
         self._send_manager.notify_inbound(item)
         logger.debug(
-            "入站消息预处理完成 conversation_id=%s msg_id=%s text_len=%s keyword_saved=%s elapsed=%.3fs",
+            "入站消息预处理完成 conversation_id=%s msg_id=%s text_len=%s elapsed=%.3fs",
             conversation_id,
             event.message_id,
             len(text),
-            keyword_saved,
             time.monotonic() - enqueue_t0,
         )
         if self._send_manager.should_defer_batch(conversation_id):

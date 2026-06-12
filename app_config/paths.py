@@ -7,6 +7,7 @@
             secrets.enc             <- AES 加密后的 API 密钥库
             secrets.meta            <- RSA 加密的 AES 主密钥
             rsa_public.pem          <- RSA 公钥（可公开）
+            rsa_private.pem         <- keyring 不可用时的本地私钥兜底（0600）
             memory/{name}/          <- 各人格的对话历史
             logs/                   <- 结构化日志
             emoji/                  <- 表情包资源
@@ -15,7 +16,8 @@
                                        用户自创的由 .gitignore 排除
         providers/presets/          <- 提供商预设（git 追踪）
 
-RSA 私钥不落盘，仅保存在系统密钥环（keyring）。
+RSA 私钥优先保存在系统密钥环（keyring）；Linux 无可用 keyring 后端时，
+退回 data/rsa_private.pem 本地私钥文件。
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ class AppPaths:
         self.SECRETS_FILE: Path = self.DATA_DIR / "secrets.enc"
         self.SECRETS_META_FILE: Path = self.DATA_DIR / "secrets.meta"
         self.RSA_PUBLIC_KEY_FILE: Path = self.DATA_DIR / "rsa_public.pem"
+        self.RSA_PRIVATE_KEY_FILE: Path = self.DATA_DIR / "rsa_private.pem"
 
         self.MEMORY_DIR: Path = self.DATA_DIR / "memory"
         self.LOGS_DIR: Path = self.DATA_DIR / "logs"

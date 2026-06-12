@@ -12,7 +12,6 @@
     agent_task_tools    —— start_agent_task 后台子 Agent 资料处理
     control_tools       —— no_action / schedule_wakeup
     feature_tools       —— describe_image / web_search / get_weather
-    keyword_save        —— 关键词强制保存联动
 
 公开 API：
     ToolContext         —— 给 AgentRunner 用的执行上下文
@@ -20,7 +19,6 @@
     build_default_registry(config)
                         —— 构造稳定工具集合的工厂
     get_default_specs() —— 全部已注册的工具规格
-    try_save_from_user  —— 关键词强制保存
 """
 
 from __future__ import annotations
@@ -56,7 +54,6 @@ from .base import (
     get_default_specs,
     tool,
 )
-from .keyword_save import try_save_from_user
 from .message_builder import (
     FORBIDDEN_TAGS,
     build_emoji_hint,
@@ -97,8 +94,6 @@ __all__ = [
     "resolve_emoji_path",
     "resolve_send_image_ref",
     "typing_delay",
-    # keyword_save
-    "try_save_from_user",
     # factory
     "build_default_registry",
     "MEMORY_FILE_TOOLS",

@@ -114,11 +114,17 @@ class SendPrivateArgs(_ToolArgs):
     )
     responding_to_message_ids: list[str] = Field(
         default_factory=list,
-        description="可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；不确定不要编造。",
+        description=(
+            "可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；"
+            "用于跨消息回应、回答被引用的消息或复核后继续旧内容；不确定不要编造。"
+        ),
     )
     reply_to_message_id: str | None = Field(
         default=None,
-        description="可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用。不确定不要编造。",
+        description=(
+            "可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用。"
+            "只在需要锚定原消息时填；没有可靠 msg_id 不要编造。"
+        ),
     )
     reason: str | None = Field(
         default=None,
@@ -210,15 +216,17 @@ class SendGroupArgs(_ToolArgs):
         default_factory=list,
         description=(
             "可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；"
-            "群聊回答某个人的问题、跨消息回应或复核后提交旧内容时可填；不确定不要编造。"
+            "群聊回答某个人的问题、回复对象不是紧邻上一条、多人连续插话、"
+            "回答被引用的消息或复核后提交旧内容时可填；不确定不要编造。"
         ),
     )
     reply_to_message_id: str | None = Field(
         default=None,
         description=(
             "可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用。"
-            "群聊中回复具体消息、回答某个人的问题、前后有多人插话、或复核后提交旧 attempt 时，"
-            "若“行/OK/可以/知道了”等短回复会产生歧义，优先填写。不要机械每条都填；不确定不要编造。"
+            "群聊中回复对象不是紧邻上一条、多人连续插话、回答被引用的消息、"
+            "复核后继续提交旧 attempt，或“行/OK/可以/知道了/不要”等短回复可能看不出回谁时，"
+            "优先填写。普通顺序闲聊不要机械每条都填；没有可靠 msg_id 不要编造。"
         ),
     )
     reason: str | None = Field(
@@ -250,8 +258,9 @@ class CommitSendAttemptArgs(_ToolArgs):
     reply_to_message_id: str | None = Field(
         default=None,
         description=(
-            "可选：确认发送时给第一条文本消息补引用。群聊复核后提交旧 attempt、"
-            "中间已有多人插话或短确认会看不出回谁时优先填写；不要机械每条都填，不确定不要编造。"
+            "可选：确认发送时给第一条文本消息补引用。提交旧 attempt 前先复核旧回复是否需要补引用；"
+            "群聊复核后提交旧 attempt、中间已有多人插话、回答被引用的消息，"
+            "或短确认会看不出回谁时优先填写；普通顺序闲聊不要机械每条都填，没有可靠 msg_id 不要编造。"
         ),
     )
     ignore_review_interrupts: bool = Field(

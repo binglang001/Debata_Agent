@@ -24,7 +24,7 @@ EventBus（按事件类型分发）
   ↓ ↓ ↓
 MessagePipeline / RecallHandler / RequestHandler
   ↓
-（合并窗口 / 中断检测 / 关键词强制保存）
+（合并窗口 / 中断检测）
   ↓
 ChatAgent.run(messages, tools, executor)
   ├─ IProvider.chat_completion() → 多轮工具循环
@@ -88,6 +88,26 @@ IAdapter.send_text() → 用户收到消息
 
 ---
 
+## 主上下文与滚动摘要
+
+`HistoryManager` 对真实聊天、运行时上下文和工具结果使用永久全量 append；主路径不再按“最近 N 条”裁剪工作历史。主模型调用前，`MessagePipeline` 会按 `behavior.context.max_context_tokens`（或推荐预算）预检装配后的上下文：
+
+1. 未超预算：直接调用主模型。
+2. 超过预算：触发滚动摘要，把较早的活跃 history 合入 summary，并推进活跃窗口起点。
+3. 首次压缩后仍超预算或压缩失败：按更小的重试目标再次扩大压缩范围。
+4. 仍无法满足预算：显式退出本轮并记录错误，而不是静默裁剪历史。
+
+相关配置：
+
+- `behavior.summarize.trigger_at_context_percent`：未显式配置 token 阈值时，按工作上下文预算推导触发点。
+- `behavior.summarize.target_after_context_percent`：首次压缩后的活跃窗口目标。
+- `behavior.summarize.retry_target_after_context_percent`：首次压缩仍不够时的重试压缩目标。
+- `behavior.context.summary_token_budget`：滚动摘要注入主上下文的预算。
+
+`range_start_messages`、`range_end_messages` 以及 `behavior.context` 中旧的“活跃历史保底 / 保留最近 N 条运行时记录”字段已经废弃；主动思考路由器使用独立的 `proactive_router_*` 预算字段，不参与主聊天历史裁剪。
+
+---
+
 ## 工具结果创建即定型
 
 工具结果只在刚返回时做一次精简，写入 `history` 后不再回改。这样旧 `tool` record 的字节稳定，避免为了清理长结果而破坏 KV 缓存前缀。
@@ -99,11 +119,11 @@ IAdapter.send_text() → 用户收到消息
 
 相关配置位于 `behavior.context`：
 
-- `tool_result_soft_limit_tokens`：默认 600，超过后走工具特定精简策略。
-- `tool_result_hard_cap_tokens`：默认 1500，超过后做中央 head/tail 截断。
-- `tool_result_soft_overrides`：按工具名覆盖软阈值，如 `describe_image=900`。
+- `tool_result_budgets`：按工具分别配置 inline、artifact 和 hard 上限。
+- `tool_result_default_budget_tokens`：未单独配置工具的 inline 默认预算。
+- `tool_result_default_hard_cap_tokens`：未单独配置工具的事故兜底上限。
 
-设置页「高级 → 上下文预算」提供对应入口。
+设置页「Token预算」提供对应入口。旧的 `tool_result_soft_limit_tokens`、`tool_result_hard_cap_tokens` 和 `tool_result_soft_overrides` 只为兼容历史配置保留。
 
 ---
 
@@ -111,7 +131,7 @@ IAdapter.send_text() → 用户收到消息
 
 `features.long_term_memory.mode`：
 
-- **`file`**（默认）：AI 主动调 `save_important_memory` + 关键词强制保存（"记住"/"约定"/"我叫"）。零开销、完全透明。
+- **`file`**（默认）：AI 通过显式 `save_important_memory` / `update_important_memory` 工具维护重要记忆。零额外向量开销、完全透明。
 - **`rag`**：同样保存重要记忆，并给新条目维护向量索引；上下文注入时按语义检索相关条目。需要 `features.embedding` 启用。
 
 切换模式时，`build_tool_use_protocol(memory_mode)` 会动态注入不同的工具说明，区分文件直写与 RAG 语义检索的使用方式。
@@ -121,7 +141,7 @@ IAdapter.send_text() → 用户收到消息
 - `scope`：`global` / `user:{qq}` / `group:{gid}`，只决定当前轮优先注入哪些记忆。
 - `pinned`：置顶记忆永远注入，不受当前会话 scope 过滤；普通记忆受 `memory_token_budget` 控制。
 
-`MessagePipeline` 会把当前 `conversation_id` 映射到记忆 scope：`private:123 → user:123`，`group:456 → group:456`。关键词保存与 `save_important_memory` 默认使用当前会话 scope，除非工具参数显式指定。
+`MessagePipeline` 会把当前 `conversation_id` 映射到记忆 scope：`private:123 → user:123`，`group:456 → group:456`。`save_important_memory` 默认使用当前会话 scope，除非工具参数显式指定。
 
 ### RAG 装配
 

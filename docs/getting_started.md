@@ -30,6 +30,14 @@ python main.py
 
 环境要求：Python 3.11+，一个 LLM API 密钥（推荐 [DeepSeek](https://platform.deepseek.com)）。
 
+Linux 服务器或 SSH 环境可以直接跑纯 CLI 向导：
+
+```bash
+python main.py --no-gui --setup
+```
+
+CLI 向导覆盖主模型、子 Agent、图片理解、天气、TTS、RAG、NapCat 和人格等主要配置。密钥优先保存到系统 keyring；如果 Linux 没有可用 Secret Service，会自动退回 `data/rsa_private.pem` 本地私钥文件，并使用 0600 权限保护。
+
 ---
 
 ## 3. 走完向导
@@ -131,6 +139,10 @@ python main.py
 ![设置模型](https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/dashboard_settings_model.png)
 
 设置页 → 模型 → 改 Provider 密钥或 Agent 模型。点「测试连接」确认可用。
+
+### 调上下文预算
+
+设置页 → Token预算 → 滚动摘要压缩，可以调触发滚动摘要的上下文占比、压缩后的活跃窗口目标，以及第一次压缩仍超预算时的重试压缩目标。正常使用建议保留默认值；这里不再提供“保留最近 N 条工作历史”一类旧裁剪开关。
 
 ### 调主题
 

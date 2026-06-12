@@ -180,7 +180,7 @@ def _make_root_config(*, merge_window_seconds: float = 0.01) -> RootConfig:
             )
         ),
         features=FeaturesConfig(
-            long_term_memory=LongTermMemoryConfig(mode="file", keyword_trigger_save=True),
+            long_term_memory=LongTermMemoryConfig(mode="file"),
         ),
         persona=PersonaConfig(active="test_persona"),
         behavior=BehaviorConfig(
@@ -192,11 +192,7 @@ def _make_root_config(*, merge_window_seconds: float = 0.01) -> RootConfig:
                 chars_per_second=999.0,
             ),
             rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
-            summarize=SummarizeConfig(
-                trigger_at_messages=99999,
-                range_start_messages=9000,
-                range_end_messages=11000,
-            ),
+            summarize=SummarizeConfig(),
         ),
     )
 

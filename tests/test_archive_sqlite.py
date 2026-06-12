@@ -321,6 +321,70 @@ async def test_archive_append_records_short_ids_are_stable_and_compatible(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_archive_append_many_skips_exact_duplicate_records(tmp_path):
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
+    record = _chat_record(
+        "重复图片 [图片 workspace=incoming/dup.jpg]",
+        conversation_id="private:1",
+        sender_id="1",
+        sender_name="Alice",
+        timestamp="2026-06-01 10:00:00",
+    )
+    next_record = _chat_record(
+        "重复后新增",
+        conversation_id="private:1",
+        sender_id="1",
+        sender_name="Alice",
+        timestamp="2026-06-01 10:01:00",
+    )
+
+    await archive.append_many([record, record])
+    reloaded = ArchiveStore(tmp_path / "archive.sqlite3")
+    await reloaded.append_many([record, next_record])
+
+    records = await reloaded.records()
+    assert [item["archive_id"] for item in records] == ["a1", "a2"]
+    assert [item["content"] for item in records] == [
+        "重复图片 [图片 workspace=incoming/dup.jpg]",
+        "重复后新增",
+    ]
+    media = await reloaded.media_records()
+    assert len(media) == 1
+    assert media[0]["archive_id"] == "a1"
+    assert media[0]["workspace_path"] == "incoming/dup.jpg"
+
+
+@pytest.mark.asyncio
+async def test_archive_append_many_keeps_same_content_with_different_metadata(tmp_path):
+    archive = ArchiveStore(tmp_path / "archive.sqlite3")
+    first = _chat_record(
+        "同文本不同消息",
+        conversation_id="private:1",
+        sender_id="1",
+        sender_name="Alice",
+        timestamp="2026-06-01 10:00:00",
+    )
+    second = _chat_record(
+        "同文本不同消息",
+        conversation_id="private:1",
+        sender_id="1",
+        sender_name="Alice",
+        timestamp="2026-06-01 10:01:00",
+    )
+
+    await archive.append_many([first, second])
+
+    records = await archive.records()
+    assert [item["archive_id"] for item in records] == ["a1", "a2"]
+    assert [item["content"] for item in records] == [
+        "同文本不同消息",
+        "同文本不同消息",
+    ]
+    assert records[0]["metadata"]["timestamp"] == "2026-06-01 10:00:00"
+    assert records[1]["metadata"]["timestamp"] == "2026-06-01 10:01:00"
+
+
+@pytest.mark.asyncio
 async def test_archive_append_many_keeps_only_real_chat_and_sent_outbound(tmp_path):
     archive = ArchiveStore(tmp_path / "archive.sqlite3")
     await archive.append_many(

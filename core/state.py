@@ -236,9 +236,6 @@ class PendingMessageItem:
     raw_event: object = field(default=None)
     """原始 IncomingMessage 引用，便于回查"""
 
-    keyword_saved: bool = False
-    """入队前是否已由关键词强制保存为长期记忆。"""
-
 
 class MessageBatch:
     """消息批处理队列。

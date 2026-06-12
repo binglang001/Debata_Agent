@@ -189,10 +189,13 @@ def test_tool_use_protocol_documents_runtime_contracts_without_legacy_terms():
     assert "不能绕过撤回、禁言、无权限、退群、发送失败等硬错误" in s
     assert "复核后重新调用发送工具改写新消息时，先复核新消息" in s
     assert "commit_send_attempt 的 ignore_review_interrupts 保持旧 attempt 复核语义" in s
+    assert "复核旧回复是否会脱离上下文" in s
     assert "群聊里不要机械每条引用" in s
-    assert "前后有多人插话" in s
-    assert "短回复会让人看不出在回谁" in s
-    assert '"行/OK/可以/知道了"这类简短确认' in s
+    assert "普通顺序闲聊、紧邻上一条且无歧义时自然回复即可" in s
+    assert "群聊回复对象不是紧邻上一条、多人连续插话、回答被引用的消息" in s
+    assert "没有可靠消息 ID 时不要伪造" in s
+    assert '"行/OK/可以/知道了/不要"这类简短确认' in s
+    assert "只要可能不清楚回谁，就引用、@ 或点名" in s
     assert "中文约 1.5 字/秒" in s
     assert "每条 target 都必须填写 delay" in s
     assert "本条发出后到下一条发出前的等待秒数" in s
@@ -343,12 +346,14 @@ def test_group_reply_reference_rules_are_conditional():
     p = _persona()
     sys = build_combined_system_prompt(p)
 
-    assert "回复某条具体消息、回答某个人的问题、前后有多人插话" in sys
+    assert "回答被引用的消息" in sys
+    assert "目标不是紧邻上一条、前后有多人插话" in sys
     assert "复核/被打断后继续提交旧回复" in sys
     assert "如果短回复会产生歧义，要引用、@ 或点名" in sys
-    assert '"行/OK/可以/知道了"这类简短确认尤其如此' in sys
+    assert '"行/OK/可以/知道了/不要"这类简短确认尤其如此' in sys
     assert "不要机械每条都引用" in sys
     assert "上下文清楚、上一句就是目标消息时自然短回即可" in sys
+    assert "不知道消息 ID 或 QQ 号时，用自然语言说明在回哪件事，不要伪造 CQ" in sys
 
 
 def test_group_claims_and_banter_keep_independent_judgment():
@@ -471,7 +476,8 @@ def test_build_combined_system_prompt_includes_human_chat_patterns():
     assert "极短为主" in sys
     assert "拆条瀑布" in sys
     assert "不打句号" in sys
-    assert "不告别" in sys
+    assert "自然结束" in sys
+    assert "不必再回复" in sys
 
 
 def test_human_chat_patterns_after_persona_before_tools():
@@ -854,6 +860,51 @@ def test_build_messages_can_reuse_persisted_task_context_record_for_prefix_stabi
     assert current[2]["content"] == task_record["content"]
 
 
+def test_build_messages_preserves_complete_tool_call_group():
+    p = _persona()
+    msgs = build_messages(
+        p,
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc-ok",
+                        "type": "function",
+                        "function": {"name": "no_action", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc-ok", "content": '{"no_action": true}'},
+        ],
+    )
+
+    assert msgs[1]["role"] == "assistant"
+    assert msgs[1]["tool_calls"][0]["id"] == "tc-ok"
+    assert msgs[2]["role"] == "tool"
+    assert msgs[2]["tool_call_id"] == "tc-ok"
+
+
+def test_build_messages_converts_orphan_tool_result_without_dropping_content():
+    p = _persona()
+    msgs = build_messages(
+        p,
+        [
+            {"role": "tool", "tool_call_id": "tc-lost", "content": '{"ok": true}'},
+            {"role": "user", "content": "后续消息"},
+        ],
+    )
+
+    assert msgs[1]["role"] == "system"
+    assert "historical_tool_record_unreplayable" in msgs[1]["content"]
+    assert "tc-lost" in msgs[1]["content"]
+    assert "ok" in msgs[1]["content"]
+    assert "true" in msgs[1]["content"]
+    assert msgs[2]["role"] == "user"
+    assert msgs[2]["content"] == "后续消息"
+
+
 def test_build_messages_user_event_is_final_user_message():
     p = _persona()
     msgs = build_messages(
@@ -942,61 +993,30 @@ async def test_history_on_append_multiple_subscribers(tmp_path):
     assert counts == [1, 1]
 
 
+def test_important_memory_keyword_force_save_api_removed():
+    import inspect
+
+    import memory.important as important_module
+    from memory import ImportantMemoryManager
+
+    assert not hasattr(ImportantMemoryManager, "force_save_from_keyword")
+    assert not hasattr(important_module, "DEFAULT_FORCE_SAVE_KEYWORDS")
+    assert not hasattr(important_module, "_strip_memory_keyword")
+    assert "matched_keyword" not in inspect.getsource(important_module)
+
+
 @pytest.mark.asyncio
-async def test_important_force_save_keyword(tmp_path):
-    """关键词强制保存：命中关键词应保存，未命中应跳过。"""
+async def test_important_save_keeps_keyword_text_as_explicit_tool_content(tmp_path):
     from memory import ImportantMemoryManager
 
     im = ImportantMemoryManager(tmp_path / "imp.json")
     await im.load()
 
-    # 命中 "记住"
-    result = await im.force_save_from_keyword("记住我的 QQ 是 123456")
+    result = await im.save("记住第一条")
+
     assert result["saved"] is True
-    assert result["matched_keyword"] == "记住"
-
-    result_note = await im.force_save_from_keyword("记一下：7月7日参加选拔赛")
-    assert result_note["saved"] is True
-    assert result_note["matched_keyword"] == "记一下"
-    assert result_note["content"] == "7月7日参加选拔赛"
-
-    # 未命中
-    result2 = await im.force_save_from_keyword("今天天气真好")
-    assert result2["saved"] is False
-    assert result2["matched_keyword"] is None
-
-
-@pytest.mark.asyncio
-async def test_important_force_save_custom_keywords(tmp_path):
-    from memory import ImportantMemoryManager
-
-    im = ImportantMemoryManager(tmp_path / "imp.json")
-    await im.load()
-
-    # 自定义关键词
-    result = await im.force_save_from_keyword(
-        "我喜欢猫", keywords=["喜欢"]
-    )
-    assert result["saved"] is True
-    assert result["matched_keyword"] == "喜欢"
-
-
-@pytest.mark.asyncio
-async def test_important_force_save_blocks_exact_duplicate(tmp_path):
-    """关键词强制保存也只拦截完全相同文本。"""
-    from memory import ImportantMemoryManager
-
-    im = ImportantMemoryManager(tmp_path / "imp.json")
-    await im.load()
-    first = await im.force_save_from_keyword("记住第一条")
-    second = await im.force_save_from_keyword("记住第一条")
-
-    assert first["saved"] is True
-    assert second["saved"] is False
-    assert second["duplicate"] is True
-    assert second["duplicate_type"] == "exact"
-    assert len(im.items()) == 1
-    assert im.items()[0].get("source", "").startswith("keyword:")
+    assert im.items()[0]["content"] == "记住第一条"
+    assert im.items()[0].get("source") is None
 
 
 # ============================================================
@@ -1009,7 +1029,7 @@ def test_schema_long_term_memory_config_defaults():
 
     c = LongTermMemoryConfig()
     assert c.mode == "file"
-    assert c.keyword_trigger_save is True
+    assert not hasattr(c, "keyword_trigger_save")
     assert c.rag_top_k == 5
 
 

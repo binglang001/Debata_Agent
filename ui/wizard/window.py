@@ -671,7 +671,6 @@ class WizardWindow(QMainWindow):
         features.web_search = WebSearchFeatureConfig(enabled=c.web_search.enabled)
         features.long_term_memory = LongTermMemoryConfig(
             mode=c.long_term_memory_mode,
-            keyword_trigger_save=c.long_term_memory_keyword_trigger_save,
         )
         if c.long_term_memory_mode == "rag":
             features.embedding = EmbeddingFeatureConfig(

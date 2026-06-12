@@ -7,39 +7,27 @@ selection logic while moving methods.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from utils.token_budget import TokenBudget, TokenEstimator
 
 from .pipeline_context import _recommended_context_budget
-from .pipeline_history import (
-    _record_conversation_id,
-    _working_history_noise_indices,
-    _working_history_optional_runtime_indices,
-)
 
 logger = logging.getLogger(__name__)
 
-_SEND_RECEIPT_BLOCK_RE = re.compile(
-    r"<send_receipt>\s*(.*?)\s*</send_receipt>",
-    re.DOTALL,
-)
-_SEND_RECEIPT_JSON_KEYS = {
-    "type",
-    "send_id",
-    "conversation_id",
-    "status",
-    "interrupted",
-    "sent",
-    "unsent",
-    "new_messages",
-    "recalled_messages",
-    "errors",
-    "accepted_messages",
-}
+
+@dataclass(slots=True)
+class MainPromptBudgetResult:
+    ok: bool
+    messages: list[dict[str, Any]]
+    estimated_tokens: int
+    budget_tokens: int
+    pre_summary_status: str = ""
+    attempts: list[str] = field(default_factory=list)
+    failure_reason: str = ""
 
 
 class PipelineWorkingContextMixin:
@@ -178,43 +166,39 @@ class PipelineWorkingContextMixin:
         self,
         conversation_id: str | None,
     ) -> list[dict[str, Any]]:
-        """按 token 预算选择统一近期时间线。
-
-        conversation_id 只用于保证当前会话最近若干条不被高频群聊挤掉；
-        工作窗口本身仍来自同一条全局 history，不按会话过滤。
-        """
-        records = await self.history.records()
-        return self._select_history_records(
-            records,
-            working_budget=self._working_history_budget(),
-            conversation_id=conversation_id,
-            ensure_current_records=(
-                self.behavior_cfg.context.current_conversation_min_records
-            ),
-            log_context=conversation_id,
-            log_level=logging.INFO,
-        )
+        """返回 rolling summary 游标之后的完整活跃时间线。"""
+        _ = conversation_id
+        return await self._active_history_records()
 
     async def _select_proactive_router_history(self) -> list[dict[str, Any]]:
         """主动路由专用小窗口；真正行动轮仍使用正常工作窗口。"""
-        records = await self.history.records()
-        return self._select_history_records(
+        records = await self._active_history_records()
+        return self._select_recent_records_for_budget(
             records,
             working_budget=min(
                 self._working_history_budget(),
                 self.behavior_cfg.proactive_router_history_token_budget,
             ),
-            conversation_id=None,
-            ensure_current_records=0,
-            log_context="proactive_router",
-            log_level=logging.DEBUG,
         )
+
+    async def _active_history_records(self) -> list[dict[str, Any]]:
+        records = await self.history.records()
+        active_start = self._active_start_index_for_prompt(records)
+        return records[active_start:]
+
+    def _active_start_index_for_prompt(self, records: list[dict[str, Any]]) -> int:
+        if self.rolling_summary is None:
+            return 0
+        helper = getattr(self, "_active_start_index_for_records", None)
+        if callable(helper):
+            return helper(records)
+        return max(0, min(self.rolling_summary.active_start_index(), len(records)))
 
     def _working_history_budget(self) -> int:
         budget = self._context_budget()
         context_cfg = self.behavior_cfg.context
         return max(
-            context_cfg.min_working_history_tokens,
+            1,
             budget.total_input_budget
             - budget.memory_token_budget
             - budget.summary_token_budget
@@ -226,7 +210,7 @@ class PipelineWorkingContextMixin:
         summarize = self.behavior_cfg.summarize
         if self.summary_agent is None or self.archive is None or self.rolling_summary is None:
             logger.warning(
-                "未启用滚动摘要/归档压缩；长会话超过工作窗口后会逐条淘汰历史，KV 缓存命中率会下降"
+                "未启用滚动摘要/归档压缩；长会话超过主模型输入预算后会显式跳过模型调用"
             )
             return
         trigger = summarize.trigger_at_tokens
@@ -238,216 +222,183 @@ class PipelineWorkingContextMixin:
             )
         if trigger >= working_budget:
             logger.warning(
-                "滚动摘要触发线高于工作窗口预算：trigger=%s working_budget=%s；"
-                "长会话可能先发生窗口淘汰，导致 KV 缓存前缀逐轮重建",
+                "滚动摘要触发线高于活跃记录预算：trigger=%s working_budget=%s；"
+                "长会话可能先触发主模型预算预检失败",
                 trigger,
                 working_budget,
             )
 
-    def _select_history_records(
+    def _estimate_main_prompt_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools_schema: list[dict[str, Any]] | None,
+        estimator: TokenEstimator | None = None,
+    ) -> int:
+        estimator = estimator or self._token_estimator()
+        estimated = estimator.estimate_messages(messages)
+        if tools_schema:
+            estimated += estimator.estimate_text(str(tools_schema))
+        return estimated
+
+    async def _prepare_main_prompt_for_model(
+        self,
+        *,
+        conversation_id: str | None,
+        phase: str,
+        tools_schema: list[dict[str, Any]] | None,
+        rebuild_messages: Callable[[], Awaitable[list[dict[str, Any]]]],
+    ) -> MainPromptBudgetResult:
+        pre_summary = await self._maybe_summarize(reason=f"{phase}_preflight")
+        estimator = self._token_estimator()
+        budget_tokens = self._context_budget().total_input_budget
+        messages = await rebuild_messages()
+        estimated = self._estimate_main_prompt_tokens(messages, tools_schema, estimator)
+        if estimated <= budget_tokens:
+            return MainPromptBudgetResult(
+                ok=True,
+                messages=messages,
+                estimated_tokens=estimated,
+                budget_tokens=budget_tokens,
+                pre_summary_status=pre_summary.status,
+            )
+
+        attempts: list[str] = []
+        first_target = await self._first_budget_retry_target(estimator)
+        if first_target is not None:
+            first = await self._compact_active_history(
+                target_after_tokens=first_target,
+                reason=f"{phase}_budget_first",
+            )
+            attempts.append(
+                f"first:{first.status}:{first.reason}:archived={first.archived_count}"
+            )
+            messages = await rebuild_messages()
+            estimated = self._estimate_main_prompt_tokens(messages, tools_schema, estimator)
+            if first.success and estimated <= budget_tokens:
+                return MainPromptBudgetResult(
+                    ok=True,
+                    messages=messages,
+                    estimated_tokens=estimated,
+                    budget_tokens=budget_tokens,
+                    pre_summary_status=pre_summary.status,
+                    attempts=attempts,
+                )
+            retry_target = await self._retry_budget_target(
+                estimator,
+                first_target=first_target,
+            )
+        else:
+            attempts.append("first:failed:no_compressible_active_history")
+            retry_target = await self._retry_budget_target(
+                estimator,
+                first_target=None,
+            )
+
+        retry = await self._compact_active_history(
+            target_after_tokens=retry_target,
+            reason=f"{phase}_budget_retry_config_target",
+        )
+        attempts.append(
+            f"retry:{retry.status}:{retry.reason}:archived={retry.archived_count}"
+        )
+        messages = await rebuild_messages()
+        estimated = self._estimate_main_prompt_tokens(messages, tools_schema, estimator)
+        if retry.success and estimated <= budget_tokens:
+            return MainPromptBudgetResult(
+                ok=True,
+                messages=messages,
+                estimated_tokens=estimated,
+                budget_tokens=budget_tokens,
+                pre_summary_status=pre_summary.status,
+                attempts=attempts,
+            )
+
+        await self._record_main_prompt_budget_failure(
+            conversation_id=conversation_id,
+            phase=phase,
+            estimated_tokens=estimated,
+            budget_tokens=budget_tokens,
+            attempts=attempts,
+        )
+        return MainPromptBudgetResult(
+            ok=False,
+            messages=messages,
+            estimated_tokens=estimated,
+            budget_tokens=budget_tokens,
+            pre_summary_status=pre_summary.status,
+            attempts=attempts,
+            failure_reason="over_budget_after_retry",
+        )
+
+    async def _first_budget_retry_target(
+        self,
+        estimator: TokenEstimator,
+    ) -> int | None:
+        active = await self._active_history_records()
+        if len(active) <= 1:
+            return None
+        active_tokens = estimator.estimate_messages(active)
+        return self._summary_target_after_tokens(active_tokens=active_tokens)
+
+    async def _retry_budget_target(
+        self,
+        estimator: TokenEstimator,
+        *,
+        first_target: int | None,
+    ) -> int:
+        active = await self._active_history_records()
+        if not active:
+            return 1
+        active_tokens = estimator.estimate_messages(active)
+        if active_tokens <= 1:
+            return 1
+        retry_percent = self.behavior_cfg.summarize.retry_target_after_context_percent
+        retry_target = int(
+            self._context_budget().max_context_tokens
+            * retry_percent
+            / 100
+        )
+        retry_target = max(1, min(retry_target, active_tokens - 1))
+        if first_target is not None:
+            retry_target = min(retry_target, max(1, first_target))
+        return retry_target
+
+    async def _record_main_prompt_budget_failure(
+        self,
+        *,
+        conversation_id: str | None,
+        phase: str,
+        estimated_tokens: int,
+        budget_tokens: int,
+        attempts: list[str],
+    ) -> None:
+        note = (
+            "[上下文预算] 主模型输入预检失败，已跳过本轮模型调用；"
+            f"phase={phase}，estimated={estimated_tokens} tokens，"
+            f"budget={budget_tokens} tokens，attempts={'; '.join(attempts)}。"
+        )
+        logger.error(note)
+        await self.history.add_system_note(
+            note,
+            conversation_id=conversation_id or "system:context_budget",
+        )
+
+    def _select_recent_records_for_budget(
         self,
         records: list[dict[str, Any]],
         *,
         working_budget: int,
-        conversation_id: str | None,
-        ensure_current_records: int,
-        log_context: str | None,
-        log_level: int,
     ) -> list[dict[str, Any]]:
-        estimator = self._token_estimator()
-        context_cfg = self.behavior_cfg.context
-        selected_indices: set[int] = set()
-        noise_indices = _working_history_noise_indices(
-            records,
-            conversation_id=conversation_id,
-            ensure_current_records=ensure_current_records,
-            runtime_record_keep_count=context_cfg.runtime_record_keep_count,
-            send_receipt_keep_count=context_cfg.send_receipt_keep_count,
-            no_action_keep_count=context_cfg.no_action_keep_count,
-        )
-        optional_runtime_indices = _working_history_optional_runtime_indices(
-            records,
-            conversation_id=conversation_id,
-            ensure_current_records=ensure_current_records,
-            runtime_record_keep_count=context_cfg.runtime_record_keep_count,
-            send_receipt_keep_count=context_cfg.send_receipt_keep_count,
-            no_action_keep_count=context_cfg.no_action_keep_count,
-        )
-        used = 0
-
-        def add_index(index: int, *, force: bool = False) -> bool:
-            nonlocal used
-            if index in selected_indices:
-                return True
-            if not force and index in noise_indices:
-                return True
-            cost = estimator.estimate_messages([records[index]])
-            if not force and selected_indices and used + cost > working_budget:
-                return False
-            selected_indices.add(index)
-            used += cost
-            return True
-
-        if conversation_id and ensure_current_records > 0:
-            current_indices: list[int] = []
-            for idx in range(len(records) - 1, -1, -1):
-                if _record_conversation_id(records[idx]) == conversation_id:
-                    current_indices.append(idx)
-                    if len(current_indices) >= ensure_current_records:
-                        break
-            for idx in reversed(current_indices):
-                add_index(idx, force=True)
-
-        for idx in range(len(records) - 1, -1, -1):
-            if idx in selected_indices:
-                continue
-            if idx in optional_runtime_indices:
-                continue
-            if not add_index(idx):
-                break
-
-        for idx in range(len(records) - 1, -1, -1):
-            if idx in selected_indices:
-                continue
-            if idx not in optional_runtime_indices:
-                continue
-            if not add_index(idx):
-                break
-
-        selected = [records[idx] for idx in sorted(selected_indices)]
-        dropped = len(records) - len(selected)
-        if dropped > 0:
-            logger.log(
-                log_level,
-                "上下文预算裁剪：view=%s 丢弃活跃区较早记录 %s 条 "
-                "(working_budget≈%s tokens, used≈%s tokens)",
-                log_context,
-                dropped,
-                working_budget,
-                used,
-            )
-        filtered = self._filter_working_history_runtime_noise(
-            selected,
-            conversation_id=conversation_id,
-            ensure_current_records=ensure_current_records,
-            log_context=log_context,
-            log_level=log_level,
-        )
-        return self._normalize_working_history_send_receipts(filtered)
-
-    def _filter_working_history_runtime_noise(
-        self,
-        records: list[dict[str, Any]],
-        *,
-        conversation_id: str | None,
-        ensure_current_records: int,
-        log_context: str | None,
-        log_level: int,
-    ) -> list[dict[str, Any]]:
-        """Drop old runtime-only records from the prompt view, not from history.
-
-        The working window remains a unified cross-conversation timeline. This filter only
-        prevents old task snapshots, clean send-status records, and complete
-        no_action assistant/tool blocks from being replayed into every model call
-        after they are no longer useful for immediate decision-making. Tool
-        blocks are dropped only when the full assistant/tool pair is present.
-        """
+        """从活跃记录尾部按 token 预算取最近后缀。"""
         if not records:
-            return records
-
-        context_cfg = self.behavior_cfg.context
-        drop_indices = _working_history_noise_indices(
-            records,
-            conversation_id=conversation_id,
-            ensure_current_records=ensure_current_records,
-            runtime_record_keep_count=context_cfg.runtime_record_keep_count,
-            send_receipt_keep_count=context_cfg.send_receipt_keep_count,
-            no_action_keep_count=context_cfg.no_action_keep_count,
-        )
-
-        if not drop_indices:
-            return records
-
-        filtered = [
-            record for idx, record in enumerate(records)
-            if idx not in drop_indices
-        ]
-        logger.log(
-            log_level,
-            "上下文运行时瘦身：view=%s 移除旧运行时记录 %s 条 "
-            "(保留当前会话最近 %s 条、全局近期 runtime %s 条、近期 send_receipt %s 条)",
-            log_context,
-            len(drop_indices),
-            ensure_current_records,
-            context_cfg.runtime_record_keep_count,
-            context_cfg.send_receipt_keep_count,
-        )
-        return filtered
-
-    def _normalize_working_history_send_receipts(
-        self,
-        records: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """只归一化 prompt view 中旧版 JSON 回执，不回写原始历史。"""
-        normalized: list[dict[str, Any]] = []
-        changed = False
-        for record in records:
-            content = record.get("content")
-            if not isinstance(content, str) or "<send_receipt" not in content:
-                normalized.append(record)
-                continue
-            new_content = self._normalize_send_receipt_content(content, record)
-            if new_content == content:
-                normalized.append(record)
-                continue
-            copied = dict(record)
-            copied["content"] = new_content
-            normalized.append(copied)
-            changed = True
-        return normalized if changed else records
-
-    def _normalize_send_receipt_content(
-        self,
-        content: str,
-        record: dict[str, Any],
-    ) -> str:
-        def replace(match: re.Match[str]) -> str:
-            receipt = self._parse_legacy_send_receipt_json(match.group(1))
-            if receipt is None:
-                return match.group(0)
-            if not receipt.get("conversation_id"):
-                conversation_id = _record_conversation_id(record)
-                if conversation_id:
-                    receipt = dict(receipt)
-                    receipt["conversation_id"] = conversation_id
-            return self._format_send_receipt(receipt)
-
-        return _SEND_RECEIPT_BLOCK_RE.sub(replace, content)
-
-    @staticmethod
-    def _parse_legacy_send_receipt_json(text: str) -> dict[str, Any] | None:
-        stripped = text.strip()
-        if not stripped:
-            return None
-
-        decoder = json.JSONDecoder()
-        candidates = [stripped]
-        first_brace = stripped.find("{")
-        if first_brace > 0:
-            candidates.append(stripped[first_brace:])
-
-        for candidate in candidates:
-            if not candidate.startswith("{"):
-                continue
-            try:
-                payload, end = decoder.raw_decode(candidate)
-            except json.JSONDecodeError:
-                continue
-            if candidate[end:].strip():
-                continue
-            if not isinstance(payload, dict):
-                continue
-            if not (_SEND_RECEIPT_JSON_KEYS & payload.keys()):
-                continue
-            return payload
-        return None
+            return []
+        estimator = self._token_estimator()
+        selected: list[dict[str, Any]] = []
+        used = 0
+        for record in reversed(records):
+            cost = estimator.estimate_messages([record])
+            if selected and used + cost > working_budget:
+                break
+            selected.append(record)
+            used += cost
+        return list(reversed(selected))
