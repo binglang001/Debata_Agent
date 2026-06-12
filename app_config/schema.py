@@ -137,10 +137,25 @@ class NapCatAdapterConfig(StrictModel):
     """WS ping 未收到 pong 多久判定为断连。"""
 
     initial_connect_timeout_seconds: float = 10.0
-    """初次连接等待超时（之后仍会后台重连）。"""
+    """旧配置兼容：初次连接等待超时。新逻辑优先使用 startup_connect_timeout_seconds。"""
+
+    startup_connect_timeout_seconds: float = 1.5
+    """Runtime 启动时最多等待首次连接的时间；超过后后台继续重连。"""
 
     api_timeout_seconds: float = 30.0
     """调用 OneBot API（send_msg / get_friend_list 等）的超时。"""
+
+    api_wait_connected_timeout_seconds: float = 3.0
+    """调用 OneBot API 前等待连接建立的最长时间。0 表示不等待。"""
+
+    fast_reconnect_attempts: int = 5
+    """启动早期或断线后的快速重试次数。"""
+
+    fast_reconnect_interval_seconds: float = 0.3
+    """快速重试间隔。"""
+
+    reconnect_jitter_seconds: float = 0.2
+    """慢速重连等待的随机抖动上限。"""
 
     process_warmup_seconds: float = 2.0
     """manage_process=True 时拉起 NapCat 后等待启动的时间。"""
@@ -240,7 +255,7 @@ class AgentConfig(StrictModel):
     first_token_timeout_seconds: float = 30.0
     """首 token 超时（秒）。流式模式下，首字未到即超时重试。"""
 
-    max_loops: int = 15
+    max_loops: int = 25
     """工具循环最大轮次（仅 chat agent 用）。"""
 
     refocus_interval: int = Field(default=5, ge=0)
@@ -430,20 +445,20 @@ class WebSearchFeatureConfig(StrictModel):
 
 
 class LongTermMemoryConfig(StrictModel):
-    """长期记忆配置 —— 决定 important.json 之外是否启用 RAG。"""
+    """长期记忆配置。"""
 
     mode: Literal["file", "rag"] = "file"
     """file = 纯文件模式（默认，零开销，AI 主动调 save_important_memory 工具触发）;
-    rag = 文件 + 向量检索（需 features.embedding 启用，P2 才生效）"""
+    rag = 会话历史向量检索（需 features.embedding 启用，不使用 important.json）"""
 
     keyword_trigger_save: bool = True
     """命中关键词（"记住"/"约定"/"我叫"等）时强制保存为重要记忆，不依赖 AI 主动调用工具。"""
 
     rag_top_k: int = 5
-    """RAG 模式下每次召回的相关条目数（仅 mode=rag 生效，当前未实装）"""
+    """RAG 模式下每次召回的相关历史条目数（仅 mode=rag 生效）"""
 
     rag_extractor_interval: int = 15
-    """被动抽取触发间隔（每 N 轮对话扫描一次，仅 mode=rag 生效，当前未实装）"""
+    """预留：被动结构化抽取触发间隔。当前 RAG 索引历史原文，不使用重要记忆抽取。"""
 
 
 class EmbeddingFeatureConfig(StrictModel):
@@ -535,6 +550,72 @@ class SummarizeConfig(StrictModel):
     """compaction 后活跃 history 目标 token。None 表示按模型工作预算自动推导。"""
 
 
+class ToolResultBudgetConfig(StrictModel):
+    """单个工具结果的 token 预算。
+
+    inline_budget_tokens 控制工具可直接回传给模型的预算。
+    artifact_threshold_tokens 供资料型工具判断何时改写 workspace 文件。
+    hard_cap_tokens 是事故兜底，不应作为正常截断机制。
+    """
+
+    inline_budget_tokens: int = Field(default=800, ge=256)
+    artifact_threshold_tokens: int | None = Field(default=None, ge=256)
+    hard_cap_tokens: int | None = Field(default=None, ge=512)
+
+
+def default_tool_result_budgets() -> dict[str, ToolResultBudgetConfig]:
+    """项目推荐的各工具结果预算。默认偏保守，大资料应走 artifact/分页。"""
+    return {
+        # 动作类
+        "send_private_messages": ToolResultBudgetConfig(inline_budget_tokens=600),
+        "send_group_message": ToolResultBudgetConfig(inline_budget_tokens=600),
+        "send_voice_message": ToolResultBudgetConfig(inline_budget_tokens=800),
+        "upload_file": ToolResultBudgetConfig(inline_budget_tokens=500),
+        "recall_message": ToolResultBudgetConfig(inline_budget_tokens=400),
+        "set_friend_add_request": ToolResultBudgetConfig(inline_budget_tokens=400),
+        "set_group_add_request": ToolResultBudgetConfig(inline_budget_tokens=400),
+        "no_action": ToolResultBudgetConfig(inline_budget_tokens=256),
+        "schedule_wakeup": ToolResultBudgetConfig(inline_budget_tokens=700),
+        # 查询类
+        "list_contacts": ToolResultBudgetConfig(
+            inline_budget_tokens=1200,
+            artifact_threshold_tokens=1200,
+        ),
+        "get_user_info": ToolResultBudgetConfig(inline_budget_tokens=800),
+        "get_weather": ToolResultBudgetConfig(inline_budget_tokens=1000),
+        "web_search": ToolResultBudgetConfig(inline_budget_tokens=1800),
+        # 资料类
+        "describe_image": ToolResultBudgetConfig(
+            inline_budget_tokens=1800,
+            artifact_threshold_tokens=2500,
+        ),
+        "read_file": ToolResultBudgetConfig(
+            inline_budget_tokens=2500,
+            artifact_threshold_tokens=2500,
+        ),
+        "run_python": ToolResultBudgetConfig(
+            inline_budget_tokens=2500,
+            artifact_threshold_tokens=2500,
+        ),
+        "get_forward_msg": ToolResultBudgetConfig(
+            inline_budget_tokens=1000,
+            artifact_threshold_tokens=1000,
+        ),
+        "recall_history": ToolResultBudgetConfig(
+            inline_budget_tokens=3000,
+            artifact_threshold_tokens=3000,
+        ),
+        "get_recent_chat_messages": ToolResultBudgetConfig(
+            inline_budget_tokens=3000,
+            artifact_threshold_tokens=3000,
+        ),
+        # 子 Agent
+        "start_agent_task": ToolResultBudgetConfig(inline_budget_tokens=600),
+        "summarize_chat_history": ToolResultBudgetConfig(inline_budget_tokens=600),
+        "summarize_conversation": ToolResultBudgetConfig(inline_budget_tokens=600),
+    }
+
+
 class ContextConfig(StrictModel):
     """上下文预算配置。max_context_tokens 是工作预算，不是模型硬上限。"""
 
@@ -550,14 +631,25 @@ class ContextConfig(StrictModel):
     summary_token_budget: int = Field(default=4096, ge=256)
     """滚动摘要注入预算。"""
 
+    tool_result_default_budget_tokens: int = Field(default=800, ge=256)
+    """未单独配置的工具结果 inline 默认预算。"""
+
+    tool_result_default_hard_cap_tokens: int = Field(default=3000, ge=512)
+    """未单独配置的工具结果事故兜底上限。"""
+
+    tool_result_budgets: dict[str, ToolResultBudgetConfig] = Field(
+        default_factory=default_tool_result_budgets
+    )
+    """按工具名配置结果预算。普通用户不建议手动修改。"""
+
     tool_result_soft_limit_tokens: int = Field(default=600, ge=64)
-    """单条工具结果的软阈值；超过后按工具特定规则精简。"""
+    """旧配置兼容：单条工具结果软阈值。新逻辑优先使用 tool_result_budgets。"""
 
     tool_result_hard_cap_tokens: int = Field(default=1500, ge=128)
-    """单条工具结果的中央硬上限；未被特判的结果超过后通用截断。"""
+    """旧配置兼容：单条工具结果硬上限。新逻辑优先使用 tool_result_budgets。"""
 
     tool_result_soft_overrides: dict[str, int] = Field(default_factory=dict)
-    """按工具名覆盖软阈值，如 {"describe_image": 900}。"""
+    """旧配置兼容：按工具名覆盖软阈值，如 {"describe_image": 900}。"""
 
 
 class BehaviorConfig(StrictModel):

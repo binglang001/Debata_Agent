@@ -35,16 +35,16 @@ from .main_model_custom import _PRESET_DEFAULTS
 
 _EMBEDDING_PRESETS: dict[str, dict[str, str]] = {
     "volcengine": {
-        "display": "火山方舟 · 独立 Embedding",
+        "display": "火山方舟 · 独立 Embedding（推荐 · 图文多模态向量）",
         "model": "doubao-embedding-vision-251215",
-    },
-    "qwen": {
-        "display": "通义千问 · 独立 Embedding",
-        "model": "text-embedding-v4",
     },
     "openai": {
         "display": "OpenAI · 独立 Embedding",
         "model": "text-embedding-3-small",
+    },
+    "qwen": {
+        "display": "通义千问 · 独立 Embedding",
+        "model": "text-embedding-v4",
     },
     "siliconflow": {
         "display": "SiliconFlow · 独立 Embedding",
@@ -53,6 +53,14 @@ _EMBEDDING_PRESETS: dict[str, dict[str, str]] = {
     "glm": {
         "display": "智谱 · 独立 Embedding",
         "model": "embedding-3",
+    },
+    "gemini": {
+        "display": "Google Gemini · 独立 Embedding",
+        "model": "text-embedding-004",
+    },
+    "together": {
+        "display": "Together AI · 独立 Embedding",
+        "model": "intfloat/multilingual-e5-large-instruct",
     },
     "custom": {
         "display": "自行填一个 Embedding 服务",

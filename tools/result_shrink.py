@@ -9,12 +9,19 @@ from __future__ import annotations
 import copy
 import json
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from utils.token_budget import TokenEstimator
 
-_LINE_TOOLS = {"run_python", "get_forward_msg"}
-_SUMMARY_TOOLS = {"summarize_chat_history", "summarize_conversation"}
+_LINE_TOOLS = {"get_forward_msg"}
+
+
+@dataclass(frozen=True, slots=True)
+class ToolBudget:
+    inline: int
+    artifact_threshold: int
+    hard_cap: int
 
 
 def shrink_tool_result(tool_name: str, result: dict[str, Any], ctx: Any) -> dict[str, Any]:
@@ -22,28 +29,18 @@ def shrink_tool_result(tool_name: str, result: dict[str, Any], ctx: Any) -> dict
     if not isinstance(result, dict):
         return {"ok": True, "value": result}
 
-    soft_limit = _soft_limit(tool_name, ctx)
-    hard_cap = max(soft_limit, int(getattr(ctx, "tool_result_hard_cap_tokens", 1500) or 1500))
+    budget = tool_budget(tool_name, ctx)
+    soft_limit = budget.inline
+    hard_cap = budget.hard_cap
     estimator = TokenEstimator()
 
     shrunk = copy.deepcopy(result)
     if tool_name == "web_search":
         shrunk = _shrink_web_search(shrunk, soft_limit, estimator)
-    elif tool_name in {"list_contacts", "list_files"}:
+    elif tool_name == "list_contacts":
         shrunk = _shrink_contacts(tool_name, shrunk)
-    elif tool_name == "read_file":
-        shrunk = _shrink_read_file(shrunk, soft_limit, estimator)
     elif tool_name in _LINE_TOOLS:
         shrunk = _shrink_line_result(tool_name, shrunk, soft_limit, estimator)
-    elif tool_name in _SUMMARY_TOOLS:
-        shrunk = _shrink_text_field(
-            shrunk,
-            field="summary",
-            limit_tokens=soft_limit,
-            reason="摘要过长已精简",
-            full="如需更细节，请缩小总结范围或重新调用工具。",
-            estimator=estimator,
-        )
 
     return _hard_cap(tool_name, shrunk, hard_cap, estimator)
 
@@ -55,7 +52,55 @@ def add_condensed_marker(result: dict[str, Any], *, reason: str, full: str) -> d
     return result
 
 
-def _soft_limit(tool_name: str, ctx: Any) -> int:
+def tool_budget(tool_name: str, ctx: Any) -> ToolBudget:
+    """读取单工具预算；新配置优先，旧 soft override 兼容兜底。"""
+    configured = _configured_tool_budget(tool_name, ctx)
+    if configured is not None:
+        inline = _coerce_budget_value(
+            _budget_field(configured, "inline_budget_tokens"),
+            default=_default_inline(ctx),
+            minimum=256,
+        )
+        artifact = _coerce_budget_value(
+            _budget_field(configured, "artifact_threshold_tokens"),
+            default=inline,
+            minimum=256,
+        )
+        hard_cap = _coerce_budget_value(
+            _budget_field(configured, "hard_cap_tokens"),
+            default=_default_hard_cap(ctx),
+            minimum=512,
+        )
+        return ToolBudget(
+            inline=inline,
+            artifact_threshold=artifact,
+            hard_cap=max(inline, hard_cap),
+        )
+
+    legacy_override = _legacy_soft_override(tool_name, ctx)
+    inline = legacy_override if legacy_override is not None else _default_inline(ctx)
+    hard_cap = _default_hard_cap(ctx)
+    return ToolBudget(
+        inline=inline,
+        artifact_threshold=inline,
+        hard_cap=max(inline, hard_cap),
+    )
+
+
+def _configured_tool_budget(tool_name: str, ctx: Any) -> Any | None:
+    budgets = getattr(ctx, "tool_result_budgets", None) or {}
+    if not isinstance(budgets, dict):
+        return None
+    return budgets.get(tool_name)
+
+
+def _budget_field(value: Any, field: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(field)
+    return getattr(value, field, None)
+
+
+def _legacy_soft_override(tool_name: str, ctx: Any) -> int | None:
     overrides = getattr(ctx, "tool_result_soft_overrides", None) or {}
     if isinstance(overrides, dict):
         try:
@@ -64,7 +109,41 @@ def _soft_limit(tool_name: str, ctx: Any) -> int:
                 return max(64, int(value))
         except (TypeError, ValueError):
             pass
-    return max(64, int(getattr(ctx, "tool_result_soft_limit_tokens", 600) or 600))
+    return None
+
+
+def _default_inline(ctx: Any) -> int:
+    if _uses_legacy_budget(ctx):
+        value = getattr(ctx, "tool_result_soft_limit_tokens", 800)
+    else:
+        value = getattr(ctx, "tool_result_default_budget_tokens", None)
+        if value is None:
+            value = getattr(ctx, "tool_result_soft_limit_tokens", 800)
+    return _coerce_budget_value(value, default=800, minimum=64)
+
+
+def _default_hard_cap(ctx: Any) -> int:
+    if _uses_legacy_budget(ctx):
+        value = getattr(ctx, "tool_result_hard_cap_tokens", 3000)
+    else:
+        value = getattr(ctx, "tool_result_default_hard_cap_tokens", None)
+        if value is None:
+            value = getattr(ctx, "tool_result_hard_cap_tokens", 3000)
+    return _coerce_budget_value(value, default=3000, minimum=128)
+
+
+def _uses_legacy_budget(ctx: Any) -> bool:
+    budgets = getattr(ctx, "tool_result_budgets", None)
+    return isinstance(budgets, dict) and not budgets
+
+
+def _coerce_budget_value(value: Any, *, default: int, minimum: int) -> int:
+    if value is None:
+        return max(minimum, default)
+    try:
+        return max(minimum, int(value))
+    except (TypeError, ValueError):
+        return max(minimum, default)
 
 
 def _estimate_dict(result: dict[str, Any], estimator: TokenEstimator) -> int:
@@ -144,28 +223,6 @@ def _shrink_contacts(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _shrink_read_file(
-    result: dict[str, Any],
-    soft_limit: int,
-    estimator: TokenEstimator,
-) -> dict[str, Any]:
-    """read_file 已经分页；这里只压缩单页内容，并保留续读元数据。"""
-    if _estimate_dict(result, estimator) <= soft_limit:
-        return result
-    full_hint = "可调小 max_lines 或使用 offset 重新分页读取。"
-    next_offset = result.get("next_offset")
-    if next_offset is not None:
-        full_hint = f"继续调用 read_file，传 offset={next_offset} 读取后续；也可调小 max_lines 重读当前页。"
-    return _shrink_text_field(
-        result,
-        field="content",
-        limit_tokens=soft_limit,
-        reason="文件内容页过长已按 token 预算截断",
-        full=full_hint,
-        estimator=estimator,
-    )
-
-
 def _shrink_line_result(
     tool_name: str,
     result: dict[str, Any],
@@ -206,22 +263,6 @@ def _shrink_line_result(
     return result
 
 
-def _shrink_text_field(
-    result: dict[str, Any],
-    *,
-    field: str,
-    limit_tokens: int,
-    reason: str,
-    full: str,
-    estimator: TokenEstimator,
-) -> dict[str, Any]:
-    value = result.get(field)
-    if not isinstance(value, str) or estimator.estimate_text(value) <= limit_tokens:
-        return result
-    result[field] = _trim_head_tail(value, limit_tokens, estimator)
-    return add_condensed_marker(result, reason=reason, full=full)
-
-
 def _hard_cap(
     tool_name: str,
     result: dict[str, Any],
@@ -233,13 +274,29 @@ def _hard_cap(
 
     compact = {
         "ok": result.get("ok", True),
+        "status": result.get("status", "truncated"),
         "tool": tool_name,
-        "preview": _trim_head_tail(
+        "brief": result.get(
+            "brief",
+            "工具结果超过硬上限，已拒绝把不完整正文作为完整结果交给模型。",
+        ),
+    }
+    if "artifact" in result:
+        compact["artifact"] = result.get("artifact")
+    if "path" in result:
+        compact["path"] = result.get("path")
+    if "count" in result:
+        compact["count"] = result.get("count")
+    if "data" in result:
+        compact["data"] = result.get("data")
+    if "next" in result:
+        compact["next"] = result.get("next")
+    if "artifact" not in compact:
+        compact["preview"] = _trim_head_tail(
             json.dumps(result, ensure_ascii=False, sort_keys=True),
             hard_cap,
             estimator,
-        ),
-    }
+        )
     return add_condensed_marker(
         compact,
         reason="工具结果超过中央 hard cap，已通用截断",

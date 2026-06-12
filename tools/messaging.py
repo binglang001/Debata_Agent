@@ -10,6 +10,7 @@ import asyncio
 import logging
 
 from adapters.types import Target
+from utils import get_time
 
 from .base import ToolContext, tool
 from .message_builder import build_message, contains_forbidden, typing_delay
@@ -26,6 +27,58 @@ logger = logging.getLogger(__name__)
 def _mark_activity(ctx: ToolContext) -> None:
     if ctx.activity_cb is not None:
         ctx.activity_cb()
+
+
+def _send_result(
+    *,
+    sent: list[dict],
+    sent_messages: list[dict],
+    errors: list[str],
+    action_count: int,
+) -> dict:
+    result: dict = {
+        "ok": bool(sent) or not action_count,
+        "status": "sent",
+        "brief": (
+            f"已发送 {len(sent)} 条消息，QQ 可见。"
+            if sent
+            else "发送尝试完成，但没有消息发出。"
+        ),
+        "qq_visible": bool(sent),
+        "count": len(sent),
+        "sent": sent,
+        "sent_messages": sent_messages,
+    }
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def _sent_message_item(
+    *,
+    target_type: str,
+    target_id: str,
+    order: int,
+    content: str,
+    delay: float,
+    msg_id: object,
+) -> dict:
+    item = {
+        "conversation_id": f"{target_type}:{target_id}",
+        "target_type": target_type,
+        "target_id": target_id,
+        "order": int(order),
+        "content": content,
+        "delay": float(delay),
+        "msg_id": str(msg_id) if msg_id is not None else None,
+        "time": get_time(),
+        "qq_visible": True,
+    }
+    if target_type == "private":
+        item["target_qq"] = target_id
+    if target_type == "group":
+        item["group_id"] = target_id
+    return item
 
 
 # ============================================================
@@ -95,6 +148,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
         return result
 
     sent: list[dict[str, str | int | None]] = []
+    sent_messages: list[dict] = []
     for i, action in enumerate(actions):
         target = Target(
             adapter=ctx.adapter.name,
@@ -116,15 +170,27 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
                 "msg_id": str(msg_id) if msg_id is not None else None,
             }
         )
+        sent_messages.append(
+            _sent_message_item(
+                target_type="private",
+                target_id=target.target_id,
+                order=int(action["order"]),
+                content=str(action.get("label") or action.get("content") or ""),
+                delay=float(action.get("delay") or 0.0),
+                msg_id=msg_id,
+            )
+        )
 
         delay = float(action.get("delay") or 0.0)
         if delay > 0 and i < len(actions) - 1:
             await asyncio.sleep(delay)
 
-    result: dict = {"ok": bool(sent) or not actions, "count": len(sent), "sent": sent}
-    if errors:
-        result["errors"] = errors
-    return result
+    return _send_result(
+        sent=sent,
+        sent_messages=sent_messages,
+        errors=errors,
+        action_count=len(actions),
+    )
 
 
 # ============================================================
@@ -188,6 +254,7 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
         return result
 
     sent: list[dict[str, str | int | None]] = []
+    sent_messages: list[dict] = []
     for i, action in enumerate(actions):
         target = Target(
             adapter=ctx.adapter.name,
@@ -209,15 +276,27 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
                 "msg_id": str(msg_id) if msg_id is not None else None,
             }
         )
+        sent_messages.append(
+            _sent_message_item(
+                target_type="group",
+                target_id=target.target_id,
+                order=int(action["order"]),
+                content=str(action.get("label") or action.get("content") or ""),
+                delay=float(action.get("delay") or 0.0),
+                msg_id=msg_id,
+            )
+        )
 
         delay = float(action.get("delay") or 0.0)
         if delay > 0 and i < len(actions) - 1:
             await asyncio.sleep(delay)
 
-    result: dict = {"ok": bool(sent) or not actions, "count": len(sent), "sent": sent}
-    if errors:
-        result["errors"] = errors
-    return result
+    return _send_result(
+        sent=sent,
+        sent_messages=sent_messages,
+        errors=errors,
+        action_count=len(actions),
+    )
 
 
 # ============================================================
@@ -234,13 +313,29 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
 async def recall_message(args: RecallMessageArgs, ctx: ToolContext) -> dict:
     """直接调用 adapter.recall。"""
     if ctx.adapter is None:
-        return {"ok": False, "error": "未连接适配器"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "撤回失败：未连接适配器。",
+            "error": "未连接适配器",
+        }
 
     ok = await ctx.adapter.recall(str(args.message_id))
     if not ok:
-        return {"ok": False, "error": "撤回失败（可能已超时或消息不存在）"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "撤回失败：可能已超时或消息不存在。",
+            "error": "撤回失败（可能已超时或消息不存在）",
+            "data": {"message_id": str(args.message_id)},
+        }
     _mark_activity(ctx)
-    return {"ok": True}
+    return {
+        "ok": True,
+        "status": "done",
+        "brief": f"已撤回消息 {args.message_id}。",
+        "data": {"message_id": str(args.message_id)},
+    }
 
 
 # ============================================================
@@ -261,17 +356,33 @@ async def recall_message(args: RecallMessageArgs, ctx: ToolContext) -> dict:
 async def upload_file(args: UploadFileArgs, ctx: ToolContext) -> dict:
     """通过 adapter.upload_file 上传。安全检查：file_path 必须在 workspace 下。"""
     if ctx.adapter is None:
-        return {"ok": False, "error": "未连接适配器"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "上传文件失败：未连接适配器。",
+            "error": "未连接适配器",
+        }
 
     from .workspace import WorkspaceError, resolve_in_workspace
 
     try:
         file_path = resolve_in_workspace(args.file_path, ctx.workspace_dir)
     except WorkspaceError as e:
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"上传文件失败：{e}",
+            "error": str(e),
+        }
 
     if not file_path.exists() or not file_path.is_file():
-        return {"ok": False, "error": "文件不存在"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "上传文件失败：文件不存在。",
+            "error": "文件不存在",
+            "data": {"path": str(args.file_path)},
+        }
 
     from adapters.types import Target  # 延迟导入避免循环
 
@@ -290,9 +401,30 @@ async def upload_file(args: UploadFileArgs, ctx: ToolContext) -> dict:
         )
         _mark_activity(ctx)
     except NotImplementedError:
-        return {"ok": False, "error": "当前适配器不支持上传文件"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "上传文件失败：当前适配器不支持上传文件。",
+            "error": "当前适配器不支持上传文件",
+        }
     except Exception as e:
         logger.exception(f"upload_file 失败: {e}")
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"上传文件失败：{e}",
+            "error": str(e),
+        }
 
-    return {"ok": True}
+    display_name = args.file_name or file_path.name
+    return {
+        "ok": True,
+        "status": "done",
+        "brief": f"已上传文件 {display_name}。",
+        "data": {
+            "target_type": scope,
+            "target_id": str(args.target_id),
+            "path": str(file_path),
+            "file_name": display_name,
+        },
+    }

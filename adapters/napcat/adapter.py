@@ -24,7 +24,6 @@ from typing import Any, Literal
 
 from adapters.base import (
     AdapterAPIError,
-    AdapterNotConnectedError,
     IAdapter,
 )
 from adapters.types import (
@@ -59,18 +58,24 @@ class NapCatAdapter(IAdapter):
         *,
         process_manager: NapCatProcessManager | None = None,
         api_timeout_seconds: float = 30.0,
+        api_wait_connected_timeout_seconds: float = 3.0,
         process_warmup_seconds: float = 2.0,
         voice_fetch_delay_seconds: float = 1.0,
     ) -> None:
         super().__init__(name)
         self._connection = connection
-        self._api = NapCatApiCaller(connection, default_timeout=api_timeout_seconds)
+        self._api = NapCatApiCaller(
+            connection,
+            default_timeout=api_timeout_seconds,
+            wait_connected_timeout=api_wait_connected_timeout_seconds,
+        )
         self._process = process_manager
         self._process_warmup_seconds = process_warmup_seconds
         self._voice_fetch_delay_seconds = voice_fetch_delay_seconds
 
         # 安装消息分发
         connection.on_message(self._on_napcat_message)
+        connection.on_connection_lost(self._api.discard_pending)
 
     # ============================================================
     # 工厂方法
@@ -115,7 +120,10 @@ class NapCatAdapter(IAdapter):
                 reconnect_backoff_max=cfg.reconnect_backoff_max_seconds,
                 ping_interval=cfg.ping_interval_seconds,
                 ping_timeout=cfg.ping_timeout_seconds,
-                initial_connect_timeout=min(cfg.initial_connect_timeout_seconds, 1.0),
+                initial_connect_timeout=cfg.startup_connect_timeout_seconds,
+                fast_reconnect_attempts=cfg.fast_reconnect_attempts,
+                fast_reconnect_interval=cfg.fast_reconnect_interval_seconds,
+                reconnect_jitter=cfg.reconnect_jitter_seconds,
             )
         else:  # mode == "server"
             # 程序作为 WS 服务端，监听 {host}:{port}{path} 等 NapCat 反向连入
@@ -141,6 +149,7 @@ class NapCatAdapter(IAdapter):
             connection=connection,
             process_manager=process_manager,
             api_timeout_seconds=cfg.api_timeout_seconds,
+            api_wait_connected_timeout_seconds=cfg.api_wait_connected_timeout_seconds,
             process_warmup_seconds=cfg.process_warmup_seconds,
             voice_fetch_delay_seconds=cfg.voice_fetch_delay_seconds,
         )
@@ -466,9 +475,6 @@ class NapCatAdapter(IAdapter):
 
     def _build_send_params(self, target: Target, content: str) -> dict[str, Any]:
         """根据 Target 构造 send_msg 的参数。"""
-        if not self.is_connected:
-            raise AdapterNotConnectedError(f"NapCat 未连接，无法发送到 {target}")
-
         if target.scope == "private":
             return {
                 "message_type": "private",

@@ -107,13 +107,18 @@ class PersonaStepView(BaseStepView):
         sep.setProperty("role", "separator")
         card.add_content(sep)
 
+        admin_hint = QLabel("熟悉的人（管理员）能够允许她/他通过好友，请谨慎填写。一般情况下，填你的信息即可。")
+        admin_hint.setProperty("role", "secondary")
+        admin_hint.setWordWrap(True)
+        card.add_content(admin_hint)
+
         self._admin_name_edit = QLineEdit()
         self._admin_name_edit.setPlaceholderText("可选 —— 角色称呼你的名字")
-        card.add_content(self._wrap_field("管理员名称", self._admin_name_edit))
+        card.add_content(self._wrap_field("熟悉的人", self._admin_name_edit))
 
         self._admin_edit = QLineEdit()
         self._admin_edit.setPlaceholderText("可选 —— 用于审核陌生人加好友/加群")
-        card.add_content(self._wrap_field("管理员 QQ", self._admin_edit))
+        card.add_content(self._wrap_field("QQ", self._admin_edit))
 
         outer.addStretch(1)
 

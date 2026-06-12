@@ -46,6 +46,9 @@ DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "set_friend_add_request",
     "set_group_add_request",
     "schedule_wakeup",
+    "start_agent_task",
+    "summarize_chat_history",
+    "summarize_conversation",
 }
 
 # 发送类工具：send_only=True 时同样算作终止信号
@@ -80,6 +83,7 @@ class AgentRunner:
         tool_executor: ToolExecutor,
         task_contract: str | None = None,
         pending_context_provider: Callable[[], Awaitable[list[dict[str, Any]]]] | None = None,
+        max_loops: int | None = None,
     ) -> AgentRunResult:
         """执行多轮工具循环。
 
@@ -94,6 +98,7 @@ class AgentRunner:
         finish_reason: FinishReason = "max_loops"
         loop_count = 0
         prompt_tokens_total = 0
+        effective_max_loops = max(1, int(max_loops or self.cfg.max_loops))
         refocus_interval = self.cfg.refocus_interval
         has_pending_send_actions = False
 
@@ -102,6 +107,7 @@ class AgentRunner:
         logger.info(
             f"AgentRunner[{self.provider.name}] 启动 model={self.cfg.model}, "
             f"tools={tool_names_dbg}, refocus={refocus_interval}, "
+            f"max_loops={effective_max_loops}, "
             f"task_contract={task_contract[:60] if task_contract else None!r}"
         )
 
@@ -116,7 +122,7 @@ class AgentRunner:
             logger.info("注入发送回执/新消息上下文 %s 条", len(pending))
             return True
 
-        while loop_count < self.cfg.max_loops:
+        while loop_count < effective_max_loops:
             loop_count += 1
 
             if await append_pending_context():
@@ -202,14 +208,14 @@ class AgentRunner:
 
             # === 分支 1：无工具调用 → 引导重试或终止 ===
             if not result.tool_calls:
-                if await append_pending_context() and loop_count < self.cfg.max_loops:
+                if await append_pending_context() and loop_count < effective_max_loops:
                     continue
                 content = (result.content or "").strip()
                 if has_pending_send_actions:
                     final_content = content
                     finish_reason = "send_only_complete"
                     break
-                if loop_count < self.cfg.max_loops:
+                if loop_count < effective_max_loops:
                     # 还有下一轮：插入系统纠正后继续
                     err = {
                         "role": "system",
@@ -242,7 +248,7 @@ class AgentRunner:
                 msgs.append(tool_record)
                 records.append(tool_record)
 
-            if await append_pending_context() and loop_count < self.cfg.max_loops:
+            if await append_pending_context() and loop_count < effective_max_loops:
                 continue
 
             # === 终止条件检查 ===
@@ -256,8 +262,19 @@ class AgentRunner:
                 finish_reason = self._classify_no_feedback(tc_results)
                 break
 
-        if loop_count >= self.cfg.max_loops:
-            logger.warning(f"达到最大循环次数 {self.cfg.max_loops}")
+        if loop_count >= effective_max_loops and finish_reason == "max_loops":
+            logger.warning(f"达到最大循环次数 {effective_max_loops}")
+            if not final_content:
+                final_content = self._last_assistant_text(records)
+            records.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"工具循环达到上限 {effective_max_loops} 轮，"
+                        "已停止继续调用工具；上层应根据已有工具结果产出部分结果或说明未完成原因。"
+                    ),
+                }
+            )
 
         return AgentRunResult(
             final_content=final_content,
@@ -304,6 +321,15 @@ class AgentRunner:
                 for tc in result.tool_calls
             ]
         return record
+
+    @staticmethod
+    def _last_assistant_text(records: list[dict[str, Any]]) -> str:
+        for record in reversed(records):
+            if record.get("role") == "assistant":
+                content = str(record.get("content") or "").strip()
+                if content:
+                    return content
+        return ""
 
     async def _execute_tools(
         self,

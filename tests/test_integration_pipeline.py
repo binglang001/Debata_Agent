@@ -36,6 +36,7 @@ from adapters.types import (
     UserInfo,
 )
 from agents import ChatAgent, Persona
+from agents.base import AgentRunResult
 from app_config.schema import (
     AgentConfig,
     AgentsConfig,
@@ -60,7 +61,6 @@ from memory import (
     ImportantMemoryManager,
     RollingSummaryStore,
 )
-from memory.rag_store import RagStore
 from providers.base import CompletionResult, IProvider, ToolCall, Usage
 from tools import ToolContext, build_default_registry
 
@@ -338,12 +338,15 @@ async def _drain_pipeline(pipeline: MessagePipeline, max_wait: float = 1.0) -> N
         )
         receipt_tasks = getattr(pipeline, "_send_receipt_tasks", {})
         receipt_tasks_done = all(task.done() for task in receipt_tasks.values())
+        agent_task_tasks = getattr(pipeline, "_agent_task_tasks", {})
+        agent_task_tasks_done = all(task.done() for task in agent_task_tasks.values())
         if (
             (batch_task is None or batch_task.done())
             and (requeue is None or requeue.done())
             and all(t.done() for t in rag_tasks)
             and send_workers_done
             and receipt_tasks_done
+            and agent_task_tasks_done
         ):
             return
     raise AssertionError(f"pipeline 在 {max_wait}s 内未完成")
@@ -724,6 +727,114 @@ async def test_proactive_action_runs_under_acquired_lock(build_pipeline):
 
 
 @pytest.mark.asyncio
+async def test_agent_task_materializes_sources_without_url(build_pipeline, tmp_path):
+    pipeline, _, adapter, history, _ = await build_pipeline([])
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pipeline.workspace_dir = workspace
+    (workspace / "input.md").write_text("已有文件", encoding="utf-8")
+    await history.add_user_message("这里有 msg_id=abc123 的记录", conversation_id="private:123")
+    task_dir = workspace / "agent_tasks" / "manual"
+    task_dir.mkdir(parents=True)
+
+    async def fake_get_forward_msg(forward_id: str):
+        if forward_id == "outer":
+            return [
+                {
+                    "sender": {"nickname": "Lilith"},
+                    "raw_message": "[CQ:forward,id=inner]",
+                }
+            ]
+        return [
+            {
+                "sender": {"nickname": "Diana"},
+                "raw_message": "内层消息",
+            }
+        ]
+
+    adapter.get_forward_msg = fake_get_forward_msg  # type: ignore[method-assign]
+
+    manifest = await pipeline._materialize_agent_task_sources(
+        [
+            {"type": "workspace_path", "value": "input.md"},
+            {"type": "inline_text", "value": "内联材料"},
+            {"type": "message_id", "value": "abc123"},
+            {"type": "image_ref", "value": "https://example.com/a.png"},
+            {"type": "forward_id", "value": "outer"},
+        ],
+        task_dir,
+    )
+
+    assert manifest["count"] == 5
+    assert manifest["sources"][0]["path"] == "input.md"
+    inline_path = workspace / manifest["sources"][1]["path"]
+    assert inline_path.read_text(encoding="utf-8") == "内联材料"
+    assert manifest["sources"][2]["record_count"] == 1
+    assert "暂不支持直接传 URL" in manifest["sources"][3]["error"]
+    assert manifest["sources"][4]["message_count"] == 2
+    assert manifest["sources"][4]["nested_forward_count"] == 1
+    forward_tree = json.loads(
+        (workspace / manifest["sources"][4]["path"]).read_text(encoding="utf-8")
+    )
+    assert forward_tree["type"] == "forward"
+    assert forward_tree["messages"][0]["segments"][0]["node"]["forward_id"] == "inner"
+
+
+@pytest.mark.asyncio
+async def test_agent_task_max_loops_writes_partial_result(build_pipeline, tmp_path):
+    pipeline, _, _, _, _ = await build_pipeline([])
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pipeline.workspace_dir = workspace
+    delivered: list[dict[str, Any]] = []
+
+    async def fake_run(_messages, *, max_loops=None, **_kwargs):
+        assert max_loops == 17
+        return AgentRunResult(
+            final_content="还没完全整理完",
+            records=[{"role": "assistant", "content": "正在整理资料"}],
+            loop_count=17,
+            finish_reason="max_loops",
+        )
+
+    async def fake_deliver(task_id, *, status, result_path, conversation_id, default_target, error):
+        delivered.append(
+            {
+                "task_id": task_id,
+                "status": status,
+                "result_path": result_path,
+                "conversation_id": conversation_id,
+                "default_target": default_target,
+                "error": error,
+            }
+        )
+
+    pipeline.chat_agent.run = fake_run  # type: ignore[method-assign]
+    pipeline._deliver_agent_task_result = fake_deliver  # type: ignore[method-assign]
+
+    await pipeline._run_agent_task(
+        "task-partial",
+        {
+            "prompt": "整理资料并输出 Markdown",
+            "max_loops": 17,
+            "output_format": "markdown",
+            "output_name": "result.md",
+        },
+        conversation_id="private:123",
+        default_target=None,
+    )
+
+    result_path = workspace / "agent_tasks" / "task-partial" / "result.md"
+    assert result_path.exists()
+    text = result_path.read_text(encoding="utf-8")
+    assert "部分结果" in text
+    assert "整理资料并输出 Markdown" in text
+    assert delivered[0]["status"] == "partial"
+    assert delivered[0]["result_path"] == result_path
+    assert "工具循环上限" in delivered[0]["error"]
+
+
+@pytest.mark.asyncio
 async def test_context_budget_uses_provider_context_length(build_pipeline):
     pipeline, _, _, _, _ = await build_pipeline([])
     pipeline.model_context_length = 1_000_000
@@ -804,6 +915,31 @@ async def test_send_private_immediate_path_reaches_adapter(build_pipeline):
 
 
 @pytest.mark.asyncio
+async def test_chat_timeline_records_real_inbound_and_successful_outbound(build_pipeline):
+    """真实 QQ 时间线只记录已进入处理的入站和 adapter 成功返回后的出站。"""
+    pipeline, _, adapter, _, _ = await build_pipeline(
+        [_ai_send_private(target_qq="456", content="真实回复", send_only=True)]
+    )
+
+    await pipeline.enqueue(_msg(user_id="456", text="真实入站", message_id="in-1"))
+    await _drain_pipeline(pipeline)
+
+    assert [content for _, content in adapter.sent] == ["真实回复"]
+    messages = pipeline.chat_timeline.recent("private:456", 10)
+    markdown = pipeline.chat_timeline.to_markdown(messages)
+    assert "用户(456)：真实入站 [msg_id=in-1]" in markdown
+    assert "我(999)：真实回复 [msg_id=1000]" in markdown
+
+    ctx = pipeline._build_tool_context(conversation_id="private:456")
+    executor = pipeline.tool_registry.get_executor(ctx)
+    result = await executor("get_recent_chat_messages", {"limit": 10})
+    assert result["ok"] is True
+    assert result["status"] == "inline"
+    assert "真实入站" in result["content"]
+    assert "真实回复" in result["content"]
+
+
+@pytest.mark.asyncio
 async def test_send_private_with_delay_uses_async_queue(build_pipeline):
     """多条且存在正 delay 时，工具先返回 queued，后台仍按原拆条发完。"""
     args = {
@@ -839,6 +975,9 @@ async def test_send_private_with_delay_uses_async_queue(build_pipeline):
         if r.get("role") == "tool" and r.get("tool_call_id") == "tc-send"
     ]
     assert tool_contents[-1]["status"] == "queued"
+    assert tool_contents[-1]["qq_visible"] == "pending"
+    assert tool_contents[-1]["data"]["conversation_ids"] == ["private:123"]
+    assert tool_contents[-1]["data"]["message_count"] == 2
     assert any(
         "发送完成（全部消息已发出）" in (r.get("content") or "")
         for r in records
@@ -936,6 +1075,8 @@ async def test_same_conversation_interrupt_flushes_async_send_queue(build_pipeli
     assert '"interrupted": true' in joined
     assert '"content": "二"' in joined
     assert '"content": "三"' in joined
+    assert '"qq_visible": false' in joined
+    assert '"qq_visible": true' in joined
     receipt_turn_context = "\n".join(
         str(m.get("content", ""))
         for m in provider.calls[-1]["messages"]
@@ -991,8 +1132,34 @@ async def test_same_conversation_message_while_model_thinking_returns_stale(buil
     records = await history.records()
     joined = "\n".join(str(r.get("content", "")) for r in records)
     assert '"status": "stale"' in joined
+    tool_contents = [
+        json.loads(r["content"])
+        for r in records
+        if r.get("role") == "tool" and r.get("tool_call_id") == "tc-send"
+    ]
+    stale_result = tool_contents[-1]
+    assert stale_result["qq_visible"] is False
+    attempted = stale_result["attempted_messages"][0]
+    assert attempted["send_id"] == stale_result["send_id"]
+    assert attempted["conversation_id"] == "private:123"
+    assert attempted["target_type"] == "private"
+    assert attempted["target_id"] == "123"
+    assert attempted["order"] == 1
+    assert attempted["content"] == "旧回复"
+    assert attempted["delay"] >= 0
+    assert attempted["qq_visible"] is False
+    assert stale_result["new_visible_messages"][0]["conversation_id"] == "private:123"
+    assert stale_result["new_visible_messages"][0]["text"] == "我改口"
+    assert stale_result["new_visible_messages"][0]["qq_visible"] is True
+    assert "get_recent_chat_messages" in stale_result["next"]
     assert "m-new" in joined
     assert "<send_receipt>" in joined
+    timeline_markdown = pipeline.chat_timeline.to_markdown(
+        pipeline.chat_timeline.recent("private:123", 10)
+    )
+    assert "m-old" in timeline_markdown
+    assert "m-new" in timeline_markdown
+    assert "旧回复" not in timeline_markdown
 
 
 @pytest.mark.asyncio
@@ -1170,10 +1337,11 @@ async def test_recall_history_reads_archive(build_pipeline):
     )
 
     assert result["ok"] is True
+    assert result["status"] == "inline"
     assert result["count"] == 2
-    joined = "\n".join(item["content"] for item in result["results"])
-    assert "周日做游戏 Demo" in joined
-    assert "周一补玩法文档" in joined
+    assert "周日做游戏 Demo" in result["content"]
+    assert "周一补玩法文档" in result["content"]
+    assert "metadata" not in result["results"][0]
 
 
 @pytest.mark.asyncio
@@ -1196,45 +1364,15 @@ async def test_pipeline_injects_scope_filtered_important_memory(build_pipeline):
     assert "群 99 约定" not in joined
 
 
-class _FakeEmbedding:
-    async def warmup(self):
-        pass
-
-    async def embed_one(self, text: str) -> list[float]:
-        return [float(len(text)), 1.0]
-
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        return [[float(len(t)), 1.0] for t in texts]
-
-    async def aclose(self):
-        pass
-
-    @property
-    def dimension(self) -> int:
-        return 2
-
-
 @pytest.mark.asyncio
-async def test_rag_mode_save_tool_indexes_long_term_memory(build_pipeline, tmp_path):
-    save_tc = ToolCall(
-        id="tc-save",
-        name="save_important_memory",
-        arguments=json.dumps({"memory_text": "用户报名了某项长期活动，7月7日有选拔环节"}),
-    )
-    pipeline, provider, _, _, important = await build_pipeline(
-        [CompletionResult(tool_calls=[save_tc], finish_reason="tool_calls")]
-    )
-    rag_store = RagStore(tmp_path / "rag.jsonl")
-    await rag_store.load()
-    important.attach_rag(_FakeEmbedding(), rag_store)
+async def test_rag_mode_does_not_write_important_memory(build_pipeline):
+    pipeline, _, _, _, important = await build_pipeline([_ai_no_action()])
     pipeline.features_cfg.long_term_memory.mode = "rag"
 
     await pipeline.enqueue(_msg(text="记一下：我报名了某项长期活动，7月7日有选拔环节"))
     await _drain_pipeline(pipeline)
 
-    items = important.items()
-    assert any("长期活动" in (i.get("content") or "") for i in items)
-    assert len(rag_store) == 1
+    assert important.items() == []
 
 
 @pytest.mark.asyncio

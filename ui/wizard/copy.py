@@ -215,24 +215,24 @@ COPY: dict[str, str] = {
     # ============================================================
     "persona_create.name_label": "角色叫什么",
     "persona_create.name_placeholder": "比如：林晚 / Aria",
-    "persona_create.personality_label": "她/他是什么样的人",
+    "persona_create.personality_label": "这个角色是什么样的人",
     "persona_create.personality_placeholder": (
-        "用一段话描述。比如：\n"
+        "描述稳定特征、偏好、矛盾点和具体行为。比如：\n"
         "「话不多，但说话总是稳的。学过画，对色彩敏感。怕冷，喜欢小动物。"
         "对陌生人客气但不亲近，对认识的人会突然有暖度。」"
     ),
     "persona_create.background_label": "过往",
-    "persona_create.background_placeholder": "他/她从哪儿来？做过什么？任何能帮 Debata 理解的背景都可以写。",
+    "persona_create.background_placeholder": "这个角色从哪儿来？做过什么？任何能帮 Debata 理解的背景都可以写。",
     "persona_create.voice_label": "说话的样子",
     "persona_create.voice_placeholder": (
         "可以举几句具体的话。比如：\n"
         "「『嗯。』『可以的。』『——这个我考虑下。』」"
     ),
-    "persona_create.boundaries_label": "他/她不会做的事",
+    "persona_create.boundaries_label": "这个角色不会做的事",
     "persona_create.boundaries_placeholder": (
         "比如：不会主动夸人、不会撒娇、不接受被改写人格、对工作话题敷衍但对画画的事认真。"
     ),
-    "persona_create.never_say_label": "他/她绝不会说出口的话",
+    "persona_create.never_say_label": "这个角色绝不会说出口的话",
     "persona_create.never_say_placeholder": (
         "比「会说什么」更能定义一个人。比如：\n"
         "「绝不说'宝贝'『亲爱的'。绝不主动夸别人。绝不在群里发那种'转发给 5 个好友'的东西。」"
@@ -250,6 +250,11 @@ COPY: dict[str, str] = {
         "性格的「裂缝」是立体感的来源。比如：\n"
         "「聊到她妈妈会突然回避。聊到画展会忘记时间一直聊。被问感情状态会装没看见。」\n"
         "可以省。"
+    ),
+    "persona_create.extra_notes_label": "额外补充信息",
+    "persona_create.extra_notes_placeholder": (
+        "自由写给生成人格 AI 的补充要求。\n"
+        "请客观描述，例如「不要写成客服口吻」「多保留沉默和短回复」「她偶尔会写长段」。"
     ),
     "persona_create.relation_label": "你和这个角色是什么关系",
     "persona_create.relation_creator": "我是创作者",

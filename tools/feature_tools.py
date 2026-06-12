@@ -24,7 +24,7 @@ from adapters.types import Target
 from utils.token_budget import TokenEstimator
 
 from .base import ToolContext, tool
-from .result_shrink import add_condensed_marker
+from .result_shrink import add_condensed_marker, tool_budget
 from .schemas import (
     DescribeImageArgs,
     GetWeatherArgs,
@@ -49,7 +49,12 @@ logger = logging.getLogger(__name__)
 )
 async def describe_image(args: DescribeImageArgs, ctx: ToolContext) -> dict:
     if ctx.vision is None:
-        return {"ok": False, "error": "未启用图像理解功能"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "未启用图像理解功能。",
+            "error": "未启用图像理解功能",
+        }
 
     try:
         image_url = _normalize_image_input(args.image_url, ctx)
@@ -57,28 +62,41 @@ async def describe_image(args: DescribeImageArgs, ctx: ToolContext) -> dict:
         raw = await ctx.vision.describe(image_url, question)
     except Exception as e:
         logger.warning(f"describe_image 失败: {e}")
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"图片理解失败：{e}",
+            "error": str(e),
+        }
 
     parsed = _vision_result(raw)
     description = parsed["description"]
     summary = parsed["summary"]
-    result: dict[str, Any] = {"ok": True, "summary": summary}
-    threshold = ctx.tool_result_soft_overrides.get(
-        "describe_image",
-        ctx.tool_result_soft_limit_tokens,
-    )
+    result: dict[str, Any] = {
+        "ok": True,
+        "status": "inline",
+        "brief": "已完成图片理解。",
+        "summary": summary,
+        "data": {
+            "image_ref": args.image_url,
+            "question": question or None,
+        },
+    }
+    threshold = tool_budget("describe_image", ctx).artifact_threshold
     if question:
-        threshold *= 3
+        threshold = max(threshold, tool_budget("describe_image", ctx).inline * 2)
 
     if TokenEstimator().estimate_text(description) > threshold:
         saved = _save_image_description(args.image_url, description, ctx)
         if saved:
+            result["status"] = "artifact"
+            result["brief"] = f"图片描述较长，完整描述已写入 {saved}。"
             result["full_saved"] = saved
-            add_condensed_marker(
-                result,
-                reason="图片描述过长，已保存完整描述",
-                full=f"用 read_file 读取 {saved} 可查看完整描述；也可带 question 重调 describe_image。",
-            )
+            result["artifact"] = {
+                "path": saved,
+                "type": "markdown",
+            }
+            result["next"] = "需要完整图片描述时读取 artifact.path；也可带更具体 question 重调 describe_image。"
         else:
             result["description"] = description[:2000]
             add_condensed_marker(
@@ -174,15 +192,34 @@ def _hashed_desc_name(value: str) -> str:
 )
 async def web_search(args: WebSearchArgs, ctx: ToolContext) -> dict:
     if ctx.web_search is None:
-        return {"ok": False, "error": "未启用联网搜索功能"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "未启用联网搜索功能。",
+            "error": "未启用联网搜索功能",
+        }
 
     try:
         result = await ctx.web_search.search(args.query)
     except Exception as e:
         logger.warning(f"web_search 失败: {e}")
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"联网搜索失败：{e}",
+            "error": str(e),
+        }
 
-    return {"ok": True, "query": args.query, "result": result}
+    return {
+        "ok": True,
+        "status": "inline",
+        "brief": f"已搜索：{args.query}",
+        "query": args.query,
+        "result": result,
+        "data": {
+            "query": args.query,
+        },
+    }
 
 
 @tool(
@@ -197,15 +234,34 @@ async def web_search(args: WebSearchArgs, ctx: ToolContext) -> dict:
 )
 async def get_weather(args: GetWeatherArgs, ctx: ToolContext) -> dict:
     if ctx.weather is None:
-        return {"ok": False, "error": "未启用天气查询功能"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "未启用天气查询功能。",
+            "error": "未启用天气查询功能",
+        }
 
     try:
         result = await ctx.weather.query(args.city, args.days)
     except Exception as e:
         logger.warning(f"get_weather 失败: {e}")
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"天气查询失败：{e}",
+            "error": str(e),
+        }
 
-    return {"ok": True, "result": result}
+    return {
+        "ok": True,
+        "status": "inline",
+        "brief": f"已查询 {args.city} 天气（{args.days} 天）。",
+        "result": result,
+        "data": {
+            "city": args.city,
+            "days": args.days,
+        },
+    }
 
 
 @tool(

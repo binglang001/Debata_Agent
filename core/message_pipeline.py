@@ -4,7 +4,7 @@
     1. 接收 IncomingMessage（来自 EventBus）
     2. 速率限制（非好友）
     3. 重建可读文本（CQ 码解析 + 附加媒体 URL）
-    4. 关键词强制保存（命中即触发 ImportantMemoryManager.force_save）
+    4. 文件记忆模式下的关键词强制保存（RAG 模式不写 important.json）
     5. 合并窗口暂存
     6. 批处理触发：合并窗口到时，组装 messages → 调 ChatAgent
     7. 发送类工具走同步快路径或每会话异步发送队列
@@ -71,6 +71,7 @@ from tools import (
 from utils import get_time, parse_raw_cq
 from utils.token_budget import TokenBudget, TokenEstimator
 
+from .chat_timeline import ChatTimelineStore
 from .state import MessageBatch, PendingMessageItem, PendingRequestStore, RateLimiter
 from .wakeup import WakeupScheduler
 
@@ -191,7 +192,16 @@ class _AsyncSendManager:
         send_id = self._next_send_id()
         normalized = [self._normalize_action(a) for a in actions]
         if not normalized:
-            return {"ok": True, "status": "sent", "send_id": send_id, "count": 0, "sent": []}
+            return {
+                "ok": True,
+                "status": "sent",
+                "brief": "没有可发送的有效消息。",
+                "qq_visible": False,
+                "send_id": send_id,
+                "count": 0,
+                "sent": [],
+                "sent_messages": [],
+            }
 
         groups: dict[str, list[dict[str, Any]]] = {}
         for action in normalized:
@@ -199,12 +209,20 @@ class _AsyncSendManager:
 
         stale_convs = [cid for cid in groups if self._state(cid).needs_resync]
         if stale_convs:
+            new_visible_messages: list[dict[str, Any]] = []
+            for cid in stale_convs:
+                new_visible_messages.extend(self._state(cid).interrupt_messages)
             return {
                 "ok": False,
                 "status": "stale",
+                "brief": "发送未执行：目标会话刚收到新消息，需要重新判断。",
+                "qq_visible": False,
                 "send_id": send_id,
                 "note": "该会话刚来新消息，请先看新消息再决定发不发",
                 "stale_conversations": stale_convs,
+                "attempted_messages": self._attempted_items(normalized, send_id),
+                "new_visible_messages": new_visible_messages,
+                "next": "不要自动补发 attempted_messages；先阅读 new_visible_messages，必要时调用 get_recent_chat_messages 确认 QQ 当前聊天记录后重新判断。",
             }
 
         can_sync = all(self._can_sync_send(cid, acts) for cid, acts in groups.items())
@@ -237,7 +255,13 @@ class _AsyncSendManager:
         return {
             "ok": True,
             "status": "queued",
+            "brief": "消息已进入发送队列，QQ 可见状态待后台发送确认。",
+            "qq_visible": "pending",
             "send_id": send_id,
+            "data": {
+                "conversation_ids": list(groups.keys()),
+                "message_count": sum(len(items) for items in groups.values()),
+            },
             "note": "已进入发送队列；正常发完只静默记历史，被打断或失败才会追加 send_receipt。",
         }
 
@@ -320,9 +344,16 @@ class _AsyncSendManager:
         result: dict[str, Any] = {
             "ok": bool(sent) or not errors,
             "status": "sent",
+            "brief": (
+                f"已发送 {len(sent)} 条消息，QQ 可见。"
+                if sent
+                else "发送尝试完成，但没有消息发出。"
+            ),
+            "qq_visible": bool(sent),
             "send_id": send_id,
             "count": len(sent),
             "sent": sent,
+            "sent_messages": sent,
         }
         if errors:
             result["errors"] = errors
@@ -423,6 +454,12 @@ class _AsyncSendManager:
             msg_id = await self.pipeline.adapter.send_text(target, content)
 
         self.pipeline.mark_activity()
+        if msg_id is not None:
+            self.pipeline._record_successful_outbound(
+                action,
+                conversation_id=conversation_id,
+                msg_id=str(msg_id),
+            )
         logger.debug(
             "出站气泡 sent_at_ms=%s msg_id=%s source=%s conversation_id=%s "
             "trigger_msg_id=%s order=%s kind=%s",
@@ -438,16 +475,23 @@ class _AsyncSendManager:
 
     @staticmethod
     def _sent_item(action: dict[str, Any], msg_id: str | None) -> dict[str, Any]:
+        target_scope = action.get("target_scope")
+        target_id = action.get("target_id")
         item: dict[str, Any] = {
+            "conversation_id": f"{target_scope}:{target_id}",
             "order": int(action.get("order", 0)),
-            "target_type": action.get("target_scope"),
-            "target_id": action.get("target_id"),
+            "target_type": target_scope,
+            "target_id": target_id,
             "msg_id": str(msg_id) if msg_id is not None else None,
+            "content": action.get("label") or action.get("content") or "",
+            "delay": float(action.get("delay") or 0.0),
+            "time": get_time(),
+            "qq_visible": True,
         }
-        if action.get("target_scope") == "private":
-            item["target_qq"] = action.get("target_id")
-        if action.get("target_scope") == "group":
-            item["group_id"] = action.get("target_id")
+        if target_scope == "private":
+            item["target_qq"] = target_id
+        if target_scope == "group":
+            item["group_id"] = target_id
         return item
 
     @staticmethod
@@ -455,10 +499,29 @@ class _AsyncSendManager:
         return [
             {
                 "send_id": send_id,
+                "conversation_id": f"{action.get('target_scope')}:{action.get('target_id')}",
                 "order": int(action.get("order", 0)),
                 "target_type": action.get("target_scope"),
                 "target_id": action.get("target_id"),
                 "content": action.get("label") or action.get("content") or "",
+                "delay": float(action.get("delay") or 0.0),
+                "qq_visible": False,
+            }
+            for action in actions
+        ]
+
+    @staticmethod
+    def _attempted_items(actions: list[dict[str, Any]], send_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "send_id": send_id,
+                "conversation_id": f"{action.get('target_scope')}:{action.get('target_id')}",
+                "target_type": action.get("target_scope"),
+                "target_id": action.get("target_id"),
+                "order": int(action.get("order", 0)),
+                "content": action.get("label") or action.get("content") or "",
+                "delay": float(action.get("delay") or 0.0),
+                "qq_visible": False,
             }
             for action in actions
         ]
@@ -509,10 +572,13 @@ class _AsyncSendManager:
     @staticmethod
     def _inbound_to_receipt_message(ref: _InboundRef) -> dict[str, Any]:
         return {
+            "conversation_id": ref.conversation_id,
+            "time": get_time(),
             "nickname": ref.nickname,
             "user_id": ref.user_id,
             "text": ref.text,
             "msg_id": ref.message_id,
+            "qq_visible": True,
         }
 
 
@@ -596,6 +662,135 @@ def _record_conversation_id(record: dict[str, Any]) -> str | None:
     return None
 
 
+def _safe_agent_task_filename(name: str, *, default: str, suffix: str) -> str:
+    """把模型给的输出文件名压成 workspace 内单文件名。"""
+    raw = Path(name or default).name.strip() or default
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw)
+    if not safe:
+        safe = default
+    if not safe.lower().endswith(suffix):
+        safe += suffix
+    return safe[:120]
+
+
+def _clamp_agent_task_max_loops(value: Any, default: int) -> int:
+    try:
+        raw = int(value if value is not None else default)
+    except (TypeError, ValueError):
+        raw = default
+    return min(60, max(5, raw))
+
+
+def _agent_task_partial_text(
+    *,
+    task_id: str,
+    prompt: str,
+    result: Any,
+    output_rel: str,
+    max_loops: int,
+) -> str:
+    lines = [
+        f"# 后台子 Agent 部分结果：{task_id}",
+        "",
+        f"- 状态：达到工具循环上限 {max_loops} 轮",
+        f"- 目标输出文件：{output_rel}",
+        f"- 已执行轮数：{getattr(result, 'loop_count', 0)}",
+        "",
+        "## 任务说明",
+        "",
+        prompt.strip() or "（无）",
+        "",
+    ]
+    final_content = str(getattr(result, "final_content", "") or "").strip()
+    if final_content:
+        lines.extend(["## 最后一轮模型输出", "", final_content, ""])
+
+    records = list(getattr(result, "records", []) or [])
+    if records:
+        lines.extend(["## 最近执行记录", ""])
+        for record in records[-8:]:
+            role = str(record.get("role") or "?")
+            content = str(record.get("content") or "").strip()
+            tool_calls = record.get("tool_calls") or []
+            if content:
+                lines.append(f"- {role}: {content[:500]}")
+            elif tool_calls:
+                names = []
+                for tool_call in tool_calls:
+                    func = tool_call.get("function") if isinstance(tool_call, dict) else None
+                    if isinstance(func, dict):
+                        names.append(str(func.get("name") or "?"))
+                lines.append(f"- {role}: 调用工具 {', '.join(names) if names else '?'}")
+        lines.append("")
+
+    lines.append("任务没有失败，但还没有在轮数上限内完整收尾。可以提高 max_loops 或基于当前文件继续处理。")
+    return "\n".join(lines)
+
+
+def _resolve_agent_workspace_path(value: str, workspace_dir: Path | None) -> Path:
+    from tools.workspace import resolve_in_workspace
+
+    return resolve_in_workspace(value, workspace_dir)
+
+
+def _workspace_rel(path: Path | None, workspace_dir: Path | None) -> str:
+    if path is None or workspace_dir is None:
+        return ""
+    try:
+        return str(path.resolve(strict=False).relative_to(workspace_dir.resolve(strict=False))).replace("\\", "/")
+    except Exception:
+        return str(path)
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def _agent_record_matches(
+    record: dict[str, Any],
+    *,
+    conversation_id: str | None,
+    keyword: str | None,
+    time_range: str | None,
+) -> bool:
+    if conversation_id and record.get("conversation_id") != conversation_id:
+        return False
+    text = "\n".join([str(record.get("content") or ""), str(record.get("metadata") or "")])
+    keyword = (keyword or "").strip()
+    if keyword and keyword not in text:
+        return False
+    time_range = (time_range or "").strip()
+    if time_range and time_range not in text:
+        return False
+    return True
+
+
+def _record_has_message_id(record: dict[str, Any], message_id: str) -> bool:
+    meta = record.get("metadata")
+    if isinstance(meta, dict):
+        messages = meta.get("messages")
+        if isinstance(messages, list):
+            for msg in messages:
+                if isinstance(msg, dict) and str(msg.get("message_id") or msg.get("msg_id") or "") == message_id:
+                    return True
+    return message_id in str(record.get("content") or "")
+
+
+def _file_head_tail_preview(path: Path, *, lines: int = 8) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    all_lines = text.splitlines()
+    return {
+        "bytes": path.stat().st_size,
+        "line_count": len(all_lines),
+        "head": "\n".join(all_lines[:lines]),
+        "tail": "\n".join(all_lines[-lines:]) if len(all_lines) > lines else "",
+    }
+
+
 class MessagePipeline:
     """消息处理管道。
 
@@ -631,6 +826,7 @@ class MessagePipeline:
         weather: IWeatherService | None = None,
         asr: Any = None,
         tts: Any = None,
+        rag_memory: Any = None,
     ) -> None:
         self.adapter = adapter
         self.chat_agent = chat_agent
@@ -658,6 +854,7 @@ class MessagePipeline:
         self.weather = weather
         self.asr = asr
         self.tts = tts
+        self.rag_memory = rag_memory
 
         self.batch = MessageBatch()
         self.reply_lock = asyncio.Lock()
@@ -670,6 +867,9 @@ class MessagePipeline:
         self._inbound_seq = 0
         self._send_manager = _AsyncSendManager(self)
         self._send_receipt_tasks: dict[str, asyncio.Task] = {}
+        self._agent_task_tasks: dict[str, asyncio.Task] = {}
+        self.chat_timeline = ChatTimelineStore(max_per_conversation=1000)
+        self._self_id_by_conversation: dict[str, str] = {}
 
     def mark_activity(self) -> None:
         """刷新活动时间。主动思考只在足够空闲后触发。"""
@@ -684,6 +884,7 @@ class MessagePipeline:
 
     async def enqueue(self, event: IncomingMessage) -> None:
         """接收一条入站消息，做前置检查后加入批处理队列。"""
+        enqueue_t0 = time.monotonic()
         if not event.text and not event.media:
             # 空消息（无文本无媒体）忽略
             return
@@ -742,6 +943,7 @@ class MessagePipeline:
             event.message_id,
             event.user_id,
         )
+        self._self_id_by_conversation[conversation_id] = str(getattr(event, "self_id", "") or "")
 
         item = PendingMessageItem(
             message_id=event.message_id,
@@ -756,8 +958,22 @@ class MessagePipeline:
             keyword_saved=keyword_saved,
         )
 
+        self.chat_timeline.append_inbound_event(
+            event,
+            conversation_id=conversation_id,
+            text=text,
+            timestamp=getattr(event, "timestamp", None),
+        )
         await self.batch.append(item)
         self._send_manager.notify_inbound(item)
+        logger.debug(
+            "入站消息预处理完成 conversation_id=%s msg_id=%s text_len=%s keyword_saved=%s elapsed=%.3fs",
+            conversation_id,
+            event.message_id,
+            len(text),
+            keyword_saved,
+            time.monotonic() - enqueue_t0,
+        )
         if self._send_manager.should_defer_batch(conversation_id):
             return
         # 启动批处理任务（如未运行）
@@ -871,6 +1087,7 @@ class MessagePipeline:
             4. 执行遗留 collected 兜底动作（常规发送已在工具内即时完成）
             5. 触发可选总结
         """
+        batch_t0 = time.monotonic()
         now = get_time()
         user_record = self._build_user_record(items, now)
         conversation_id = user_record.get("conversation_id") or "legacy:unknown"
@@ -883,6 +1100,12 @@ class MessagePipeline:
         important_text = await self._important_memory_text(
             conversation_id,
             query=items[-1].text if items else None,
+        )
+        logger.debug(
+            "批处理记忆准备完成 conversation_id=%s memory_len=%s elapsed=%.3fs",
+            conversation_id,
+            len(important_text),
+            time.monotonic() - batch_t0,
         )
 
         history_window = await self._select_working_history(conversation_id)
@@ -917,6 +1140,7 @@ class MessagePipeline:
         # 只串行模型轮；Phase 0 后台发送不占 reply_lock。
         async with self.reply_lock:
             self._send_manager.begin_model_turn(conversation_id)
+            model_t0 = time.monotonic()
             try:
                 result = await self.chat_agent.run(
                     messages,
@@ -929,6 +1153,13 @@ class MessagePipeline:
                 )
             finally:
                 self._send_manager.end_model_turn(conversation_id)
+            logger.debug(
+                "模型轮完成 conversation_id=%s finish=%s loops=%s elapsed=%.3fs",
+                conversation_id,
+                result.finish_reason,
+                result.loop_count,
+                time.monotonic() - model_t0,
+            )
 
             # 写 records
             if result.records:
@@ -943,6 +1174,12 @@ class MessagePipeline:
             self.mark_activity()
 
         self._schedule_summarize()
+        logger.debug(
+            "批处理完成 conversation_id=%s items=%s elapsed=%.3fs",
+            conversation_id,
+            len(items),
+            time.monotonic() - batch_t0,
+        )
 
         return False
 
@@ -999,10 +1236,13 @@ class MessagePipeline:
             records.append(self._build_user_record(interrupted_items))
             new_messages = [
                 {
+                    "conversation_id": item.conversation_id,
+                    "time": get_time(),
                     "nickname": item.nickname,
                     "user_id": item.user_id,
                     "text": item.text,
                     "msg_id": item.message_id,
+                    "qq_visible": True,
                 }
                 for item in interrupted_items
             ]
@@ -1072,7 +1312,10 @@ class MessagePipeline:
             messages = build_messages(
                 persona=self.persona,
                 history=await self._select_working_history(conversation_id),
-                important_memory_text=await self._important_memory_text(conversation_id),
+                important_memory_text=await self._important_memory_text(
+                    conversation_id,
+                    query=task_context,
+                ),
                 rolling_summary_text=self._rolling_summary_text(),
                 current_context=task_context,
                 memory_mode=self.features_cfg.long_term_memory.mode,
@@ -1104,8 +1347,9 @@ class MessagePipeline:
         return (
             "<send_receipt>\n"
             "发送回执：这是当前会话的发送状态记录，请以 sent / unsent / interrupted / new_messages 字段判断结果。\n"
-            "sent 表示已经发出；unsent 表示未发出；interrupted 表示发送是否被新消息中断；new_messages 是中断期间的新消息。\n"
+            "sent 表示已经发出，qq_visible=true；unsent 表示未发出，qq_visible=false；interrupted 表示发送是否被新消息中断；new_messages 是中断期间 QQ 上真实出现的新消息。\n"
             "未发出的消息不要自动补发，先结合新消息判断是否需要回应。\n"
+            "如果当前 QQ 真实聊天状态不清楚，先调用 get_recent_chat_messages。\n"
             f"{json.dumps(receipt, ensure_ascii=False)}\n"
             "</send_receipt>"
         )
@@ -1169,18 +1413,18 @@ class MessagePipeline:
         conversation_id: str | None,
         *,
         query: str | None = None,
+        token_budget: int | None = None,
     ) -> str:
-        """按当前会话选择重要记忆注入文本。"""
+        """按当前会话选择长期记忆注入文本。"""
         estimator = self._token_estimator()
-        budget = self._context_budget().memory_token_budget
-        if (
-            self.features_cfg.long_term_memory.mode == "rag"
-            and self.important.rag_enabled
-            and query
-        ):
-            return await self.important.retrieve_for_query(
+        budget = token_budget or self._context_budget().memory_token_budget
+        if self.features_cfg.long_term_memory.mode == "rag":
+            if self.rag_memory is None or not query:
+                return ""
+            return await self.rag_memory.retrieve_for_query(
                 query,
                 conversation_id=conversation_id,
+                top_k=self.features_cfg.long_term_memory.rag_top_k,
                 token_budget=budget,
                 estimator=estimator,
             )
@@ -1376,9 +1620,21 @@ class MessagePipeline:
                     return None
                 msg_id = await send_voice(target, Path(audio_path))
                 self.mark_activity()
+                if msg_id is not None:
+                    self._record_successful_outbound(
+                        action,
+                        conversation_id=f"{scope}:{target_id}",
+                        msg_id=str(msg_id),
+                    )
                 return msg_id
             msg_id = await self.adapter.send_text(target, content)
             self.mark_activity()
+            if msg_id is not None:
+                self._record_successful_outbound(
+                    action,
+                    conversation_id=f"{scope}:{target_id}",
+                    msg_id=str(msg_id),
+                )
             return msg_id
         except Exception as e:
             logger.error(f"发送失败 {target}: {e}")
@@ -1464,7 +1720,10 @@ class MessagePipeline:
         messages = build_messages(
             persona=self.persona,
             history=await self._select_working_history(conversation_id),
-            important_memory_text=await self._important_memory_text(conversation_id),
+            important_memory_text=await self._important_memory_text(
+                conversation_id,
+                query=task_context,
+            ),
             rolling_summary_text=self._rolling_summary_text(),
             current_context=task_context,
             memory_mode=self.features_cfg.long_term_memory.mode,
@@ -1529,7 +1788,10 @@ class MessagePipeline:
         messages = build_messages(
             persona=self.persona,
             history=await self._select_working_history(None),
-            important_memory_text=await self._important_memory_text(conversation_id),
+            important_memory_text=await self._important_memory_text(
+                conversation_id,
+                query=task_context,
+            ),
             rolling_summary_text=self._rolling_summary_text(),
             current_context=task_context,
             memory_mode=self.features_cfg.long_term_memory.mode,
@@ -1587,14 +1849,6 @@ class MessagePipeline:
 
         collected 是 per-call 的（绝不复用），所以每次新建实例。
         """
-        # SummaryAgent 启用时把它的 provider/model 注入给 summarize_chat_history 工具用
-        if self.summary_agent is not None:
-            summary_provider = self.summary_agent.provider
-            summary_model = self.summary_agent.cfg.model
-        else:
-            summary_provider = None
-            summary_model = ""
-
         extras: dict[str, Any] = {}
         if default_target is not None:
             raw_target_id = str(default_target.target_id)
@@ -1604,6 +1858,7 @@ class MessagePipeline:
             }
         if latest_user_text:
             extras["latest_user_message"] = latest_user_text
+        extras["chat_timeline"] = self.chat_timeline
 
         async def _send_actions(
             actions: list[dict[str, Any]],
@@ -1615,6 +1870,13 @@ class MessagePipeline:
                 trigger_message_id=trigger_message_id,
                 trigger_inbound_seq=trigger_inbound_seq,
                 trigger_user_id=trigger_user_id,
+            )
+
+        async def _agent_task(payload: dict[str, Any]) -> dict[str, Any]:
+            return await self._start_agent_task(
+                payload,
+                conversation_id=conversation_id,
+                default_target=default_target,
             )
 
         return ToolContext(
@@ -1632,16 +1894,41 @@ class MessagePipeline:
             emoji_dir=self.emoji_dir,
             typing_chars_per_second=self.behavior_cfg.typing.chars_per_second,
             typing_max_delay_seconds=self.behavior_cfg.typing.max_delay_seconds,
+            tool_result_default_budget_tokens=self.behavior_cfg.context.tool_result_default_budget_tokens,
+            tool_result_default_hard_cap_tokens=self.behavior_cfg.context.tool_result_default_hard_cap_tokens,
+            tool_result_budgets=dict(self.behavior_cfg.context.tool_result_budgets),
             tool_result_soft_limit_tokens=self.behavior_cfg.context.tool_result_soft_limit_tokens,
             tool_result_hard_cap_tokens=self.behavior_cfg.context.tool_result_hard_cap_tokens,
             tool_result_soft_overrides=dict(self.behavior_cfg.context.tool_result_soft_overrides),
             activity_cb=self.mark_activity,
             send_actions_cb=_send_actions,
+            agent_task_cb=_agent_task,
             default_history_fetch_count=self.behavior_cfg.default_history_fetch_count,
-            summary_provider=summary_provider,
-            summary_model=summary_model,
             collected=[],
             extras=extras,
+        )
+
+    def _record_successful_outbound(
+        self,
+        action: dict[str, Any],
+        *,
+        conversation_id: str,
+        msg_id: str,
+    ) -> None:
+        """记录 QQ 上真实发送成功的出站消息。"""
+        self_id = self._self_id_by_conversation.get(conversation_id) or None
+        normalized = {
+            "target_scope": action.get("target_scope") or action.get("action"),
+            "target_id": action.get("target_id") or action.get("target"),
+            "content": action.get("content") or "",
+            "label": action.get("label") or action.get("content") or "",
+            "kind": action.get("kind", "text"),
+        }
+        self.chat_timeline.append_outbound_action(
+            normalized,
+            conversation_id=conversation_id,
+            msg_id=msg_id,
+            self_id=self_id,
         )
 
     # ============================================================
@@ -1669,6 +1956,387 @@ class MessagePipeline:
             parts.append(pending_info)
 
         return "\n".join(parts)
+
+    # ============================================================
+    # 后台子 Agent 任务
+    # ============================================================
+
+    async def _start_agent_task(
+        self,
+        payload: dict[str, Any],
+        *,
+        conversation_id: str | None,
+        default_target: Target | None,
+    ) -> dict[str, Any]:
+        """创建后台资料处理任务，立即返回 task_id。"""
+        if self.workspace_dir is None:
+            return {"ok": False, "error": "workspace 未配置，无法启动后台子 Agent 任务"}
+
+        task_id = f"agent-{int(time.time() * 1000)}-{len(self._agent_task_tasks) + 1}"
+        task = asyncio.create_task(
+            self._run_agent_task(
+                task_id,
+                payload,
+                conversation_id=conversation_id,
+                default_target=default_target,
+            )
+        )
+        self._agent_task_tasks[task_id] = task
+        task.add_done_callback(lambda _task: self._agent_task_tasks.pop(task_id, None))
+        self.mark_activity()
+        return {
+            "ok": True,
+            "status": "queued",
+            "task_id": task_id,
+            "note": "后台子 Agent 已启动；完成后系统会把结果作为一次新请求回传。",
+        }
+
+    async def _run_agent_task(
+        self,
+        task_id: str,
+        payload: dict[str, Any],
+        *,
+        conversation_id: str | None,
+        default_target: Target | None,
+    ) -> None:
+        task_dir = self.workspace_dir / "agent_tasks" / task_id if self.workspace_dir else None
+        try:
+            if task_dir is None:
+                raise RuntimeError("workspace 未配置")
+            task_dir.mkdir(parents=True, exist_ok=True)
+            prompt = str(payload.get("prompt") or "").strip()
+            if not prompt:
+                raise RuntimeError("后台子 Agent 任务缺少 prompt")
+
+            output_format = str(payload.get("output_format") or "markdown")
+            suffix = {"markdown": ".md", "json": ".json", "text": ".txt"}.get(output_format, ".md")
+            output_name = _safe_agent_task_filename(
+                str(payload.get("output_name") or f"result{suffix}"),
+                default=f"result{suffix}",
+                suffix=suffix,
+            )
+            output_path = task_dir / output_name
+            max_loops = _clamp_agent_task_max_loops(
+                payload.get("max_loops"),
+                int(getattr(getattr(self.chat_agent, "cfg", None), "max_loops", 25) or 25),
+            )
+            source_manifest = await self._materialize_agent_task_sources(
+                payload.get("sources") or [],
+                task_dir,
+            )
+            manifest_path = task_dir / "sources.json"
+            manifest_path.write_text(
+                json.dumps(source_manifest, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+            from tools import ToolContext, ToolRegistry, get_default_specs
+
+            allowed = {
+                "no_action",
+                "read_file",
+                "list_files",
+                "write_file",
+                "run_python",
+                "get_forward_msg",
+                "get_recent_chat_messages",
+                "recall_history",
+            }
+            if self.vision is not None:
+                allowed.add("describe_image")
+            sub_registry = ToolRegistry(
+                [spec for spec in get_default_specs() if spec.name in allowed]
+            )
+            sub_ctx = ToolContext(
+                adapter=self.adapter,
+                history=self.history,
+                archive=self.archive,
+                vision=self.vision,
+                workspace_dir=self.workspace_dir,
+                conversation_id=conversation_id,
+                default_history_fetch_count=self.behavior_cfg.default_history_fetch_count,
+                tool_result_default_budget_tokens=self.behavior_cfg.context.tool_result_default_budget_tokens,
+                tool_result_default_hard_cap_tokens=self.behavior_cfg.context.tool_result_default_hard_cap_tokens,
+                tool_result_budgets=dict(self.behavior_cfg.context.tool_result_budgets),
+                tool_result_soft_limit_tokens=self.behavior_cfg.context.tool_result_soft_limit_tokens,
+                tool_result_hard_cap_tokens=self.behavior_cfg.context.tool_result_hard_cap_tokens,
+                tool_result_soft_overrides=dict(self.behavior_cfg.context.tool_result_soft_overrides),
+                activity_cb=self.mark_activity,
+                extras={"chat_timeline": self.chat_timeline},
+            )
+            output_rel = _workspace_rel(output_path, self.workspace_dir)
+            manifest_rel = _workspace_rel(manifest_path, self.workspace_dir)
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是后台资料处理子 Agent。你只处理资料整理、提取、转换和分析任务，"
+                        "不要联系用户，不要发送消息，不要改记忆。\n"
+                        "你可以读取 workspace 文件、检索本地历史、读取合并转发、运行 workspace 内的 Python，"
+                        "并用 write_file 写出结果。\n"
+                        f"必须把完整结果写入 workspace 文件：{output_rel}。\n"
+                        "写完后调用 no_action 结束。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"task_id: {task_id}\n"
+                        f"输出格式: {output_format}\n"
+                        f"资料清单文件: {manifest_rel}\n\n"
+                        f"任务说明：\n{prompt}"
+                    ),
+                },
+            ]
+            result = await self.chat_agent.run(
+                messages,
+                tools=sub_registry.get_schemas(),
+                tool_executor=sub_registry.get_executor(sub_ctx),
+                task_contract=f"后台资料处理任务 {task_id}",
+                max_loops=max_loops,
+            )
+            status = "partial" if result.finish_reason == "max_loops" else "completed"
+            if not output_path.exists():
+                fallback = (result.final_content or "").strip()
+                if status == "partial":
+                    fallback = _agent_task_partial_text(
+                        task_id=task_id,
+                        prompt=prompt,
+                        result=result,
+                        output_rel=output_rel,
+                        max_loops=max_loops,
+                    )
+                elif not fallback:
+                    fallback = "后台子 Agent 已结束，但没有写出结果内容。"
+                output_path.write_text(fallback, encoding="utf-8")
+
+            await self._deliver_agent_task_result(
+                task_id,
+                status=status,
+                result_path=output_path,
+                conversation_id=conversation_id,
+                default_target=default_target,
+                error="达到工具循环上限，已产出部分结果。" if status == "partial" else "",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("后台子 Agent 任务失败 task_id=%s", task_id)
+            error_path = None
+            if task_dir is not None:
+                try:
+                    task_dir.mkdir(parents=True, exist_ok=True)
+                    error_path = task_dir / "error.txt"
+                    error_path.write_text(str(e), encoding="utf-8")
+                except Exception:
+                    error_path = None
+            await self._deliver_agent_task_result(
+                task_id,
+                status="failed",
+                result_path=error_path,
+                conversation_id=conversation_id,
+                default_target=default_target,
+                error=str(e),
+            )
+
+    async def _materialize_agent_task_sources(
+        self,
+        sources: Any,
+        task_dir: Path,
+    ) -> dict[str, Any]:
+        """把多种 source 解析为 workspace 文件，避免大材料经过工具结果通道。"""
+        source_items = sources if isinstance(sources, list) else []
+        manifest: dict[str, Any] = {"count": 0, "sources": []}
+        for idx, raw in enumerate(source_items, start=1):
+            if not isinstance(raw, dict):
+                continue
+            source_type = str(raw.get("type") or "")
+            item: dict[str, Any] = {"index": idx, "type": source_type}
+            try:
+                if source_type in {"workspace_path", "tool_result_file", "image_ref"}:
+                    value = str(raw.get("value") or "").strip()
+                    if source_type == "image_ref" and value.startswith(("http://", "https://")):
+                        raise ValueError("image_ref 暂不支持直接传 URL")
+                    path = _resolve_agent_workspace_path(value, self.workspace_dir)
+                    item["path"] = _workspace_rel(path, self.workspace_dir)
+                    item["exists"] = path.exists()
+                elif source_type == "workspace_glob":
+                    pattern = str(raw.get("value") or "*").strip() or "*"
+                    root = self.workspace_dir.resolve(strict=False)
+                    matches = [
+                        _workspace_rel(p, self.workspace_dir)
+                        for p in root.glob(pattern)
+                        if p.is_file() and _is_within(p, root)
+                    ][:500]
+                    item["paths"] = matches
+                    item["count"] = len(matches)
+                elif source_type == "directory":
+                    path = _resolve_agent_workspace_path(str(raw.get("value") or "."), self.workspace_dir)
+                    entries = []
+                    if path.is_dir():
+                        for child in sorted(path.iterdir())[:500]:
+                            entries.append(
+                                {
+                                    "path": _workspace_rel(child, self.workspace_dir),
+                                    "type": "dir" if child.is_dir() else "file",
+                                    "size": child.stat().st_size if child.is_file() else None,
+                                }
+                            )
+                    item["path"] = _workspace_rel(path, self.workspace_dir)
+                    item["entries"] = entries
+                elif source_type == "inline_text":
+                    text_path = task_dir / f"source_{idx}.txt"
+                    text_path.write_text(str(raw.get("value") or ""), encoding="utf-8")
+                    item["path"] = _workspace_rel(text_path, self.workspace_dir)
+                elif source_type == "inline_json":
+                    json_path = task_dir / f"source_{idx}.json"
+                    json_path.write_text(
+                        json.dumps(raw.get("data"), ensure_ascii=False, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                    item["path"] = _workspace_rel(json_path, self.workspace_dir)
+                elif source_type == "forward_id":
+                    if self.adapter is None:
+                        raise ValueError("adapter 未就绪，无法读取合并转发")
+                    from tools.platform_tools import (
+                        build_forward_tree,
+                        summarize_forward_tree,
+                        write_forward_artifact,
+                    )
+
+                    forward_id = str(raw.get("value") or "").strip()
+                    tree = await build_forward_tree(
+                        self.adapter,
+                        forward_id,
+                        recursive=True,
+                        max_depth=3,
+                    )
+                    forward_path = write_forward_artifact(
+                        self.workspace_dir,
+                        tree,
+                        output="json",
+                        prefix=f"agent_source_{idx}",
+                    )
+                    summary = summarize_forward_tree(tree)
+                    item["path"] = _workspace_rel(forward_path, self.workspace_dir)
+                    item["message_count"] = summary["message_count"]
+                    item["nested_forward_count"] = summary["nested_forward_count"]
+                    item["expired_forward_count"] = summary["expired_forward_count"]
+                    item["image_count"] = summary["image_count"]
+                elif source_type == "conversation_history":
+                    records = await self._agent_task_history_records(raw)
+                    history_path = task_dir / f"history_{idx}.json"
+                    history_path.write_text(
+                        json.dumps(records, ensure_ascii=False, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                    item["path"] = _workspace_rel(history_path, self.workspace_dir)
+                    item["record_count"] = len(records)
+                elif source_type == "message_id":
+                    records = await self._agent_task_message_records(str(raw.get("value") or ""))
+                    msg_path = task_dir / f"message_{idx}.json"
+                    msg_path.write_text(
+                        json.dumps(records, ensure_ascii=False, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                    item["path"] = _workspace_rel(msg_path, self.workspace_dir)
+                    item["record_count"] = len(records)
+                elif source_type == "tool_call_id":
+                    records = await self._agent_task_tool_records(str(raw.get("value") or ""))
+                    tool_path = task_dir / f"tool_call_{idx}.json"
+                    tool_path.write_text(
+                        json.dumps(records, ensure_ascii=False, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                    item["path"] = _workspace_rel(tool_path, self.workspace_dir)
+                    item["record_count"] = len(records)
+                else:
+                    item["error"] = f"不支持的 source type: {source_type}"
+            except Exception as e:
+                item["error"] = str(e)
+            manifest["sources"].append(item)
+        manifest["count"] = len(manifest["sources"])
+        return manifest
+
+    async def _agent_task_history_records(self, source: dict[str, Any]) -> list[dict[str, Any]]:
+        conversation_id = source.get("conversation_id")
+        keyword = source.get("keyword")
+        time_range = source.get("time_range")
+        limit = max(1, min(int(source.get("limit") or 50), 500))
+        records: list[dict[str, Any]] = []
+        if self.archive is not None:
+            records.extend(
+                await self.archive.search(
+                    conversation_id=conversation_id,
+                    keyword=keyword,
+                    time_range=time_range,
+                    limit=limit,
+                )
+            )
+        if self.history is not None:
+            for record in await self.history.records():
+                if _agent_record_matches(
+                    record,
+                    conversation_id=conversation_id,
+                    keyword=keyword,
+                    time_range=time_range,
+                ):
+                    records.append(record)
+            records = records[-limit:]
+        return records
+
+    async def _agent_task_message_records(self, message_id: str) -> list[dict[str, Any]]:
+        if not message_id:
+            return []
+        records = await self._all_history_records()
+        return [record for record in records if _record_has_message_id(record, message_id)]
+
+    async def _agent_task_tool_records(self, tool_call_id: str) -> list[dict[str, Any]]:
+        if not tool_call_id:
+            return []
+        records = await self._all_history_records()
+        return [
+            record
+            for record in records
+            if str(record.get("tool_call_id") or "") == tool_call_id
+        ]
+
+    async def _all_history_records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        if self.archive is not None:
+            records.extend(await self.archive.records())
+        if self.history is not None:
+            records.extend(await self.history.records())
+        return records
+
+    async def _deliver_agent_task_result(
+        self,
+        task_id: str,
+        *,
+        status: str,
+        result_path: Path | None,
+        conversation_id: str | None,
+        default_target: Target | None,
+        error: str,
+    ) -> None:
+        rel_path = _workspace_rel(result_path, self.workspace_dir) if result_path else ""
+        preview = _file_head_tail_preview(result_path) if result_path and result_path.exists() else {}
+        task_context = (
+            "<agent_task_result priority=\"high\">\n"
+            "后台子 Agent 任务已结束。这是一次系统请求，请根据原用户请求继续处理："
+            "需要回复就发送消息，需要交付文件就调用 upload_file。\n"
+            f"task_id: {task_id}\n"
+            f"status: {status}\n"
+            f"result_file: {rel_path}\n"
+            f"error: {error or ''}\n"
+            f"preview: {json.dumps(preview, ensure_ascii=False)}\n"
+            "</agent_task_result>"
+        )
+        await self.run_one_turn(
+            task_context,
+            default_target=default_target,
+            conversation_id=conversation_id,
+        )
 
     async def _build_readable_text(self, event: IncomingMessage) -> str:
         """把 IncomingMessage 重建为人类可读文本（CQ 解析 + 媒体 URL/转录附加）。
@@ -1846,7 +2514,7 @@ class MessagePipeline:
                 async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
                     resp = await client.get(url)
                     resp.raise_for_status()
-                    dest.write_bytes(resp.content)
+                    await asyncio.to_thread(dest.write_bytes, resp.content)
             return f"incoming/{dest.name}"
         except Exception as e:  # noqa: BLE001
             logger.warning(f"下载媒体到 workspace 失败 url={url[:60]}: {e}")
@@ -1859,7 +2527,23 @@ class MessagePipeline:
             window_seconds=rl.window_seconds, max_messages=rl.max_messages
         )
         try:
-            await self.adapter.send_text(event.source_target, text)
+            msg_id = await self.adapter.send_text(event.source_target, text)
+            if msg_id is not None:
+                conversation_id = self._conversation_id_from_event(event)
+                self._self_id_by_conversation[conversation_id] = str(
+                    getattr(event, "self_id", "") or ""
+                )
+                self._record_successful_outbound(
+                    {
+                        "target_scope": event.source_target.scope,
+                        "target_id": event.source_target.target_id,
+                        "content": text,
+                        "label": text,
+                        "kind": "text",
+                    },
+                    conversation_id=conversation_id,
+                    msg_id=str(msg_id),
+                )
         except Exception:
             logger.debug("发送速率超限提示失败（adapter 可能未连接）")
 
@@ -1921,10 +2605,15 @@ class MessagePipeline:
             logger.warning("compaction 未选出可归档切片，跳过")
             return
 
+        important_text = (
+            self.important.text()
+            if self.features_cfg.long_term_memory.mode != "rag"
+            else ""
+        )
         result = await self.summary_agent.summarize_rolling(
             slice_records,
             self.rolling_summary.text(),
-            self.important.text(),
+            important_text,
         )
         if not result:
             logger.warning("滚动摘要 Agent 返回 None，跳过本次截断")
@@ -1949,7 +2638,11 @@ class MessagePipeline:
             },
             updated_at=get_time(),
         )
-        if isinstance(new_important_items, list) and new_important_items:
+        if (
+            self.features_cfg.long_term_memory.mode != "rag"
+            and isinstance(new_important_items, list)
+            and new_important_items
+        ):
             for item in new_important_items:
                 content = (item.get("content") or "").strip() if isinstance(item, dict) else ""
                 if content:
@@ -1958,9 +2651,17 @@ class MessagePipeline:
         cut_point = len(slice_records)
         await self.history.truncate_head(cut_point)
 
+        important_count = (
+            len(new_important_items)
+            if (
+                self.features_cfg.long_term_memory.mode != "rag"
+                and isinstance(new_important_items, list)
+            )
+            else 0
+        )
         await self.history.add_system_note(
             f"[滚动摘要] 已归档并移出活跃历史 {cut_point} 条；"
-            f"新增重要记忆 {len(new_important_items) if isinstance(new_important_items, list) else 0} 条"
+            f"新增重要记忆 {important_count} 条"
         )
 
     @staticmethod
@@ -1989,7 +2690,12 @@ class MessagePipeline:
 
     async def shutdown(self) -> None:
         """优雅停止：取消批处理任务。"""
-        tasks = [self._batch_task, self._requeue_task, self._summary_task]
+        tasks = [
+            self._batch_task,
+            self._requeue_task,
+            self._summary_task,
+            *self._agent_task_tasks.values(),
+        ]
         for task in tasks:
             if task and not task.done():
                 task.cancel()

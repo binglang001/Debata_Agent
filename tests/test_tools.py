@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
+from core.chat_timeline import ChatTimelineMessage, ChatTimelineStore
 from tools import (
     DEFAULT_NO_FEEDBACK_TOOLS,
     FEATURE_TOOL_FEATURES,
@@ -22,9 +24,61 @@ from tools import (
 )
 from tools.base import _inline_refs, _strip_pydantic_metadata, tool
 from tools.feature_tools import send_voice_message
+from tools.result_shrink import tool_budget
 from tools.schemas import (
     SendVoiceMessageArgs,
 )
+
+
+def test_tool_budget_uses_default_per_tool_values():
+    ctx = ToolContext()
+
+    budget = tool_budget("read_file", ctx)
+
+    assert budget.inline == 2500
+    assert budget.artifact_threshold == 2500
+    assert budget.hard_cap >= 2500
+
+
+def test_tool_budget_falls_back_to_global_default_for_unknown_tool():
+    ctx = ToolContext()
+
+    budget = tool_budget("unknown_tool", ctx)
+
+    assert budget.inline == 800
+    assert budget.artifact_threshold == 800
+    assert budget.hard_cap == 3000
+
+
+def test_tool_budget_keeps_legacy_override_when_no_new_budget_exists():
+    ctx = ToolContext(
+        tool_result_budgets={},
+        tool_result_soft_limit_tokens=700,
+        tool_result_hard_cap_tokens=1600,
+        tool_result_soft_overrides={"read_file": 900},
+    )
+
+    budget = tool_budget("read_file", ctx)
+
+    assert budget.inline == 900
+    assert budget.artifact_threshold == 900
+    assert budget.hard_cap == 1600
+
+
+def _timeline_message(message_id: str, text: str) -> ChatTimelineMessage:
+    return ChatTimelineMessage(
+        conversation_id="private:123",
+        direction="inbound",
+        timestamp=1_780_000_000.0,
+        time_text="2026-05-30 00:00:00",
+        sender_name="用户",
+        sender_id="123",
+        target_id="123",
+        group_id=None,
+        msg_id=message_id,
+        text=text,
+        raw_message=text,
+    )
 
 
 class FakeSendAdapter:
@@ -130,9 +184,9 @@ def test_all_expected_tools_registered():
     expected = {
         "send_private_messages", "send_group_message", "recall_message", "upload_file",
         "save_important_memory", "delete_important_memory",
-        "list_contacts", "get_user_info", "get_forward_msg",
+        "list_contacts", "get_user_info", "get_forward_msg", "get_recent_chat_messages",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
-        "summarize_conversation", "recall_history",
+        "summarize_conversation", "recall_history", "start_agent_task",
         "no_action", "schedule_wakeup",
         "describe_image", "web_search", "get_weather",
         "send_voice_message",
@@ -229,11 +283,11 @@ def test_registry_file_mode_includes_memory_tools():
     assert "delete_important_memory" in reg
 
 
-def test_registry_rag_mode_includes_memory_tools():
+def test_registry_rag_mode_excludes_memory_tools():
     cfg = _make_config(memory_mode="rag")
     reg = build_default_registry(cfg)
     for name in MEMORY_FILE_TOOLS:
-        assert name in reg, f"RAG 模式下也应注册 {name}"
+        assert name not in reg, f"RAG 模式下不应注册 {name}"
 
 
 def test_registry_feature_disabled_excludes_tool():
@@ -278,6 +332,15 @@ def test_registry_no_feedback_names_includes_known():
     assert "no_action" in names
     assert "save_important_memory" in names
     assert "schedule_wakeup" in names
+
+
+def test_registry_rag_no_feedback_names_excludes_memory_tools():
+    cfg = _make_config(memory_mode="rag")
+    reg = build_default_registry(cfg)
+    names = reg.get_no_feedback_names()
+    assert "no_action" in names
+    assert "save_important_memory" not in names
+    assert "delete_important_memory" not in names
 
 
 def test_registry_duplicate_spec_raises():
@@ -331,6 +394,8 @@ async def test_executor_no_action_works():
     executor = reg.get_executor(ctx)
     result = await executor("no_action", {})
     assert result["ok"] is True
+    assert result["status"] == "done"
+    assert "不需要执行" in result["brief"]
     assert result.get("no_action") is True
 
 
@@ -427,15 +492,23 @@ async def test_describe_image_long_description_saved_once(tmp_path):
     ctx = ToolContext(
         vision=FakeVision(),
         workspace_dir=workspace,
-        tool_result_soft_overrides={"describe_image": 20},
+        tool_result_budgets={
+            "describe_image": {
+                "inline_budget_tokens": 256,
+                "artifact_threshold_tokens": 256,
+                "hard_cap_tokens": 512,
+            }
+        },
     )
     executor = reg.get_executor(ctx)
     result = await executor("describe_image", {"image_url": "incoming/a.png"})
 
     assert result["ok"] is True
+    assert result["status"] == "artifact"
     assert result["summary"] == "胡桃和魈表情包"
     assert "description" not in result
     assert result["full_saved"] == "incoming/a.desc.md"
+    assert result["artifact"]["path"] == "incoming/a.desc.md"
     assert (workspace / "incoming" / "a.desc.md").read_text(encoding="utf-8").startswith("完整描述")
     first = dict(result)
     second = await executor("describe_image", {"image_url": "incoming/a.png"})
@@ -466,6 +539,7 @@ async def test_web_search_condenses_long_results():
     reg = build_default_registry(cfg)
     ctx = ToolContext(
         web_search=FakeSearch(),
+        tool_result_budgets={},
         tool_result_soft_limit_tokens=80,
         tool_result_hard_cap_tokens=500,
     )
@@ -558,6 +632,11 @@ async def test_send_private_sends_immediately(tmp_path):
         {"order": 1, "target_qq": "12345", "msg_id": "100"},
         {"order": 2, "target_qq": "12345", "msg_id": "101"},
     ]
+    assert result["status"] == "sent"
+    assert result["qq_visible"] is True
+    assert result["sent_messages"][0]["conversation_id"] == "private:12345"
+    assert result["sent_messages"][0]["content"] == "你好"
+    assert result["sent_messages"][0]["qq_visible"] is True
     assert ctx.collected == []
     assert [content for _, content in adapter.sent] == ["你好", "在吗"]
 
@@ -605,6 +684,13 @@ async def test_send_group_order_sorted(tmp_path):
     contents = [content for _, content in adapter.sent]
     assert contents == ["first", "second", "third"]
     assert [item["msg_id"] for item in result["sent"]] == ["100", "101", "102"]
+    assert result["qq_visible"] is True
+    assert result["sent_messages"][0]["conversation_id"] == "group:100"
+    assert [item["content"] for item in result["sent_messages"]] == [
+        "first",
+        "second",
+        "third",
+    ]
 
 
 # ============================================================
@@ -804,7 +890,7 @@ async def test_read_file_large_text_is_paginated(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_read_file_condenses_content_but_keeps_paging_metadata(tmp_path):
+async def test_read_file_writes_complete_artifact_for_large_page(tmp_path):
     cfg = _make_config()
     reg = build_default_registry(cfg)
     workspace = tmp_path / "workspace"
@@ -816,6 +902,7 @@ async def test_read_file_condenses_content_but_keeps_paging_metadata(tmp_path):
 
     ctx = ToolContext(
         workspace_dir=workspace,
+        tool_result_budgets={},
         tool_result_soft_limit_tokens=80,
         tool_result_hard_cap_tokens=500,
     )
@@ -823,12 +910,19 @@ async def test_read_file_condenses_content_but_keeps_paging_metadata(tmp_path):
     result = await executor("read_file", {"path": "long.txt"})
 
     assert result["ok"] is True
+    assert result["status"] == "artifact"
     assert result["offset"] == 0
     assert result["next_offset"] > 0
     assert result["total_lines"] == 300
     assert "preview" not in result
-    assert result["_condensed"]["reason"] == "文件内容页过长已按 token 预算截断"
-    assert f"offset={result['next_offset']}" in result["_condensed"]["full"]
+    assert "content" not in result
+    assert result["artifact"]["type"] == "markdown"
+    artifact = workspace / result["artifact"]["path"]
+    assert artifact.exists()
+    text = artifact.read_text(encoding="utf-8")
+    assert "line 0" in text
+    assert f"line {result['next_offset'] - 1}" in text
+    assert "...[已按 token 预算截断]..." not in text
 
 
 @pytest.mark.asyncio
@@ -862,7 +956,7 @@ async def test_get_user_info_strips_binary_buffers():
 
 
 @pytest.mark.asyncio
-async def test_list_files_condenses_entries_but_keeps_count(tmp_path):
+async def test_list_files_returns_explicit_pages(tmp_path):
     cfg = _make_config()
     reg = build_default_registry(cfg)
     workspace = tmp_path / "workspace"
@@ -871,42 +965,251 @@ async def test_list_files_condenses_entries_but_keeps_count(tmp_path):
         (workspace / f"{i:02d}.txt").write_text("x", encoding="utf-8")
 
     executor = reg.get_executor(ToolContext(workspace_dir=workspace))
-    result = await executor("list_files", {"path": ".", "pattern": "*.txt"})
+    result = await executor("list_files", {"path": ".", "pattern": "*.txt", "limit": 50})
 
     assert result["ok"] is True
     assert result["count"] == 60
     assert len(result["entries"]) == 50
+    assert result["next_offset"] == 50
     assert "preview" not in result
-    assert "list_files" in result["_condensed"]["full"]
+
+    second = await executor(
+        "list_files",
+        {
+            "path": ".",
+            "pattern": "*.txt",
+            "limit": 50,
+            "offset": result["next_offset"],
+        },
+    )
+    assert len(second["entries"]) == 10
+    assert "next_offset" not in second
 
 
 @pytest.mark.asyncio
-async def test_get_forward_msg_long_content_keeps_content_field():
+async def test_get_forward_msg_writes_nested_artifact_and_preserves_image_url(tmp_path):
     class FakeAdapter:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
         async def get_forward_msg(self, forward_id: str):
+            self.calls.append(forward_id)
+            if forward_id == "outer":
+                return [
+                    {
+                        "sender": {"nickname": "Lilith", "user_id": 1},
+                        "raw_message": (
+                            "看图 "
+                            "[CQ:image,summary=&#91;动画表情&#93;,file=a.png,url=https://img.example/a.png]"
+                            "[CQ:forward,id=inner]"
+                        ),
+                        "message_id": "m1",
+                    }
+                ]
             return [
                 {
-                    "sender": {"nickname": f"用户{i}"},
-                    "raw_message": "转发内容 " * 80,
+                    "sender": {"nickname": "Diana", "user_id": 2},
+                    "content": [
+                        {"type": "text", "data": {"text": "内层消息"}},
+                        {
+                            "type": "image",
+                            "data": {
+                                "summary": "截图",
+                                "file": "b.jpg",
+                                "url": "https://img.example/b.jpg",
+                            },
+                        },
+                    ],
                 }
-                for i in range(100)
             ]
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = FakeAdapter()
     ctx = ToolContext(
-        adapter=FakeAdapter(),
-        tool_result_soft_limit_tokens=80,
-        tool_result_hard_cap_tokens=500,
+        adapter=adapter,
+        workspace_dir=workspace,
     )
     executor = reg.get_executor(ctx)
-    result = await executor("get_forward_msg", {"forward_id": "forward-1"})
+    result = await executor("get_forward_msg", {"forward_id": "outer"})
 
     assert result["ok"] is True
-    assert "content" in result
-    assert "preview" not in result
-    assert "forward-1" not in result["content"]
-    assert result["_condensed"]["reason"] == "工具输出过长已保留头尾"
+    assert result["status"] == "artifact"
+    assert "content" not in result
+    assert result["artifact"]["type"] == "json"
+    assert result["data"]["message_count"] == 2
+    assert result["data"]["nested_forward_count"] == 1
+    assert result["data"]["image_count"] == 2
+    assert adapter.calls == ["outer", "inner"]
+    path = workspace / result["artifact"]["path"]
+    tree = json.loads(path.read_text(encoding="utf-8"))
+    outer_segments = tree["messages"][0]["segments"]
+    assert outer_segments[1]["url"] == "https://img.example/a.png"
+    nested = outer_segments[2]["node"]
+    assert nested["forward_id"] == "inner"
+    assert nested["messages"][0]["segments"][1]["url"] == "https://img.example/b.jpg"
+    assert "preview" in result
+    assert "artifact.path" in result["next"]
+
+
+@pytest.mark.asyncio
+async def test_get_forward_msg_keeps_parent_when_nested_forward_expired(tmp_path):
+    class FakeAdapter:
+        async def get_forward_msg(self, forward_id: str):
+            if forward_id == "outer":
+                return [
+                    {
+                        "sender": {"nickname": "Lilith"},
+                        "raw_message": "[CQ:forward,id=expired-inner]",
+                    }
+                ]
+            raise RuntimeError("API get_forward_msg 失败 (retcode=1200): 消息已过期或者为内层消息")
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    executor = reg.get_executor(ToolContext(adapter=FakeAdapter(), workspace_dir=workspace))
+
+    result = await executor("get_forward_msg", {"forward_id": "outer"})
+
+    assert result["ok"] is True
+    assert result["data"]["expired_forward_count"] == 1
+    path = workspace / result["artifact"]["path"]
+    tree = json.loads(path.read_text(encoding="utf-8"))
+    nested = tree["messages"][0]["segments"][0]["node"]
+    assert nested["status"] == "expired"
+    assert nested["forward_id"] == "expired-inner"
+
+
+@pytest.mark.asyncio
+async def test_get_recent_chat_messages_requires_timeline():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext(conversation_id="private:123"))
+
+    result = await executor("get_recent_chat_messages", {"limit": 5})
+
+    assert result["ok"] is False
+    assert "聊天时间线" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_recent_chat_messages_returns_inline_markdown():
+    timeline = ChatTimelineStore()
+    timeline.append(_timeline_message("m1", "你好"))
+    timeline.append(_timeline_message("m2", "我改口"))
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        conversation_id="private:123",
+        extras={"chat_timeline": timeline},
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor("get_recent_chat_messages", {"limit": 2})
+
+    assert result["ok"] is True
+    assert result["status"] == "inline"
+    assert result["data"]["count"] == 2
+    assert result["data"]["first_msg_id"] == "m1"
+    assert result["data"]["last_msg_id"] == "m2"
+    assert "2026-05-30 00:00:00 用户(123)：你好 [msg_id=m1]" in result["content"]
+    assert "我改口" in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_get_recent_chat_messages_writes_complete_artifact(tmp_path):
+    timeline = ChatTimelineStore()
+    for idx in range(20):
+        timeline.append(_timeline_message(f"m{idx}", f"消息{idx} " + "很长" * 40))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        conversation_id="private:123",
+        workspace_dir=workspace,
+        extras={"chat_timeline": timeline},
+        tool_result_budgets={
+            "get_recent_chat_messages": {
+                "inline_budget_tokens": 256,
+                "artifact_threshold_tokens": 256,
+                "hard_cap_tokens": 1200,
+            }
+        },
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor("get_recent_chat_messages", {"limit": 20})
+
+    assert result["ok"] is True
+    assert result["status"] == "artifact"
+    assert "content" not in result
+    assert result["data"]["count"] == 20
+    assert result["data"]["first_msg_id"] == "m0"
+    assert result["data"]["last_msg_id"] == "m19"
+    path = workspace / result["path"]
+    text = path.read_text(encoding="utf-8")
+    assert "消息0" in text
+    assert "消息19" in text
+    assert "msg_id=m0" in text
+    assert "msg_id=m19" in text
+    assert "已按 token 预算截断" not in text
+
+
+@pytest.mark.asyncio
+async def test_recall_history_writes_complete_artifact(tmp_path):
+    from memory import ArchiveStore
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    archive = ArchiveStore(tmp_path / "archive.jsonl")
+    await archive.append_many(
+        [
+            {
+                "role": "user",
+                "content": f"历史消息 {idx} " + ("很长" * 80),
+                "conversation_id": "group:42",
+                "metadata": {"timestamp": f"2026-05-30 00:{idx:02d}"},
+            }
+            for idx in range(12)
+        ]
+    )
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        archive=archive,
+        workspace_dir=workspace,
+        tool_result_budgets={
+            "recall_history": {
+                "inline_budget_tokens": 256,
+                "artifact_threshold_tokens": 256,
+                "hard_cap_tokens": 1200,
+            }
+        },
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "recall_history",
+        {"conversation_id": "group:42", "limit": 12},
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "artifact"
+    assert "content" not in result
+    assert result["artifact"]["count"] == 12
+    assert result["count"] == 12
+    assert "metadata" not in result["results"][0]
+    text = (workspace / result["artifact"]["path"]).read_text(encoding="utf-8")
+    assert "历史消息 0" in text
+    assert "历史消息 11" in text
+    assert "2026-05-30 00:00" in text
+    assert "2026-05-30 00:11" in text
+    assert "已按 token 预算截断" not in text
 
 
 @pytest.mark.asyncio
@@ -921,7 +1224,11 @@ async def test_executor_hard_cap_is_creation_time_stable():
     new_spec = next(s for s in get_default_specs() if s.name == "_huge_result")
     try:
         reg = ToolRegistry([new_spec])
-        ctx = ToolContext(tool_result_soft_limit_tokens=100, tool_result_hard_cap_tokens=120)
+        ctx = ToolContext(
+            tool_result_budgets={},
+            tool_result_soft_limit_tokens=100,
+            tool_result_hard_cap_tokens=120,
+        )
         executor = reg.get_executor(ctx)
         first = await executor("_huge_result", {})
         second = await executor("_huge_result", {})
@@ -942,6 +1249,7 @@ async def test_run_python_single_long_line_keeps_stdout_field(tmp_path):
     workspace.mkdir()
     ctx = ToolContext(
         workspace_dir=workspace,
+        tool_result_budgets={},
         tool_result_soft_limit_tokens=80,
         tool_result_hard_cap_tokens=800,
     )
@@ -950,10 +1258,15 @@ async def test_run_python_single_long_line_keeps_stdout_field(tmp_path):
     result = await executor("run_python", {"code": "print('x' * 5000)"})
 
     assert result["ok"] is True
+    assert result["status"] == "artifact"
     assert "stdout" in result
     assert "preview" not in result
     assert len(result["stdout"]) < 5000
-    assert result["_condensed"]["reason"] == "工具输出过长已保留头尾"
+    assert result["stdout_truncated"] is True
+    artifact = workspace / result["artifact"]["path"]
+    text = artifact.read_text(encoding="utf-8")
+    assert "x" * 5000 in text
+    assert "...[已按 token 预算截断]..." not in text
 
 
 class _FakeAdapter:
@@ -962,9 +1275,22 @@ class _FakeAdapter:
 
     def __init__(self):
         self.uploaded: list = []
+        self.recalled: list[str] = []
+        self.friend_requests: list[tuple[str, bool, str]] = []
+        self.group_requests: list[tuple[str, str, bool, str]] = []
 
     async def upload_file(self, target, file_path, *, display_name=None):
         self.uploaded.append((target, file_path, display_name))
+
+    async def recall(self, message_id: str) -> bool:
+        self.recalled.append(message_id)
+        return message_id != "999"
+
+    async def handle_friend_request(self, flag, approve, remark=""):
+        self.friend_requests.append((flag, approve, remark))
+
+    async def handle_group_request(self, flag, sub_type, approve, reason=""):
+        self.group_requests.append((flag, sub_type, approve, reason))
 
 
 @pytest.mark.asyncio
@@ -983,6 +1309,8 @@ async def test_upload_file_outside_whitelist_rejected(tmp_path):
         {"target_type": "private", "target_id": 1, "file_path": str(outside)},
     )
     assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "上传文件失败" in result["brief"]
     assert "workspace" in result["error"]
 
 
@@ -1003,6 +1331,9 @@ async def test_upload_file_inside_whitelist_ok(tmp_path):
         {"target_type": "group", "target_id": 1, "file_path": str(inside)},
     )
     assert result["ok"] is True
+    assert result["status"] == "done"
+    assert result["data"]["file_name"] == "x.txt"
+    assert result["data"]["target_type"] == "group"
     assert len(fake.uploaded) == 1
     assert fake.uploaded[0][2] == "x.txt"
 
@@ -1018,6 +1349,36 @@ async def test_upload_file_no_adapter():
         {"target_type": "private", "target_id": 1, "file_path": "/tmp/x"},
     )
     assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "未连接适配器" in result["brief"]
+
+
+@pytest.mark.asyncio
+async def test_recall_message_result_envelope():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    fake = _FakeAdapter()
+    executor = reg.get_executor(ToolContext(adapter=fake))
+
+    result = await executor("recall_message", {"message_id": 123})
+
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert result["data"]["message_id"] == "123"
+    assert fake.recalled == ["123"]
+
+
+@pytest.mark.asyncio
+async def test_recall_message_failure_result_envelope():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext(adapter=_FakeAdapter()))
+
+    result = await executor("recall_message", {"message_id": 999})
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "撤回失败" in result["brief"]
 
 
 # ============================================================
@@ -1035,6 +1396,8 @@ async def test_schedule_wakeup_no_callback():
         "schedule_wakeup", {"delay_seconds": 10, "reminder": "test"}
     )
     assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "未注册唤醒回调" in result["brief"]
 
 
 @pytest.mark.asyncio
@@ -1052,6 +1415,9 @@ async def test_schedule_wakeup_with_callback():
         "schedule_wakeup", {"delay_seconds": 10, "reminder": "test"}
     )
     assert result["ok"] is True
+    assert result["status"] == "done"
+    assert result["data"]["delay_seconds"] == 10
+    assert result["data"]["mode"] == "wakeup"
     assert received == [(10, "test", None, "wakeup", None)]
 
 
@@ -1074,6 +1440,7 @@ async def test_schedule_wakeup_uses_default_reply_target():
     )
 
     assert result["ok"] is True
+    assert result["data"]["target"] == {"target_type": "private", "target_id": 123}
     delay, reminder, target, mode, message_text = received[0]
     assert delay == 10
     assert target == {"target_type": "private", "target_id": 123}
@@ -1136,6 +1503,7 @@ async def test_schedule_wakeup_send_message_mode_uses_default_target():
     )
 
     assert result["ok"] is True
+    assert result["data"]["message_text"] == "到点了"
     delay, reminder, target, mode, message_text = received[0]
     assert delay == 30
     assert target == {"target_type": "private", "target_id": 123}
@@ -1164,7 +1532,35 @@ async def test_schedule_wakeup_send_message_requires_target():
     )
 
     assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "缺少发送目标" in result["brief"]
     assert "mode=send_message 需要" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_request_action_tools_result_envelope():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    fake = _FakeAdapter()
+    executor = reg.get_executor(ToolContext(adapter=fake))
+
+    friend = await executor(
+        "set_friend_add_request",
+        {"flag": "f1", "approve": True, "remark": "熟人"},
+    )
+    group = await executor(
+        "set_group_add_request",
+        {"flag": "g1", "sub_type": "invite", "approve": False, "reason": "暂不加入"},
+    )
+
+    assert friend["ok"] is True
+    assert friend["status"] == "done"
+    assert friend["data"]["flag"] == "f1"
+    assert group["ok"] is True
+    assert group["status"] == "done"
+    assert group["data"]["approve"] is False
+    assert fake.friend_requests == [("f1", True, "熟人")]
+    assert fake.group_requests == [("g1", "invite", False, "暂不加入")]
 
 
 # ============================================================
@@ -1247,26 +1643,8 @@ async def test_delete_memory_with_manager(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_summarize_conversation_uses_local_archive_and_history(tmp_path):
+async def test_summarize_conversation_starts_agent_task(tmp_path):
     from memory import ArchiveStore, HistoryManager
-    from providers.base import CompletionResult
-
-    class FakeSummaryProvider:
-        timeout = 12.0
-
-        def __init__(self) -> None:
-            self.calls = []
-
-        async def chat_completion(self, messages, *, model, tools=None, **kwargs):
-            self.calls.append(
-                {
-                    "messages": messages,
-                    "model": model,
-                    "tools": tools,
-                    "kwargs": kwargs,
-                }
-            )
-            return CompletionResult(content="本地摘要")
 
     archive = ArchiveStore(tmp_path / "archive.jsonl")
     history = HistoryManager(tmp_path / "history.jsonl")
@@ -1280,15 +1658,18 @@ async def test_summarize_conversation_uses_local_archive_and_history(tmp_path):
         ]
     )
     await history.add_user_message("活跃区继续讨论茶会", conversation_id="group:42")
-    provider = FakeSummaryProvider()
+    calls = []
+
+    async def fake_agent_task(payload):
+        calls.append(payload)
+        return {"ok": True, "status": "queued", "task_id": "agent-test"}
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
     ctx = ToolContext(
         archive=archive,
         history=history,
-        summary_provider=provider,  # type: ignore[arg-type]
-        summary_model="summary-model",
+        agent_task_cb=fake_agent_task,
         conversation_id="group:42",
     )
     executor = reg.get_executor(ctx)
@@ -1299,13 +1680,42 @@ async def test_summarize_conversation_uses_local_archive_and_history(tmp_path):
     )
 
     assert result["ok"] is True
-    assert result["summary"] == "本地摘要"
-    assert result["count"] == 2
-    assert result["source"] == "local_archive"
-    assert provider.calls[0]["model"] == "summary-model"
-    prompt = "\n".join(m["content"] for m in provider.calls[0]["messages"])
-    assert "归档里提到茶会安排" in prompt
-    assert "活跃区继续讨论茶会" in prompt
+    assert result["status"] == "queued"
+    assert result["task_id"] == "agent-test"
+    assert calls
+    assert "茶会" in calls[0]["prompt"]
+    assert calls[0]["sources"][0]["type"] == "conversation_history"
+    assert calls[0]["sources"][0]["conversation_id"] == "group:42"
+    assert calls[0]["sources"][0]["time_range"] == "茶会"
+
+
+@pytest.mark.asyncio
+async def test_start_agent_task_requires_prompt_and_calls_runtime():
+    calls = []
+
+    async def fake_agent_task(payload):
+        calls.append(payload)
+        return {"ok": True, "status": "queued", "task_id": "agent-1"}
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext(agent_task_cb=fake_agent_task))
+
+    result = await executor(
+        "start_agent_task",
+        {
+            "prompt": "提取对话，保留发送者",
+            "sources": [{"type": "inline_text", "value": "A: hi"}],
+            "output_format": "markdown",
+            "max_loops": 30,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["task_id"] == "agent-1"
+    assert calls[0]["prompt"] == "提取对话，保留发送者"
+    assert calls[0]["sources"][0]["type"] == "inline_text"
+    assert calls[0]["max_loops"] == 30
 
 
 # ============================================================
@@ -1341,8 +1751,41 @@ async def test_list_contacts_with_adapter():
     executor = reg.get_executor(ctx)
     result = await executor("list_contacts", {"scope": "friends"})
     assert result["ok"] is True
+    assert result["status"] == "inline"
     assert result["count"] == 1
     assert result["friends"][0]["nickname"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_list_contacts_returns_explicit_pages():
+    """联系人列表按 offset/limit 显式分页，不依赖压缩器截断。"""
+    from adapters.types import FriendInfo
+
+    class FakeAd:
+        name = "fake"
+        is_connected = True
+
+        async def list_friends(self):
+            return [FriendInfo(user_id=str(i), nickname=f"F{i}") for i in range(60)]
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(adapter=FakeAd())  # type: ignore
+    executor = reg.get_executor(ctx)
+    result = await executor("list_contacts", {"scope": "friends", "limit": 50})
+
+    assert result["ok"] is True
+    assert result["count"] == 60
+    assert len(result["friends"]) == 50
+    assert result["next_offset"] == 50
+    assert "_condensed" not in result
+
+    second = await executor(
+        "list_contacts",
+        {"scope": "friends", "limit": 50, "offset": result["next_offset"]},
+    )
+    assert len(second["friends"]) == 10
+    assert "next_offset" not in second
 
 
 @pytest.mark.asyncio

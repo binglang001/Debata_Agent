@@ -18,7 +18,12 @@ logger = logging.getLogger(__name__)
     no_feedback=True,
 )
 async def no_action(args: NoActionArgs, ctx: ToolContext) -> dict:
-    return {"ok": True, "no_action": True}
+    return {
+        "ok": True,
+        "status": "done",
+        "brief": "本轮不需要执行任何操作。",
+        "no_action": True,
+    }
 
 
 @tool(
@@ -36,7 +41,12 @@ async def no_action(args: NoActionArgs, ctx: ToolContext) -> dict:
 )
 async def schedule_wakeup(args: ScheduleWakeupArgs, ctx: ToolContext) -> dict:
     if ctx.wakeup_cb is None:
-        return {"ok": False, "error": "未注册唤醒回调"}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": "设置定时任务失败：未注册唤醒回调。",
+            "error": "未注册唤醒回调",
+        }
 
     target = None
     if args.target_type and args.target_id is not None:
@@ -47,6 +57,8 @@ async def schedule_wakeup(args: ScheduleWakeupArgs, ctx: ToolContext) -> dict:
     if args.mode == "send_message" and target is None:
         return {
             "ok": False,
+            "status": "failed",
+            "brief": "设置定时发送失败：缺少发送目标。",
             "error": "mode=send_message 需要 target_type/target_id，或当前会话默认回复目标",
         }
 
@@ -65,12 +77,25 @@ async def schedule_wakeup(args: ScheduleWakeupArgs, ctx: ToolContext) -> dict:
         )
     except Exception as e:  # noqa: BLE001
         logger.exception(f"schedule_wakeup 回调失败: {e}")
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "status": "failed",
+            "brief": f"设置定时任务失败：{e}",
+            "error": str(e),
+        }
 
     return {
         "ok": True,
+        "status": "done",
+        "brief": f"已设置 {args.delay_seconds} 秒后定时任务。",
         "scheduled": True,
         "info": f"已设置 {args.delay_seconds} 秒后定时任务",
+        "data": {
+            "delay_seconds": args.delay_seconds,
+            "mode": args.mode,
+            "target": target,
+            "message_text": args.message_text if args.mode == "send_message" else None,
+        },
     }
 
 

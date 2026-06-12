@@ -1,38 +1,56 @@
 """RAG 核心功能 unit test。
 
-只测 Claude 实装的部分：
+覆盖：
     - cosine_similarity 数学正确
-    - RagStore CRUD + reload
-    - ImportantMemoryManager attach_rag 后 save 自动索引 + retrieve_for_query 召回
+    - 旧 RagStore CRUD + reload
+    - SQLite 向量库持久化
+    - RAG 会话历史后台索引 + 按会话召回
 
 OpenAICompatEmbeddingService 实装由 DS 完成，留 stub 测试。
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from pathlib import Path
 
 import httpx
 import pytest
 
-from memory.important import ImportantMemoryManager
+from memory.rag_memory import RagMemoryService, SqliteVectorStore
 from memory.rag_store import RagEntry, RagStore, cosine_similarity
 
 
 class _FakeEmbedding:
-    """测试用假 embedding：md5 前 6 字节作伪向量。同 text 必相同。"""
+    """测试用假 embedding：按关键词生成稳定向量，便于断言召回。"""
+
+    def __init__(self) -> None:
+        self.batch_calls = 0
+        self.one_calls = 0
 
     async def embed_one(self, text: str) -> list[float]:
-        h = hashlib.md5(text.encode("utf-8")).digest()[:6]
-        return [b / 255.0 for b in h]
+        self.one_calls += 1
+        return self._vec(text)
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        self.batch_calls += 1
+        return [self._vec(text) for text in texts]
 
     @property
     def dimension(self) -> int:
-        return 6
+        return 3
 
     async def aclose(self) -> None:
         pass
+
+    def _vec(self, text: str) -> list[float]:
+        if "猫" in text:
+            return [1.0, 0.0, 0.0]
+        if "茶会" in text:
+            return [0.0, 1.0, 0.0]
+        h = hashlib.md5(text.encode("utf-8")).digest()[0]
+        return [0.0, 0.0, h / 255.0]
 
 
 def test_cosine_basic():
@@ -104,129 +122,75 @@ async def test_rag_store_crud(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_important_with_rag(tmp_path: Path):
-    im = ImportantMemoryManager(tmp_path / "imp.json")
-    await im.load()
-    assert not im.rag_enabled
+async def test_sqlite_vector_store_persists_and_filters_by_conversation(tmp_path: Path):
+    from memory.rag_memory import RagDocument
 
-    # 未 attach 时 retrieve 走 text() 全部
-    await im.save("用户喜欢猫")
-    out = await im.retrieve_for_query("不相关", top_k=1)
-    assert "用户喜欢猫" in out
-
-    # attach RAG
-    rs = RagStore(tmp_path / "rag.jsonl")
-    await rs.load()
-    im.attach_rag(_FakeEmbedding(), rs)
-    assert im.rag_enabled
-
-    # 再保存：会异步索引
-    await im.save("约定每周汇报")
-    assert len(rs) == 1  # 只有 attach 后的新增被索引（这是预期：attach 前的旧条目不重建索引）
-
-    # 召回：完全相同 query 应命中
-    out = await im.retrieve_for_query("约定每周汇报", top_k=1)
-    assert "约定每周汇报" in out
-    assert "RAG 召回" in out
-
-    # 空 query 退回 text()
-    out2 = await im.retrieve_for_query("", top_k=3)
-    assert "RAG 召回" not in out2
-
-
-@pytest.mark.asyncio
-async def test_rag_retrieve_filters_by_scope_and_keeps_pinned(tmp_path: Path):
-    counter = [0]
-
-    def now() -> str:
-        counter[0] += 1
-        return f"T{counter[0]:04d}"
-
-    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=now)
-    await im.load()
-    rs = RagStore(tmp_path / "rag.jsonl")
-    await rs.load()
-    im.attach_rag(_FakeEmbedding(), rs)
-
-    await im.save("群 B 的茶会安排", scope="group:B")
-    await im.save("群 C 的茶会安排", scope="group:C")
-    await im.save("任何场景都要保留的置顶事项", scope="group:C", pinned=True)
-
-    out = await im.retrieve_for_query("茶会安排", top_k=5, conversation_id="group:B")
-
-    assert "群 B 的茶会安排" in out
-    assert "任何场景都要保留的置顶事项" in out
-    assert "群 C 的茶会安排" not in out
-
-
-@pytest.mark.asyncio
-async def test_rag_delete_propagates(tmp_path: Path):
-    # 用递增 timestamp 模拟，避免默认 now_fn 秒级精度让两条记录同 id
-    counter = [0]
-    def now() -> str:
-        counter[0] += 1
-        return f"T{counter[0]:04d}"
-
-    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=now)
-    await im.load()
-    rs = RagStore(tmp_path / "rag.jsonl")
-    await rs.load()
-    im.attach_rag(_FakeEmbedding(), rs)
-
-    await im.save("关于猫的事")
-    await im.save("关于狗的事")
-    assert len(rs) == 2
-
-    n = await im.delete_by_keyword("猫")
-    assert n == 1
-    # RAG 索引也应同步删除
-    assert len(rs) == 1
-    assert "狗" in rs.all_entries()[0].text
-
-
-@pytest.mark.asyncio
-async def test_keyword_force_save_indexes_rag(tmp_path: Path):
-    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=lambda: "T-keyword")
-    await im.load()
-    rs = RagStore(tmp_path / "rag.jsonl")
-    await rs.load()
-    im.attach_rag(_FakeEmbedding(), rs)
-
-    result = await im.force_save_from_keyword("请记住用户喜欢茶", keywords=["请记住"])
-
-    assert result["saved"] is True
-    assert len(rs) == 1
-    entry = rs.all_entries()[0]
-    assert entry.id == "T-keyword"
-    assert entry.text == "用户喜欢茶"
-
-
-@pytest.mark.asyncio
-async def test_replace_all_rebuilds_rag_index(tmp_path: Path):
-    counter = [0]
-
-    def now() -> str:
-        counter[0] += 1
-        return f"T{counter[0]:04d}"
-
-    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=now)
-    await im.load()
-    rs = RagStore(tmp_path / "rag.jsonl")
-    await rs.load()
-    im.attach_rag(_FakeEmbedding(), rs)
-
-    await im.save("旧记忆 A")
-    await im.save("旧记忆 B")
-    assert len(rs) == 2
-
-    await im.replace_all(
+    store = SqliteVectorStore(tmp_path / "rag.sqlite3")
+    await store.load()
+    await store.upsert_many(
         [
-            {"timestamp": "T-new", "content": "新记忆"},
-            {"timestamp": "T-empty", "content": ""},
+            RagDocument(
+                id="a",
+                text="用户喜欢猫",
+                vector=[1.0, 0.0, 0.0],
+                conversation_id="private:1",
+                role="user",
+            ),
+            RagDocument(
+                id="b",
+                text="群里的茶会安排",
+                vector=[0.0, 1.0, 0.0],
+                conversation_id="group:2",
+                role="assistant",
+            ),
         ]
     )
 
-    entries = rs.all_entries()
-    assert len(entries) == 1
-    assert entries[0].id == "T-new"
-    assert entries[0].text == "新记忆"
+    reloaded = SqliteVectorStore(tmp_path / "rag.sqlite3")
+    await reloaded.load()
+    assert len(reloaded) == 2
+    hits = reloaded.top_k([1.0, 0.0, 0.0], k=3, conversation_id="private:1")
+    assert [hit.document.id for hit in hits] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_rag_memory_indexes_history_in_background(tmp_path: Path):
+    embedding = _FakeEmbedding()
+    store = SqliteVectorStore(tmp_path / "rag.sqlite3")
+    await store.load()
+    service = RagMemoryService(embedding=embedding, store=store, top_k=3)
+    await service.load()
+
+    await service.enqueue_records(
+        [
+            {
+                "role": "user",
+                "content": "用户说自己喜欢猫",
+                "conversation_id": "private:1",
+                "metadata": {"timestamp": "2026-06-01 10:00:00"},
+            },
+            {
+                "role": "system",
+                "content": "系统记录不进入 RAG",
+                "conversation_id": "private:1",
+            },
+            {
+                "role": "assistant",
+                "content": "群里的茶会安排在周五",
+                "conversation_id": "group:2",
+            },
+        ]
+    )
+
+    assert embedding.batch_calls == 0
+    await asyncio.wait_for(service._queue.join(), timeout=1.0)
+    assert embedding.batch_calls == 1
+
+    out = await service.retrieve_for_query("猫", conversation_id="private:1")
+    assert "相关历史 · RAG 召回" in out
+    assert "用户说自己喜欢猫" in out
+    assert "茶会安排" not in out
+
+    out_other = await service.retrieve_for_query("猫", conversation_id="private:404")
+    assert out_other == ""
+    await service.shutdown()

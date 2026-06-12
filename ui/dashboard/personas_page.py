@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -12,17 +13,20 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
-from agents.persona_gen_agent import PersonaGenResult, render_persona_file
+from agents.persona_gen_agent import PersonaBrief, PersonaGenAgent, PersonaGenResult, render_persona_file
 from agents.persona_import import (
     PersonaImportError,
     copy_persona_dir,
@@ -88,6 +92,11 @@ class PersonasPage(QWidget):
         self._duplicate_btn.clicked.connect(self._on_duplicate)
         actions.addWidget(self._duplicate_btn)
 
+        self._modify_btn = QPushButton("修改")
+        self._modify_btn.setProperty("role", "secondary")
+        self._modify_btn.clicked.connect(self._on_modify)
+        actions.addWidget(self._modify_btn)
+
         self._export_btn = QPushButton(DASHBOARD_COPY["personas.export_button"])
         self._export_btn.setProperty("role", "secondary")
         self._export_btn.clicked.connect(self._on_export)
@@ -142,6 +151,7 @@ class PersonasPage(QWidget):
         return out
 
     def refresh(self) -> None:
+        selected = self._selected()
         self._list.clear()
         for name in self._list_personas():
             tags = []
@@ -154,6 +164,11 @@ class PersonasPage(QWidget):
             item = QListWidgetItem(line)
             item.setData(Qt.ItemDataRole.UserRole, name)
             self._list.addItem(item)
+        target = selected or self._active_name
+        if target:
+            self._select_name(target)
+        elif self._list.count() > 0:
+            self._list.setCurrentRow(0)
         self._update_button_states()
 
     def _select_name(self, name: str) -> None:
@@ -175,6 +190,7 @@ class PersonasPage(QWidget):
         self._create_btn.setEnabled(self._runtime is not None)
         self._activate_btn.setEnabled(has and name != self._active_name)
         self._duplicate_btn.setEnabled(has)
+        self._modify_btn.setEnabled(has)
         self._export_btn.setEnabled(has)
         # 内置 / 当前激活不允许删除
         self._delete_btn.setEnabled(
@@ -260,7 +276,7 @@ class PersonasPage(QWidget):
         target.mkdir(parents=True, exist_ok=True)
         (target / "__init__.py").touch(exist_ok=True)
         result = PersonaGenResult(persona_prompt=p.generated_xml, display_name=p.active)
-        admins = _admin_entries(context.admin_qq, context.admin_name)
+        admins = _admin_entries_from_brief(p.brief) or _admin_entries(context.admin_qq, context.admin_name)
         file_text = (
             render_persona_file(result, p.brief, admins=admins)
             if p.brief
@@ -268,6 +284,58 @@ class PersonasPage(QWidget):
         )
         (target / "persona_prompt.py").write_text(file_text, encoding="utf-8")
         return p.active
+
+    def _on_modify(self) -> None:
+        name = self._selected()
+        if not name:
+            return
+        context = self._build_creator_context()
+        if context is None:
+            return
+        persona_file = self._personas_dir / name / "persona_prompt.py"
+        try:
+            prompt = _extract_persona_prompt(persona_file)
+        except Exception as e:  # noqa: BLE001
+            show_message(self, "无法读取", str(e), is_danger=True)
+            return
+        dlg = _PersonaRefineDialog(name, prompt, context, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated = dlg.result_prompt
+        if not updated.strip():
+            return
+        if not show_message(
+            self,
+            "确认覆盖？",
+            f"将覆盖角色「{name}」的人格文件。覆盖前会自动备份原文件。",
+            confirm_text="覆盖",
+            cancel_text="取消",
+            is_danger=True,
+        ):
+            return
+        try:
+            self._backup_persona_file(persona_file)
+            brief = PersonaBrief(name=name)
+            result = PersonaGenResult(persona_prompt=updated, display_name=name)
+            admins = _read_existing_admins(persona_file)
+            gender = _read_existing_gender(persona_file)
+            if gender:
+                brief.gender = gender
+            persona_file.write_text(render_persona_file(result, brief, admins=admins), encoding="utf-8")
+            show_message(self, "已修改", f"已覆盖角色「{name}」。重启 Debata 后生效。")
+            self.refresh()
+            self._select_name(name)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("修改人格失败")
+            show_message(self, "未能完成", str(e), is_danger=True)
+
+    def _backup_persona_file(self, persona_file: Path) -> Path:
+        backup_dir = persona_file.parent.parent / ".backups" / persona_file.parent.name
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        target = backup_dir / f"persona_prompt_{ts}.py"
+        shutil.copy2(persona_file, target)
+        return target
 
     def _on_activate(self) -> None:
         name = self._selected()
@@ -409,7 +477,12 @@ class _PersonaCreatorDialog(FramelessDialog):
         self._creator.invalid_input.connect(
             lambda msg: show_message(self, "还没完成", msg, is_danger=True)
         )
-        self.body_layout().addWidget(self._creator, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(self._creator)
+        self.body_layout().addWidget(scroll, 1)
 
         actions = QHBoxLayout()
         actions.addStretch(1)
@@ -429,6 +502,133 @@ class _PersonaCreatorDialog(FramelessDialog):
             self.accept()
 
 
+class _PersonaRefineDialog(FramelessDialog):
+    """修改已有人格。只输入调整要求，结果确认后由调用方覆盖文件。"""
+
+    def __init__(
+        self,
+        persona_name: str,
+        current_prompt: str,
+        context: WizardContext,
+        parent=None,
+    ) -> None:
+        super().__init__(f"修改角色 · {persona_name}", parent)
+        self.setMinimumSize(900, 680)
+        self.result_prompt = ""
+        self._persona_name = persona_name
+        self._current_prompt = current_prompt
+        self._context = context
+        self._agent: PersonaGenAgent | None = self._build_persona_agent()
+
+        title = QLabel(f"当前角色：{persona_name}")
+        title.setProperty("role", "title-3")
+        self.body_layout().addWidget(title)
+
+        hint = QLabel("写明要调整的人格方向。请客观描述修改要求，不要像聊天一样对角色说话。")
+        hint.setProperty("role", "secondary")
+        hint.setWordWrap(True)
+        self.body_layout().addWidget(hint)
+
+        self._feedback = QPlainTextEdit()
+        self._feedback.setPlaceholderText("例如：说话更冷一点，但熟人面前会多解释；减少客服口吻；保留偶尔长段解释。")
+        self._feedback.setFixedHeight(100)
+        self.body_layout().addWidget(self._feedback)
+
+        self._status = QLabel("")
+        self._status.setProperty("role", "secondary")
+        self.body_layout().addWidget(self._status)
+
+        self._preview = QPlainTextEdit()
+        self._preview.setPlainText(current_prompt)
+        self._preview.setReadOnly(True)
+        self.body_layout().addWidget(self._preview, 1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setProperty("role", "secondary")
+        cancel_btn.clicked.connect(self.reject)
+        row.addWidget(cancel_btn)
+        self._generate_btn = QPushButton("生成修改版")
+        self._generate_btn.setProperty("role", "secondary")
+        self._generate_btn.clicked.connect(self._on_generate)
+        row.addWidget(self._generate_btn)
+        self._save_btn = QPushButton("使用此版本")
+        self._save_btn.setProperty("role", "primary")
+        self._save_btn.setEnabled(False)
+        self._save_btn.clicked.connect(self._on_accept)
+        row.addWidget(self._save_btn)
+        self.body_layout().addLayout(row)
+
+    def _build_persona_agent(self) -> PersonaGenAgent | None:
+        from app_config.schema import AgentConfig
+        from providers import AnthropicProvider, OpenAICompatProvider
+
+        m = self._context.main
+        if not m.api_key:
+            return None
+        base_url = m.base_url
+        if not base_url and m.preset != "custom":
+            from ui.wizard.step_views.main_model_custom import _PRESET_DEFAULTS
+
+            base_url = _PRESET_DEFAULTS.get(m.preset, {}).get("url", "")
+        if not base_url:
+            return None
+        if m.protocol == "anthropic":
+            provider = AnthropicProvider("dashboard_persona_refine", base_url=base_url, api_key=m.api_key, timeout=180.0)
+        else:
+            provider = OpenAICompatProvider("dashboard_persona_refine", base_url=base_url, api_key=m.api_key, timeout=180.0)
+        cfg = AgentConfig(
+            provider=m.preset or "deepseek",
+            model=m.model,
+            temperature=m.temperature,
+            top_p=m.top_p,
+            max_tokens=max(8192, m.max_tokens),
+            first_token_timeout_seconds=60.0,
+        )
+        return PersonaGenAgent(provider, cfg)
+
+    def _on_generate(self) -> None:
+        import asyncio
+
+        feedback = self._feedback.toPlainText().strip()
+        if not feedback:
+            self._status.setText("先写修改要求")
+            return
+        if self._agent is None:
+            self._status.setText("人格生成模型未就绪")
+            return
+        self._status.setText("正在生成修改版……")
+        self._generate_btn.setEnabled(False)
+        self._save_btn.setEnabled(False)
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self._status.setText("事件循环未就绪")
+            self._generate_btn.setEnabled(True)
+            return
+
+        async def _do() -> None:
+            try:
+                result = await self._agent.refine(self.result_prompt or self._current_prompt, feedback)
+                self.result_prompt = result.persona_prompt
+                self._preview.setPlainText(self.result_prompt)
+                self._status.setText("修改版已生成。确认后会覆盖当前人格文件。")
+                self._save_btn.setEnabled(True)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("修改人格生成失败", exc_info=True)
+                self._status.setText(f"未能完成：{e}")
+            finally:
+                self._generate_btn.setEnabled(True)
+
+        loop.create_task(_do())
+
+    def _on_accept(self) -> None:
+        if self.result_prompt.strip():
+            self.accept()
+
+
 def _admin_entries(admin_qq: str, admin_name: str) -> list[dict[str, object]]:
     if not admin_qq:
         return []
@@ -438,19 +638,77 @@ def _admin_entries(admin_qq: str, admin_name: str) -> list[dict[str, object]]:
     return [entry]
 
 
-def _render_minimal_persona(name: str, xml: str, admins: list[dict[str, object]] | None = None) -> str:
-    import json
+def _admin_entries_from_brief(brief: PersonaBrief | None) -> list[dict[str, object]]:
+    if brief is None:
+        return []
+    entries: list[dict[str, object]] = []
+    for item in brief.admins:
+        qq = str(item.get("qq", "")).strip()
+        name = str(item.get("name", "")).strip()
+        relation = str(item.get("relation", "")).strip()
+        if not qq:
+            continue
+        entry: dict[str, object] = {"qq": int(qq), "role": "owner"}
+        if name:
+            entry["name"] = name
+        if relation:
+            entry["relation"] = relation
+        entries.append(entry)
+    if entries:
+        return entries
+    return _admin_entries(brief.admin_qq, brief.admin_name)
 
+
+def _extract_persona_prompt(persona_file: Path) -> str:
+    module = _load_persona_module(persona_file)
+    prompt = getattr(module, "PERSONA_PROMPT", "")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError(f"{persona_file} 缺少 PERSONA_PROMPT")
+    return prompt.strip()
+
+
+def _read_existing_admins(persona_file: Path) -> list[dict[str, object]]:
+    module = _load_persona_module(persona_file)
+    vars_obj = getattr(module, "PERSONA_VARS", {})
+    if not isinstance(vars_obj, dict):
+        return []
+    admins = vars_obj.get("admins", [])
+    return list(admins) if isinstance(admins, list) else []
+
+
+def _read_existing_gender(persona_file: Path) -> str:
+    module = _load_persona_module(persona_file)
+    vars_obj = getattr(module, "PERSONA_VARS", {})
+    if not isinstance(vars_obj, dict):
+        return ""
+    gender = vars_obj.get("gender", "")
+    return str(gender) if gender else ""
+
+
+def _load_persona_module(persona_file: Path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(f"_dashboard_persona_{persona_file.parent.name}", persona_file)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"无法加载 {persona_file}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _render_minimal_persona(name: str, xml: str, admins: list[dict[str, object]] | None = None) -> str:
     safe = xml.replace("'''", "\\'\\'\\'")
-    admins_text = json.dumps(admins or [], ensure_ascii=False, indent=4)
-    admins_text = "\n".join("    " + line for line in admins_text.splitlines())
+    vars_text = _format_python_literal({"name": name, "admins": admins or []})
     return (
         '"""自动生成的人格档案。"""\n\n'
         "PERSONA_PROMPT = '''\n"
         f"{safe}\n"
         "'''\n\n"
-        "PERSONA_VARS = {\n"
-        f"    \"name\": \"{name}\",\n"
-        f"    \"admins\": {admins_text},\n"
-        "}\n"
+        f"PERSONA_VARS = {vars_text}\n"
     )
+
+
+def _format_python_literal(value: Any) -> str:
+    import pprint
+
+    return pprint.pformat(value, width=96, sort_dicts=False)

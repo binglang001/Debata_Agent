@@ -26,6 +26,7 @@ import asyncio
 import logging
 import os
 import signal
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -78,11 +79,13 @@ class Runtime:
         self.weather: Any = None
         self.embedding_service: Any = None
         self.rag_store: Any = None
+        self.rag_memory: Any = None
         self.plugin_manager: Any = None
         self.asr: Any = None
         self.tts: Any = None
         self.provider_health: dict[str, Any] = {}
         self.feature_failures: dict[str, str] = {}
+        self._provider_health_task: asyncio.Task | None = None
         self._shutdown_started = False
         self._shutdown_complete = False
 
@@ -96,8 +99,10 @@ class Runtime:
         self._shutdown_started = False
         self._shutdown_complete = False
         logger.info("Runtime 启动中...")
+        start_t0 = time.monotonic()
 
         # ----- 1. 路径与配置 -----
+        stage_t0 = time.monotonic()
         from app_config import AppPaths, SecretsManager, load_config
 
         self.paths = AppPaths(project_root=self.project_root, config_file=self._config_file)
@@ -115,8 +120,10 @@ class Runtime:
         except Exception:
             logger.warning(f"无效的日志级别: {self.config.app.log_level}，回退 INFO")
         logger.debug(f"配置已加载（persona={self.config.persona.active}）")
+        logger.debug("Runtime 阶段完成：配置和密钥 %.2fs", time.monotonic() - stage_t0)
 
         # ----- 2. 人格 -----
+        stage_t0 = time.monotonic()
         from agents import list_available_personas, load_persona
 
         active = self.config.persona.active
@@ -135,8 +142,10 @@ class Runtime:
                 f"然后重新启动。"
             ) from None
         logger.debug(f"人格已加载: {self.persona.name}")
+        logger.debug("Runtime 阶段完成：人格加载 %.2fs", time.monotonic() - stage_t0)
 
         # ----- 3. 记忆 -----
+        stage_t0 = time.monotonic()
         from memory import (
             ArchiveStore,
             HistoryManager,
@@ -158,8 +167,10 @@ class Runtime:
         logger.debug(
             f"记忆已加载（history={self._hist_len} 条，important={len(self.important.items())} 条）"
         )
+        logger.debug("Runtime 阶段完成：记忆加载 %.2fs", time.monotonic() - stage_t0)
 
         # ----- 4. Providers（用 ProviderRegistry 统一管理便于 close_all）-----
+        stage_t0 = time.monotonic()
         from providers import ProviderRegistry
 
         self.provider_registry = ProviderRegistry()
@@ -170,8 +181,10 @@ class Runtime:
             for name in self.provider_registry.list_names()
         }
         logger.debug(f"Provider 已实例化: {list(self.providers.keys())}")
+        logger.debug("Runtime 阶段完成：Provider 构造 %.2fs", time.monotonic() - stage_t0)
 
         # ----- 5. Agents -----
+        stage_t0 = time.monotonic()
         from agents import ChatAgent, ProactiveRouterAgent, SummaryAgent
 
         chat_cfg = self.config.agents.chat
@@ -205,9 +218,11 @@ class Runtime:
                 self.config.behavior.summarize,
             )
 
-        await self._check_provider_health()
+        self._schedule_provider_health_check()
+        logger.debug("Runtime 阶段完成：Agent 构造 %.2fs", time.monotonic() - stage_t0)
 
         # ----- 6. Features service（按 enabled 实例化）-----
+        stage_t0 = time.monotonic()
         from features import VisionService, WeatherService, WebSearchService
 
         if self.config.features.vision.enabled:
@@ -256,11 +271,15 @@ class Runtime:
         # ----- 6.5 RAG 长期记忆（embedding + 向量存储）-----
         if self.config.features.long_term_memory.mode == "rag":
             await self._setup_rag(mem_dir)
+        logger.debug("Runtime 阶段完成：Feature 服务 %.2fs", time.monotonic() - stage_t0)
 
         # ----- 6.6 插件扫描（ASR / TTS / 本地 embedding，按需）-----
+        stage_t0 = time.monotonic()
         await self._setup_plugins()
+        logger.debug("Runtime 阶段完成：插件扫描/启用 %.2fs", time.monotonic() - stage_t0)
 
         # ----- 7. Adapter -----
+        stage_t0 = time.monotonic()
         from adapters.napcat.adapter import NapCatAdapter
 
         if not self.config.adapters:
@@ -268,11 +287,14 @@ class Runtime:
         adapter_name, adapter_cfg = next(iter(self.config.adapters.items()))
         self.adapter = NapCatAdapter.from_config(adapter_name, adapter_cfg, self.secrets)
         logger.debug(f"Adapter 已实例化: {adapter_name}")
+        logger.debug("Runtime 阶段完成：Adapter 构造 %.2fs", time.monotonic() - stage_t0)
 
         # ----- 8. Tools -----
+        stage_t0 = time.monotonic()
         from tools import build_default_registry
 
         self.tool_registry = build_default_registry(self.config)
+        logger.debug("Runtime 阶段完成：工具注册 %.2fs", time.monotonic() - stage_t0)
 
         # 启动摘要：一行涵盖人格/记忆/provider/adapter/tools
         logger.info(
@@ -334,6 +356,7 @@ class Runtime:
             weather=self.weather,
             asr=self.asr,
             tts=self.tts,
+            rag_memory=self.rag_memory,
         )
         # 回填 wakeup 双向依赖
         self.wakeup_scheduler._on_fire = self.pipeline.run_wakeup_turn
@@ -368,10 +391,12 @@ class Runtime:
         )
 
         # ----- 15. 启动 adapter + proactive loop -----
+        stage_t0 = time.monotonic()
         await self.adapter.start()
         await self.proactive_loop.start()
+        logger.debug("Runtime 阶段完成：Adapter/主动循环启动 %.2fs", time.monotonic() - stage_t0)
 
-        logger.info("Runtime 启动完成")
+        logger.info("Runtime 启动完成（耗时 %.1fs）", time.monotonic() - start_t0)
 
     def _model_context_length(self, provider_id: str, model_id: str) -> int | None:
         """从 provider preset 中读取模型上下文硬上限，找不到则返回 None。"""
@@ -436,9 +461,16 @@ class Runtime:
                     timeout=2.0,
                 )
 
+        if self._provider_health_task is not None and not self._provider_health_task.done():
+            self._provider_health_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._provider_health_task
+
         async def _close(label: str, coro_factory, timeout: float = 8.0) -> None:
+            t0 = time.monotonic()
             try:
                 await asyncio.wait_for(coro_factory(), timeout=timeout)
+                logger.debug("关闭 %s 完成（%.2fs）", label, time.monotonic() - t0)
             except asyncio.TimeoutError:
                 logger.warning(f"关闭 {label} 超时，跳过")
             except Exception as e:
@@ -454,6 +486,8 @@ class Runtime:
             await _close("wakeup_scheduler", self.wakeup_scheduler.cancel_all)
         if self.pipeline is not None:
             await _close("pipeline", self.pipeline.shutdown)
+        if self.rag_memory is not None:
+            await _close("rag_memory", self.rag_memory.shutdown)
         if self.embedding_service is not None:
             await _close("embedding_service", self.embedding_service.aclose)
         if self.asr is not None:
@@ -484,9 +518,9 @@ class Runtime:
             return set()
 
     async def _setup_rag(self, mem_dir) -> None:
-        """RAG 模式装配 EmbeddingService + RagStore，并 attach 到 important。
+        """RAG 模式装配 EmbeddingService + 会话向量检索服务。
 
-        失败仅 warn，不阻塞主流程（pipeline 会自动 fallback 到 text() 全部注入）。
+        失败仅 warn，不阻塞主流程。RAG 模式不再复用 important.json。
         """
         ecfg = self.config.features.embedding
         if not ecfg.enabled:
@@ -504,11 +538,20 @@ class Runtime:
                         model_dir = "data/models/embedding/all-MiniLM-L6-v2"
                 model_dir = self._resolve_project_path(model_dir)
                 self.embedding_service = get_local_service(model_dir)
-                from memory.rag_store import RagStore
+                from memory import RagMemoryService, SqliteVectorStore
 
-                self.rag_store = RagStore(mem_dir / "rag.jsonl")
+                self.rag_store = SqliteVectorStore(mem_dir / "rag_memory.sqlite3")
                 await self.rag_store.load()
-                self.important.attach_rag(self.embedding_service, self.rag_store)
+                self.rag_memory = RagMemoryService(
+                    embedding=self.embedding_service,
+                    store=self.rag_store,
+                    top_k=self.config.features.long_term_memory.rag_top_k,
+                )
+                await self.rag_memory.load()
+                self.history.on_append(self.rag_memory.enqueue_records)
+                archive_records = await self.archive.records()
+                history_records = await self.history.records()
+                self.rag_memory.schedule_bootstrap([*archive_records, *history_records])
                 self._fire_warmup("embedding", self.embedding_service)
                 logger.info(
                     f"RAG 已就位（本地 embedding）：quality={ecfg.local_quality}, "
@@ -519,6 +562,7 @@ class Runtime:
                 self._disable_feature_after_failure("embedding", e)
                 self.embedding_service = None
                 self.rag_store = None
+                self.rag_memory = None
         elif ecfg.type == "api":
             if not ecfg.provider or ecfg.provider not in self.providers:
                 logger.warning(
@@ -548,10 +592,20 @@ class Runtime:
                     api_key=api_key or "",
                     model=ecfg.api_model or "text-embedding-v1",
                 )
-                from memory.rag_store import RagStore
-                self.rag_store = RagStore(mem_dir / "rag.jsonl")
+                from memory import RagMemoryService, SqliteVectorStore
+
+                self.rag_store = SqliteVectorStore(mem_dir / "rag_memory.sqlite3")
                 await self.rag_store.load()
-                self.important.attach_rag(self.embedding_service, self.rag_store)
+                self.rag_memory = RagMemoryService(
+                    embedding=self.embedding_service,
+                    store=self.rag_store,
+                    top_k=self.config.features.long_term_memory.rag_top_k,
+                )
+                await self.rag_memory.load()
+                self.history.on_append(self.rag_memory.enqueue_records)
+                archive_records = await self.archive.records()
+                history_records = await self.history.records()
+                self.rag_memory.schedule_bootstrap([*archive_records, *history_records])
                 logger.info(
                     f"RAG 已就位：provider={ecfg.provider}, model={ecfg.api_model}, "
                     f"索引条目={len(self.rag_store)}"
@@ -561,6 +615,7 @@ class Runtime:
                 self._disable_feature_after_failure("embedding", e)
                 self.embedding_service = None
                 self.rag_store = None
+                self.rag_memory = None
 
     async def _setup_plugins(self) -> None:
         """扫描 plugins/ 并按 features.asr/tts 决定要不要 build。
@@ -750,6 +805,34 @@ class Runtime:
             return_exceptions=True,
         )
 
+    def _schedule_provider_health_check(self) -> None:
+        """后台做 provider 健康检查，不阻塞 Runtime 启动和 Dashboard 创建。"""
+        if not self.providers:
+            return
+        try:
+            from providers.health import ProviderHealth
+
+            for name in self.providers:
+                self.provider_health[name] = ProviderHealth("checking", "检测中")
+        except Exception:
+            logger.debug("初始化 provider_health 状态失败", exc_info=True)
+        if self._provider_health_task is not None and not self._provider_health_task.done():
+            return
+        self._provider_health_task = asyncio.create_task(
+            self._check_provider_health(),
+            name="provider-health-check",
+        )
+        self._provider_health_task.add_done_callback(self._on_provider_health_done)
+
+    @staticmethod
+    def _on_provider_health_done(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Provider 健康检查后台任务失败：%s", e, exc_info=True)
+
     def _provider_chat_model_map(self) -> dict[str, str]:
         result: dict[str, str] = {}
         for _name, agent in self.config._iter_agents():
@@ -825,6 +908,7 @@ class Runtime:
                 self.config.features.long_term_memory.mode = "file"
                 self.embedding_service = None
                 self.rag_store = None
+                self.rag_memory = None
                 if self.important is not None:
                     self.important._embedding = None
                     self.important._rag_store = None

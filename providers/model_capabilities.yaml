@@ -1,0 +1,744 @@
+# ============================================================================
+# Diana 模型与提供商能力矩阵
+# ============================================================================
+# 生成日期: 2026-06-02
+# 用途:
+#   1. 向导/设置页模型选择下拉、能力校验、默认推荐
+#   2. 运行时 context_length 推导、vision/embedding provider 自动匹配
+#   3. 新用户默认模型选择
+#
+# 字段约定:
+#   capabilities:
+#     chat         - 基础文本对话
+#     tool_call    - 函数调用 / 工具使用
+#     reasoning    - 思考/推理（extended thinking / reasoning_effort / thinking budget）
+#     vision       - 图像/多模态输入
+#     embedding    - 向量嵌入（通常独立模型，不与 chat 模型共用）
+#   context_length - 最大上下文窗口（tokens）
+#   status:
+#     recommended  - 新用户默认推荐（性价比 + 能力均衡）
+#     active       - 可用，适合特定场景
+#     deprecated   - 已停用或即将下线，仅兼容旧配置
+#     legacy       - 官方下线，仅保留 ID 供历史配置迁移提示
+#
+# 视觉模型复用规则:
+#   - 若主模型本身 supports_vision，向导默认"复用主模型"选项可用
+#   - 若主模型不支持 vision，向导引导用户选择独立 vision provider
+#
+# RAG / Embedding 默认规则:
+#   - Embedding 模型与 chat 模型是独立模型，不能默认复用主 chat provider
+#   - 火山引擎 embedding 默认模型: doubao-embedding-vision-251215
+#   - OpenAI embedding 推荐: text-embedding-3-small
+#   - 其余 provider 若无 embedding 模型，RAG 默认选择独立 embedding provider
+#
+# 未确认能力标记:
+#   - 若官方文档未明确某项能力，标记为 "unknown"，不猜测 true/false
+# ============================================================================
+
+providers:
+
+  # =========================================================================
+  # Anthropic Claude
+  # =========================================================================
+  anthropic:
+    display_name: Anthropic Claude
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    has_embedding: false
+    embedding_note: "Anthropic 不提供 embedding API，RAG 需选其他 provider"
+    vision_reuse: true
+    vision_reuse_note: "所有 Claude 模型原生支持 vision，可直接复用主模型"
+    models:
+      - id: claude-opus-4-8
+        display_name: Claude Opus 4.8
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1000000
+        status: recommended
+        notes: "2026-05-28 发布，当前最强 Claude；动态工作流 + 1000 子 Agent；Fast Mode 降价 3×"
+      - id: claude-sonnet-4-6
+        display_name: Claude Sonnet 4.6
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1000000
+        status: recommended
+        notes: "最佳性价比默认模型；日常生产首选"
+      - id: claude-haiku-4-5-20251001
+        display_name: Claude Haiku 4.5
+        capabilities: [chat, tool_call, vision]
+        context_length: 200000
+        status: active
+        notes: "轻量快速；不支持 extended thinking；高吞吐分类/提取场景"
+
+  # =========================================================================
+  # DeepSeek
+  # =========================================================================
+  deepseek:
+    display_name: DeepSeek
+    protocol: openai_compat
+    base_url: https://api.deepseek.com/v1
+    reasoning_style: thinking_extra_body
+    has_embedding: false
+    embedding_note: "DeepSeek 不提供 embedding API，RAG 需选其他 provider"
+    vision_reuse: false
+    vision_reuse_note: "DeepSeek 无视觉模型，vision 需独立 provider"
+    models:
+      - id: deepseek-v4-flash
+        display_name: DeepSeek V4 Flash（推荐 · 1M 上下文）
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 1000000
+        status: recommended
+        notes: "1M 上下文；缓存命中极便宜；中文表现好；推荐新用户默认"
+      - id: deepseek-v4-pro
+        display_name: DeepSeek V4 Pro（重推理）
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 1000000
+        status: active
+        notes: "MoE 1.6T/49B active；512K~1M 上下文；FP4 量化；重推理场景"
+      - id: deepseek-chat
+        display_name: DeepSeek Chat（legacy，2026-07-24 后停用）
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 128000
+        status: legacy
+        notes: "官方已于 2026-07-24 下线；仅保留 ID 供历史配置兼容"
+      - id: deepseek-reasoner
+        display_name: DeepSeek Reasoner（legacy，2026-07-24 后停用）
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 128000
+        status: legacy
+        notes: "官方已于 2026-07-24 下线；仅保留 ID 供历史配置兼容"
+
+  # =========================================================================
+  # OpenAI
+  # =========================================================================
+  openai:
+    display_name: OpenAI
+    protocol: openai_compat
+    base_url: https://api.openai.com/v1
+    reasoning_style: openai_native
+    has_embedding: true
+    embedding_note: "text-embedding-3-small 推荐用于 RAG"
+    vision_reuse: true
+    vision_reuse_note: "GPT-5.x 和 GPT-4o 系列原生支持 vision，可直接复用主模型"
+    embedding_models:
+      - id: text-embedding-3-small
+        display_name: Text Embedding 3 Small（推荐）
+        dimensions: 1536
+        status: recommended
+      - id: text-embedding-3-large
+        display_name: Text Embedding 3 Large
+        dimensions: 3072
+        status: active
+    models:
+      - id: gpt-5.5
+        display_name: GPT-5.5（推荐 · 最新旗舰 · 1M 上下文）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1050000
+        status: recommended
+        notes: "2026-04-23 发布；2026-06-02 上架 Amazon Bedrock；$5/$30 per MTok；最高质量通用模型"
+      - id: gpt-5.4
+        display_name: GPT-5.4（推荐 · 性价比 · 1M 上下文）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1050000
+        status: recommended
+        notes: "2026-03-05 发布；1M 上下文；$2.50/$15 per MTok；性价比旗舰"
+      - id: gpt-5.4-mini
+        display_name: GPT-5.4 Mini（日常生产首选）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 400000
+        status: recommended
+        notes: "2026-03-17 发布；$0.75/$4.50 per MTok；日常生产首选"
+      - id: gpt-5.4-nano
+        display_name: GPT-5.4 Nano
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 400000
+        status: active
+        notes: "最便宜 GPT-5.x；$0.20/$1.25 per MTok；分类/提取场景"
+      - id: gpt-4o
+        display_name: GPT-4o
+        capabilities: [chat, tool_call, vision]
+        context_length: 128000
+        status: active
+        notes: "已从 ChatGPT 退役（2026-02），API 仍可用；稳定兼容选择"
+      - id: gpt-4o-mini
+        display_name: GPT-4o Mini
+        capabilities: [chat, tool_call, vision]
+        context_length: 128000
+        status: active
+        notes: "超便宜轻量模型；微调仍可用"
+      - id: o3
+        display_name: o3
+        capabilities: [chat, reasoning]
+        context_length: 200000
+        status: active
+        notes: "深度推理模型；tool_call 官方未明确"
+      - id: o3-mini
+        display_name: o3-mini
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 200000
+        status: active
+        notes: "经济推理模型；支持工具调用"
+
+    # 以下为已退役/历史模型，仅用于兼容旧配置
+    deprecated_models:
+      - id: gpt-5.2
+        display_name: GPT-5.2（已退役）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 400000
+        status: deprecated
+        notes: "2025-12-11 发布；已被 GPT-5.4 取代"
+      - id: gpt-5.2-pro
+        display_name: GPT-5.2 Pro（已退役）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 400000
+        status: deprecated
+        notes: "已被 GPT-5.4 取代"
+      - id: gpt-5
+        display_name: GPT-5（已退役）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 400000
+        status: deprecated
+        notes: "2025-08-07 发布；2026-02 从 ChatGPT 退役；API 可能仍可用"
+      - id: gpt-5-mini
+        display_name: GPT-5 Mini（已退役）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 400000
+        status: deprecated
+        notes: "已从 ChatGPT 退役"
+
+  # =========================================================================
+  # Google Gemini
+  # =========================================================================
+  gemini:
+    display_name: Google Gemini
+    protocol: openai_compat
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    reasoning_style: openai_native
+    has_embedding: true
+    embedding_note: "text-embedding-004 可用；国内需代理"
+    vision_reuse: true
+    vision_reuse_note: "所有 Gemini 模型原生多模态，可直接复用主模型"
+    embedding_models:
+      - id: text-embedding-004
+        display_name: Text Embedding 004
+        dimensions: 768
+        status: active
+    models:
+      - id: gemini-3-pro
+        display_name: Gemini 3 Pro（推荐 · 2M 上下文）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 2000000
+        status: recommended
+        notes: "2025-11 发布；Deep Think 视觉推理；2M 上下文（图像可达）；原生多模态"
+      - id: gemini-2.5-flash
+        display_name: Gemini 2.5 Flash（推荐 · 性价比）
+        capabilities: [chat, tool_call, vision]
+        context_length: 1000000
+        status: recommended
+        notes: "$0.15/$0.60 per MTok；可切换 thinking budget；生产 API 首选"
+      - id: gemini-2.5-pro
+        display_name: Gemini 2.5 Pro
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1000000
+        status: active
+        notes: "2025-06 发布；深度推理 + 视觉；复杂文档/长视频理解"
+      - id: gemini-2.5-flash-lite
+        display_name: Gemini 2.5 Flash Lite
+        capabilities: [chat, tool_call, vision]
+        context_length: 1000000
+        status: active
+        notes: "$0.10/$0.40 per MTok；翻译/分类/高吞吐场景"
+
+  # =========================================================================
+  # 智谱清言 GLM
+  # =========================================================================
+  glm:
+    display_name: 智谱清言 GLM
+    protocol: openai_compat
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    reasoning_style: thinking_extra_body
+    has_embedding: true
+    embedding_note: "embedding-3 模型可用于 RAG"
+    vision_reuse: false
+    vision_reuse_note: "GLM 视觉模型与文本模型独立；vision 需选 GLM-4.6V / GLM-4.5V"
+    embedding_models:
+      - id: embedding-3
+        display_name: Embedding 3（推荐）
+        dimensions: 2048
+        status: recommended
+    models:
+      - id: glm-5.1
+        display_name: GLM-5.1（推荐 · 旗舰）
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 128000
+        status: recommended
+        notes: "智谱最新旗舰；对标 Claude Opus 4.6；tool use 增强"
+      - id: glm-4.7-flash
+        display_name: GLM-4.7 Flash（推荐 · 免费）
+        capabilities: [chat, tool_call]
+        context_length: 128000
+        status: recommended
+        notes: "免费轻量模型；开发测试首选"
+      - id: glm-4.7
+        display_name: GLM-4.7
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 128000
+        status: active
+        notes: "Agentic Coding 优化；工具调用增强"
+      - id: glm-4.6v
+        display_name: GLM-4.6V（推荐 · 视觉）
+        capabilities: [chat, tool_call, vision]
+        context_length: 128000
+        status: recommended
+        notes: "视觉基座模型；原生工具调用；截图即代码"
+      - id: glm-4.5v
+        display_name: GLM-4.5V
+        capabilities: [chat, vision]
+        context_length: 64000
+        status: active
+        notes: "100B 级别视觉模型；有思考模式开关"
+      - id: glm-4-flash
+        display_name: GLM-4 Flash（免费）
+        capabilities: [chat, tool_call]
+        context_length: 128000
+        status: active
+        notes: "免费轻量模型"
+      - id: glm-4-plus
+        display_name: GLM-4 Plus
+        capabilities: [chat, tool_call]
+        context_length: 128000
+        status: active
+        notes: "上一代旗舰"
+
+  # =========================================================================
+  # Groq
+  # =========================================================================
+  groq:
+    display_name: Groq
+    protocol: openai_compat
+    base_url: https://api.groq.com/openai/v1
+    reasoning_style: none
+    has_embedding: false
+    embedding_note: "Groq 不提供 embedding API"
+    vision_reuse: false
+    vision_reuse_note: "Groq 仅 Llama 4 Scout 支持 vision，其余为纯文本；不能默认复用"
+    models:
+      - id: llama-4-scout-17b-16e-instruct
+        display_name: Llama 4 Scout 17B（推荐 · 视觉）
+        capabilities: [chat, tool_call, vision]
+        context_length: 128000
+        status: recommended
+        notes: "Meta MoE 17B active；多模态视觉；LPU 极致速度（~594 tok/s）"
+      - id: llama-3.3-70b-versatile
+        display_name: Llama 3.3 70B
+        capabilities: [chat, tool_call]
+        context_length: 131072
+        status: active
+        notes: "经典通用模型；~394 tok/s"
+      - id: qwen-3-32b
+        display_name: Qwen3 32B
+        capabilities: [chat, tool_call]
+        context_length: 131072
+        status: active
+        notes: "多语言性能强；~662 tok/s"
+      - id: mixtral-8x7b-32768
+        display_name: Mixtral 8x7B
+        capabilities: [chat, tool_call]
+        context_length: 32768
+        status: active
+        notes: "经典 MoE 模型"
+      - id: gemma2-9b-it
+        display_name: Gemma 2 9B
+        capabilities: [chat, tool_call]
+        context_length: 8192
+        status: active
+        notes: "轻量 Google 模型"
+
+  # =========================================================================
+  # 月之暗面 Kimi (Moonshot)
+  # =========================================================================
+  moonshot:
+    display_name: 月之暗面 Kimi
+    protocol: openai_compat
+    base_url: https://api.moonshot.cn/v1
+    reasoning_style: thinking_extra_body
+    has_embedding: false
+    embedding_note: "Moonshot 不提供 embedding API，RAG 需选其他 provider"
+    vision_reuse: true
+    vision_reuse_note: "Kimi K2.5+ 原生多模态（MoonViT 400M 编码器），可直接复用主模型"
+    models:
+      - id: kimi-k2.6
+        display_name: Kimi K2.6（推荐 · 最新）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 262144
+        status: recommended
+        notes: "2026-04-20 发布；1T MoE/32B active；300-Agent Swarm；SWE-bench 80.2%；thinking 模式可切换"
+      - id: kimi-k2.5
+        display_name: Kimi K2.5
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 262144
+        status: active
+        notes: "2026-01-27 发布；1T/32B active；100-Agent Swarm；thinking/instant 双模式"
+      - id: kimi-k2-instruct
+        display_name: Kimi K2 Instruct
+        capabilities: [chat, tool_call]
+        context_length: 256000
+        status: deprecated
+        notes: "早期 K2 模型；将于 2026-05-25 停用；请迁移到 K2.5/K2.6"
+      - id: moonshot-v1-128k
+        display_name: Moonshot V1 128K
+        capabilities: [chat, tool_call]
+        context_length: 128000
+        status: active
+        notes: "上一代通用模型"
+      - id: moonshot-v1-32k
+        display_name: Moonshot V1 32K
+        capabilities: [chat, tool_call]
+        context_length: 32000
+        status: active
+        notes: "短上下文场景"
+
+  # =========================================================================
+  # OpenRouter
+  # =========================================================================
+  openrouter:
+    display_name: OpenRouter
+    protocol: openai_compat
+    base_url: https://openrouter.ai/api/v1
+    reasoning_style: openai_native
+    has_embedding: false
+    embedding_note: "OpenRouter 不直接提供 embedding；可路由到支持 embedding 的上游"
+    vision_reuse: true
+    vision_reuse_note: "取决于所选上游模型是否支持 vision"
+    models:
+      - id: anthropic/claude-sonnet-4-6
+        display_name: Claude Sonnet 4.6（via OpenRouter）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1000000
+        status: recommended
+        notes: "OpenRouter 路由 Anthropic；统一计费"
+      - id: anthropic/claude-opus-4-8
+        display_name: Claude Opus 4.8（via OpenRouter）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1000000
+        status: active
+        notes: "最强 Claude via OpenRouter"
+      - id: deepseek/deepseek-v4-flash
+        display_name: DeepSeek V4 Flash（via OpenRouter）
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 1000000
+        status: active
+        notes: "DeepSeek via OpenRouter 路由"
+      - id: openai/gpt-5.4
+        display_name: GPT-5.4（via OpenRouter）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1050000
+        status: active
+        notes: "OpenAI via OpenRouter 路由"
+      - id: google/gemini-2.5-flash
+        display_name: Gemini 2.5 Flash（via OpenRouter）
+        capabilities: [chat, tool_call, vision]
+        context_length: 1000000
+        status: active
+        notes: "Gemini via OpenRouter 路由"
+      - id: meta-llama/llama-3.3-70b-instruct
+        display_name: Llama 3.3 70B Instruct
+        capabilities: [chat, tool_call]
+        context_length: 128000
+        status: active
+        notes: "开源模型 via OpenRouter"
+
+  # =========================================================================
+  # 通义千问 (Qwen)
+  # =========================================================================
+  qwen:
+    display_name: 通义千问
+    protocol: openai_compat
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    reasoning_style: qwen_enable_thinking
+    has_embedding: true
+    embedding_note: "text-embedding-v4 推荐用于 RAG；text-embedding-v3 也可用"
+    vision_reuse: true
+    vision_reuse_note: "Qwen3.6-Plus 原生多模态（文本+图像+视频）；Qwen3.7-Max 为纯文本需独立 vision"
+    embedding_models:
+      - id: text-embedding-v4
+        display_name: Text Embedding V4（推荐）
+        dimensions: 2048
+        status: recommended
+        notes: "最新 Qwen3-Embedding；支持灵活维度"
+      - id: text-embedding-v3
+        display_name: Text Embedding V3
+        dimensions: 1024
+        status: active
+    models:
+      - id: qwen3.7-max
+        display_name: Qwen3.7 Max（推荐 · 最新旗舰）
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 1000000
+        status: recommended
+        notes: "最新旗舰文本模型；1M 上下文"
+      - id: qwen3.6-plus
+        display_name: Qwen3.6 Plus（推荐 · 1M · 多模态）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1000000
+        status: recommended
+        notes: "1M 上下文；文本+图像+视频；201 语言；旗舰多模态"
+      - id: qwen3.6-flash
+        display_name: Qwen3.6 Flash（1M · 多模态）
+        capabilities: [chat, tool_call, vision]
+        context_length: 1000000
+        status: active
+        notes: "1M 上下文；多模态轻量版"
+      - id: qwen3-max
+        display_name: Qwen3 Max
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 262144
+        status: active
+        notes: "上一代旗舰文本模型"
+      - id: qwen-plus
+        display_name: Qwen Plus（1M · thinking）
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 1000000
+        status: active
+        notes: "1M 上下文；thinking 支持；$0.40/$1.20"
+      - id: qwen3-vl-plus
+        display_name: Qwen3-VL Plus（视觉专用）
+        capabilities: [chat, vision]
+        context_length: 131072
+        status: active
+        notes: "视觉专用模型；支持图像+视频"
+      - id: qwen3-vl-max
+        display_name: Qwen3-VL Max（视觉专用）
+        capabilities: [chat, vision]
+        context_length: 131072
+        status: active
+        notes: "视觉旗舰"
+      - id: qwen3-turbo
+        display_name: Qwen3 Turbo
+        capabilities: [chat, tool_call]
+        context_length: 128000
+        status: active
+        notes: "高速轻量"
+
+  # =========================================================================
+  # SiliconFlow（硅基流动）
+  # =========================================================================
+  siliconflow:
+    display_name: SiliconFlow（硅基流动）
+    protocol: openai_compat
+    base_url: https://api.siliconflow.cn/v1
+    reasoning_style: thinking_extra_body
+    has_embedding: true
+    embedding_note: "BAAI/bge-m3 推荐用于中文 RAG；BAAI/bge-large-zh-v1.5 也可用"
+    vision_reuse: true
+    vision_reuse_note: "硅基流动托管多款视觉模型，取决于所选模型"
+    embedding_models:
+      - id: BAAI/bge-m3
+        display_name: BGE-M3（推荐 · 多语言）
+        dimensions: 1024
+        status: recommended
+        notes: "100+ 语言支持；中文 RAG 首选"
+      - id: BAAI/bge-large-zh-v1.5
+        display_name: BGE Large ZH v1.5
+        dimensions: 1024
+        status: active
+        notes: "中文专用向量模型"
+      - id: Qwen3-Embedding-8B
+        display_name: Qwen3 Embedding 8B
+        dimensions: 4096
+        status: active
+        notes: "最大 32K tokens 输入"
+    models:
+      - id: deepseek-ai/DeepSeek-V4-Flash
+        display_name: DeepSeek V4 Flash（推荐）
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 1000000
+        status: recommended
+        notes: "SiliconFlow 托管 DeepSeek V4 Flash；¥1/¥2 per MTok"
+      - id: deepseek-ai/DeepSeek-V3.2-Exp
+        display_name: DeepSeek V3.2 Exp
+        capabilities: [chat, tool_call]
+        context_length: 128000
+        status: active
+        notes: "实验版稀疏注意力；¥0.27/¥0.41"
+      - id: Qwen/Qwen3.6-35B-A3B
+        display_name: Qwen3.6 35B-A3B（推荐）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 262144
+        status: recommended
+        notes: "2026-04 发布；MoE 35B/3B active；视觉+工具"
+      - id: Qwen/Qwen3.5-397B-A17B
+        display_name: Qwen3.5 397B-A17B
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 262144
+        status: active
+        notes: "大 MoE 多模态旗舰"
+      - id: Pro/zai-org/GLM-5.1
+        display_name: GLM-5.1（SiliconFlow 托管）
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 128000
+        status: active
+        notes: "智谱旗舰 via SiliconFlow"
+      - id: Pro/moonshotai/Kimi-K2.6
+        display_name: Kimi K2.6（SiliconFlow 托管）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 262144
+        status: active
+        notes: "Kimi 最新 via SiliconFlow"
+
+  # =========================================================================
+  # Together AI
+  # =========================================================================
+  together:
+    display_name: Together AI
+    protocol: openai_compat
+    base_url: https://api.together.xyz/v1
+    reasoning_style: none
+    has_embedding: true
+    embedding_note: "intfloat/multilingual-e5-large-instruct 推荐；BAAI/bge-base-en-v1.5 也可用"
+    vision_reuse: true
+    vision_reuse_note: "托管多款视觉模型（Llama 4 Scout / Qwen3-VL 系列）"
+    embedding_models:
+      - id: intfloat/multilingual-e5-large-instruct
+        display_name: Multilingual E5 Large（推荐）
+        dimensions: 1024
+        status: recommended
+        notes: "多语言 embedding；$0.02/MTok"
+      - id: BAAI/bge-base-en-v1.5
+        display_name: BGE Base EN v1.5
+        dimensions: 768
+        status: active
+    models:
+      - id: deepseek-ai/DeepSeek-V4-Pro
+        display_name: DeepSeek V4 Pro（推荐）
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 524288
+        status: recommended
+        notes: "MoE 1.6T/49B active；512K 上下文；缓存 $0.20/MTok"
+      - id: Qwen/Qwen3.6-Plus
+        display_name: Qwen3.6 Plus（推荐 · 1M 上下文）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1000000
+        status: recommended
+        notes: "1M 上下文；201 语言；$0.50/$3.00"
+      - id: meta-llama/Llama-3.3-70B-Instruct-Turbo
+        display_name: Llama 3.3 70B Turbo
+        capabilities: [chat, tool_call]
+        context_length: 131072
+        status: active
+        notes: "经典开源通用模型"
+      - id: moonshotai/Kimi-K2.6
+        display_name: Kimi K2.6
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 262144
+        status: active
+        notes: "Agent-first 模型 via Together"
+      - id: Qwen/Qwen3.5-397B-A17B
+        display_name: Qwen3.5 397B-A17B
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 262144
+        status: active
+        notes: "大 MoE 多模态旗舰"
+
+  # =========================================================================
+  # 火山方舟（豆包）
+  # =========================================================================
+  volcengine:
+    display_name: 火山方舟（豆包）
+    protocol: openai_compat
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    reasoning_style: thinking_extra_body
+    has_embedding: true
+    embedding_note: "doubao-embedding-vision-251215 是默认 RAG embedding 模型（图文多模态向量）"
+    vision_reuse: true
+    vision_reuse_note: "Seed 2.0 Lite/Pro 原生多模态；Seed 1.6 Vision 为专用视觉模型"
+    embedding_models:
+      - id: doubao-embedding-vision-251215
+        display_name: 豆包 Embedding Vision（默认 · 图文多模态）
+        dimensions: 2048
+        status: recommended
+        notes: "2025-06-15 发布；支持文本+图像+视频联合嵌入；1024/2048 维度可配；RAG 默认模型"
+      - id: doubao-embedding-text-01
+        display_name: 豆包 Embedding Text
+        dimensions: 1024
+        status: active
+        notes: "纯文本向量；轻量"
+    models:
+      - id: doubao-seed-2-0-lite-260428
+        display_name: 豆包 Seed 2.0 Lite（推荐 · 多模态）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 256000
+        status: recommended
+        notes: "2026-02 发布；$0.13/$0.76 per MTok；平衡性价比；多模态"
+      - id: doubao-seed-2-0-pro-260215
+        display_name: 豆包 Seed 2.0 Pro
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 256000
+        status: active
+        notes: "旗舰推理+多模态+视频；$0.67/$3.36 per MTok"
+      - id: doubao-seed-1-6-vision-250815
+        display_name: 豆包 Seed 1.6 Vision
+        capabilities: [chat, vision]
+        context_length: 32000
+        status: active
+        notes: "专用视觉模型；上一代"
+      - id: doubao-pro-256k
+        display_name: 豆包 Pro 256K
+        capabilities: [chat, tool_call]
+        context_length: 256000
+        status: active
+        notes: "上一代通用模型"
+      - id: doubao-lite-128k
+        display_name: 豆包 Lite 128K
+        capabilities: [chat]
+        context_length: 128000
+        status: active
+        notes: "轻量；仅基础对话"
+
+  # =========================================================================
+  # xAI Grok
+  # =========================================================================
+  xai:
+    display_name: xAI Grok
+    protocol: openai_compat
+    base_url: https://api.x.ai/v1
+    reasoning_style: none
+    has_embedding: false
+    embedding_note: "xAI 不提供 embedding API，RAG 需选其他 provider"
+    vision_reuse: true
+    vision_reuse_note: "Grok 4.3 和 Grok 4.20 系列支持多模态 vision；可直接复用主模型"
+    models:
+      - id: grok-4.3
+        display_name: Grok 4.3（推荐 · 旗舰）
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1000000
+        status: recommended
+        notes: "2026-04-30 发布；1M 上下文；可配 reasoning (none/low/med/high)；已整合 Grok 4/4.1 旧模型"
+      - id: grok-4.20-0309-reasoning
+        display_name: Grok 4.20 Reasoning
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 2000000
+        status: active
+        notes: "2M 上下文；推理优化 CoT 变体"
+      - id: grok-4.20-0309-non-reasoning
+        display_name: Grok 4.20（非推理）
+        capabilities: [chat, tool_call, vision]
+        context_length: 2000000
+        status: active
+        notes: "2M 上下文；低延迟标准补全"
+      - id: grok-4.20-multi-agent-0309
+        display_name: Grok 4.20 Multi-Agent
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 2000000
+        status: active
+        notes: "4 内部 Agent 交叉验证推理"
+      - id: grok-2-1212
+        display_name: Grok 2（legacy）
+        capabilities: [chat, tool_call]
+        context_length: 131072
+        status: deprecated
+        notes: "已于 2026-05-15 退役；请求自动重定向至 grok-4.3"
+      - id: grok-2-vision-1212
+        display_name: Grok 2 Vision（legacy）
+        capabilities: [chat, tool_call, vision]
+        context_length: 131072
+        status: deprecated
+        notes: "已于 2026-05-15 退役"

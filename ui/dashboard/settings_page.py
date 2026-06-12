@@ -39,7 +39,9 @@ from app_config.schema import (
     NapCatAdapterConfig,
     ProviderConfig,
     ReasoningConfig,
+    ToolResultBudgetConfig,
     WhitelistConfig,
+    default_tool_result_budgets,
 )
 
 from ..theme import Spacing
@@ -1092,6 +1094,7 @@ class SettingsPage(QWidget):
         sections_lay.addWidget(self._build_emoji_section())
         sections_lay.addWidget(self._build_appearance_section())
         sections_lay.addWidget(self._build_memory_section())
+        sections_lay.addWidget(self._build_token_budget_section())
         sections_lay.addWidget(self._build_advanced_section())
 
         inner_scroll.setWidget(sections)
@@ -1626,6 +1629,20 @@ class SettingsPage(QWidget):
         )
         form.addRow(QLabel("模型 ID"), model_edit)
 
+        if agent_name == "chat":
+            loops_spin = QSpinBox()
+            loops_spin.setRange(5, 60)
+            loops_spin.setValue(min(60, max(5, int(agent_cfg.max_loops or 25))))
+            loops_spin.setSuffix(" 轮")
+            install_wheel_freeze(loops_spin)
+            loops_spin.editingFinished.connect(
+                lambda *_, an=agent_name, s=loops_spin: self._on_agent_max_loops_changed(
+                    an,
+                    s.value(),
+                )
+            )
+            form.addRow(QLabel("工具轮数上限"), loops_spin)
+
         # 思考
         chk = QCheckBox("启用")
         is_on = bool(agent_cfg.reasoning and agent_cfg.reasoning.enabled)
@@ -1680,6 +1697,18 @@ class SettingsPage(QWidget):
             return
         a.model = model
         self._save_now(needs_restart=True, change_desc=f"agents.{agent_name}.model={model}")
+
+    def _on_agent_max_loops_changed(self, agent_name: str, value: int) -> None:
+        if self._suppress_signals:
+            return
+        a = getattr(self._cfg().agents, agent_name, None)
+        if a is None:
+            return
+        value = min(60, max(5, int(value)))
+        if a.max_loops == value:
+            return
+        a.max_loops = value
+        self._save_now(needs_restart=False, change_desc=f"agents.{agent_name}.max_loops={value} (hot)")
 
     def _on_agent_reasoning_changed(self, agent_name: str, enabled: bool, budget) -> None:
         if self._suppress_signals:
@@ -2527,6 +2556,176 @@ class SettingsPage(QWidget):
         card.add_content(self._build_embedding_card())
         return card
 
+    def _build_token_budget_section(self) -> SectionCard:
+        card = SectionCard(
+            title="Token预算",
+            subtitle=(
+                "建议不要修改此项，除非你知道你在做什么。错误预算可能导致成本上升、"
+                "回复变慢，或工具结果过早写入文件。"
+            ),
+        )
+        b = self._cfg().behavior
+
+        hint = QLabel(
+            "工作上下文控制每轮最多放入多少历史和记忆；输出预留留给模型回复；"
+            "工具预算按工具分别控制，资料过长时会写入 workspace artifact。"
+        )
+        hint.setProperty("role", "secondary")
+        hint.setWordWrap(True)
+        card.add_content(hint)
+
+        context_form = QFormLayout()
+        context_form.setSpacing(Spacing.SM)
+
+        ctx_max = QSpinBox()
+        ctx_max.setRange(0, 1_000_000)
+        ctx_max.setValue(b.context.max_context_tokens or 0)
+        ctx_max.setSuffix(" token")
+        ctx_max.setSpecialValueText("按模型自动")
+        ctx_max.editingFinished.connect(
+            lambda: self._on_behavior_nested("context", "max_context_tokens", ctx_max.value() or None)
+        )
+        context_form.addRow(QLabel("工作上下文"), ctx_max)
+
+        ctx_reserve = QSpinBox()
+        ctx_reserve.setRange(1024, 500_000)
+        ctx_reserve.setValue(b.context.reserve_output_tokens)
+        ctx_reserve.setSuffix(" token")
+        ctx_reserve.editingFinished.connect(
+            lambda: self._on_behavior_nested("context", "reserve_output_tokens", ctx_reserve.value())
+        )
+        context_form.addRow(QLabel("输出预留"), ctx_reserve)
+
+        ctx_mem = QSpinBox()
+        ctx_mem.setRange(256, 100_000)
+        ctx_mem.setValue(b.context.memory_token_budget)
+        ctx_mem.setSuffix(" token")
+        ctx_mem.editingFinished.connect(
+            lambda: self._on_behavior_nested("context", "memory_token_budget", ctx_mem.value())
+        )
+        context_form.addRow(QLabel("长期记忆预算"), ctx_mem)
+
+        ctx_sum = QSpinBox()
+        ctx_sum.setRange(256, 100_000)
+        ctx_sum.setValue(b.context.summary_token_budget)
+        ctx_sum.setSuffix(" token")
+        ctx_sum.editingFinished.connect(
+            lambda: self._on_behavior_nested("context", "summary_token_budget", ctx_sum.value())
+        )
+        context_form.addRow(QLabel("滚动摘要预算"), ctx_sum)
+
+        default_inline = QSpinBox()
+        default_inline.setRange(256, 100_000)
+        default_inline.setValue(b.context.tool_result_default_budget_tokens)
+        default_inline.setSuffix(" token")
+        default_inline.editingFinished.connect(
+            lambda: self._on_behavior_nested(
+                "context",
+                "tool_result_default_budget_tokens",
+                default_inline.value(),
+            )
+        )
+        context_form.addRow(QLabel("未列出工具 inline 默认"), default_inline)
+
+        default_hard = QSpinBox()
+        default_hard.setRange(512, 200_000)
+        default_hard.setValue(b.context.tool_result_default_hard_cap_tokens)
+        default_hard.setSuffix(" token")
+        default_hard.editingFinished.connect(
+            lambda: self._on_behavior_nested(
+                "context",
+                "tool_result_default_hard_cap_tokens",
+                default_hard.value(),
+            )
+        )
+        context_form.addRow(QLabel("未列出工具硬上限默认"), default_hard)
+
+        card.add_layout(context_form)
+
+        tool_title = QLabel("按工具结果预算")
+        tool_title.setProperty("role", "title-3")
+        card.add_content(tool_title)
+        tool_hint = QLabel(
+            "inline 是直接回传给模型的预算；artifact 是资料型工具改写文件的阈值；"
+            "hard 是事故兜底上限。留空 artifact/hard 表示按 inline 或默认硬上限处理。"
+        )
+        tool_hint.setProperty("role", "secondary")
+        tool_hint.setWordWrap(True)
+        card.add_content(tool_hint)
+
+        defaults = default_tool_result_budgets()
+        budgets = b.context.tool_result_budgets
+        for tool_name in sorted(defaults):
+            budget = budgets.get(tool_name) or defaults[tool_name]
+            if tool_name not in budgets:
+                budgets[tool_name] = budget
+            card.add_content(self._build_tool_budget_row(tool_name, budget))
+
+        legacy = _format_tool_result_overrides(b.context.tool_result_soft_overrides)
+        if legacy:
+            legacy_lbl = QLabel(f"检测到旧版工具软阈值覆盖：{legacy}。当前页面不再编辑旧字段。")
+            legacy_lbl.setProperty("role", "warning")
+            legacy_lbl.setWordWrap(True)
+            card.add_content(legacy_lbl)
+
+        return card
+
+    def _build_tool_budget_row(
+        self,
+        tool_name: str,
+        budget: ToolResultBudgetConfig,
+    ) -> QWidget:
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(Spacing.SM)
+
+        name = QLabel(tool_name)
+        name.setMinimumWidth(190)
+        lay.addWidget(name)
+
+        inline = QSpinBox()
+        inline.setRange(256, 100_000)
+        inline.setValue(budget.inline_budget_tokens)
+        inline.setSuffix(" inline")
+        inline.editingFinished.connect(
+            lambda: self._on_tool_result_budget_field(
+                tool_name,
+                "inline_budget_tokens",
+                inline.value(),
+            )
+        )
+        lay.addWidget(inline)
+
+        artifact = QSpinBox()
+        artifact.setRange(0, 100_000)
+        artifact.setValue(budget.artifact_threshold_tokens or 0)
+        artifact.setSpecialValueText("自动 artifact")
+        artifact.editingFinished.connect(
+            lambda: self._on_tool_result_budget_field(
+                tool_name,
+                "artifact_threshold_tokens",
+                artifact.value() or None,
+            )
+        )
+        lay.addWidget(artifact)
+
+        hard = QSpinBox()
+        hard.setRange(0, 200_000)
+        hard.setValue(budget.hard_cap_tokens or 0)
+        hard.setSpecialValueText("默认 hard")
+        hard.editingFinished.connect(
+            lambda: self._on_tool_result_budget_field(
+                tool_name,
+                "hard_cap_tokens",
+                hard.value() or None,
+            )
+        )
+        lay.addWidget(hard)
+
+        lay.addStretch(1)
+        return row
+
     # ============================================================
     # 高级节：行为参数 + 日志级别
     # ============================================================
@@ -2661,73 +2860,6 @@ class SettingsPage(QWidget):
         )
         form.addRow(QLabel("压缩后目标 token"), sum_target_tokens)
 
-        context_title = QLabel("上下文预算")
-        context_title.setProperty("role", "title-3")
-        form.addRow(context_title)
-
-        ctx_max = QSpinBox()
-        ctx_max.setRange(0, 1_000_000)
-        ctx_max.setValue(b.context.max_context_tokens or 0)
-        ctx_max.setSuffix(" token")
-        ctx_max.setSpecialValueText("按模型自动")
-        ctx_max.editingFinished.connect(
-            lambda: self._on_behavior_nested("context", "max_context_tokens", ctx_max.value() or None)
-        )
-        form.addRow(QLabel("工作上下文"), ctx_max)
-
-        ctx_reserve = QSpinBox()
-        ctx_reserve.setRange(1024, 500_000)
-        ctx_reserve.setValue(b.context.reserve_output_tokens)
-        ctx_reserve.setSuffix(" token")
-        ctx_reserve.editingFinished.connect(
-            lambda: self._on_behavior_nested("context", "reserve_output_tokens", ctx_reserve.value())
-        )
-        form.addRow(QLabel("输出预留"), ctx_reserve)
-
-        ctx_mem = QSpinBox()
-        ctx_mem.setRange(256, 100_000)
-        ctx_mem.setValue(b.context.memory_token_budget)
-        ctx_mem.setSuffix(" token")
-        ctx_mem.editingFinished.connect(
-            lambda: self._on_behavior_nested("context", "memory_token_budget", ctx_mem.value())
-        )
-        form.addRow(QLabel("重要记忆预算"), ctx_mem)
-
-        ctx_sum = QSpinBox()
-        ctx_sum.setRange(256, 100_000)
-        ctx_sum.setValue(b.context.summary_token_budget)
-        ctx_sum.setSuffix(" token")
-        ctx_sum.editingFinished.connect(
-            lambda: self._on_behavior_nested("context", "summary_token_budget", ctx_sum.value())
-        )
-        form.addRow(QLabel("滚动摘要预算"), ctx_sum)
-
-        ctx_tool_soft = QSpinBox()
-        ctx_tool_soft.setRange(64, 100_000)
-        ctx_tool_soft.setValue(b.context.tool_result_soft_limit_tokens)
-        ctx_tool_soft.setSuffix(" token")
-        ctx_tool_soft.editingFinished.connect(
-            lambda: self._on_behavior_nested("context", "tool_result_soft_limit_tokens", ctx_tool_soft.value())
-        )
-        form.addRow(QLabel("工具结果软阈值"), ctx_tool_soft)
-
-        ctx_tool_hard = QSpinBox()
-        ctx_tool_hard.setRange(128, 200_000)
-        ctx_tool_hard.setValue(b.context.tool_result_hard_cap_tokens)
-        ctx_tool_hard.setSuffix(" token")
-        ctx_tool_hard.editingFinished.connect(
-            lambda: self._on_behavior_nested("context", "tool_result_hard_cap_tokens", ctx_tool_hard.value())
-        )
-        form.addRow(QLabel("工具结果硬上限"), ctx_tool_hard)
-
-        ctx_tool_overrides = QLineEdit()
-        ctx_tool_overrides.setPlaceholderText("describe_image=900, read_file=2000")
-        ctx_tool_overrides.setText(_format_tool_result_overrides(b.context.tool_result_soft_overrides))
-        ctx_tool_overrides.editingFinished.connect(
-            lambda: self._on_tool_result_overrides(ctx_tool_overrides.text())
-        )
-        form.addRow(QLabel("工具软阈值覆盖"), ctx_tool_overrides)
-
         # Log level
         log_combo = QComboBox()
         for lvl in ("DEBUG", "INFO", "WARNING", "ERROR"):
@@ -2748,7 +2880,9 @@ class SettingsPage(QWidget):
         "trigger_at_messages", "range_start_messages", "range_end_messages",
         "trigger_at_tokens", "target_after_tokens",
         "max_context_tokens", "reserve_output_tokens", "memory_token_budget", "summary_token_budget",
-        "tool_result_soft_limit_tokens", "tool_result_hard_cap_tokens", "tool_result_soft_overrides",
+        "tool_result_default_budget_tokens", "tool_result_default_hard_cap_tokens",
+        "tool_result_budgets", "tool_result_soft_limit_tokens", "tool_result_hard_cap_tokens",
+        "tool_result_soft_overrides",
         "default_history_fetch_count",
     }
 
@@ -2779,6 +2913,27 @@ class SettingsPage(QWidget):
             self._status.mark_error(str(e))
             return
         self._on_behavior_nested("context", "tool_result_soft_overrides", value)
+
+    def _on_tool_result_budget_field(
+        self,
+        tool_name: str,
+        field: str,
+        value: int | None,
+    ) -> None:
+        if self._suppress_signals:
+            return
+        budgets = self._cfg().behavior.context.tool_result_budgets
+        budget = budgets.get(tool_name)
+        if budget is None:
+            budget = default_tool_result_budgets().get(tool_name) or ToolResultBudgetConfig()
+            budgets[tool_name] = budget
+        if getattr(budget, field) == value:
+            return
+        setattr(budget, field, value)
+        self._save_now(
+            needs_restart=False,
+            change_desc=f"behavior.context.tool_result_budgets.{tool_name}.{field}",
+        )
 
     def _on_log_level_changed(self, level: str) -> None:
         if self._suppress_signals:

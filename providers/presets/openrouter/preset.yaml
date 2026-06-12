@@ -7,14 +7,29 @@ reasoning_style: openai_native
 
 models:
   - id: anthropic/claude-sonnet-4-6
-    display_name: Claude Sonnet 4.6 (via OpenRouter)
+    display_name: Claude Sonnet 4.6（推荐 · via OpenRouter）
     capabilities: [chat, tool_call, reasoning, vision]
     context_length: 1000000
 
-  - id: deepseek/deepseek-chat
-    display_name: DeepSeek Chat (via OpenRouter)
-    capabilities: [chat, tool_call]
-    context_length: 128000
+  - id: anthropic/claude-opus-4-8
+    display_name: Claude Opus 4.8（via OpenRouter）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 1000000
+
+  - id: openai/gpt-5.4
+    display_name: GPT-5.4（via OpenRouter）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 1050000
+
+  - id: deepseek/deepseek-v4-flash
+    display_name: DeepSeek V4 Flash（via OpenRouter）
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 1000000
+
+  - id: google/gemini-2.5-flash
+    display_name: Gemini 2.5 Flash（via OpenRouter）
+    capabilities: [chat, tool_call, vision]
+    context_length: 1000000
 
   - id: meta-llama/llama-3.3-70b-instruct
     display_name: Llama 3.3 70B Instruct

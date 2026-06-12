@@ -14,6 +14,7 @@ from app_config.schema import (
     NapCatAdapterConfig,
     ProviderConfig,
     RootConfig,
+    ToolResultBudgetConfig,
 )
 
 
@@ -38,6 +39,43 @@ def test_minimal_valid_config():
     cfg = _minimal_config()
     assert cfg.agents.chat.provider == "ds"
     assert cfg.version == 2
+    budgets = cfg.behavior.context.tool_result_budgets
+    assert budgets["read_file"].inline_budget_tokens == 2500
+    assert budgets["get_recent_chat_messages"].artifact_threshold_tokens == 3000
+
+
+def test_tool_result_budget_config_accepts_custom_values():
+    cfg = _minimal_config()
+    cfg.behavior.context.tool_result_budgets["read_file"] = ToolResultBudgetConfig(
+        inline_budget_tokens=1200,
+        artifact_threshold_tokens=1800,
+        hard_cap_tokens=2400,
+    )
+
+    budget = cfg.behavior.context.tool_result_budgets["read_file"]
+    assert budget.inline_budget_tokens == 1200
+    assert budget.artifact_threshold_tokens == 1800
+    assert budget.hard_cap_tokens == 2400
+
+
+def test_legacy_tool_result_overrides_still_load():
+    cfg = RootConfig.model_validate(
+        {
+            "agents": {"chat": {"provider": "ds", "model": "deepseek-chat"}},
+            "providers": {"ds": {"preset": "deepseek", "api_key_id": "ds_main"}},
+            "behavior": {
+                "context": {
+                    "tool_result_soft_limit_tokens": 700,
+                    "tool_result_hard_cap_tokens": 1600,
+                    "tool_result_soft_overrides": {"read_file": 900},
+                }
+            },
+        }
+    )
+
+    assert cfg.behavior.context.tool_result_soft_limit_tokens == 700
+    assert cfg.behavior.context.tool_result_hard_cap_tokens == 1600
+    assert cfg.behavior.context.tool_result_soft_overrides["read_file"] == 900
 
 
 def test_agent_provider_must_exist():

@@ -131,9 +131,10 @@ def test_tool_use_protocol_file_mode():
 
 def test_tool_use_protocol_rag_mode():
     s = build_tool_use_protocol("rag")
-    assert "RAG 语义检索" in s
+    assert "RAG 会话向量检索" in s
     assert "save_important_memory" in s
-    assert "必须主动保存" in s
+    assert "没有 save_important_memory" in s
+    assert "必须主动保存" not in s
 
 
 def test_tool_use_protocol_default_is_file():
@@ -212,9 +213,10 @@ def test_build_combined_system_prompt_memory_mode_default():
 def test_build_combined_system_prompt_rag_mode_no_active_save():
     p = _persona()
     sys = build_combined_system_prompt(p, memory_mode="rag")
-    assert "RAG 语义检索" in sys
+    assert "RAG 会话向量检索" in sys
     assert "save_important_memory" in sys
-    assert "必须主动保存" in sys
+    assert "没有 save_important_memory" in sys
+    assert "必须主动保存" not in sys
 
 
 def test_build_combined_system_prompt_with_important_memory():
@@ -247,24 +249,31 @@ def test_build_admin_info_with_admins():
 
 
 def test_persona_brief_includes_admin_info():
-    brief = PersonaBrief(name="Mika", admin_name="Lily", admin_qq="123456")
+    brief = PersonaBrief(
+        name="Mika",
+        gender="female",
+        admins=[{"name": "Lily", "qq": "123456", "relation": "创作者"}],
+    )
     block = brief.to_brief_block()
-    assert "管理员/用户信息" in block
+    assert "熟悉的人（管理员）" in block
+    assert "性别" in block
     assert "Lily" in block
     assert "123456" in block
+    assert "创作者" in block
 
 
 def test_render_persona_file_writes_admins():
-    brief = PersonaBrief(name="Mika")
+    brief = PersonaBrief(name="Mika", gender="female")
     result = PersonaGenResult(persona_prompt="<identity>Mika</identity>", display_name="Mika")
     text = render_persona_file(
         result,
         brief,
-        admins=[{"qq": 123456, "name": "Lily", "role": "owner"}],
+            admins=[{"qq": 123456, "name": "Lily", "role": "owner"}],
     )
-    assert '"admins":' in text
-    assert '"qq": 123456' in text
-    assert '"name": "Lily"' in text
+    assert "'admins':" in text
+    assert "'qq': 123456" in text
+    assert "'name': 'Lily'" in text
+    assert "'gender': 'female'" in text
 
 
 def test_persona_generation_prompt_requires_second_person():
@@ -343,8 +352,8 @@ def test_build_messages_memory_mode_propagates():
     p = _persona()
     msgs_rag = build_messages(p, [], memory_mode="rag")
     msgs_file = build_messages(p, [], memory_mode="file")
-    assert "RAG 语义检索" in msgs_rag[0]["content"]
-    assert "必须主动保存" in msgs_rag[0]["content"]
+    assert "RAG 会话向量检索" in msgs_rag[0]["content"]
+    assert "必须主动保存" not in msgs_rag[0]["content"]
     assert "必须主动保存" in msgs_file[0]["content"]
 
 

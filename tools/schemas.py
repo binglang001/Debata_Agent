@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -172,6 +172,17 @@ class ListContactsArgs(_ToolArgs):
     group_id: int | None = Field(
         default=None, description="scope=group_members 时必填，填目标群号"
     )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="从第几条联系人开始返回，默认 0。返回 next_offset 时可用它续读。",
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=200,
+        description="本页最多返回多少条，默认 100，最多 200。",
+    )
 
     @model_validator(mode="after")
     def validate_group_id(self) -> ListContactsArgs:
@@ -193,6 +204,50 @@ class GetForwardMsgArgs(_ToolArgs):
         ...,
         min_length=1,
         description="合并转发消息的 ID，从 [合并转发 id=xxx] 标记中获取",
+    )
+    recursive: bool = Field(
+        default=True,
+        description="是否递归尝试展开内层合并转发。默认开启。",
+    )
+    max_depth: int = Field(
+        default=3,
+        ge=0,
+        le=5,
+        description="递归展开内层合并转发的最大深度，0 表示只读取外层。",
+    )
+    output: Literal["auto", "json", "markdown"] = Field(
+        default="auto",
+        description="完整结果写入文件的格式。auto/json 写嵌套 JSON；markdown 写可读 Markdown。",
+    )
+
+
+class GetRecentChatMessagesArgs(_ToolArgs):
+    """get_recent_chat_messages 工具参数。"""
+
+    conversation_id: str | None = Field(
+        default=None,
+        description=(
+            "要读取的当前运行期真实 QQ 会话，如 private:430666862 或 group:1039163467。"
+            "不填则使用当前会话。"
+        ),
+    )
+    limit: int = Field(
+        default=50,
+        ge=1,
+        le=1000,
+        description="最多读取多少条最近消息，1 到 1000。返回的是连续最近窗口，不做头尾拼接。",
+    )
+    since_msg_id: str | None = Field(
+        default=None,
+        description="只读取此 msg_id 之后的消息；用于 stale/回执后确认当前真实聊天状态。",
+    )
+    before_msg_id: str | None = Field(
+        default=None,
+        description="只读取此 msg_id 之前的消息；用于向前翻连续历史窗口。",
+    )
+    include_raw: bool = Field(
+        default=False,
+        description="是否附带原始 CQ 消息。通常不要开启，只有排查图片/合并转发/引用等原始结构时使用。",
     )
 
 
@@ -251,7 +306,7 @@ class SummarizeConversationArgs(_ToolArgs):
         default=4096,
         ge=512,
         le=16384,
-        description="总结模型最大输出 token，默认 4096。",
+        description="兼容旧参数；现在总结由后台子 Agent 写文件，通常不需要填写。",
     )
 
 
@@ -274,6 +329,93 @@ class RecallHistoryArgs(_ToolArgs):
         description="时间范围关键词，如 2026-05-30 / 凌晨 / 昨晚。Phase A 按原文和 metadata 做简单文本匹配。",
     )
     limit: int = Field(default=20, ge=1, le=100, description="最多返回多少条记录")
+
+
+class AgentTaskSource(_ToolArgs):
+    """start_agent_task 的资料来源。"""
+
+    type: Literal[
+        "workspace_path",
+        "tool_call_id",
+        "tool_result_file",
+        "forward_id",
+        "conversation_history",
+        "message_id",
+        "image_ref",
+        "inline_text",
+        "inline_json",
+        "workspace_glob",
+        "directory",
+    ] = Field(
+        ...,
+        description=(
+            "资料类型。不支持 URL；网页类资料需先由其它工具保存到 workspace 后再传 workspace_path。"
+        ),
+    )
+    value: str | None = Field(
+        default=None,
+        description="通用值：路径、tool_call_id、forward_id、message_id、图片引用或短文本。",
+    )
+    conversation_id: str | None = Field(
+        default=None,
+        description="conversation_history/message_id 可用：private:QQ 或 group:群号。",
+    )
+    keyword: str | None = Field(
+        default=None,
+        description="conversation_history 可用：按关键词检索历史。",
+    )
+    time_range: str | None = Field(
+        default=None,
+        description="conversation_history 可用：时间范围线索，如 2026-05-30。",
+    )
+    limit: int = Field(
+        default=50,
+        ge=1,
+        le=500,
+        description="conversation_history 可用：最多收集多少条记录。",
+    )
+    data: Any = Field(
+        default=None,
+        description="inline_json 可用：直接传入的小型 JSON 资料。",
+    )
+
+
+class StartAgentTaskArgs(_ToolArgs):
+    """start_agent_task 工具参数。"""
+
+    prompt: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "必须填写：交给后台子 Agent 的完整任务说明。写清要处理哪些资料、输出什么、"
+            "是否保留发送者/时间/证据。"
+        ),
+    )
+    sources: list[AgentTaskSource] = Field(
+        default_factory=list,
+        description=(
+            "资料来源列表。支持 workspace_path/tool_call_id/tool_result_file/forward_id/"
+            "conversation_history/message_id/image_ref/inline_text/inline_json/"
+            "workspace_glob/directory；不支持 URL。"
+        ),
+    )
+    output_format: Literal["markdown", "json", "text"] = Field(
+        default="markdown",
+        description="期望输出格式。",
+    )
+    output_name: str | None = Field(
+        default=None,
+        description="期望结果文件名，可不填；系统会保存到 workspace/agent_tasks/ 下。",
+    )
+    max_loops: int | None = Field(
+        default=None,
+        ge=5,
+        le=60,
+        description=(
+            "后台子 Agent 最多可调用工具多少轮。复杂资料整理可调高；"
+            "必须在 5 到 60 之间。不填则使用主 Agent 当前默认值。"
+        ),
+    )
 
 
 # ============================================================
@@ -476,6 +618,17 @@ class ListFilesArgs(_ToolArgs):
     pattern: str = Field(
         default="*",
         description="glob 模式，如 '*.txt' 或 '**/*.py'。默认 '*' 列所有",
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="从第几条匹配结果开始返回，默认 0。返回 next_offset 时可用它续读。",
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=200,
+        description="本页最多返回多少条，默认 100，最多 200。",
     )
 
 

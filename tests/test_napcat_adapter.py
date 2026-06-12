@@ -10,7 +10,7 @@ import pytest
 from adapters.base import AdapterAPIError, AdapterNotConnectedError
 from adapters.napcat.adapter import NapCatAdapter
 from adapters.napcat.api_call import NapCatApiCaller
-from adapters.napcat.connection import NapCatConnection
+from adapters.napcat.connection import ConnectionStatus, NapCatConnection, ReverseWSConnection
 from adapters.napcat.process import NapCatProcessManager
 from adapters.types import (
     FriendInfo,
@@ -34,12 +34,34 @@ class FakeConnection(NapCatConnection):
         self.sent: list[dict] = []
         # 自动响应器：根据请求的 action 返回固定数据
         self.responders: dict[str, dict[str, Any]] = {}
+        self._connected_event = asyncio.Event()
+        self._status = ConnectionStatus(
+            state="idle",
+            connected=False,
+            attempt=0,
+            last_connected_at=None,
+            last_disconnected_at=None,
+            last_error=None,
+            endpoint="fake",
+        )
 
     async def start(self) -> None:
         self._connected = True
+        self._connected_event.set()
+        self._status = ConnectionStatus(
+            state="connected",
+            connected=True,
+            attempt=1,
+            last_connected_at=None,
+            last_disconnected_at=None,
+            last_error=None,
+            endpoint="fake",
+        )
 
     async def stop(self) -> None:
         self._connected = False
+        self._connected_event.clear()
+        self._notify_connection_lost()
 
     async def send(self, data: dict) -> None:
         self.sent.append(data)
@@ -58,6 +80,24 @@ class FakeConnection(NapCatConnection):
 
     @property
     def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def status(self) -> ConnectionStatus:
+        return self._status
+
+    async def wait_connected(self, timeout: float | None = None) -> bool:
+        if self._connected:
+            return True
+        if timeout is not None and timeout <= 0:
+            return self._connected
+        try:
+            if timeout is None:
+                await self._connected_event.wait()
+            else:
+                await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return self._connected
         return self._connected
 
     async def simulate_receive(self, data: dict) -> None:
@@ -116,9 +156,36 @@ async def test_api_call_roundtrip():
 async def test_api_call_not_connected_raises():
     conn = FakeConnection()
     # 不调 start()
-    api = NapCatApiCaller(conn)
+    api = NapCatApiCaller(conn, wait_connected_timeout=0)
 
     with pytest.raises(AdapterNotConnectedError):
+        await api.call("send_msg", {})
+
+
+@pytest.mark.asyncio
+async def test_api_call_waits_for_connection_before_send():
+    conn = FakeConnection()
+    api = NapCatApiCaller(conn, wait_connected_timeout=0.2)
+    _bridge_caller_to_conn(api, conn)
+
+    async def connect_later():
+        await asyncio.sleep(0.02)
+        await conn.start()
+        conn.responders["send_msg"] = {"message_id": 123}
+
+    asyncio.create_task(connect_later())
+    result = await api.call("send_msg", {"message": "hi"}, timeout=1.0)
+
+    assert result == {"message_id": 123}
+    assert conn.sent[-1]["action"] == "send_msg"
+
+
+@pytest.mark.asyncio
+async def test_api_call_wait_connected_timeout_is_clear():
+    conn = FakeConnection()
+    api = NapCatApiCaller(conn, wait_connected_timeout=0.01)
+
+    with pytest.raises(AdapterNotConnectedError, match="等待 0.0s 后仍无法调用"):
         await api.call("send_msg", {})
 
 
@@ -190,6 +257,49 @@ async def test_discard_pending_on_disconnect():
         await task
 
 
+@pytest.mark.asyncio
+async def test_adapter_discards_pending_when_connection_lost():
+    conn = FakeConnection()
+    adapter = NapCatAdapter("napcat_test", conn)
+    await adapter.start()
+
+    task = asyncio.create_task(adapter.call_api("hangs"))
+    while not conn.sent:
+        await asyncio.sleep(0.001)
+    await conn.stop()
+
+    with pytest.raises(AdapterNotConnectedError):
+        await task
+
+
+def test_adapter_from_config_uses_startup_connect_timeout():
+    class FakeSecrets:
+        def get(self, _key: str) -> None:
+            return None
+
+    from app_config.schema import NapCatAdapterConfig
+
+    cfg = NapCatAdapterConfig(
+        mode="client",
+        initial_connect_timeout_seconds=10.0,
+        startup_connect_timeout_seconds=2.5,
+        api_wait_connected_timeout_seconds=1.25,
+        fast_reconnect_attempts=7,
+        fast_reconnect_interval_seconds=0.1,
+        reconnect_jitter_seconds=0.0,
+    )
+
+    adapter = NapCatAdapter.from_config("napcat_test", cfg, FakeSecrets())  # type: ignore[arg-type]
+
+    conn = adapter._connection  # type: ignore[attr-defined]
+    assert isinstance(conn, ReverseWSConnection)
+    assert conn.initial_connect_timeout == 2.5
+    assert conn.fast_reconnect_attempts == 7
+    assert conn.fast_reconnect_interval == 0.1
+    assert conn.reconnect_jitter == 0.0
+    assert adapter._api.wait_connected_timeout == 1.25  # type: ignore[attr-defined]
+
+
 # ============================================================
 # NapCatAdapter 测试
 # ============================================================
@@ -211,6 +321,28 @@ async def test_adapter_send_text_private():
     assert conn.sent[-1]["params"]["message_type"] == "private"
     assert conn.sent[-1]["params"]["user_id"] == 1001
     assert conn.sent[-1]["params"]["message"] == "你好"
+
+
+@pytest.mark.asyncio
+async def test_adapter_send_text_waits_for_connection():
+    conn = FakeConnection()
+    adapter = NapCatAdapter(
+        "napcat_test",
+        conn,
+        api_wait_connected_timeout_seconds=0.2,
+    )
+    target = Target(adapter="napcat_test", scope="private", target_id="1001")
+
+    async def connect_later():
+        await asyncio.sleep(0.02)
+        await conn.start()
+        conn.responders["send_msg"] = {"message_id": 456}
+
+    asyncio.create_task(connect_later())
+    msg_id = await adapter.send_text(target, "启动后第一条")
+
+    assert msg_id == "456"
+    assert conn.sent[-1]["params"]["message"] == "启动后第一条"
 
 
 @pytest.mark.asyncio

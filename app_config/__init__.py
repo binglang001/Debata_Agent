@@ -35,12 +35,14 @@ from .schema import (
     ReasoningConfig,
     RootConfig,
     SummarizeConfig,
+    ToolResultBudgetConfig,
     TTSFeatureConfig,
     TypingConfig,
     VisionFeatureConfig,
     WeatherFeatureConfig,
     WebSearchFeatureConfig,
     WhitelistConfig,
+    default_tool_result_budgets,
 )
 from .secrets import SecretsError, SecretsManager
 
@@ -68,6 +70,8 @@ __all__ = [
     "PersonaConfig",
     "BehaviorConfig",
     "ContextConfig",
+    "ToolResultBudgetConfig",
+    "default_tool_result_budgets",
     "TypingConfig",
     "RateLimitConfig",
     "SummarizeConfig",

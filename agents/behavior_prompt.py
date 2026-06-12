@@ -38,7 +38,7 @@ CORE_RULES = """<core_rules priority="critical">
 #
 #    拆成 _HEADER + _MEMORY_BLOCK_* + _FOOTER 三段，便于按
 #    long_term_memory.mode 动态注入对应的记忆工具说明
-#    RAG 模式同样暴露 save/delete，但说明会强调向量索引同步。
+#    RAG 模式不暴露 save/delete，长期记忆由会话向量检索自动完成。
 # ============================================================
 
 _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
@@ -50,6 +50,8 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 - 一条 target = 一条消息。**默认每条 target 5-15 字**，超过 20 字必须重新考虑能否拆条
 - 多条消息 = 多个 target，按 order 从小到大发送
 - 本轮对话已收尾时 send_only=true；还需继续操作（搜索、追问）则不设
+- 发送工具结果以 qq_visible 为准：true=已在 QQ 可见，false=没有发出，pending=排队中等待后台确认
+- status=stale 时 attempted_messages 没有发出；先看 new_visible_messages，必要时调用 get_recent_chat_messages 确认 QQ 真实聊天记录后重新判断
 - 发送工具可能先返回 queued；正常发完只静默记历史，被打断或失败才会追加 send_receipt。看到 <send_receipt> 时按 sent / unsent / interrupted / new_messages 判断发送状态；已发的当已发，未发的不要机械补发，优先结合新消息回应
 - 心里有长话 → 拆成 3-7 条短消息瀑布式连发，每条只承载一个语义单元
 - delay 控制条间隔，模拟真人打字（默认 3 字/秒，首条无延迟）
@@ -136,22 +138,12 @@ _MEMORY_BLOCK_FILE_MODE = """<memory>
 """
 
 _MEMORY_BLOCK_RAG_MODE = """<memory>
-## save_important_memory / delete_important_memory（RAG 语义检索）
+## RAG 会话向量检索
 
-长期记忆会保存到文件并建立向量索引。与你当前话题相关的记忆会在 <long_term_memory> 中召回。
+系统会自动把历史对话建立向量索引。与你当前话题相关的旧消息会在 <long_term_memory> 中召回。
 
-必须主动保存的情况：
-- 用户明确说“记住 / 记一下 / 帮我记 / 约定”
-- 认识了新的人——对方是谁、QQ 号、与你的关系
-- 与人做了约定或承诺——时间、内容、对方
-- 对方表达了稳定偏好、长期目标或需要以后参考的事实
-- 你做了自我反思，发现要改进的地方
-- 管理员给了反馈或指示
-
-保存时用一句话概括核心信息，不存日常寒暄、临时测试、工具执行结果或已经过期的信息。scope 通常留空由系统按当前私聊/群聊推断；只有跨会话稳定事实才用 global，需要任何场景都常驻时才 pinned=true。
-如果用户只是笼统说“随便记”，但没有给出可保存的事实、偏好或约定，应追问要记什么。
-
-记忆过时、错误、重复或不再需要 → delete_important_memory（关键词模糊匹配）。删除会同步移除 RAG 索引。
+RAG 模式下不要主动保存或删除重要记忆；没有 save_important_memory / delete_important_memory 工具。
+用户说“记住 / 记一下 / 帮我记 / 约定”时，把它当作当前对话内容正常回应即可，后续会由历史向量检索召回。
 </memory>
 """
 
@@ -170,8 +162,10 @@ _TOOL_USE_PROTOCOL_FOOTER = """<no_action>
 - recall_message：撤回（仅 2 分钟内的消息）
 - get_forward_msg：提取合并转发内容
 - get_user_info：查 QQ 用户公开信息
-- summarize_conversation：总结本地归档和活跃历史，私聊/群聊都可用
-- summarize_chat_history：拉取并总结 NapCat 服务器侧近期群历史，仅群聊可用
+- start_agent_task：启动后台子 Agent 处理大资料、长文件、合并转发、本地历史提取/整理任务；必须传 prompt，不支持直接传 URL；调用后先返回 task_id，完成后系统会把结果作为新请求回传
+- 用户让你整理/提取/转换合并转发、长历史或长文件时，优先用 start_agent_task，把资料来源交给后台处理；不要先把大材料完整取回当前轮导致工具结果截断
+- summarize_conversation：启动后台子 Agent 总结本地归档和活跃历史，私聊/群聊都可用；不会立刻返回摘要
+- summarize_chat_history：拉取 NapCat 服务器侧近期群历史并启动后台子 Agent 总结，仅群聊可用；不会立刻返回摘要
 - upload_file：发送本地文件
 - send_voice_message：发送语音。调用时必须填写 prompt，用一句话写清语气/音色/节奏；不要省略语气提示词
 - set_friend_add_request / set_group_add_request：处理验证请求（必须管理员同意后才调）
@@ -185,7 +179,7 @@ def build_tool_use_protocol(memory_mode: str = "file") -> str:
 
     Args:
         memory_mode: "file" = 文件模式（AI 主动调用 save_important_memory）
-                     "rag"  = RAG 模式（AI 主动保存 + 向量检索）
+                     "rag"  = RAG 模式（自动会话向量检索，不暴露重要记忆工具）
 
     Returns:
         完整的 <tool_use_protocol>...</tool_use_protocol> 字符串
@@ -404,7 +398,7 @@ SELF_REFLECTION = """<self_reflection priority="medium">
 - 是否误解了对方
 - 是否漏了该保存的重要信息
 
-发现问题 → 用 save_important_memory 记录："反思：[问题]，下次注意[改进]"。
+发现问题 → 后续对话中修正；若当前工具集中提供长期记忆工具，才把稳定、长期需要参考的信息保存。
 </self_reflection>"""
 
 

@@ -758,7 +758,9 @@ class WizardWindow(QMainWindow):
                 display_name=p.active,
             )
             brief = p.brief
-            admins = _admin_entries(self._context.admin_qq, self._context.admin_name)
+            admins = _admin_entries_from_brief(brief) if brief else []
+            if not admins:
+                admins = _admin_entries(self._context.admin_qq, self._context.admin_name)
             file_text = (
                 render_persona_file(result, brief, admins=admins)
                 if brief
@@ -848,6 +850,25 @@ def _admin_entries(admin_qq: str, admin_name: str) -> list[dict[str, object]]:
     if admin_name:
         entry["name"] = admin_name
     return [entry]
+
+
+def _admin_entries_from_brief(brief) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for item in getattr(brief, "admins", []) or []:
+        qq = str(item.get("qq", "")).strip()
+        name = str(item.get("name", "")).strip()
+        relation = str(item.get("relation", "")).strip()
+        if not qq:
+            continue
+        entry: dict[str, object] = {"qq": int(qq), "role": "owner"}
+        if name:
+            entry["name"] = name
+        if relation:
+            entry["relation"] = relation
+        entries.append(entry)
+    if entries:
+        return entries
+    return _admin_entries(getattr(brief, "admin_qq", ""), getattr(brief, "admin_name", ""))
 
 
 def _render_minimal_persona(name: str, xml: str, admins: list[dict[str, object]] | None = None) -> str:

@@ -29,7 +29,11 @@ from app_config.schema import (
 )
 from memory.important import ImportantMemoryManager
 from memory.rag_store import RagEntry
-from ui.dashboard.chats_page import _group_records_by_conversation
+from ui.dashboard.chats_page import (
+    _format_tool_call_for_display,
+    _group_records_by_conversation,
+    _scrollbar_near_bottom,
+)
 from ui.dashboard.logs_page import _format_record
 from ui.dashboard.memory_page import MemoryPage
 from ui.dashboard.personas_page import PersonasPage
@@ -83,6 +87,61 @@ def test_chats_group_records_by_metadata_and_legacy_header():
     assert grouped[0]["label"] == "群聊 20002"
     assert grouped[1]["key"] == "private:10001"
     assert len(grouped[1]["records"]) == 2
+
+
+def test_chats_group_records_prefers_explicit_conversation_id():
+    records = [
+        {"role": "user", "content": "u", "conversation_id": "private:10001"},
+        {"role": "assistant", "content": "a", "conversation_id": "private:10001"},
+        {"role": "system", "content": "主动思考：本次跳过"},
+        {
+            "role": "tool",
+            "content": "{}",
+            "tool_call_id": "tc",
+            "conversation_id": "group:20002",
+        },
+    ]
+
+    grouped = _group_records_by_conversation(records)
+    by_key = {item["key"]: item for item in grouped}
+
+    assert by_key["private:10001"]["label"] == "私聊 10001"
+    assert len(by_key["private:10001"]["records"]) == 2
+    assert by_key["system:global"]["records"][0]["content"] == "主动思考：本次跳过"
+    assert by_key["group:20002"]["records"][0]["tool_call_id"] == "tc"
+
+
+def test_chats_formats_send_tool_call_readably():
+    text = _format_tool_call_for_display(
+        {
+            "function": {
+                "name": "send_group_message",
+                "arguments": (
+                    '{"group_id":1039163467,"targets":['
+                    '{"content":"好好好 不说了","delay":0.5},'
+                    '{"content":"那我先待机","delay":0.6}]}'
+                ),
+            }
+        }
+    )
+
+    assert text == "在群 1039163467 发送消息：好好好 不说了（0.5s）；那我先待机（0.6s）"
+
+
+def test_chats_scrollbar_bottom_threshold():
+    class FakeBar:
+        def __init__(self, value: int, maximum: int) -> None:
+            self._value = value
+            self._maximum = maximum
+
+        def value(self) -> int:
+            return self._value
+
+        def maximum(self) -> int:
+            return self._maximum
+
+    assert _scrollbar_near_bottom(FakeBar(980, 1000), threshold=24) is True
+    assert _scrollbar_near_bottom(FakeBar(900, 1000), threshold=24) is False
 
 
 @pytest.mark.asyncio
@@ -244,11 +303,12 @@ def test_memory_page_rag_mode_shows_index_view(qapp):
     try:
         page.refresh()
 
-        assert page._title.text() == "RAG 记忆索引"
+        assert page._title.text() == "RAG 历史向量索引"
         assert "索引 1 条" in page._rag_status.text()
         assert page._list.count() == 1
         assert page._add_row_widget.isHidden()
         assert page._action_row_widget.isHidden()
+        assert page._metadata_row_widget.isHidden()
     finally:
         page.deleteLater()
 
@@ -287,7 +347,14 @@ def test_personas_page_can_build_and_save_generated_persona(qapp, tmp_path):
         context.persona.source = "create"
         context.persona.active = "Mika"
         context.persona.generated_xml = "<identity>你是 Mika</identity>"
-        context.persona.brief = PersonaBrief(name="Mika", admin_name="Lily", admin_qq="123456")
+        context.persona.brief = PersonaBrief(
+            name="Mika",
+            gender="female",
+            admins=[
+                {"name": "Lily", "qq": "123456", "relation": "创作者"},
+                {"name": "Robin", "qq": "654321", "relation": "朋友"},
+            ],
+        )
         context.admin_name = "Lily"
         context.admin_qq = "123456"
 
@@ -296,7 +363,36 @@ def test_personas_page_can_build_and_save_generated_persona(qapp, tmp_path):
         assert saved.exists()
         text = saved.read_text(encoding="utf-8")
         assert "<identity>你是 Mika</identity>" in text
-        assert '"qq": 123456' in text
+        assert "'qq': 123456" in text
+        assert "'qq': 654321" in text
+        assert "'gender': 'female'" in text
+    finally:
+        page.deleteLater()
+
+
+def test_personas_page_selects_active_persona_on_refresh(qapp, tmp_path):
+    cfg = _minimal_root_config()
+    cfg.persona.active = "Mika"
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir()
+    for name in ("debata", "Mika"):
+        d = personas_dir / name
+        d.mkdir()
+        (d / "persona_prompt.py").write_text("PERSONA_PROMPT = 'x'\n", encoding="utf-8")
+
+    runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "config": cfg,
+            "secrets": None,
+            "paths": type("Paths", (), {"PERSONAS_DIR": personas_dir})(),
+        },
+    )()
+    page = PersonasPage(runtime)
+    try:
+        page.refresh()
+        assert page._selected() == "Mika"
     finally:
         page.deleteLater()
 

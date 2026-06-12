@@ -44,9 +44,18 @@ from pydantic import BaseModel
 if TYPE_CHECKING:
     from adapters.base import IAdapter
     from memory import ArchiveStore, HistoryManager, ImportantMemoryManager
-    from providers.base import IProvider
 
 logger = logging.getLogger(__name__)
+
+
+def _default_tool_result_budgets() -> dict[str, Any]:
+    try:
+        from app_config.schema import default_tool_result_budgets
+
+        return default_tool_result_budgets()
+    except Exception:
+        logger.debug("加载默认工具预算失败，使用空预算表", exc_info=True)
+        return {}
 
 
 # ============================================================
@@ -104,6 +113,9 @@ SendActionsCallback = Callable[
 ]
 """发送类工具的 Phase 0 队列回调：(actions, source_tool) -> result。"""
 
+AgentTaskCallback = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+"""后台子 Agent 任务回调：(payload) -> queued result。"""
+
 
 # ============================================================
 # ToolContext —— 工具执行所需的全部依赖
@@ -136,12 +148,6 @@ class ToolContext:
     archive: ArchiveStore | None = None
     """永久历史归档（recall_history 等工具使用）。"""
 
-    summary_provider: IProvider | None = None
-    """用于总结的 LLM provider（独立配置，通常小模型）。"""
-
-    summary_model: str = ""
-    """summary provider 上具体使用的模型 ID。"""
-
     vision: IVisionService | None = None
     web_search: IWebSearchService | None = None
     weather: IWeatherService | None = None
@@ -167,6 +173,9 @@ class ToolContext:
     tool_result_soft_limit_tokens: int = 600
     tool_result_hard_cap_tokens: int = 1500
     tool_result_soft_overrides: dict[str, int] = field(default_factory=dict)
+    tool_result_default_budget_tokens: int = 800
+    tool_result_default_hard_cap_tokens: int = 3000
+    tool_result_budgets: dict[str, Any] = field(default_factory=_default_tool_result_budgets)
     """工具结果创建即定型压缩阈值。"""
 
     activity_cb: Callable[[], None] | None = None
@@ -174,6 +183,9 @@ class ToolContext:
 
     send_actions_cb: SendActionsCallback | None = None
     """Phase 0 真异步发送入口。存在时 send_* 工具交给 pipeline 队列处理。"""
+
+    agent_task_cb: AgentTaskCallback | None = None
+    """start_agent_task 工具触发时调用，创建后台子 Agent 任务。"""
 
     collected: list[dict[str, Any]] = field(default_factory=list)
     """遗留发送动作兜底队列。
@@ -466,6 +478,9 @@ DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "set_friend_add_request",
     "set_group_add_request",
     "schedule_wakeup",
+    "start_agent_task",
+    "summarize_chat_history",
+    "summarize_conversation",
 }
 """与 agents.runner.DEFAULT_NO_FEEDBACK_TOOLS 对齐。
 ToolRegistry.get_no_feedback_names() 是更准的来源（按实际启用工具）；
