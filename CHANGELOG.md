@@ -2,6 +2,14 @@
 
 本文件记录 Debata 所有重要变更，格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v0.8.6-alpha] — 2026-06-12
+
+### Fixed
+- 修复 CI 干净 checkout 时测试依赖 ignored `data/config.yaml` 导致的 Linux/Python 3.12 失败
+
+### Changed
+- 发布版本号更新为 v0.8.6-alpha
+
 ## [v0.8.5-alpha] — 2026-06-11
 
 ### Added

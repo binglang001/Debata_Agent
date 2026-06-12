@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import yaml
 from pydantic import ValidationError
@@ -92,8 +90,7 @@ def test_budget_limit_schema_defaults_load_for_legacy_config():
 
 
 def test_data_config_explicit_budget_defaults_roundtrip(tmp_paths):
-    config_path = Path(__file__).resolve().parent.parent / "data" / "config.yaml"
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw = _minimal_config().model_dump(mode="json", exclude_none=True)
 
     expected = {
         ("agents", "chat", "tool_loop_final_max_tokens"): 4096,
@@ -155,7 +152,10 @@ def test_data_config_explicit_budget_defaults_roundtrip(tmp_paths):
         assert node == value
 
     RootConfig.model_validate(raw)
-    tmp_paths.CONFIG_FILE.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+    tmp_paths.CONFIG_FILE.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
     loaded = load_config(tmp_paths, set_global=False)
     assert loaded.agents.chat.tool_loop_final_max_tokens == 4096
     assert loaded.features.vision.max_tokens == 1024
