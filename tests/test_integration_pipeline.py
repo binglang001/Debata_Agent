@@ -65,6 +65,7 @@ from core.state import PendingMessageItem, PendingRequestStore, RateLimiter
 from core.wakeup import WakeupScheduler
 from memory import (
     ArchiveStore,
+    EventStore,
     HistoryManager,
     ImportantMemoryManager,
     RollingSummaryStore,
@@ -119,7 +120,9 @@ def _make_root_config() -> RootConfig:
             recall_merge_window_seconds=0.05,
             proactive_think_interval_seconds=600.0,
             default_history_fetch_count=10000,
-            typing=TypingConfig(chars_per_second=999.0, max_delay_seconds=0.01),
+            typing=TypingConfig(
+                chars_per_second=999.0,
+            ),
             rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
             summarize=SummarizeConfig(
                 trigger_at_messages=99999, range_start_messages=9000, range_end_messages=11000,
@@ -240,6 +243,22 @@ class FakeAdapter(IAdapter):
         self.uploaded.append((target, file_path, display_name))
 
 
+class FailingQQSentEventStore:
+    def __init__(self) -> None:
+        self.appended_events: list[dict[str, Any]] = []
+
+    async def append_event(self, **event: Any) -> int:
+        self.appended_events.append(event)
+        if event.get("event_type") == "qq_message_sent":
+            raise RuntimeError("append log failed")
+        return len(self.appended_events)
+
+
+class ProjectionFailingEventStore(EventStore):
+    def _project_events_sync(self, events: list[Any]) -> None:
+        raise RuntimeError("projection failed")
+
+
 # ============================================================
 # fixture：构造完整 pipeline
 # ============================================================
@@ -255,6 +274,7 @@ def build_pipeline(tmp_path):
         emoji_dir=None,
         workspace_dir=None,
         rate_limiter=None,
+        event_store=None,
     ):
         cfg = _make_root_config()
         provider = ScriptedProvider(script)
@@ -291,6 +311,7 @@ def build_pipeline(tmp_path):
             workspace_dir=workspace_dir,
             rate_limiter=rate_limiter,
             summary_agent=None,
+            event_store=event_store,
         )
         scheduler._on_fire = pipeline.run_wakeup_turn  # 双向依赖回填
         return pipeline, provider, adapter, history, important
@@ -329,7 +350,7 @@ def _msg(
 
 def _ai_send_private(target_qq: str = "123", content: str = "嗨") -> CompletionResult:
     args = {
-        "targets": [{"target_qq": target_qq, "content": content, "order": 1}],
+        "targets": [{"target_qq": target_qq, "content": content, "order": 1, "delay": 0}],
     }
     tc = ToolCall(id="tc-1", name="send_private_messages", arguments=json.dumps(args))
     return CompletionResult(tool_calls=[tc], finish_reason="tool_calls")
@@ -338,7 +359,7 @@ def _ai_send_private(target_qq: str = "123", content: str = "嗨") -> Completion
 def _ai_send_group(group_id: str = "5555", content: str = "群好") -> CompletionResult:
     args = {
         "group_id": int(group_id),
-        "targets": [{"content": content, "order": 1}],
+        "targets": [{"content": content, "order": 1, "delay": 0}],
     }
     tc = ToolCall(id="tc-g", name="send_group_message", arguments=json.dumps(args))
     return CompletionResult(tool_calls=[tc], finish_reason="tool_calls")
@@ -434,6 +455,47 @@ async def test_main_reply_persists_task_context_snapshot_for_kv_prefix(build_pip
     assert first_call[1]["role"] == "user"
     assert first_call[2]["role"] == "user"
     assert first_call[2]["content"] == records[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_one_turn_tool_call_writes_runtime_events_and_history(build_pipeline, tmp_path):
+    event_store = EventStore(tmp_path / "events.sqlite3")
+    pipeline, _, adapter, history, _ = await build_pipeline(
+        [_ai_send_private(target_qq="123", content="旁路回复"), _ai_no_action()],
+        event_store=event_store,
+    )
+
+    await pipeline.run_one_turn(
+        "旁路模型轮 runtime event 测试",
+        user_event="请执行一次工具调用",
+        conversation_id="private:123",
+        history_conversation_id="system:proactive",
+    )
+
+    assert [content for _, content in adapter.sent] == ["旁路回复"]
+    assert await event_store.wait_projected(timeout=1.0)
+    events = await event_store.iter_events(limit=20)
+    runtime_event_types = [event["event_type"] for event in events]
+    assert "tool_call_started" in runtime_event_types
+    assert "tool_result_received" in runtime_event_types
+    assert {
+        event["conversation_id"]
+        for event in events
+        if event["event_type"] in {"tool_call_started", "tool_result_received"}
+    } == {"system:proactive"}
+
+    records = await history.records()
+    assert any(
+        record.get("role") == "assistant" and record.get("tool_calls")
+        for record in records
+    )
+    assert any(
+        record.get("role") == "tool"
+        and record.get("tool_call_id") == "tc-1"
+        and "旁路回复" in str(record.get("content") or "")
+        for record in records
+    )
+    await event_store.shutdown()
 
 
 @pytest.mark.asyncio
@@ -678,6 +740,24 @@ async def test_working_history_without_conversation_uses_normal_budget(build_pip
 
 
 @pytest.mark.asyncio
+async def test_working_history_budget_uses_context_min_and_prompt_overhead(build_pipeline):
+    pipeline, _, _, _, _ = await build_pipeline([])
+    context = pipeline.behavior_cfg.context
+    context.max_context_tokens = 20_000
+    context.reserve_output_tokens = 2_000
+    context.memory_token_budget = 3_000
+    context.summary_token_budget = 4_000
+    context.prompt_overhead_estimate_tokens = 5_000
+    context.min_working_history_tokens = 2_500
+
+    assert pipeline._working_history_budget() == 6_000
+
+    context.prompt_overhead_estimate_tokens = 20_000
+
+    assert pipeline._working_history_budget() == 2_500
+
+
+@pytest.mark.asyncio
 async def test_working_history_trims_old_runtime_context_records(build_pipeline):
     pipeline, _, _, history, _ = await build_pipeline([])
     await history.add_user_message("群聊真实旧消息仍属于统一时间线", conversation_id="group:1")
@@ -783,13 +863,57 @@ async def test_working_history_keeps_recent_current_conversation_runtime(build_p
 async def test_working_history_keeps_recent_send_receipt_fields(build_pipeline):
     pipeline, _, _, history, _ = await build_pipeline([])
     for idx in range(16):
+        legacy_receipt = {
+            "interrupted": True,
+            "send_id": f"legacy-{idx}",
+            "sent": [{"content": f"已发-{idx}", "order": 1, "msg_id": f"s-{idx}"}],
+            "unsent": [
+                {
+                    "content": f"旧 JSON 未发-{idx}",
+                    "order": 2,
+                    "send_id": f"legacy-{idx}",
+                    "conversation_id": "group:5555",
+                }
+            ],
+            "new_messages": [
+                {
+                    "conversation_id": "group:5555",
+                    "user_id": "123",
+                    "nickname": f"用户{idx}",
+                    "text": f"旧 JSON 新消息 {idx}-1",
+                    "seq": idx * 10 + 1,
+                    "time": "10:00",
+                    "msg_id": f"legacy-new-{idx}-1",
+                },
+                {
+                    "conversation_id": "group:5555",
+                    "user_id": "123",
+                    "nickname": f"用户{idx}",
+                    "text": f"旧 JSON 新消息 {idx}-2",
+                    "seq": idx * 10 + 2,
+                    "time": "10:01",
+                    "msg_id": f"legacy-new-{idx}-2",
+                },
+            ],
+            "recalled_messages": [
+                {
+                    "msg_id": f"legacy-recall-{idx}",
+                    "conversation_id": "group:5555",
+                    "note": "旧 JSON 撤回",
+                }
+            ],
+            "errors": [{"order": 3, "error": "旧 JSON 错误"}],
+            "accepted_messages": [{"content": "不应进入 prompt 的 accepted"}],
+            "irrelevant_raw_payload": "不应进入 prompt 的无关字段",
+        }
         await history.add_records(
             [
                 {
                     "role": "user",
                     "content": (
                         "<send_receipt>\n"
-                        f'{{"interrupted": true, "unsent": [], "new_messages": [], "old": {idx}}}\n'
+                        "系统说明：运行时发送状态；按 JSON 字段判断。\n"
+                        f"{json.dumps(legacy_receipt, ensure_ascii=False)}\n"
                         "</send_receipt>"
                     ),
                     "conversation_id": "group:5555",
@@ -802,9 +926,16 @@ async def test_working_history_keeps_recent_send_receipt_fields(build_pipeline):
                 "role": "user",
                 "content": (
                     "<send_receipt>\n"
-                    '{"interrupted": true, "unsent": [{"content": "未发"}], '
-                    '"new_messages": [{"text": "新消息"}], '
-                    '"recalled_messages": [{"msg_id": "m1"}]}\n'
+                    "发送回执：send-latest\n"
+                    "会话：group:5555\n"
+                    "状态：部分发送；发送期间被新消息打断（interrupted=true）。\n"
+                    "未发送 1 条：\n"
+                    "1. 未发；order=2；send_id=send-latest；conversation_id=group:5555\n"
+                    "新消息 1 条：\n"
+                    "- 用户（group:5555；user_id=123）1 条；样例：\"新消息\"；"
+                    "最新 seq=8/time=10:00/msg_id=m-new\n"
+                    "撤回消息 1 条：\n"
+                    "1. msg_id=m1；conversation_id=group:5555；note=用户撤回\n"
                     "</send_receipt>"
                 ),
                 "conversation_id": "group:5555",
@@ -814,12 +945,167 @@ async def test_working_history_keeps_recent_send_receipt_fields(build_pipeline):
 
     selected = await pipeline._select_working_history("group:5555")
     joined = "\n".join(str(r.get("content", "")) for r in selected)
+    raw_joined = "\n".join(str(r.get("content", "")) for r in await history.records())
 
-    assert '"old": 0' not in joined
-    assert '"interrupted": true' in joined
-    assert '"content": "未发"' in joined
-    assert '"text": "新消息"' in joined
-    assert '"recalled_messages": [{"msg_id": "m1"}]' in joined
+    assert '"new_messages"' not in joined
+    assert "accepted_messages" not in joined
+    assert "irrelevant_raw_payload" not in joined
+    assert "不应进入 prompt 的 accepted" not in joined
+    assert "不应进入 prompt 的无关字段" not in joined
+    assert '"new_messages"' in raw_joined
+    assert "accepted_messages" in raw_joined
+    assert "发送回执：legacy-15" in joined
+    assert "会话：group:5555" in joined
+    assert "状态：部分发送；发送期间被新消息打断（interrupted=true）。" in joined
+    assert "旧 JSON 未发-15；order=2；send_id=legacy-15" in joined
+    assert "新消息 2 条" in joined
+    assert "用户15（group:5555；user_id=123）2 条" in joined
+    assert "样例：\"旧 JSON 新消息 15-1\"" in joined
+    assert "最新 seq=152/time=10:01/msg_id=legacy-new-15-2" in joined
+    assert "撤回消息 1 条" in joined
+    assert "msg_id=legacy-recall-15" in joined
+    assert "错误 1 条" in joined
+    assert "error=旧 JSON 错误；order=3" in joined
+    assert "发送回执：send-latest" in joined
+    assert "未发；order=2；send_id=send-latest" in joined
+    assert "样例：\"新消息\"" in joined
+    assert "msg_id=m1" in joined
+
+
+@pytest.mark.asyncio
+async def test_format_send_receipt_summarizes_spam_without_full_json(build_pipeline):
+    pipeline, _, _, _, _ = await build_pipeline([])
+    long_sent_content = "已发-" + "长" * 220
+    receipt = {
+        "type": "send_receipt",
+        "send_id": "send-token",
+        "conversation_id": "private:123",
+        "interrupted": True,
+        "sent": [
+            {
+                "content": long_sent_content if idx == 0 else f"已发-{idx}",
+                "order": idx + 1,
+                "msg_id": f"sent-{idx}",
+                "conversation_id": "private:123",
+            }
+            for idx in range(3)
+        ]
+        + [
+            {
+                "content": "已发-隐藏",
+                "order": 4,
+                "msg_id": "sent-hidden",
+                "conversation_id": "private:123",
+            }
+        ],
+        "unsent": [
+            {
+                "content": f"未发-{idx}",
+                "order": idx + 10,
+                "send_id": "send-token",
+                "conversation_id": "private:123",
+            }
+            for idx in range(5)
+        ]
+        + [
+            {
+                "content": "未发-隐藏",
+                "order": 99,
+                "send_id": "send-token",
+                "conversation_id": "private:123",
+            }
+        ],
+        "new_messages": [
+            {
+                "conversation_id": "private:123",
+                "user_id": "123",
+                "nickname": "用户",
+                "text": f"刷屏 {idx}",
+                "seq": idx + 1,
+                "time": f"10:{idx:02d}",
+                "msg_id": f"m-spam-{idx}",
+                "priority_reasons": ["private_message"] if idx == 0 else [],
+                "priority_reason": "focus_user" if idx == 1 else "",
+            }
+            for idx in range(20)
+        ],
+        "recalled_messages": [
+            {
+                "conversation_id": "private:123",
+                "time": "10:30",
+                "msg_id": "m-recall",
+                "note": "用户撤回",
+                "qq_visible": False,
+            }
+        ],
+        "errors": ["order=9: boom", {"order": 10, "error": "timeout"}],
+        "accepted_messages": [{"content": "不应重复出现的 accepted 内容"}],
+    }
+
+    summary = pipeline._format_send_receipt(receipt)
+
+    assert "<send_receipt>" in summary
+    assert "</send_receipt>" in summary
+    assert '"new_messages"' not in summary
+    assert '{"conversation_id"' not in summary
+    assert summary.count("msg_id=m-spam-") == 1
+    assert "新消息 20 条：" in summary
+    assert "用户（private:123；user_id=123）20 条" in summary
+    assert "样例：\"刷屏 0\"" in summary
+    assert "最新 seq=20/time=10:19/msg_id=m-spam-19" in summary
+    assert "priority_reasons=private_message,focus_user" in summary
+    assert "已发送 4 条：" in summary
+    expected_sent_content = f"{long_sent_content[:157]}..."
+    assert (
+        f"{expected_sent_content}；order=1；msg_id=sent-0；conversation_id=private:123"
+        in summary
+    )
+    assert long_sent_content not in summary
+    assert "已发-隐藏" not in summary
+    assert "... 另有 1 条未列出。" in summary
+    assert "未发送 6 条：" in summary
+    assert "未发-4；order=14；send_id=send-token；conversation_id=private:123" in summary
+    assert "未发-隐藏" not in summary
+    assert "撤回消息 1 条：" in summary
+    assert "msg_id=m-recall；conversation_id=private:123；time=10:30；note=用户撤回" in summary
+    assert "错误 2 条：" in summary
+    assert "order=9: boom" in summary
+    assert "error=timeout；order=10" in summary
+    assert "不应重复出现的 accepted 内容" not in summary
+
+
+@pytest.mark.asyncio
+async def test_format_send_receipt_limits_new_message_groups(build_pipeline):
+    pipeline, _, _, _, _ = await build_pipeline([])
+    receipt = {
+        "type": "send_receipt",
+        "send_id": "send-groups",
+        "conversation_id": "group:0",
+        "interrupted": True,
+        "sent": [],
+        "unsent": [],
+        "new_messages": [
+            {
+                "conversation_id": f"group:{idx}",
+                "user_id": str(idx),
+                "nickname": f"用户{idx}",
+                "text": f"消息 {idx}",
+                "seq": idx + 1,
+                "time": f"10:{idx:02d}",
+                "msg_id": f"m-group-{idx}",
+            }
+            for idx in range(8)
+        ],
+    }
+
+    summary = pipeline._format_send_receipt(receipt)
+
+    assert "新消息 8 条：" in summary
+    assert "用户0（group:0；user_id=0）1 条" in summary
+    assert "用户5（group:5；user_id=5）1 条" in summary
+    assert "用户6（group:6；user_id=6）1 条" not in summary
+    assert "... 另有 2 组未列出。" in summary
+    assert '"new_messages"' not in summary
 
 
 @pytest.mark.asyncio
@@ -1080,6 +1366,55 @@ async def test_proactive_router_flattens_history_to_system_context(build_pipelin
     assert "tool_calls" not in joined
     assert "<｜｜DSML｜｜TOOL_CALLS>" not in joined
     assert "<send_receipt>" not in joined
+
+
+@pytest.mark.asyncio
+async def test_proactive_router_uses_custom_text_and_tool_limits(build_pipeline):
+    pipeline, _, _, history, _ = await build_pipeline([])
+    pipeline.behavior_cfg.proactive_router_text_limit_tokens = 32
+    pipeline.behavior_cfg.proactive_router_tool_result_inline_tokens = 32
+    pipeline.behavior_cfg.proactive_router_tool_result_hard_cap_tokens = 128
+    await history.add_user_message(
+        "主动路由长文本 " + ("填充 " * 50),
+        conversation_id="private:123",
+    )
+    await history.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "tc-limit",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{}"},
+            }
+        ],
+        conversation_id="private:123",
+    )
+    await history.add_tool_result(
+        "tc-limit",
+        json.dumps(
+            {
+                "ok": True,
+                "summary": "工具摘要 " + ("结果 " * 30),
+            },
+            ensure_ascii=False,
+        ),
+        conversation_id="private:123",
+    )
+    router = FakeProactiveRouter(False)
+    loop = ProactiveLoop(
+        pipeline=pipeline,
+        proactive_agent=router,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+    pipeline.last_activity_at = time.monotonic() - (
+        pipeline.behavior_cfg.proactive_think_interval_seconds + 1
+    )
+
+    await loop._maybe_act()
+
+    assert len(router.calls) == 1
+    joined = "\n".join(str(m.get("content", "")) for m in router.calls[0])
+    assert joined.count("...[已截断]...") >= 2
 
 
 @pytest.mark.asyncio
@@ -1580,7 +1915,7 @@ async def test_context_budget_uses_provider_context_length(build_pipeline):
 async def test_send_result_msg_id_can_be_recalled_same_turn(build_pipeline):
     """发送工具即时返回 msg_id，后续工具轮可立刻撤回刚发出的消息。"""
     send_args = {
-        "targets": [{"target_qq": 123, "content": "这条会撤回", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "这条会撤回", "order": 1, "delay": 0}],
     }
     recall_args = {"message_id": 1000}
     pipeline, _, adapter, _, _ = await build_pipeline(
@@ -1650,7 +1985,7 @@ async def test_send_private_emoji_reaches_image_adapter_and_timeline(build_pipel
     emoji_path = emoji_dir / "无语.png"
     emoji_path.write_bytes(b"\x89PNG\r\n\x1a\n")
     args = {
-        "targets": [{"target_qq": 456, "emoji": "无语", "order": 1}],
+        "targets": [{"target_qq": 456, "emoji": "无语", "order": 1, "delay": 0}],
     }
     pipeline, _, adapter, _, _ = await build_pipeline(
         [
@@ -1709,11 +2044,20 @@ async def test_pipeline_tool_context_injects_pending_requests_and_rate_limiter(
 ):
     limiter = RateLimiter(window_seconds=60, max_messages=1)
     pipeline, _, _, _, _ = await build_pipeline([], rate_limiter=limiter)
+    pipeline.behavior_cfg.typing = TypingConfig(
+        chars_per_second=2.0,
+        english_chars_per_second=6.0,
+    )
 
     ctx = pipeline._build_tool_context(conversation_id="private:456")
 
     assert ctx.extras["pending_requests"] is pipeline.pending_requests
     assert ctx.extras["rate_limiter"] is limiter
+    assert ctx.typing_chars_per_second == pytest.approx(1.0)
+    assert ctx.typing_english_chars_per_second == pytest.approx(5.0)
+    assert not hasattr(ctx, "typing_min_delay_seconds")
+    assert not hasattr(ctx, "typing_max_delay_seconds")
+    assert not hasattr(ctx, "typing_clamp_model_delay")
 
 
 @pytest.mark.asyncio
@@ -1757,8 +2101,9 @@ async def test_send_private_with_delay_returns_accepted_pending(build_pipeline):
     assert tool_contents[-1]["accepted_messages"][0]["content"] == "第一条"
     assert tool_contents[-1]["data"]["conversation_ids"] == ["private:123"]
     assert tool_contents[-1]["data"]["message_count"] == 2
-    assert "brief" not in tool_contents[-1]
-    assert "note" not in tool_contents[-1]
+    assert tool_contents[-1]["result_format"] == "structured_json"
+    assert isinstance(tool_contents[-1]["brief"], str)
+    assert tool_contents[-1]["brief"].strip()
     assert any(
         r.get("role") == "user"
         and r.get("metadata", {}).get("kind") == "send_done_snapshot"
@@ -1853,19 +2198,24 @@ async def test_same_conversation_interrupt_flushes_async_send_queue(build_pipeli
     joined = "\n".join(str(r.get("content", "")) for r in records)
     assert "m-interrupt" in joined
     assert "<send_receipt>" in joined
-    assert '"interrupted": true' in joined
-    assert '"content": "二"' in joined
-    assert '"content": "三"' in joined
-    assert '"qq_visible": false' in joined
-    assert '"qq_visible": true' in joined
+    assert "状态：部分发送；发送期间被新消息打断（interrupted=true）。" in joined
+    assert "未发送 2 条：" in joined
+    assert "二；order=2" in joined
+    assert "三；order=3" in joined
+    assert "新消息 1 条：" in joined
+    assert "最新 seq=2/" in joined
     receipt_turn_context = "\n".join(
         str(m.get("content", ""))
         for m in provider.calls[-1]["messages"]
         if m.get("role") == "user" and "<send_receipt_task" in str(m.get("content", ""))
     )
     assert "<send_receipt>" in receipt_turn_context
-    assert '"interrupted": true' in receipt_turn_context
-    assert "按 JSON 字段判断" in receipt_turn_context
+    assert "interrupted=true" in receipt_turn_context
+    assert "最新 seq=2/" in receipt_turn_context
+    assert "seq=无" not in receipt_turn_context
+    assert '"new_messages"' not in receipt_turn_context
+    assert "按回执摘要判断" in receipt_turn_context
+    assert "按 JSON 字段判断" not in receipt_turn_context
 
 
 @pytest.mark.asyncio
@@ -1945,9 +2295,9 @@ async def test_group_priority_interrupt_stops_same_trigger_user_followup(build_p
     joined = "\n".join(str(r.get("content", "")) for r in records)
     assert "m-follow" in joined
     assert "<send_receipt>" in joined
-    assert '"interrupted": true' in joined
-    assert '"priority_reason": "same_trigger_user"' in joined
-    assert '"content": "二"' in joined
+    assert "interrupted=true" in joined
+    assert "priority_reasons=same_trigger_user" in joined
+    assert "二；order=2" in joined
 
 
 @pytest.mark.asyncio
@@ -1956,7 +2306,7 @@ async def test_same_conversation_message_while_model_thinking_needs_review(build
     started = asyncio.Event()
     release = asyncio.Event()
     send_args = {
-        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1, "delay": 0}],
     }
     no_action = ToolCall(id="tc-na", name="no_action", arguments="{}")
     pipeline, provider, adapter, history, _ = await build_pipeline([])
@@ -2040,7 +2390,7 @@ async def test_other_private_message_while_model_thinking_does_not_review_curren
     started = asyncio.Event()
     release = asyncio.Event()
     send_args = {
-        "targets": [{"target_qq": 123, "content": "A回复", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "A回复", "order": 1, "delay": 0}],
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
     call_count = 0
@@ -2093,7 +2443,7 @@ async def test_unrelated_group_message_while_model_thinking_does_not_stale_send(
     release = asyncio.Event()
     send_args = {
         "group_id": 5555,
-        "targets": [{"content": "短回", "order": 1}],
+        "targets": [{"content": "短回", "order": 1, "delay": 0}],
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
     call_count = 0
@@ -2142,7 +2492,7 @@ async def test_group_review_all_requires_review_for_ordinary_unseen_message(buil
     send_args = {
         "group_id": 5555,
         "review_policy": "review_all",
-        "targets": [{"content": "短回", "order": 1}],
+        "targets": [{"content": "短回", "order": 1, "delay": 0}],
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
     call_count = 0
@@ -2193,7 +2543,7 @@ async def test_group_focus_user_followup_needs_review_before_send(build_pipeline
     release = asyncio.Event()
     send_args = {
         "group_id": 5555,
-        "targets": [{"content": "短回", "order": 1}],
+        "targets": [{"content": "短回", "order": 1, "delay": 0}],
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
     call_count = 0
@@ -2243,7 +2593,7 @@ async def test_slash_hash_group_text_does_not_trigger_priority_review(build_pipe
     release = asyncio.Event()
     send_args = {
         "group_id": 5555,
-        "targets": [{"content": "短回", "order": 1}],
+        "targets": [{"content": "短回", "order": 1, "delay": 0}],
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
     call_count = 0
@@ -2291,7 +2641,7 @@ async def test_atomic_delivery_policy_does_not_bypass_preflight_review(build_pip
     send_args = {
         "group_id": 5555,
         "delivery_interrupt_policy": "atomic",
-        "targets": [{"content": "短回", "order": 1}],
+        "targets": [{"content": "短回", "order": 1, "delay": 0}],
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
     call_count = 0
@@ -2342,7 +2692,7 @@ async def test_needs_review_again_reuses_attempt_and_increments_revision(build_p
     commit_started = asyncio.Event()
     commit_release = asyncio.Event()
     send_args = {
-        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1, "delay": 0}],
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
     call_count = 0
@@ -2423,7 +2773,7 @@ async def test_ignore_review_interrupts_forces_soft_preflight_review(build_pipel
     commit_started = asyncio.Event()
     commit_release = asyncio.Event()
     send_args = {
-        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1, "delay": 0}],
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
     call_count = 0
@@ -2502,7 +2852,7 @@ async def test_send_ignore_review_interrupts_does_not_bypass_preflight_review(
     started = asyncio.Event()
     release = asyncio.Event()
     send_args = {
-        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1, "delay": 0}],
         "ignore_review_interrupts": True,
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
@@ -2603,7 +2953,7 @@ async def test_send_ignore_review_interrupts_does_not_hide_interrupt_from_queued
         "ignore_review_interrupts": True,
     }
     second_args = {
-        "targets": [{"target_qq": 123, "content": "第二批", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "第二批", "order": 1, "delay": 0}],
     }
     pipeline, _, adapter, history, _ = await build_pipeline(
         [
@@ -2636,9 +2986,9 @@ async def test_send_ignore_review_interrupts_does_not_hide_interrupt_from_queued
     joined = "\n".join(str(r.get("content", "")) for r in records)
     assert "发送期间的新消息" in joined
     assert "<send_receipt>" in joined
-    assert '"interrupted": true' in joined
-    assert '"content": "第二批"' in joined
-    assert '"send_id": "' in joined
+    assert "interrupted=true" in joined
+    assert "第二批；order=1" in joined
+    assert "send_id=send-" in joined
 
 
 @pytest.mark.asyncio
@@ -2692,10 +3042,10 @@ async def test_send_ignore_review_interrupts_does_not_ignore_recall_during_send(
     records = await history.records()
     joined = "\n".join(str(r.get("content", "")) for r in records)
     assert "<send_receipt>" in joined
-    assert '"interrupted": true' in joined
-    assert '"recalled_messages"' in joined
+    assert "interrupted=true" in joined
+    assert "撤回消息 1 条" in joined
     assert "m-old" in joined
-    assert '"content": "第二条"' in joined
+    assert "第二条；order=2" in joined
 
 
 @pytest.mark.asyncio
@@ -2704,7 +3054,7 @@ async def test_commit_send_attempt_sends_once_and_second_commit_is_blocked(build
     started = asyncio.Event()
     release = asyncio.Event()
     send_args = {
-        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1, "delay": 0}],
     }
     no_action = ToolCall(id="tc-na", name="no_action", arguments="{}")
     pipeline, provider, adapter, history, _ = await build_pipeline([])
@@ -2798,7 +3148,7 @@ async def test_commit_send_attempt_rejects_recalled_trigger_message(build_pipeli
     started = asyncio.Event()
     release = asyncio.Event()
     send_args = {
-        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1, "delay": 0}],
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
     call_count = 0
@@ -2876,7 +3226,7 @@ async def test_commit_send_attempt_rejects_recalled_trigger_message(build_pipeli
 async def test_same_content_from_different_tool_calls_is_allowed(build_pipeline):
     """重复内容不由程序拦截，不同 tool call 明确再次发送时允许。"""
     args = {
-        "targets": [{"target_qq": 123, "content": "嗯", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "嗯", "order": 1, "delay": 0}],
     }
     pipeline, _, adapter, _, _ = await build_pipeline(
         [
@@ -2926,7 +3276,7 @@ async def test_late_inbound_after_final_async_send_restarts_deferred_batch(build
         ],
     }
     second_args = {
-        "targets": [{"target_qq": 123, "content": "新回复", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "新回复", "order": 1, "delay": 0}],
     }
     pipeline, provider, adapter, history, _ = await build_pipeline(
         [
@@ -3020,7 +3370,7 @@ async def test_recall_while_model_thinking_marks_send_stale(build_pipeline):
     started = asyncio.Event()
     release = asyncio.Event()
     send_args = {
-        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1}],
+        "targets": [{"target_qq": 123, "content": "旧回复", "order": 1, "delay": 0}],
         "ignore_review_interrupts": True,
     }
     pipeline, provider, adapter, history, _ = await build_pipeline([])
@@ -3163,7 +3513,22 @@ async def test_token_compaction_archives_before_truncate(build_pipeline):
             self.existing_important_text = existing_important_text
             return {
                 "summary_text": f"{existing_summary_text}\n已归档 {len(history_slice)} 条".strip(),
-                "new_important": [{"content": "归档中提到用户喜欢测试"}],
+                "new_important": [
+                    {
+                        "content": "归档中提到用户喜欢测试",
+                        "scope": "user:123",
+                        "pinned": True,
+                    },
+                    {"content": "归档中提到用户喜欢测试"},
+                    {"content": "归档中提到旧格式也要保存"},
+                    {
+                        "content": "归档中提到非 bool pinned 不应置顶",
+                        "scope": "group:5555",
+                        "pinned": "true",
+                    },
+                    {"content": ""},
+                    "invalid",
+                ],
             }
 
     pipeline, _, _, history, important = await build_pipeline([])
@@ -3185,7 +3550,21 @@ async def test_token_compaction_archives_before_truncate(build_pipeline):
     assert archived, "压缩前应先把原文写入 archive"
     assert after < before
     assert "已归档" in pipeline.rolling_summary.text()
-    assert any("喜欢测试" in item.get("content", "") for item in important.items())
+    items = important.items()
+    scoped_item = next(
+        item for item in items if item.get("content") == "归档中提到用户喜欢测试"
+    )
+    assert scoped_item.get("scope") == "user:123"
+    assert scoped_item.get("pinned") is True
+    assert sum(
+        1 for item in items if item.get("content") == "归档中提到用户喜欢测试"
+    ) == 1
+    assert any(item.get("content") == "归档中提到旧格式也要保存" for item in items)
+    non_bool_pinned_item = next(
+        item for item in items if item.get("content") == "归档中提到非 bool pinned 不应置顶"
+    )
+    assert non_bool_pinned_item.get("scope") == "group:5555"
+    assert non_bool_pinned_item.get("pinned") is False
 
 
 @pytest.mark.asyncio
@@ -3227,6 +3606,62 @@ async def test_rag_mode_compaction_still_reads_and_writes_important_memory(build
         "RAG 模式归档中提到用户喜欢测试" in item.get("content", "")
         for item in important.items()
     )
+
+
+@pytest.mark.asyncio
+async def test_compaction_uses_percent_thresholds_when_token_fields_are_unset(
+    build_pipeline,
+):
+    class FakeSummaryAgent:
+        def __init__(self) -> None:
+            self.history_slice: list[dict[str, Any]] = []
+
+        async def summarize_rolling(
+            self,
+            history_slice,
+            existing_summary_text,
+            existing_important_text,
+        ):
+            self.history_slice = list(history_slice)
+            return {"summary_text": "百分比摘要完成", "new_important": []}
+
+    pipeline, _, _, history, _ = await build_pipeline([])
+    agent = FakeSummaryAgent()
+    pipeline.summary_agent = agent
+    pipeline.behavior_cfg.context.max_context_tokens = 1_000
+    summarize = pipeline.behavior_cfg.summarize
+    summarize.trigger_at_tokens = None
+    summarize.target_after_tokens = None
+    summarize.trigger_at_context_percent = 50
+    summarize.target_after_context_percent = 80
+
+    estimator = pipeline._token_estimator()
+    while estimator.estimate_messages(await history.records()) < 950:
+        idx = await history.length()
+        await history.add_user_message(
+            f"百分比旧消息 {idx} " + ("很长的测试内容 " * 20),
+            conversation_id="private:123",
+        )
+
+    records = await history.records()
+    active_tokens = estimator.estimate_messages(records)
+    expected_target = int(
+        pipeline._context_budget().max_context_tokens
+        * summarize.target_after_context_percent
+        / 100
+    )
+    expected_slice = pipeline._select_compaction_slice(
+        records,
+        active_tokens=active_tokens,
+        target_after_tokens=max(1, min(expected_target, active_tokens - 1)),
+        estimator=estimator,
+    )
+
+    await pipeline._maybe_summarize()
+
+    assert agent.history_slice
+    assert len(agent.history_slice) == len(expected_slice)
+    assert "百分比摘要完成" in pipeline.rolling_summary.text()
 
 
 @pytest.mark.asyncio
@@ -3396,6 +3831,71 @@ async def test_send_message_mode_sends_without_model_or_interrupt(
 
     assert provider.calls == []
     assert adapter.sent[-1][1] == "到点了"
+
+
+@pytest.mark.asyncio
+async def test_send_message_mode_raises_when_qq_sent_append_log_fails(
+    build_pipeline,
+):
+    event_store = FailingQQSentEventStore()
+    pipeline, provider, adapter, history, _ = await build_pipeline(
+        [],
+        event_store=event_store,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="QQ 消息已发送，但 qq_message_sent 事件持久化失败.*append log failed",
+    ):
+        await pipeline.run_wakeup_turn(
+            "[定时发送消息]\n消息内容：审计失败\n发送目标：private:123",
+            {"target_type": "private", "target_id": 123},
+            mode="send_message",
+            message_text="审计失败",
+        )
+
+    assert provider.calls == []
+    assert adapter.sent[-1][0].scope == "private"
+    assert adapter.sent[-1][0].target_id == "123"
+    assert adapter.sent[-1][1] == "审计失败"
+    assert [event["event_type"] for event in event_store.appended_events] == [
+        "qq_message_sent"
+    ]
+    records = await history.records()
+    assert not any(
+        "msg_id=1000" in str(record.get("content") or "") for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_message_mode_ignores_sqlite_projection_failure(
+    build_pipeline,
+    tmp_path,
+):
+    event_store = ProjectionFailingEventStore(
+        tmp_path / "projection-fails.sqlite3",
+        projection_retry_delay=0.001,
+    )
+    pipeline, provider, adapter, _, _ = await build_pipeline(
+        [],
+        event_store=event_store,
+    )
+
+    try:
+        await pipeline.run_wakeup_turn(
+            "[定时发送消息]\n消息内容：投影失败仍发送\n发送目标：private:123",
+            {"target_type": "private", "target_id": 123},
+            mode="send_message",
+            message_text="投影失败仍发送",
+        )
+
+        stats = await event_store.stats()
+        assert provider.calls == []
+        assert adapter.sent[-1][1] == "投影失败仍发送"
+        assert stats["last_appended_event_id"] == 1
+        assert stats["last_projected_event_id"] == 0
+    finally:
+        await event_store.shutdown(timeout=0.01)
 
 
 @pytest.mark.asyncio

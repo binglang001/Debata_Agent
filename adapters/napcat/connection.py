@@ -262,6 +262,23 @@ class ReverseWSConnection(NapCatConnection):
                         except json.JSONDecodeError as e:
                             logger.warning(f"NapCat 消息 JSON 解析失败: {e}")
                             continue
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "NapCat WS 收到上报 post_type=%s message_type=%s notice_type=%s "
+                                "request_type=%s meta_event_type=%s self_id=%s user_id=%s group_id=%s "
+                                "message_id=%s raw_bytes=%s keys=%s",
+                                data.get("post_type"),
+                                data.get("message_type"),
+                                data.get("notice_type"),
+                                data.get("request_type"),
+                                data.get("meta_event_type"),
+                                data.get("self_id"),
+                                data.get("user_id"),
+                                data.get("group_id"),
+                                data.get("message_id"),
+                                len(raw) if isinstance(raw, (str, bytes)) else None,
+                                sorted(str(key) for key in data.keys()),
+                            )
                         # 异步分发，不阻塞接收循环
                         asyncio.create_task(self._dispatch(data))
 

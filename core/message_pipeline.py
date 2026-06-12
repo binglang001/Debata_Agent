@@ -50,6 +50,7 @@ from typing import Any
 from adapters.base import IAdapter
 from adapters.types import Target as Target
 from agents import ChatAgent, Persona, SummaryAgent, build_messages
+from agents.base import RuntimeEventCallback
 from app_config.schema import BehaviorConfig, FeaturesConfig, WhitelistConfig
 from memory import (
     ArchiveStore,
@@ -155,6 +156,9 @@ logger = logging.getLogger(__name__)
 
 
 _SLOW_BATCH_STAGE_SECONDS = 1.0
+_SHUTDOWN_SEND_TIMEOUT_SECONDS = 5.0
+
+
 def _log_slow_batch_stage(
     stage: str,
     started_at: float,
@@ -224,6 +228,7 @@ class MessagePipeline(
         asr: Any = None,
         tts: Any = None,
         rag_memory: Any = None,
+        event_store: Any = None,
     ) -> None:
         self.adapter = adapter
         self.chat_agent = chat_agent
@@ -252,6 +257,9 @@ class MessagePipeline(
         self.asr = asr
         self.tts = tts
         self.rag_memory = rag_memory
+        self.event_store = (
+            event_store if event_store is not None else getattr(history, "_event_store", None)
+        )
 
         self.batch = MessageBatch()
         self.reply_lock = asyncio.Lock()
@@ -432,6 +440,7 @@ class MessagePipeline(
                     pending_context_provider=lambda: self._consume_send_receipts(
                         conversation_id
                     ),
+                    runtime_event_callback=self._runtime_event_callback(conversation_id),
                 )
             finally:
                 self._send_manager.end_model_turn(conversation_id)
@@ -470,12 +479,46 @@ class MessagePipeline(
 
         return False
 
+    def _runtime_event_callback(
+        self,
+        conversation_id: str,
+    ) -> RuntimeEventCallback | None:
+        event_store = getattr(self, "event_store", None) or getattr(self, "_event_store", None)
+        if event_store is None:
+            return None
+
+        async def _append_runtime_event(event: dict[str, Any]) -> None:
+            if not isinstance(event, dict):
+                return
+            event_type = _optional_event_text(event.get("event_type"))
+            if event_type is None:
+                return
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+            tool_call_id = _optional_event_text(event.get("tool_call_id"))
+            if tool_call_id is None:
+                tool_call_id = _optional_event_text(payload.get("tool_call_id"))
+            await event_store.append_event(
+                event_type=event_type,
+                conversation_id=conversation_id,
+                source=_optional_event_text(event.get("source")) or "agent_runner",
+                tool_call_id=tool_call_id,
+                payload=dict(payload),
+            )
+
+        return _append_runtime_event
+
     # ============================================================
     # 关闭
     # ============================================================
 
     async def shutdown(self) -> None:
-        """优雅停止：取消批处理任务。"""
+        """优雅停止：先排空发送后台任务，再取消批处理任务。"""
+        await self._send_manager.shutdown(timeout=_SHUTDOWN_SEND_TIMEOUT_SECONDS)
+        await self._drain_send_receipt_tasks(timeout=_SHUTDOWN_SEND_TIMEOUT_SECONDS)
+        await self._send_manager.shutdown(timeout=_SHUTDOWN_SEND_TIMEOUT_SECONDS)
+
         tasks = [
             self._batch_task,
             self._requeue_task,
@@ -492,4 +535,57 @@ class MessagePipeline(
                     logger.warning(f"batch_task 取消异常: {e}")
         logger.info("MessagePipeline 已停止")
 
+    async def _drain_send_receipt_tasks(self, *, timeout: float) -> None:
+        """等待发送回执任务完成；超时后取消，避免关闭流程卡死。"""
+        deadline = time.monotonic() + max(0.0, timeout)
+        current_task = asyncio.current_task()
+        while True:
+            tasks = {
+                task
+                for task in self._send_receipt_tasks.values()
+                if task is not None and task is not current_task and not task.done()
+            }
+            if not tasks:
+                return
 
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await self._cancel_send_receipt_tasks(tasks)
+                return
+
+            done, pending = await asyncio.wait(tasks, timeout=remaining)
+            await self._consume_send_receipt_task_results(done)
+            if pending:
+                await self._cancel_send_receipt_tasks(pending)
+                return
+
+    async def _cancel_send_receipt_tasks(self, tasks: set[asyncio.Task[Any]]) -> None:
+        pending = {task for task in tasks if not task.done()}
+        for task in pending:
+            task.cancel()
+        await self._consume_send_receipt_task_results(pending)
+        if pending:
+            logger.warning(
+                "等待发送回执任务完成超时，已取消未完成任务 count=%s",
+                len(pending),
+            )
+
+    async def _consume_send_receipt_task_results(
+        self,
+        tasks: set[asyncio.Task[Any]],
+    ) -> None:
+        if not tasks:
+            return
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                continue
+            if isinstance(result, BaseException):
+                logger.warning("发送回执任务异常结束: %s", result)
+
+
+def _optional_event_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

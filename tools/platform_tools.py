@@ -1178,14 +1178,21 @@ async def summarize_conversation(args: SummarizeConversationArgs, ctx: ToolConte
     args_model=FilterArchiveRecordsArgs,
     category="platform",
     schema_mode="stub",
-    short_description="低频归档筛选工具。调用前先用 tool_search 查询完整参数。",
+    short_description="低频归档筛选工具。先用 tool_search 查询参数摘要；需要完整 schema 时 detail=full。",
     search_tags=["platform", "archive", "history", "recall"],
 )
 async def filter_archive_records(args: FilterArchiveRecordsArgs, ctx: ToolContext) -> dict:
     if ctx.archive is None:
         return {"ok": False, "error": "未配置本地历史归档"}
 
-    result = await ctx.archive.filter_records(args)
+    raw_result = await ctx.archive.filter_records(args)
+    result = dict(raw_result)
+    raw_results = raw_result.get("results") or []
+    result["results"] = [
+        _archive_filter_summary_result(record)
+        for record in raw_results
+        if isinstance(record, dict)
+    ]
     result["status"] = "inline"
     result["brief"] = (
         f"筛出 {result.get('count', 0)} 条候选归档记录"
@@ -1198,6 +1205,10 @@ async def filter_archive_records(args: FilterArchiveRecordsArgs, ctx: ToolContex
         "offset": result.get("offset"),
         "order": result.get("order"),
     }
+    result["next"] = (
+        "默认只返回摘要和归档 ID；需要完整原文或前后文时，把 results[].id "
+        "传给 recall_history 的 archive_ids，并按需设置 context_before/context_after。"
+    )
     return result
 
 
@@ -1337,6 +1348,28 @@ def _history_record_matches(
     return True
 
 
+def _archive_filter_summary_result(record: dict[str, Any]) -> dict[str, Any]:
+    content = str(record.get("content") or record.get("summary") or "").strip()
+    return {
+        "id": record.get("id") or record.get("archive_id"),
+        "time": record.get("time") or record.get("timestamp"),
+        "conversation_id": record.get("conversation_id"),
+        "sender": record.get("sender"),
+        "sender_id": record.get("sender_id"),
+        "sender_name": record.get("sender_name"),
+        "direction": record.get("direction"),
+        "kind": record.get("kind") or record.get("message_kind"),
+        "snippet": _compact_archive_snippet(content),
+    }
+
+
+def _compact_archive_snippet(content: str, *, limit: int = 120) -> str:
+    compacted = " ".join(content.split())
+    if len(compacted) <= limit:
+        return compacted
+    return compacted[: limit - 1].rstrip() + "..."
+
+
 def _format_history_recall_markdown(records: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for record in records:
@@ -1433,89 +1466,6 @@ def _write_history_recall_artifact(
     )
     path.write_text(header + markdown + ("\n" if markdown else ""), encoding="utf-8")
     return relative_to_workspace(path, ctx.workspace_dir)
-
-
-async def _local_summary_records(
-    ctx: ToolContext,
-    conversation_id: str | None,
-    range_hint: str,
-) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    if ctx.archive is not None:
-        for record in await ctx.archive.records():
-            if _summary_record_matches(
-                record,
-                conversation_id=conversation_id,
-                range_hint=range_hint,
-            ):
-                copied = dict(record)
-                copied["_source"] = "archive"
-                records.append(copied)
-    if ctx.history is not None:
-        for record in await ctx.history.records():
-            for chat_record in real_chat_archive_records(record):
-                if _summary_record_matches(
-                    chat_record,
-                    conversation_id=conversation_id,
-                    range_hint=range_hint,
-                ):
-                    copied = dict(chat_record)
-                    copied["_source"] = "active"
-                    records.append(copied)
-    return records
-
-
-def _summary_record_matches(
-    record: dict[str, Any],
-    *,
-    conversation_id: str | None,
-    range_hint: str,
-) -> bool:
-    if conversation_id and record.get("conversation_id") != conversation_id:
-        return False
-    if not range_hint:
-        return True
-    text = "\n".join(
-        [
-            str(record.get("content") or ""),
-            str(record.get("metadata") or ""),
-        ]
-    )
-    return range_hint in text
-
-
-def _select_summary_records(
-    records: list[dict[str, Any]],
-    *,
-    estimator: TokenEstimator,
-    input_budget: int = 60000,
-) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
-    used = 0
-    for record in reversed(records):
-        cost = estimator.estimate_text(_format_summary_record(record))
-        if selected and used + cost > input_budget:
-            break
-        selected.append(record)
-        used += cost
-    selected.reverse()
-    return selected
-
-
-def _format_summary_records(records: list[dict[str, Any]]) -> str:
-    return "\n\n".join(_format_summary_record(record) for record in records)
-
-
-def _format_summary_record(record: dict[str, Any]) -> str:
-    source = str(record.get("_source") or "unknown")
-    conversation_id = str(record.get("conversation_id") or "unknown")
-    role = str(record.get("role") or "?")
-    timestamp = _summary_timestamp(record)
-    content = str(record.get("content") or "").strip()
-    head = f"[{source}] [{conversation_id}] [{role}]"
-    if timestamp:
-        head += f" [{timestamp}]"
-    return f"{head}\n{content}"
 
 
 def _summary_timestamp(record: dict[str, Any]) -> str:

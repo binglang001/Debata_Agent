@@ -7,11 +7,18 @@ equivalent; do not change filtering logic while moving helpers here.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, TypeVar
 
 _WORKING_HISTORY_RECENT_RUNTIME_RECORDS = 12
 _WORKING_HISTORY_SEND_RECEIPT_KEEP = 4
 _WORKING_HISTORY_NO_ACTION_KEEP = 8
+_T = TypeVar("_T")
+
+
+def _recent_items(items: list[_T], count: int) -> list[_T]:
+    if count <= 0:
+        return []
+    return items[-count:]
 
 
 def _record_timestamp(record: dict[str, Any]) -> Any:
@@ -142,6 +149,9 @@ def _working_history_noise_indices(
     *,
     conversation_id: str | None,
     ensure_current_records: int,
+    runtime_record_keep_count: int,
+    send_receipt_keep_count: int,
+    no_action_keep_count: int,
 ) -> set[int]:
     """Indices of stale runtime records that can be skipped while filling budget."""
     if not records:
@@ -156,12 +166,12 @@ def _working_history_noise_indices(
         idx for idx, record in enumerate(records)
         if _runtime_context_kind(record) is not None
     ]
-    keep_runtime = set(runtime_indices[-_WORKING_HISTORY_RECENT_RUNTIME_RECORDS:])
+    keep_runtime = set(_recent_items(runtime_indices, runtime_record_keep_count))
     send_receipt_indices = [
         idx for idx in runtime_indices
         if _runtime_context_kind(records[idx]) == "send_receipt"
     ]
-    keep_runtime.update(send_receipt_indices[-_WORKING_HISTORY_SEND_RECEIPT_KEEP:])
+    keep_runtime.update(_recent_items(send_receipt_indices, send_receipt_keep_count))
 
     drop_indices: set[int] = set()
     for idx in runtime_indices:
@@ -179,7 +189,7 @@ def _working_history_noise_indices(
         idx = max(pair) + 1
 
     kept_no_action_indices: set[int] = set()
-    for pair in no_action_pairs[-_WORKING_HISTORY_NO_ACTION_KEEP:]:
+    for pair in _recent_items(no_action_pairs, no_action_keep_count):
         kept_no_action_indices.update(pair)
     for pair in no_action_pairs:
         if pair & force_keep:
@@ -214,12 +224,18 @@ def _working_history_optional_runtime_indices(
     *,
     conversation_id: str | None,
     ensure_current_records: int,
+    runtime_record_keep_count: int,
+    send_receipt_keep_count: int,
+    no_action_keep_count: int,
 ) -> set[int]:
     """Recent runtime/no_action records that may use leftover budget."""
     drop_indices = _working_history_noise_indices(
         records,
         conversation_id=conversation_id,
         ensure_current_records=ensure_current_records,
+        runtime_record_keep_count=runtime_record_keep_count,
+        send_receipt_keep_count=send_receipt_keep_count,
+        no_action_keep_count=no_action_keep_count,
     )
     force_keep = _working_history_force_keep_indices(
         records,

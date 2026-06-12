@@ -30,13 +30,6 @@ from .message_pipeline import MessagePipeline
 
 logger = logging.getLogger(__name__)
 
-_ROUTER_TOOL_SHRINK_CTX = SimpleNamespace(
-    tool_result_soft_limit_tokens=96,
-    tool_result_hard_cap_tokens=160,
-    tool_result_soft_overrides={},
-)
-_ROUTER_TEXT_LIMIT_TOKENS = 256
-_ROUTER_TOOL_LIMIT_TOKENS = 96
 _OUT_OF_BAND_DENIED_TOOLS = frozenset(
     {
         "start_agent_task",
@@ -81,7 +74,22 @@ _ROUTER_RUNTIME_CONTEXT_KINDS = frozenset(
 _ROLE_PREFIX_PATTERN = re.compile(r"\[(?:assistant|tool|system)\]\s*", re.IGNORECASE)
 
 
-def _format_proactive_router_history(records: list[dict[str, Any]]) -> str:
+def _router_tool_shrink_ctx(behavior_cfg: BehaviorConfig) -> SimpleNamespace:
+    return SimpleNamespace(
+        tool_result_soft_limit_tokens=(
+            behavior_cfg.proactive_router_tool_result_inline_tokens
+        ),
+        tool_result_hard_cap_tokens=(
+            behavior_cfg.proactive_router_tool_result_hard_cap_tokens
+        ),
+        tool_result_soft_overrides={},
+    )
+
+
+def _format_proactive_router_history(
+    records: list[dict[str, Any]],
+    behavior_cfg: BehaviorConfig,
+) -> str:
     """把主动路由的小窗口历史折成纯文本，避免 assistant/tool 角色污染路由器。"""
     lines: list[str] = []
     tool_names: dict[str, str] = {}
@@ -107,6 +115,7 @@ def _format_proactive_router_history(records: list[dict[str, Any]]) -> str:
             summary = _summarize_router_tool_result(
                 tool_names.get(tool_call_id, "unknown_tool"),
                 str(record.get("content") or ""),
+                behavior_cfg,
             )
             if summary:
                 lines.append(f"[内部结果摘要] {summary}")
@@ -120,7 +129,10 @@ def _format_proactive_router_history(records: list[dict[str, Any]]) -> str:
             continue
 
         label = _ROLE_LABELS.get(role, "上下文记录")
-        cleaned = _trim_router_text(_clean_router_text(content), _ROUTER_TEXT_LIMIT_TOKENS)
+        cleaned = _trim_router_text(
+            _clean_router_text(content),
+            behavior_cfg.proactive_router_text_limit_tokens,
+        )
         if cleaned:
             lines.append(f"[{label}] {cleaned}")
 
@@ -142,31 +154,36 @@ def _is_runtime_context_record(record: dict[str, Any]) -> bool:
     return any(marker in content for marker in _ROUTER_SUMMARY_DROP_MARKERS)
 
 
-def _summarize_router_tool_result(tool_name: str, content: str) -> str:
+def _summarize_router_tool_result(
+    tool_name: str,
+    content: str,
+    behavior_cfg: BehaviorConfig,
+) -> str:
+    limit_tokens = behavior_cfg.proactive_router_tool_result_inline_tokens
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
-        return _trim_router_text(_clean_router_text(content), _ROUTER_TOOL_LIMIT_TOKENS)
+        return _trim_router_text(_clean_router_text(content), limit_tokens)
 
     if not isinstance(parsed, dict):
         return _trim_router_text(
             _clean_router_text(json.dumps(parsed, ensure_ascii=False)),
-            _ROUTER_TOOL_LIMIT_TOKENS,
+            limit_tokens,
         )
 
     cleaned = _drop_internal_ids(parsed)
     if isinstance(cleaned, dict):
-        shrunk = shrink_tool_result(tool_name, cleaned, _ROUTER_TOOL_SHRINK_CTX)
+        shrunk = shrink_tool_result(tool_name, cleaned, _router_tool_shrink_ctx(behavior_cfg))
     else:
         shrunk = cleaned
-    return _compact_router_tool_summary(shrunk)
+    return _compact_router_tool_summary(shrunk, limit_tokens)
 
 
-def _compact_router_tool_summary(value: Any) -> str:
+def _compact_router_tool_summary(value: Any, limit_tokens: int) -> str:
     if not isinstance(value, dict):
         return _trim_router_text(
             _clean_router_text(json.dumps(value, ensure_ascii=False)),
-            _ROUTER_TOOL_LIMIT_TOKENS,
+            limit_tokens,
         )
 
     parts: list[str] = []
@@ -203,7 +220,7 @@ def _compact_router_tool_summary(value: Any) -> str:
         else:
             parts.append("无可用摘要")
 
-    return _trim_router_text("；".join(dict.fromkeys(parts)), _ROUTER_TOOL_LIMIT_TOKENS)
+    return _trim_router_text("；".join(dict.fromkeys(parts)), limit_tokens)
 
 
 def _drop_internal_ids(value: Any) -> Any:
@@ -224,7 +241,7 @@ def _clean_router_text(text: str) -> str:
     return _INTERNAL_ID_PATTERN.sub("", text).strip()
 
 
-def _clean_router_summary(text: str) -> str:
+def _clean_router_summary(text: str, limit_tokens: int) -> str:
     lines: list[str] = []
     for line in text.splitlines():
         if any(marker in line for marker in _ROUTER_SUMMARY_DROP_MARKERS):
@@ -233,7 +250,7 @@ def _clean_router_summary(text: str) -> str:
         cleaned = _clean_router_text(cleaned)
         if cleaned:
             lines.append(cleaned)
-    return _trim_router_text("\n".join(lines), 1024)
+    return _trim_router_text("\n".join(lines), limit_tokens)
 
 
 def _trim_router_text(text: str, limit_tokens: int) -> str:
@@ -366,7 +383,10 @@ class ProactiveLoop:
             if self.proactive_agent is not None:
                 try:
                     router_history = await self.pipeline._select_proactive_router_history()
-                    router_history_text = _format_proactive_router_history(router_history)
+                    router_history_text = _format_proactive_router_history(
+                        router_history,
+                        self.behavior_cfg,
+                    )
                     router_context_parts: list[str] = []
                     important_memory = await self.pipeline._important_memory_text(
                         None,
@@ -392,7 +412,10 @@ class ProactiveLoop:
                         )
                     rolling_summary = self.pipeline._rolling_summary_text()
                     if rolling_summary:
-                        rolling_summary = _clean_router_summary(rolling_summary)
+                        rolling_summary = _clean_router_summary(
+                            rolling_summary,
+                            self.behavior_cfg.proactive_router_summary_limit_tokens,
+                        )
                     if rolling_summary:
                         router_context_parts.append(
                             '<rolling_conversation_summary priority="medium">\n'

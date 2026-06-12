@@ -58,15 +58,72 @@ def contains_forbidden(text: str) -> bool:
 def typing_delay(
     text: str,
     *,
-    chars_per_second: float = 3.0,
-    max_delay: float = 2.0,
+    chars_per_second: float = 1.0,
+    english_chars_per_second: float = 5.0,
+    min_delay_seconds: float = 1.0,
+    max_delay: float = 8.0,
 ) -> float:
     """模拟真人打字延迟。"""
     if not text:
         return 0.0
+
+    max_delay = max(0.0, float(max_delay))
+    min_delay = min(max(0.0, float(min_delay_seconds)), max_delay)
+
+    chinese_chars = 0
+    english_chars = 0
+    digit_chars = 0
+    other_chars = 0
+    for char in text:
+        if char.isspace():
+            continue
+        if _is_chinese_char(char):
+            chinese_chars += 1
+        elif char.isascii() and char.isalpha():
+            english_chars += 1
+        elif char.isdigit():
+            digit_chars += 1
+        else:
+            other_chars += 1
+
+    valid_speeds = [
+        speed
+        for speed in (chars_per_second, english_chars_per_second)
+        if speed > 0
+    ]
+    other_chars_per_second = max(valid_speeds) if valid_speeds else 0.0
+    raw_delay = (
+        _delay_component(chinese_chars, chars_per_second, max_delay)
+        + _delay_component(english_chars, english_chars_per_second, max_delay)
+        + _delay_component(digit_chars, english_chars_per_second, max_delay)
+        + _delay_component(other_chars, other_chars_per_second, max_delay)
+    )
+    if raw_delay <= 0:
+        return 0.0
+    return min(max(raw_delay, min_delay), max_delay)
+
+
+def _delay_component(count: int, chars_per_second: float, max_delay: float) -> float:
+    if count <= 0:
+        return 0.0
     if chars_per_second <= 0:
         return max_delay
-    return min(len(text) / chars_per_second, max_delay)
+    return count / chars_per_second
+
+
+def _is_chinese_char(char: str) -> bool:
+    codepoint = ord(char)
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x2A6DF
+        or 0x2A700 <= codepoint <= 0x2B73F
+        or 0x2B740 <= codepoint <= 0x2B81F
+        or 0x2B820 <= codepoint <= 0x2CEAF
+        or 0x2CEB0 <= codepoint <= 0x2EBEF
+        or 0x30000 <= codepoint <= 0x3134F
+    )
 
 
 def list_emoji_files(emoji_dir: Path | None) -> list[str]:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 
+from app_config.schema import VisionFeatureConfig
 from providers.base import IProvider, ProviderError
 
 logger = logging.getLogger(__name__)
@@ -27,12 +28,14 @@ class VisionService:
         provider: IProvider,
         model: str,
         *,
-        max_tokens: int = 1024,
+        max_tokens: int | None = None,
         timeout_seconds: float = 60.0,
     ) -> None:
         self.provider = provider
         self.model = model
-        self.max_tokens = max_tokens
+        self.max_tokens = (
+            max_tokens if max_tokens is not None else VisionFeatureConfig().max_tokens
+        )
         self.timeout_seconds = timeout_seconds
 
     async def describe(self, image_url: str, prompt: str = "") -> dict[str, str]:

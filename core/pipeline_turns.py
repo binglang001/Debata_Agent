@@ -209,6 +209,9 @@ class PipelineTurnsMixin:
                         if conversation_id
                         else None
                     ),
+                    runtime_event_callback=self._runtime_event_callback(
+                        record_conversation_id or conversation_id or "system:global"
+                    ),
                 )
             finally:
                 self._send_manager.end_model_turn(conversation_id)

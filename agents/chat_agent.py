@@ -17,7 +17,13 @@ from typing import Any
 from app_config.schema import AgentConfig
 from providers.base import IProvider
 
-from .base import AgentRunResult, StatusCallback, ToolExecutor, UsageRecorder
+from .base import (
+    AgentRunResult,
+    RuntimeEventCallback,
+    StatusCallback,
+    ToolExecutor,
+    UsageRecorder,
+)
 from .runner import AgentRunner
 
 logger = logging.getLogger(__name__)
@@ -33,12 +39,18 @@ class ChatAgent:
         *,
         usage_recorder: UsageRecorder | None = None,
         status_callback: StatusCallback | None = None,
+        runtime_event_callback: RuntimeEventCallback | None = None,
     ) -> None:
         self.provider = provider
         self.cfg = cfg
         self.usage_recorder = usage_recorder
         self.status_callback = status_callback
-        self._runner = AgentRunner(provider, cfg)
+        self.runtime_event_callback = runtime_event_callback
+        self._runner = AgentRunner(
+            provider,
+            cfg,
+            runtime_event_callback=runtime_event_callback,
+        )
 
     async def run(
         self,
@@ -49,6 +61,7 @@ class ChatAgent:
         task_contract: str | None = None,
         pending_context_provider=None,
         max_loops: int | None = None,
+        runtime_event_callback: RuntimeEventCallback | None = None,
     ) -> AgentRunResult:
         """执行一次完整对话循环（直到工具调用收尾）。
 
@@ -65,5 +78,6 @@ class ChatAgent:
             max_loops=max_loops,
             usage_recorder=self.usage_recorder,
             status_callback=self.status_callback,
+            runtime_event_callback=runtime_event_callback or self.runtime_event_callback,
             status_label="主模型",
         )

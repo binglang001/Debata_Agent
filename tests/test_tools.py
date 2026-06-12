@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,10 @@ from tools.feature_tools import send_voice_message
 from tools.message_builder import MessageBuildError, resolve_emoji_path
 from tools.result_shrink import tool_budget
 from tools.schemas import (
+    SendGroupArgs,
+    SendPrivateArgs,
     SendVoiceMessageArgs,
+    ToolSearchArgs,
 )
 
 
@@ -92,6 +96,15 @@ def _approve_stub_tools(ctx: ToolContext, *names: str) -> None:
     approved = ctx.extras.setdefault("tool_search_approved_tools", set())
     assert isinstance(approved, set)
     approved.update(names)
+
+
+def _assert_tool_result_envelope(result: dict[str, Any], tool_name: str) -> None:
+    assert result["tool"] == tool_name
+    assert result["result_format"] == "structured_json"
+    assert "ok" in result
+    assert "status" in result
+    assert isinstance(result["brief"], str)
+    assert result["brief"].strip()
 
 
 class FakeSendAdapter:
@@ -259,9 +272,50 @@ def test_send_private_schema_derivation():
     assert "targets" in fn["parameters"]["properties"]
     assert "targets" in fn["parameters"]["required"]
     target_props = fn["parameters"]["properties"]["targets"]["items"]["properties"]
+    target_required = fn["parameters"]["properties"]["targets"]["items"]["required"]
     assert "emoji" in target_props
     assert "image" in target_props
     assert "不是表情包" in target_props["image"]["description"]
+    assert "delay" in target_required
+    assert "最后一条也必须填写" in target_props["delay"]["description"]
+    assert "1.5 个中文字/秒" in target_props["delay"]["description"]
+
+
+def test_send_targets_require_delay():
+    with pytest.raises(ValidationError):
+        SendPrivateArgs.model_validate(
+            {"targets": [{"target_qq": 123, "content": "你好", "order": 1}]}
+        )
+    with pytest.raises(ValidationError):
+        SendGroupArgs.model_validate(
+            {"group_id": 456, "targets": [{"content": "群消息", "order": 1}]}
+        )
+
+
+@pytest.mark.parametrize("delay", [-0.1, math.nan, math.inf, -math.inf])
+def test_send_targets_reject_invalid_delay(delay):
+    with pytest.raises(ValidationError):
+        SendPrivateArgs.model_validate(
+            {
+                "targets": [
+                    {
+                        "target_qq": 123,
+                        "content": "你好",
+                        "order": 1,
+                        "delay": delay,
+                    }
+                ]
+            }
+        )
+    with pytest.raises(ValidationError):
+        SendGroupArgs.model_validate(
+            {
+                "group_id": 456,
+                "targets": [
+                    {"content": "群消息", "order": 1, "delay": delay}
+                ],
+            }
+        )
 
 
 def test_non_no_action_schemas_expose_finish_after_success():
@@ -317,6 +371,29 @@ def test_send_schemas_expose_review_policy_and_ignore_review_interrupts():
         assert "review_priority" in props["review_policy"]["description"]
         assert "review_all" in props["review_policy"]["description"]
         assert "review_policy" not in required
+
+
+def test_send_group_schema_describes_conditional_reply_reference():
+    specs = {s.name: s for s in get_default_specs()}
+
+    send_schema = specs["send_group_message"].to_openai_schema()
+    send_props = send_schema["function"]["parameters"]["properties"]
+    reply_desc = send_props["reply_to_message_id"]["description"]
+    responding_desc = send_props["responding_to_message_ids"]["description"]
+
+    assert "前后有多人插话" in reply_desc
+    assert "行/OK/可以/知道了" in reply_desc
+    assert "不要机械每条都填" in reply_desc
+    assert "不确定不要编造" in reply_desc
+    assert "跨消息回应或复核后提交旧内容" in responding_desc
+
+    commit_schema = specs["commit_send_attempt"].to_openai_schema()
+    commit_desc = commit_schema["function"]["parameters"]["properties"][
+        "reply_to_message_id"
+    ]["description"]
+    assert "群聊复核后提交旧 attempt" in commit_desc
+    assert "短确认会看不出回谁" in commit_desc
+    assert "不要机械每条都填" in commit_desc
 
 
 def test_commit_send_attempt_schema_exposes_ignore_review_interrupts():
@@ -568,7 +645,13 @@ def test_registry_stub_and_full_schema_modes_are_stable():
     assert filter_archive_spec is not None
     assert {"archive", "history", "recall"}.issubset(filter_archive_spec.search_tags)
     assert "targets" in schema_by_name["send_private_messages"]["parameters"]["properties"]
-    assert "tool_name" in schema_by_name["tool_search"]["parameters"]["properties"]
+    tool_search_props = schema_by_name["tool_search"]["parameters"]["properties"]
+    assert "tool_name" in tool_search_props
+    assert tool_search_props["detail"]["enum"] == ["summary", "full"]
+    assert tool_search_props["detail"]["default"] == "summary"
+    args_detail_schema = ToolSearchArgs.model_json_schema()["properties"]["detail"]
+    assert args_detail_schema["enum"] == ["summary", "full"]
+    assert args_detail_schema["default"] == "summary"
 
 
 def test_registry_excludes_sensitive_and_unused_napcat_apis():
@@ -608,13 +691,49 @@ async def test_stub_tool_requires_tool_search_before_execution(tmp_path):
     )
     assert blocked["ok"] is False
     assert blocked["status"] == "need_tool_search"
+    _assert_tool_result_envelope(blocked, "upload_file")
 
     details = await executor("tool_search", {"tool_name": "upload_file", "intent": "发送文件"})
     assert details["ok"] is True
     assert details["status"] == "found"
+    _assert_tool_result_envelope(details, "tool_search")
+    assert details["result_type"] == "tool_metadata"
+    assert "工具元数据" in details["brief"]
     assert details["tool_name"] == "upload_file"
-    assert "file_path" in details["parameters_schema"]["properties"]
+    assert "parameters_schema" not in details
+    assert "parameters" in details
+    assert "parameter_summary" in details
+    assert {"constraints", "examples", "risk_level", "next"}.issubset(details)
     assert "file_path" in details["required_fields"]
+    parameter_by_name = {item["name"]: item for item in details["parameters"]}
+    assert "file_path" in parameter_by_name
+    assert "target_type" in parameter_by_name
+    assert "target_id" in parameter_by_name
+    assert parameter_by_name["target_type"]["enum"] == ["private", "group"]
+    assert "完整 JSON schema" in details["next"]
+
+    archive_details = await executor("tool_search", {"tool_name": "filter_archive_records"})
+    _assert_tool_result_envelope(archive_details, "tool_search")
+    assert archive_details["result_type"] == "tool_metadata"
+    assert "parameters_schema" not in archive_details
+    archive_parameter_by_name = {
+        item["name"]: item for item in archive_details["parameters"]
+    }
+    time_ranges = archive_parameter_by_name["time_ranges"]
+    assert time_ranges["type"] == "array"
+    assert time_ranges["items"]["type"] == "object"
+    time_range_fields = {
+        item["name"]: item for item in time_ranges["items"]["fields"]
+    }
+    assert {"start", "end"}.issubset(time_range_fields)
+
+    full_details = await executor(
+        "tool_search",
+        {"tool_name": "upload_file", "detail": "full", "intent": "发送文件"},
+    )
+    _assert_tool_result_envelope(full_details, "tool_search")
+    assert full_details["result_type"] == "tool_metadata"
+    assert "file_path" in full_details["parameters_schema"]["properties"]
 
     sent = await executor(
         "upload_file",
@@ -622,6 +741,7 @@ async def test_stub_tool_requires_tool_search_before_execution(tmp_path):
     )
     assert sent["ok"] is True
     assert sent["status"] == "done"
+    _assert_tool_result_envelope(sent, "upload_file")
     assert len(adapter.uploaded) == 1
 
 
@@ -635,6 +755,7 @@ async def test_tool_search_reports_unknown_tool_candidates():
 
     assert result["ok"] is False
     assert result["status"] == "not_found"
+    _assert_tool_result_envelope(result, "tool_search")
     assert "send_private_messages" in result["candidates"]
 
 
@@ -787,11 +908,11 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         },
         "delete_important_memory": {"memory_id": "mem-existing"},
         "send_private_messages": {
-            "targets": [{"target_qq": 123, "content": "你好", "order": 1}],
+            "targets": [{"target_qq": 123, "content": "你好", "order": 1, "delay": 0}],
         },
         "send_group_message": {
             "group_id": 456,
-            "targets": [{"content": "群消息", "order": 1}],
+            "targets": [{"content": "群消息", "order": 1, "delay": 0}],
         },
         "commit_send_attempt": {
             "send_attempt_id": "attempt-test",
@@ -871,6 +992,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         result = await executor(name, args)
         results[name] = result
         assert isinstance(result, dict), name
+        _assert_tool_result_envelope(result, name)
         assert "ok" in result, name
         if result.get("ok"):
             assert any(k in result for k in ("brief", "status", "data", "sent", "scheduled", "path")), name
@@ -906,6 +1028,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert agent_tasks[0]["max_loops"] == 5
 
     assert results["no_action"]["no_action"] is True
+    assert results["no_action"]["brief"] == "本轮不执行操作。"
     assert results["schedule_wakeup"]["scheduled"] is True
     assert wakeups[0]["delay_seconds"] == 1
     assert wakeups[0]["target"] == {"target_type": "private", "target_id": 123}
@@ -922,6 +1045,13 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["send_voice_message"]["status"] == "sent"
     assert results["send_private_messages"]["status"] == "sent"
     assert results["send_group_message"]["status"] == "sent"
+    for name in (
+        "send_private_messages",
+        "send_group_message",
+        "no_action",
+        "commit_send_attempt",
+    ):
+        _assert_tool_result_envelope(results[name], name)
     non_commit_sends = [
         item for item in sent_actions if item["source_tool"] != "commit_send_attempt"
     ]
@@ -950,8 +1080,12 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert adapter.uploaded["file_path"] == upload_path
     assert adapter.uploaded["display_name"] == "report.md"
     assert results["tool_search"]["status"] == "found"
+    assert results["tool_search"]["result_type"] == "tool_metadata"
     assert results["tool_search"]["tool_name"] == "upload_file"
-    assert "file_path" in results["tool_search"]["parameters_schema"]["properties"]
+    assert "parameters_schema" not in results["tool_search"]
+    assert "file_path" in {
+        item["name"] for item in results["tool_search"]["parameters"]
+    }
 
     assert results["list_contacts"]["data"]["scope"] == "friends"
     assert results["list_contacts"]["friends"][0]["nickname"] == "Alice"
@@ -984,8 +1118,15 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert agent_tasks[2]["output_name"] == "conversation_summary.md"
     assert agent_tasks[2]["sources"][0]["conversation_id"] == "private:123"
     assert results["filter_archive_records"]["count"] == 1
+    _assert_tool_result_envelope(
+        results["filter_archive_records"],
+        "filter_archive_records",
+    )
     assert results["filter_archive_records"]["results"][0]["id"] == "a1"
+    assert "content" not in results["filter_archive_records"]["results"][0]
+    assert "归档消息 keyword" in results["filter_archive_records"]["results"][0]["snippet"]
     assert results["recall_history"]["count"] == 1
+    _assert_tool_result_envelope(results["recall_history"], "recall_history")
     assert "归档消息 keyword" in results["recall_history"]["content"]
 
     assert results["write_file"]["path"] == "created.txt"
@@ -1048,6 +1189,7 @@ async def test_executor_unknown_tool():
     executor = reg.get_executor(ctx)
     result = await executor("does_not_exist", {})
     assert result["ok"] is False
+    _assert_tool_result_envelope(result, "does_not_exist")
     assert "unknown" in result["error"].lower()
 
 
@@ -1061,6 +1203,7 @@ async def test_executor_invalid_args():
     # save_important_memory 要求 memory_text 非空
     result = await executor("save_important_memory", {})
     assert result["ok"] is False
+    _assert_tool_result_envelope(result, "save_important_memory")
     assert "无效" in result["error"] or "memory_text" in result["error"]
 
 
@@ -1106,7 +1249,8 @@ async def test_executor_no_action_works():
     result = await executor("no_action", {})
     assert result["ok"] is True
     assert result["status"] == "done"
-    assert "brief" not in result
+    _assert_tool_result_envelope(result, "no_action")
+    assert result["brief"] == "本轮不执行操作。"
     assert result.get("no_action") is True
 
 
@@ -1472,7 +1616,10 @@ async def test_send_private_sends_immediately(tmp_path):
     emoji_dir.mkdir()
 
     adapter = FakeSendAdapter()
-    ctx = ToolContext(emoji_dir=emoji_dir, adapter=adapter)
+    ctx = ToolContext(
+        emoji_dir=emoji_dir,
+        adapter=adapter,
+    )
     executor = reg.get_executor(ctx)
     result = await executor(
         "send_private_messages",
@@ -1499,6 +1646,42 @@ async def test_send_private_sends_immediately(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_send_private_single_message_positive_delay_does_not_sleep(
+    tmp_path, monkeypatch
+):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    adapter = FakeSendAdapter()
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr("tools.messaging.asyncio.sleep", fake_sleep)
+
+    ctx = ToolContext(
+        emoji_dir=tmp_path / "emoji",
+        adapter=adapter,
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "send_private_messages",
+        {
+            "targets": [
+                {"target_qq": 12345, "content": "稍等", "order": 1, "delay": 3.0},
+            ]
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["count"] == 1
+    assert result["sent"][0]["delay"] == pytest.approx(3.0)
+    assert [content for _, content in adapter.sent] == ["稍等"]
+    assert sleep_calls == []
+
+
+@pytest.mark.asyncio
 async def test_send_private_forbidden_blocked(tmp_path):
     """含 FORBIDDEN_TAGS 的内容应被拒绝。"""
     cfg = _make_config()
@@ -1509,7 +1692,7 @@ async def test_send_private_forbidden_blocked(tmp_path):
         "send_private_messages",
         {
             "targets": [
-                {"target_qq": 1, "content": "[私聊给 X]什么", "order": 1},
+                {"target_qq": 1, "content": "[私聊给 X]什么", "order": 1, "delay": 0},
             ]
         },
     )
@@ -1525,7 +1708,10 @@ async def test_send_group_order_sorted(tmp_path):
     cfg = _make_config()
     reg = build_default_registry(cfg)
     adapter = FakeSendAdapter()
-    ctx = ToolContext(emoji_dir=tmp_path / "emoji", adapter=adapter)
+    ctx = ToolContext(
+        emoji_dir=tmp_path / "emoji",
+        adapter=adapter,
+    )
     executor = reg.get_executor(ctx)
     result = await executor(
         "send_group_message",
@@ -1549,6 +1735,126 @@ async def test_send_group_order_sorted(tmp_path):
         "third",
     ]
     assert "sent_messages" not in result
+
+
+@pytest.mark.asyncio
+async def test_send_private_keeps_small_model_delay_in_actions(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    captured: list[list[dict[str, Any]]] = []
+
+    async def fake_send_actions(actions, source_tool, *, metadata=None):
+        captured.append(actions)
+        return {
+            "ok": True,
+            "status": "accepted",
+            "qq_visible": "pending",
+            "count": len(actions),
+        }
+
+    ctx = ToolContext(
+        emoji_dir=tmp_path / "emoji",
+        adapter=FakeSendAdapter(),
+        send_actions_cb=fake_send_actions,
+        typing_chars_per_second=1.0,
+        typing_english_chars_per_second=5.0,
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "send_private_messages",
+        {
+            "targets": [
+                {"target_qq": 12345, "content": "嗯", "order": 1, "delay": 0.2},
+                {"target_qq": 12345, "content": "确实", "order": 2, "delay": 0.2},
+            ]
+        },
+    )
+
+    assert result["ok"] is True
+    assert [action["delay"] for action in captured[0]] == pytest.approx([0.2, 0.2])
+
+
+@pytest.mark.asyncio
+async def test_send_group_keeps_small_model_delay_in_actions(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    captured: list[list[dict[str, Any]]] = []
+
+    async def fake_send_actions(actions, source_tool, *, metadata=None):
+        captured.append(actions)
+        return {
+            "ok": True,
+            "status": "accepted",
+            "qq_visible": "pending",
+            "count": len(actions),
+        }
+
+    ctx = ToolContext(
+        emoji_dir=tmp_path / "emoji",
+        adapter=FakeSendAdapter(),
+        send_actions_cb=fake_send_actions,
+        typing_chars_per_second=1.0,
+        typing_english_chars_per_second=5.0,
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "send_group_message",
+        {
+            "group_id": 100,
+            "targets": [
+                {"content": "helloworld", "order": 1, "delay": 0.2},
+                {"content": "好", "order": 2, "delay": 0.2},
+            ],
+        },
+    )
+
+    assert result["ok"] is True
+    assert [action["delay"] for action in captured[0]] == pytest.approx([0.2, 0.2])
+
+
+@pytest.mark.asyncio
+async def test_send_delay_long_text_is_not_capped_by_typing_config(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    captured: list[list[dict[str, Any]]] = []
+
+    async def fake_send_actions(actions, source_tool, *, metadata=None):
+        captured.append(actions)
+        return {
+            "ok": True,
+            "status": "accepted",
+            "qq_visible": "pending",
+            "count": len(actions),
+        }
+
+    ctx = ToolContext(
+        emoji_dir=tmp_path / "emoji",
+        adapter=FakeSendAdapter(),
+        send_actions_cb=fake_send_actions,
+        typing_chars_per_second=999.0,
+        typing_english_chars_per_second=999.0,
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "send_private_messages",
+        {
+            "targets": [
+                {
+                    "target_qq": 12345,
+                    "content": "这是一条很长很长很长很长的消息",
+                    "order": 1,
+                    "delay": 12.3,
+                },
+                {"target_qq": 12345, "content": "第二条", "order": 2, "delay": 0},
+            ]
+        },
+    )
+
+    assert result["ok"] is True
+    assert [action["delay"] for action in captured[0]] == pytest.approx([12.3, 0])
 
 
 @pytest.mark.asyncio
@@ -1608,8 +1914,40 @@ async def test_send_group_image_is_workspace_or_url_not_emoji(tmp_path):
 # ============================================================
 
 
-def test_typing_delay_short():
-    assert typing_delay("a") < 1.0
+def test_typing_delay_chinese_short_uses_minimum():
+    assert typing_delay(
+        "嗯",
+        chars_per_second=2.0,
+        min_delay_seconds=1.0,
+        max_delay=8.0,
+    ) == pytest.approx(1.0)
+
+
+def test_typing_delay_long_chinese_not_capped_to_two_seconds():
+    assert typing_delay(
+        "一二三四五六",
+        chars_per_second=1.0,
+        min_delay_seconds=0.0,
+        max_delay=8.0,
+    ) == pytest.approx(6.0)
+
+
+def test_typing_delay_english_uses_english_letters_per_second():
+    assert typing_delay(
+        "helloworld",
+        min_delay_seconds=0.0,
+        max_delay=8.0,
+    ) == pytest.approx(2.0)
+
+
+def test_typing_delay_mixed_text_is_weighted():
+    assert typing_delay(
+        "你好abc12!",
+        chars_per_second=1.0,
+        english_chars_per_second=5.0,
+        min_delay_seconds=0.0,
+        max_delay=8.0,
+    ) == pytest.approx(3.2)
 
 
 def test_typing_delay_capped():
@@ -2162,7 +2500,14 @@ async def test_executor_hard_cap_is_creation_time_stable():
 
     @tool(name="_huge_result", description="huge", args_model=_Args)
     async def _huge_result(args, ctx):
-        return {"ok": True, "payload": "x" * 10000}
+        return {
+            "ok": True,
+            "status": "done",
+            "payload": "x" * 10000,
+            "legacy_flag": True,
+            "count": 20,
+            "data": {"rows": [{"id": idx, "text": "y" * 1000} for idx in range(20)]},
+        }
 
     new_spec = next(s for s in get_default_specs() if s.name == "_huge_result")
     try:
@@ -2180,8 +2525,16 @@ async def test_executor_hard_cap_is_creation_time_stable():
         _DEFAULT_REGISTRY[:] = [s for s in _DEFAULT_REGISTRY if s.name != "_huge_result"]
 
     assert first == second
+    _assert_tool_result_envelope(first, "_huge_result")
     assert first["_condensed"]["reason"].startswith("工具结果超过中央 hard cap")
-    assert "payload" not in first
+    assert {"payload", "legacy_flag", "count", "data"}.issubset(first)
+    assert first["legacy_flag"] is True
+    assert first["count"] == 20
+    assert first["payload"]["_truncated"] is True
+    assert first["payload"]["original_type"] == "string"
+    assert first["payload"]["characters"] == 10000
+    assert first["data"]["_truncated"] is True
+    assert first["data"]["keys"] == ["rows"]
 
 
 @pytest.mark.asyncio
@@ -2374,7 +2727,7 @@ async def test_group_admin_stub_requires_tool_search_before_execution():
     assert result["status"] == "need_tool_search"
     assert adapter.api_calls == []
 
-    details = await executor("tool_search", {"tool_name": "set_group_ban"})
+    details = await executor("tool_search", {"tool_name": "set_group_ban", "detail": "full"})
     assert details["ok"] is True
     assert details["risk_level"] == "high"
     assert "duration_seconds" in details["parameters_schema"]["properties"]

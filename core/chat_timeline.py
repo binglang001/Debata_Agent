@@ -9,9 +9,14 @@ Agent 工具参数、stale/unsent 草稿、system note 和模型思考不进入�
 
 from __future__ import annotations
 
+import copy
+import logging
+import queue
 import re
+import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -19,6 +24,7 @@ from adapters.types import IncomingMessage, MediaSegment, MediaType
 from utils import get_time
 
 _PARAM_SPLIT_RE = re.compile(r",(?=\w+=)")
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -40,19 +46,56 @@ class ChatTimelineMessage:
     source: Literal["qq"] = "qq"
 
 
+ChatTimelineListener = Callable[[ChatTimelineMessage], None]
+
+
 class ChatTimelineStore:
     """每会话滑动窗口，默认保留最近 1000 条真实 QQ 消息。"""
 
     def __init__(self, *, max_per_conversation: int = 1000) -> None:
         self.max_per_conversation = max(1, int(max_per_conversation))
         self._items: dict[str, deque[ChatTimelineMessage]] = {}
+        self._lock = threading.RLock()
+        self._listeners: dict[int, ChatTimelineListener] = {}
+        self._next_listener_id = 0
+        self._notify_queue: queue.Queue[ChatTimelineMessage] = queue.Queue()
+        self._notify_worker: threading.Thread | None = None
 
     def append(self, message: ChatTimelineMessage) -> None:
-        bucket = self._items.get(message.conversation_id)
-        if bucket is None:
-            bucket = deque(maxlen=self.max_per_conversation)
-            self._items[message.conversation_id] = bucket
-        bucket.append(message)
+        stored = _copy_message(message)
+        with self._lock:
+            bucket = self._items.get(stored.conversation_id)
+            if bucket is None:
+                bucket = deque(maxlen=self.max_per_conversation)
+                self._items[stored.conversation_id] = bucket
+            bucket.append(stored)
+            should_notify = bool(self._listeners)
+        if should_notify:
+            self._notify_queue.put_nowait(stored)
+
+    def subscribe(self, listener: ChatTimelineListener) -> Callable[[], None]:
+        """订阅新消息通知，返回可重复调用的取消订阅函数。"""
+        if not callable(listener):
+            raise TypeError("listener must be callable")
+        with self._lock:
+            listener_id = self._next_listener_id
+            self._next_listener_id += 1
+            self._listeners[listener_id] = listener
+            self._ensure_notify_worker_locked()
+
+        active = True
+        unsubscribe_lock = threading.Lock()
+
+        def unsubscribe() -> None:
+            nonlocal active
+            with unsubscribe_lock:
+                if not active:
+                    return
+                active = False
+            with self._lock:
+                self._listeners.pop(listener_id, None)
+
+        return unsubscribe
 
     def append_inbound_event(
         self,
@@ -126,13 +169,27 @@ class ChatTimelineStore:
         since_msg_id: str | None = None,
         before_msg_id: str | None = None,
     ) -> list[ChatTimelineMessage]:
-        items = list(self._items.get(conversation_id) or [])
+        with self._lock:
+            items = [_copy_message(item) for item in self._items.get(conversation_id) or []]
         if before_msg_id:
             items = _items_before_msg_id(items, before_msg_id)
         if since_msg_id:
             items = _items_since_msg_id(items, since_msg_id)
         limit = max(1, min(self.max_per_conversation, int(limit)))
         return items[-limit:]
+
+    def conversation_ids(self) -> list[str]:
+        """返回当前有真实消息的会话 ID 拷贝。"""
+        with self._lock:
+            return list(self._items)
+
+    def snapshot(self) -> dict[str, list[ChatTimelineMessage]]:
+        """返回所有会话真实消息的安全快照。"""
+        with self._lock:
+            return {
+                conversation_id: [_copy_message(item) for item in items]
+                for conversation_id, items in self._items.items()
+            }
 
     def to_markdown(
         self,
@@ -158,12 +215,51 @@ class ChatTimelineStore:
                 lines.append(f"    raw: {message.raw_message}")
         return "\n".join(lines)
 
+    def _ensure_notify_worker_locked(self) -> None:
+        worker = self._notify_worker
+        if worker is not None and worker.is_alive():
+            return
+        worker = threading.Thread(
+            target=self._notify_loop,
+            name="chat-timeline-listeners",
+            daemon=True,
+        )
+        self._notify_worker = worker
+        worker.start()
+
+    def _notify_loop(self) -> None:
+        while True:
+            try:
+                message = self._notify_queue.get(timeout=1.0)
+            except queue.Empty:
+                with self._lock:
+                    if not self._listeners:
+                        self._notify_worker = None
+                        return
+                continue
+            try:
+                for listener in self._listener_snapshot():
+                    try:
+                        listener(_copy_message(message))
+                    except Exception:
+                        logger.warning("聊天时间线 listener 处理失败", exc_info=True)
+            finally:
+                self._notify_queue.task_done()
+
+    def _listener_snapshot(self) -> list[ChatTimelineListener]:
+        with self._lock:
+            return list(self._listeners.values())
+
 
 def _format_time(timestamp: float) -> str:
     try:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
     except (OverflowError, OSError, ValueError):
         return get_time()
+
+
+def _copy_message(message: ChatTimelineMessage) -> ChatTimelineMessage:
+    return copy.deepcopy(message)
 
 
 def _items_before_msg_id(

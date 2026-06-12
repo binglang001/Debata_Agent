@@ -30,6 +30,7 @@ from app_config.schema import NapCatAdapterConfig, WhitelistConfig
 
 from ...theme import Spacing
 from ...widgets import show_message
+from ...widgets.unit_fields import unit_spinbox
 from ...wizard.components import SectionCard, WhitelistEditor, WhitelistState
 from ..copy import DASHBOARD_COPY
 from .helpers import _progress_slot
@@ -201,40 +202,37 @@ class SettingsAdapterMixin:
         startup_timeout.setRange(0.0, 30.0)
         startup_timeout.setSingleStep(0.5)
         startup_timeout.setValue(_cfg().startup_connect_timeout_seconds)
-        startup_timeout.setSuffix(" 秒")
         startup_timeout.setToolTip("Runtime 启动时最多等待 NapCat 首次连接的时间；超过后后台继续重连。")
         startup_timeout.editingFinished.connect(
             lambda s=startup_timeout: self._on_adapter_field_changed(
                 _cfg(), "startup_connect_timeout_seconds", s.value()
             )
         )
-        adv_form.addRow(QLabel("启动等待连接"), startup_timeout)
+        adv_form.addRow(QLabel("启动等待连接"), unit_spinbox(startup_timeout, "秒"))
 
         api_wait = QDoubleSpinBox()
         api_wait.setRange(0.0, 30.0)
         api_wait.setSingleStep(0.5)
         api_wait.setValue(_cfg().api_wait_connected_timeout_seconds)
-        api_wait.setSuffix(" 秒")
         api_wait.setToolTip("调用 OneBot API 前等待连接建立的最长时间。0 表示不等待。")
         api_wait.editingFinished.connect(
             lambda s=api_wait: self._on_adapter_field_changed(
                 _cfg(), "api_wait_connected_timeout_seconds", s.value()
             )
         )
-        adv_form.addRow(QLabel("API 前等待连接"), api_wait)
+        adv_form.addRow(QLabel("API 前等待连接"), unit_spinbox(api_wait, "秒"))
 
         api_timeout = QDoubleSpinBox()
         api_timeout.setRange(1.0, 300.0)
         api_timeout.setSingleStep(5.0)
         api_timeout.setValue(_cfg().api_timeout_seconds)
-        api_timeout.setSuffix(" 秒")
         api_timeout.setToolTip("单次 OneBot API 调用的超时。")
         api_timeout.editingFinished.connect(
             lambda s=api_timeout: self._on_adapter_field_changed(
                 _cfg(), "api_timeout_seconds", s.value()
             )
         )
-        adv_form.addRow(QLabel("API 超时"), api_timeout)
+        adv_form.addRow(QLabel("API 超时"), unit_spinbox(api_timeout, "秒"))
 
         fast_attempts = QSpinBox()
         fast_attempts.setRange(0, 50)
@@ -245,123 +243,137 @@ class SettingsAdapterMixin:
                 _cfg(), "fast_reconnect_attempts", s.value()
             )
         )
-        adv_form.addRow(QLabel("快速重试次数"), fast_attempts)
+        adv_form.addRow(QLabel("快速重试次数"), unit_spinbox(fast_attempts, "次"))
 
         fast_interval = QDoubleSpinBox()
         fast_interval.setRange(0.0, 10.0)
         fast_interval.setSingleStep(0.1)
         fast_interval.setValue(_cfg().fast_reconnect_interval_seconds)
-        fast_interval.setSuffix(" 秒")
         fast_interval.setToolTip("快速重试阶段每次等待多久。")
         fast_interval.editingFinished.connect(
             lambda s=fast_interval: self._on_adapter_field_changed(
                 _cfg(), "fast_reconnect_interval_seconds", s.value()
             )
         )
-        adv_form.addRow(QLabel("快速重试间隔"), fast_interval)
+        adv_form.addRow(QLabel("快速重试间隔"), unit_spinbox(fast_interval, "秒"))
 
         reconnect_interval = QDoubleSpinBox()
         reconnect_interval.setRange(0.1, 120.0)
         reconnect_interval.setSingleStep(0.5)
         reconnect_interval.setValue(_cfg().reconnect_interval_seconds)
-        reconnect_interval.setSuffix(" 秒")
         reconnect_interval.setToolTip("快速重试结束后的指数退避起点。")
         reconnect_interval.editingFinished.connect(
             lambda s=reconnect_interval: self._on_adapter_field_changed(
                 _cfg(), "reconnect_interval_seconds", s.value()
             )
         )
-        adv_form.addRow(QLabel("慢速重连起点"), reconnect_interval)
+        adv_form.addRow(QLabel("慢速重连起点"), unit_spinbox(reconnect_interval, "秒"))
 
         backoff_max = QDoubleSpinBox()
         backoff_max.setRange(1.0, 600.0)
         backoff_max.setSingleStep(5.0)
         backoff_max.setValue(_cfg().reconnect_backoff_max_seconds)
-        backoff_max.setSuffix(" 秒")
         backoff_max.setToolTip("指数退避的最大等待时间。")
         backoff_max.editingFinished.connect(
             lambda s=backoff_max: self._on_adapter_field_changed(
                 _cfg(), "reconnect_backoff_max_seconds", s.value()
             )
         )
-        adv_form.addRow(QLabel("退避上限"), backoff_max)
+        adv_form.addRow(QLabel("退避上限"), unit_spinbox(backoff_max, "秒"))
 
         jitter = QDoubleSpinBox()
         jitter.setRange(0.0, 10.0)
         jitter.setSingleStep(0.1)
         jitter.setValue(_cfg().reconnect_jitter_seconds)
-        jitter.setSuffix(" 秒")
         jitter.setToolTip("慢速重连等待的随机抖动上限，避免固定节拍重试。")
         jitter.editingFinished.connect(
             lambda s=jitter: self._on_adapter_field_changed(
                 _cfg(), "reconnect_jitter_seconds", s.value()
             )
         )
-        adv_form.addRow(QLabel("重连抖动"), jitter)
+        adv_form.addRow(QLabel("重连抖动"), unit_spinbox(jitter, "秒"))
 
         max_reconnect = QSpinBox()
-        max_reconnect.setRange(-1, 100000)
-        max_reconnect.setValue(_cfg().max_reconnect_attempts)
-        max_reconnect.setSpecialValueText("无限")
-        max_reconnect.setToolTip("-1 表示无限重连。")
+        max_reconnect.setRange(0, 100000)
+        max_reconnect.setValue(max(0, _cfg().max_reconnect_attempts))
+        max_reconnect.setToolTip("取消无限后使用这里的最大重连次数。")
+        max_reconnect_unlimited = QCheckBox("无限")
+        max_reconnect_unlimited.setChecked(_cfg().max_reconnect_attempts < 0)
+        max_reconnect.setEnabled(not max_reconnect_unlimited.isChecked())
+
+        def _on_max_reconnect_unlimited(on: bool) -> None:
+            max_reconnect.setEnabled(not on)
+            self._on_adapter_field_changed(
+                _cfg(),
+                "max_reconnect_attempts",
+                -1 if on else max_reconnect.value(),
+            )
+
+        max_reconnect_unlimited.toggled.connect(_on_max_reconnect_unlimited)
         max_reconnect.editingFinished.connect(
-            lambda s=max_reconnect: self._on_adapter_field_changed(
-                _cfg(), "max_reconnect_attempts", s.value()
+            lambda s=max_reconnect: None if max_reconnect_unlimited.isChecked() else self._on_adapter_field_changed(
+                _cfg(),
+                "max_reconnect_attempts",
+                s.value(),
             )
         )
-        adv_form.addRow(QLabel("最大重连次数"), max_reconnect)
+        max_reconnect_row = QHBoxLayout()
+        max_reconnect_row.setContentsMargins(0, 0, 0, 0)
+        max_reconnect_row.setSpacing(Spacing.SM)
+        max_reconnect_row.addWidget(unit_spinbox(max_reconnect, "次", add_stretch=False))
+        max_reconnect_row.addWidget(max_reconnect_unlimited)
+        max_reconnect_row.addStretch(1)
+        max_reconnect_wrap = QWidget()
+        max_reconnect_wrap.setLayout(max_reconnect_row)
+        adv_form.addRow(QLabel("最大重连次数"), max_reconnect_wrap)
 
         ping_interval = QDoubleSpinBox()
         ping_interval.setRange(1.0, 300.0)
         ping_interval.setSingleStep(5.0)
         ping_interval.setValue(_cfg().ping_interval_seconds)
-        ping_interval.setSuffix(" 秒")
         ping_interval.setToolTip("WebSocket ping 间隔。")
         ping_interval.editingFinished.connect(
             lambda s=ping_interval: self._on_adapter_field_changed(
                 _cfg(), "ping_interval_seconds", s.value()
             )
         )
-        adv_form.addRow(QLabel("Ping 间隔"), ping_interval)
+        adv_form.addRow(QLabel("Ping 间隔"), unit_spinbox(ping_interval, "秒"))
 
         ping_timeout = QDoubleSpinBox()
         ping_timeout.setRange(1.0, 300.0)
         ping_timeout.setSingleStep(5.0)
         ping_timeout.setValue(_cfg().ping_timeout_seconds)
-        ping_timeout.setSuffix(" 秒")
         ping_timeout.setToolTip("WebSocket ping 未响应多久判定断线。")
         ping_timeout.editingFinished.connect(
             lambda s=ping_timeout: self._on_adapter_field_changed(
                 _cfg(), "ping_timeout_seconds", s.value()
             )
         )
-        adv_form.addRow(QLabel("Ping 超时"), ping_timeout)
+        adv_form.addRow(QLabel("Ping 超时"), unit_spinbox(ping_timeout, "秒"))
 
         warmup = QDoubleSpinBox()
         warmup.setRange(0.0, 60.0)
         warmup.setSingleStep(0.5)
         warmup.setValue(_cfg().process_warmup_seconds)
-        warmup.setSuffix(" 秒")
         warmup.setToolTip("托管 NapCat 进程启动后，连接前等待的时间。")
         warmup.editingFinished.connect(
             lambda s=warmup: self._on_adapter_field_changed(
                 _cfg(), "process_warmup_seconds", s.value()
             )
         )
-        adv_form.addRow(QLabel("托管进程预热"), warmup)
+        adv_form.addRow(QLabel("托管进程预热"), unit_spinbox(warmup, "秒"))
 
         voice_delay = QDoubleSpinBox()
         voice_delay.setRange(0.0, 8.0)
         voice_delay.setSingleStep(0.5)
         voice_delay.setValue(_cfg().voice_fetch_delay_seconds)
-        voice_delay.setSuffix(" 秒")
         voice_delay.setToolTip("调用 NapCat 语音转文字前先等待多久。")
         voice_delay.editingFinished.connect(
             lambda s=voice_delay: self._on_adapter_field_changed(
                 _cfg(), "voice_fetch_delay_seconds", s.value()
             )
         )
-        adv_form.addRow(QLabel("语音转写等待"), voice_delay)
+        adv_form.addRow(QLabel("语音转写等待"), unit_spinbox(voice_delay, "秒"))
 
         advanced.add_layout(adv_form)
         card.add_content(advanced)

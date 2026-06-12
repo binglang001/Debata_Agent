@@ -269,6 +269,10 @@ class PersonasPage(QWidget):
         context.main.temperature = agent_cfg.temperature
         context.main.top_p = agent_cfg.top_p
         context.main.max_tokens = agent_cfg.max_tokens
+        if agent_cfg.reasoning and agent_cfg.reasoning.enabled:
+            context.main.reasoning_enabled = True
+            context.main.reasoning_budget = agent_cfg.reasoning.budget
+            context.main.reasoning_max_tokens = agent_cfg.reasoning.max_tokens
         return context
 
     def _save_generated_persona(self, context: WizardContext) -> str:

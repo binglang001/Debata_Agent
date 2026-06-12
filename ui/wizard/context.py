@@ -111,7 +111,21 @@ class PersonaChoice:
 
     brief: PersonaBrief | None = None
     generated_xml: str = ""
+    refined_count: int = 0
+    edit_history: list[dict[str, str]] = field(default_factory=list)
     import_path: str = ""
+
+
+def append_persona_edit_history(
+    edit_history: list[dict[str, str]],
+    user_content: str,
+    assistant_content: str,
+) -> list[dict[str, str]]:
+    return [
+        *edit_history,
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": assistant_content},
+    ]
 
 
 # ============================================================
@@ -218,5 +232,6 @@ __all__ = [
     "FeatureChoice",
     "AdapterChoice",
     "PersonaChoice",
+    "append_persona_edit_history",
     "BaseStepView",
 ]

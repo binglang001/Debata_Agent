@@ -268,6 +268,31 @@ async def test_runtime_start_assembles_all_components(assembled_project):
 
 
 @pytest.mark.asyncio
+async def test_runtime_passes_vision_max_tokens_to_service(assembled_project):
+    project_root, paths = assembled_project
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data.setdefault("features", {})["vision"] = {
+        "enabled": True,
+        "type": "api",
+        "provider": "fake_main",
+        "model": "fake-vision",
+        "max_tokens": 1536,
+    }
+    with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+
+        assert rt.vision is not None
+        assert rt.vision.max_tokens == 1536
+    finally:
+        await rt.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_runtime_binds_friend_confirmed_hook_to_rate_limiter(
     assembled_project,
 ):

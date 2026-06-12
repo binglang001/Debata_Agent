@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import logging
 import time
 from collections import deque
@@ -124,6 +125,7 @@ class _AsyncSendManager:
         self._send_attempts: dict[str, _SendAttempt] = {}
         self._tool_call_results: dict[str, dict[str, Any]] = {}
         self._active_model_conversation: str | None = None
+        self._shutting_down = False
 
     def begin_model_turn(self, conversation_id: str | None) -> None:
         self._active_model_conversation = conversation_id
@@ -142,6 +144,26 @@ class _AsyncSendManager:
     def should_defer_batch(self, conversation_id: str) -> bool:
         state = self._states.get(conversation_id)
         return bool(state and state.needs_resync)
+
+    async def shutdown(self, timeout: float = 5.0) -> None:
+        """等待所有会话发送 worker 清空；超时后取消未完成 worker。"""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            self._start_missing_workers()
+            workers = self._active_workers()
+            if not workers:
+                return
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await self._cancel_workers(workers)
+                return
+
+            done, pending = await asyncio.wait(workers, timeout=remaining)
+            await self._consume_worker_results(done)
+            if pending:
+                await self._cancel_workers(pending)
+                return
 
     def notify_inbound(self, item: PendingMessageItem) -> None:
         ref = _InboundRef(
@@ -357,6 +379,7 @@ class _AsyncSendManager:
                 preflight,
                 status="needs_review",
             )
+            await self._record_send_attempt(attempt, preflight, status="needs_review")
             self._remember_tool_call_result(tool_call_id, result)
             return result
 
@@ -381,11 +404,23 @@ class _AsyncSendManager:
         source_tool: str,
         *,
         ignore_review_interrupts: bool,
+        send_attempt_id: str | None = None,
+        ignored_review_count: int = 0,
         trigger_message_id: str | None,
         trigger_inbound_seq: int,
         trigger_user_id: str | None,
     ) -> dict[str, Any]:
         can_sync = all(self._can_sync_send(cid, acts) for cid, acts in groups.items())
+        await self._record_send_batch_accepted(
+            send_id,
+            normalized,
+            groups,
+            source_tool,
+            delivery="sync" if can_sync else "pending",
+            send_attempt_id=send_attempt_id,
+            ignore_review_interrupts=ignore_review_interrupts,
+            ignored_review_count=ignored_review_count,
+        )
         if can_sync:
             return await self._send_sync(
                 send_id,
@@ -480,11 +515,17 @@ class _AsyncSendManager:
         forced_unseen_messages: list[dict[str, Any]] = []
         if preflight["needs_review"] and not ignore_review_interrupts:
             attempt.revision += 1
-            return self._needs_review_result(
+            result = self._needs_review_result(
                 attempt,
                 preflight,
                 status="needs_review_again",
             )
+            await self._record_send_attempt(
+                attempt,
+                preflight,
+                status="needs_review_again",
+            )
+            return result
         if preflight["needs_review"] and ignore_review_interrupts:
             forced_unseen_messages = list(preflight["unseen_messages"])
 
@@ -509,6 +550,8 @@ class _AsyncSendManager:
             groups,
             attempt.source_tool,
             ignore_review_interrupts=False,
+            send_attempt_id=attempt_id,
+            ignored_review_count=len(forced_unseen_messages),
             trigger_message_id=attempt.trigger_message_id,
             trigger_inbound_seq=attempt.trigger_inbound_seq,
             trigger_user_id=attempt.trigger_user_id,
@@ -543,6 +586,195 @@ class _AsyncSendManager:
         state.interrupt_messages.clear()
         state.recall_events.clear()
         state.interrupt_event.clear()
+
+    def _start_missing_workers(self) -> None:
+        for conversation_id, state in self._states.items():
+            if not state.queue:
+                continue
+            if state.worker is None or state.worker.done():
+                state.worker = asyncio.create_task(self._worker(conversation_id, state))
+
+    def _active_workers(self) -> set[asyncio.Task[Any]]:
+        return {
+            state.worker
+            for state in self._states.values()
+            if state.worker is not None and not state.worker.done()
+        }
+
+    async def _consume_worker_results(self, workers: set[asyncio.Task[Any]]) -> None:
+        if not workers:
+            return
+        results = await asyncio.gather(*workers, return_exceptions=True)
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                continue
+            if isinstance(result, BaseException):
+                logger.warning("异步发送 worker 异常结束: %s", result)
+
+    async def _cancel_workers(self, workers: set[asyncio.Task[Any]]) -> None:
+        self._shutting_down = True
+        pending = {worker for worker in workers if not worker.done()}
+        for worker in pending:
+            worker.cancel()
+        await self._consume_worker_results(pending)
+        if pending:
+            logger.warning(
+                "等待异步发送 worker 清空超时，已取消未完成 worker count=%s",
+                len(pending),
+            )
+
+    async def _append_runtime_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        conversation_id: str | None = None,
+        external_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> int | None:
+        event_store = getattr(self.pipeline, "event_store", None)
+        if event_store is None:
+            return None
+        # 这里只等待 append log ack；SQLite 投影由 EventStore 后台推进。
+        return await event_store.append_event(
+            event_type=event_type,
+            conversation_id=conversation_id,
+            source="send_manager",
+            external_id=external_id,
+            tool_call_id=tool_call_id,
+            payload=payload,
+        )
+
+    async def _record_send_attempt(
+        self,
+        attempt: _SendAttempt,
+        preflight: dict[str, Any],
+        *,
+        status: str,
+    ) -> None:
+        conversation_ids = list(attempt.conversation_ids)
+        payload = {
+            "source": "send_manager",
+            "send_attempt_id": attempt.send_attempt_id,
+            "attempt_id": attempt.send_attempt_id,
+            "status": status,
+            "revision": attempt.revision,
+            "source_tool": attempt.source_tool,
+            "conversation_ids": conversation_ids,
+            "count": len(attempt.actions),
+            "counts": {
+                "messages": len(attempt.actions),
+                "conversations": len(conversation_ids),
+                "unseen_messages": _list_count(preflight.get("unseen_messages")),
+                "priority_interrupts": _list_count(preflight.get("priority_interrupts")),
+                "recalled_messages": _list_count(preflight.get("recalled_messages")),
+            },
+            "review_policy": attempt.review_policy,
+            "delivery_interrupt_policy": attempt.delivery_interrupt_policy,
+            "latest_seq": preflight.get("latest_seq"),
+        }
+        await self._append_runtime_event(
+            "send_attempt_recorded",
+            payload,
+            conversation_id=_single_conversation_id(conversation_ids),
+            external_id=attempt.send_attempt_id,
+            tool_call_id=attempt.tool_call_id,
+        )
+
+    async def _record_send_batch_accepted(
+        self,
+        send_id: str,
+        actions: list[dict[str, Any]],
+        groups: dict[str, list[dict[str, Any]]],
+        source_tool: str,
+        *,
+        delivery: str,
+        send_attempt_id: str | None,
+        ignore_review_interrupts: bool,
+        ignored_review_count: int,
+    ) -> None:
+        conversation_ids = list(groups.keys())
+        review_info_counts = {
+            "ignored_review_interrupts": 1 if ignored_review_count > 0 else 0,
+            "ignored_unseen_messages": max(0, int(ignored_review_count or 0)),
+        }
+        payload = {
+            "source": "send_manager",
+            "send_id": send_id,
+            "send_attempt_id": send_attempt_id,
+            "attempt_id": send_attempt_id,
+            "status": "accepted",
+            "delivery": delivery,
+            "source_tool": source_tool,
+            "conversation_ids": conversation_ids,
+            "count": len(actions),
+            "counts": _send_action_counts(actions, conversation_ids),
+            "ignore_review_interrupts": bool(ignore_review_interrupts),
+            "review_info_counts": review_info_counts,
+        }
+        await self._append_runtime_event(
+            "send_batch_accepted",
+            _drop_none(payload),
+            conversation_id=_single_conversation_id(conversation_ids),
+            external_id=send_id,
+        )
+
+    async def _record_send_message_started(
+        self,
+        send_id: str,
+        action: dict[str, Any],
+        conversation_id: str,
+    ) -> None:
+        await self._append_runtime_event(
+            "send_message_started",
+            _send_message_payload(send_id, action, status="started"),
+            conversation_id=conversation_id,
+            external_id=send_id,
+        )
+
+    async def _record_send_message_succeeded(
+        self,
+        send_id: str,
+        action: dict[str, Any],
+        conversation_id: str,
+        *,
+        msg_id: str,
+    ) -> None:
+        payload = _send_message_payload(send_id, action, status="succeeded")
+        payload["msg_id"] = msg_id
+        await self._append_runtime_event(
+            "send_message_succeeded",
+            payload,
+            conversation_id=conversation_id,
+            external_id=send_id,
+        )
+
+    async def _record_send_receipt(self, receipt: dict[str, Any]) -> None:
+        send_id = _optional_text(receipt.get("send_id"))
+        conversation_id = _optional_text(receipt.get("conversation_id"))
+        counts = _send_receipt_counts(receipt)
+        payload = {
+            "source": "send_manager",
+            "send_id": send_id,
+            "status": _send_receipt_event_status(receipt, counts),
+            "conversation_id": conversation_id,
+            "interrupted": bool(receipt.get("interrupted")),
+            "counts": counts,
+            "review_info_counts": {
+                "new_messages": counts["new_messages"],
+                "recalled_messages": counts["recalled_messages"],
+                "forced_unseen_messages": counts["forced_unseen_messages"],
+                "unseen_messages": counts["unseen_messages"],
+                "priority_interrupts": counts["priority_interrupts"],
+            },
+            "ignored_review_interrupts": bool(receipt.get("ignored_review_interrupts")),
+        }
+        await self._append_runtime_event(
+            "send_receipt_recorded",
+            _drop_none(payload),
+            conversation_id=conversation_id,
+            external_id=send_id,
+        )
 
     def _state(self, conversation_id: str) -> _SendConversationState:
         state = self._states.get(conversation_id)
@@ -1005,6 +1237,7 @@ class _AsyncSendManager:
                         action,
                         source_tool,
                         conversation_id,
+                        send_id=send_id,
                         trigger_message_id=trigger_message_id,
                         trigger_inbound_seq=trigger_inbound_seq,
                         trigger_user_id=trigger_user_id,
@@ -1030,6 +1263,19 @@ class _AsyncSendManager:
         }
         if errors:
             result["errors"] = errors
+        await self._record_send_receipt(
+            {
+                "type": "send_receipt",
+                "send_id": send_id,
+                "conversation_id": (
+                    list(groups.keys())[0] if len(groups) == 1 else None
+                ),
+                "sent": sent,
+                "unsent": [],
+                "interrupted": False,
+                "errors": errors,
+            }
+        )
         return result
 
     async def _worker(self, conversation_id: str, state: _SendConversationState) -> None:
@@ -1062,6 +1308,7 @@ class _AsyncSendManager:
                             action,
                             job.source_tool,
                             conversation_id,
+                            send_id=job.send_id,
                             trigger_message_id=job.trigger_message_id,
                             trigger_inbound_seq=job.trigger_inbound_seq,
                             trigger_user_id=job.trigger_user_id,
@@ -1119,7 +1366,7 @@ class _AsyncSendManager:
             state.active_trigger_user_id = None
             state.active_trigger_message_id = None
             state.worker = None
-            if state.queue:
+            if state.queue and not self._shutting_down:
                 state.worker = asyncio.create_task(self._worker(conversation_id, state))
 
     async def _send_one(
@@ -1128,6 +1375,7 @@ class _AsyncSendManager:
         source_tool: str,
         conversation_id: str,
         *,
+        send_id: str,
         trigger_message_id: str | None,
         trigger_inbound_seq: int,
         trigger_user_id: str | None,
@@ -1138,6 +1386,7 @@ class _AsyncSendManager:
             target_id=action["target_id"],
         )
         kind = action.get("kind", "text")
+        await self._record_send_message_started(send_id, action, conversation_id)
         if kind == "voice":
             send_voice = getattr(self.pipeline.adapter, "send_voice", None)
             if send_voice is None:
@@ -1159,9 +1408,15 @@ class _AsyncSendManager:
 
         self.pipeline.mark_activity()
         if msg_id is not None:
-            self.pipeline._record_successful_outbound(
+            await self.pipeline._record_successful_outbound(
                 action,
                 conversation_id=conversation_id,
+                msg_id=str(msg_id),
+            )
+            await self._record_send_message_succeeded(
+                send_id,
+                action,
+                conversation_id,
                 msg_id=str(msg_id),
             )
         logger.debug(
@@ -1258,6 +1513,7 @@ class _AsyncSendManager:
         *,
         clean: bool,
     ) -> None:
+        await self._record_send_receipt(receipt)
         if clean:
             await self.pipeline._record_clean_send_receipt(receipt)
             return
@@ -1291,6 +1547,7 @@ class _AsyncSendManager:
     def _inbound_to_receipt_message(ref: _InboundRef) -> dict[str, Any]:
         return {
             "conversation_id": ref.conversation_id,
+            "seq": ref.seq,
             "time": get_time(),
             "nickname": ref.nickname,
             "user_id": ref.user_id,
@@ -1298,3 +1555,110 @@ class _AsyncSendManager:
             "msg_id": ref.message_id,
             "qq_visible": True,
         }
+
+
+def _send_message_payload(
+    send_id: str,
+    action: dict[str, Any],
+    *,
+    status: str,
+) -> dict[str, Any]:
+    content_length, content_hash = _action_content_fingerprint(action)
+    target_scope = _optional_text(action.get("target_scope"))
+    target_id = _optional_text(action.get("target_id"))
+    payload = {
+        "source": "send_manager",
+        "send_id": send_id,
+        "status": status,
+        "order": _safe_int(action.get("order"), default=0),
+        "target_scope": target_scope,
+        "target_id": target_id,
+        "target_conversation_id": (
+            f"{target_scope}:{target_id}" if target_scope and target_id else None
+        ),
+        "kind": _optional_text(action.get("kind")) or "text",
+        "content_hash": content_hash,
+        "content_length": content_length,
+    }
+    return _drop_none(payload)
+
+
+def _action_content_fingerprint(action: dict[str, Any]) -> tuple[int, str]:
+    text = str(action.get("label") or action.get("content") or "")
+    return len(text), hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _send_action_counts(
+    actions: list[dict[str, Any]],
+    conversation_ids: list[str],
+) -> dict[str, int]:
+    return {
+        "messages": len(actions),
+        "conversations": len(conversation_ids),
+        "text": sum(1 for action in actions if action.get("kind", "text") == "text"),
+        "voice": sum(1 for action in actions if action.get("kind") == "voice"),
+        "image": sum(1 for action in actions if action.get("kind") in {"image", "emoji"}),
+    }
+
+
+def _send_receipt_counts(receipt: dict[str, Any]) -> dict[str, int]:
+    return {
+        "sent": _list_count(receipt.get("sent")),
+        "unsent": _list_count(receipt.get("unsent")),
+        "new_messages": _list_count(receipt.get("new_messages")),
+        "recalled_messages": _list_count(receipt.get("recalled_messages")),
+        "errors": _list_count(receipt.get("errors")),
+        "accepted_messages": _list_count(receipt.get("accepted_messages")),
+        "attempted_messages": _list_count(receipt.get("attempted_messages")),
+        "forced_unseen_messages": _list_count(receipt.get("forced_unseen_messages")),
+        "unseen_messages": _list_count(receipt.get("unseen_messages")),
+        "priority_interrupts": _list_count(receipt.get("priority_interrupts")),
+    }
+
+
+def _send_receipt_event_status(
+    receipt: dict[str, Any],
+    counts: dict[str, int],
+) -> str:
+    status = _optional_text(receipt.get("status"))
+    if status:
+        return status
+    if receipt.get("interrupted"):
+        return "interrupted"
+    if counts["errors"] and counts["sent"]:
+        return "partial"
+    if counts["errors"]:
+        return "failed"
+    if counts["unsent"] and counts["sent"]:
+        return "partial"
+    if counts["unsent"]:
+        return "unsent"
+    if counts["sent"]:
+        return "succeeded"
+    return "empty"
+
+
+def _single_conversation_id(conversation_ids: list[str]) -> str | None:
+    return conversation_ids[0] if len(conversation_ids) == 1 else None
+
+
+def _list_count(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 0
+
+
+def _safe_int(value: Any, *, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _drop_none(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if value is not None}

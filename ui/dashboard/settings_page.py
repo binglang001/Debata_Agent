@@ -220,7 +220,15 @@ class SettingsPage(
         if viewport_height <= 0:
             return
 
-        target_height = max(viewport_height, stack.sizeHint().height())
+        content_height = stack.sizeHint().height()
+        current = stack.currentWidget()
+        content_width = scroll.viewport().width()
+        if current.hasHeightForWidth() and content_width > 0:
+            width_height = current.heightForWidth(content_width)
+            if width_height > 0:
+                content_height = max(width_height, current.minimumSizeHint().height())
+
+        target_height = max(viewport_height, content_height)
         if stack.minimumHeight() != target_height or stack.maximumHeight() != target_height:
             stack.setFixedHeight(target_height)
             stack.updateGeometry()

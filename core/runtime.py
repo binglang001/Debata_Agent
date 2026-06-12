@@ -55,6 +55,7 @@ class Runtime:
         self.paths: Any = None
         self.persona: Any = None
         self.history: Any = None
+        self.event_store: Any = None
         self.important: Any = None
         self.archive: Any = None
         self.rolling_summary: Any = None
@@ -172,6 +173,8 @@ class Runtime:
         stage_t0 = time.monotonic()
         from memory import (
             ArchiveStore,
+            EventJournal,
+            EventStore,
             HistoryManager,
             ImportantMemoryManager,
             RollingSummaryStore,
@@ -179,7 +182,13 @@ class Runtime:
 
         mem_dir = self.paths.memory_dir_for(self.persona.name)
         mem_dir.mkdir(parents=True, exist_ok=True)
-        self.history = HistoryManager(mem_dir / "history.jsonl")
+        event_store = EventStore(mem_dir / "events.sqlite3")
+        self.event_store = EventJournal(event_store)
+        await self.event_store.start()
+        self.history = HistoryManager(
+            mem_dir / "history.jsonl",
+            event_store=self.event_store,
+        )
         self.important = ImportantMemoryManager(mem_dir / "important.json")
         self.archive = ArchiveStore(mem_dir / "archive.sqlite3")
         self.rolling_summary = RollingSummaryStore(mem_dir / "rolling_summary.json")
@@ -268,6 +277,7 @@ class Runtime:
                 self.vision = VisionService(
                     provider=self.providers[vcfg.provider],
                     model=vcfg.model or "",
+                    max_tokens=vcfg.max_tokens,
                 )
                 logger.info(
                     f"VisionService 已启用：provider={vcfg.provider}, model={vcfg.model}"
@@ -394,6 +404,7 @@ class Runtime:
             asr=self.asr,
             tts=self.tts,
             rag_memory=self.rag_memory,
+            event_store=self.event_store,
         )
         # 回填 wakeup 双向依赖
         self.wakeup_scheduler._on_fire = self.pipeline.run_wakeup_turn
@@ -524,6 +535,8 @@ class Runtime:
             await _close("wakeup_scheduler", self.wakeup_scheduler.cancel_all)
         if self.pipeline is not None:
             await _close("pipeline", self.pipeline.shutdown)
+        if self.event_store is not None:
+            await _close("event_journal", self.event_store.shutdown)
         if self.rag_memory is not None:
             await _close("rag_memory", self.rag_memory.shutdown)
         if self.embedding_service is not None:

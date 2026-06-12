@@ -280,6 +280,9 @@ class AgentConfig(StrictModel):
     tool_loop_final_grace_loops: int = Field(default=2, ge=0)
     """最终警告发出后还允许多少个工具轮。"""
 
+    tool_loop_final_max_tokens: int = Field(default=4096, ge=512)
+    """工具循环最终收尾/部分结果整理输出上限。"""
+
     refocus_interval: int = Field(default=5, ge=0)
     """Task Contract 重注入间隔（轮）。0 = 禁用。"""
 
@@ -320,6 +323,9 @@ class VisionFeatureConfig(StrictModel):
 
     model: str = ""
     """多模态模型 ID（如 doubao-seed-1-6-vision / glm-4v / qwen-vl-max）。"""
+
+    max_tokens: int = Field(default=1024, ge=128)
+    """图像理解模型单次输出上限。"""
 
     api_key_id: str | None = None
     """可独立指定密钥 ID（不填则用 providers[provider].api_key_id）。"""
@@ -538,13 +544,23 @@ class PersonaConfig(StrictModel):
 
 
 class TypingConfig(StrictModel):
-    """模拟真人打字速度（决定多条消息之间的发送间隔）。"""
+    """遗留打字速度配置；发送间隔由模型逐条填写 target.delay。"""
 
     chars_per_second: float = 1.0
-    """每秒打几个字。1 字/秒贴近真人正常聊天速度（含思考停顿）。"""
+    """已废弃：不再用于发送工具。"""
 
-    max_delay_seconds: float = 2.0
-    """单条消息最大延迟（秒）。再长的消息也不会等超过这个时间。"""
+    english_chars_per_second: float = 5.0
+    """已废弃：不再用于发送工具。"""
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_deprecated_delay_fields(cls, data: object) -> object:
+        if isinstance(data, dict):
+            data = dict(data)
+            data.pop("min_delay_seconds", None)
+            data.pop("max_delay_seconds", None)
+            data.pop("clamp_model_delay", None)
+        return data
 
 
 class RateLimitConfig(StrictModel):
@@ -576,10 +592,16 @@ class SummarizeConfig(StrictModel):
     """SummaryAgent 选择 cut_point 的上限。"""
 
     trigger_at_tokens: int | None = None
-    """活跃 history 估算 token 达到此值时触发 compaction。None 表示按模型工作预算自动推导。"""
+    """活跃 history 估算 token 达到此值时触发 compaction。显式配置优先于百分比推导。"""
 
     target_after_tokens: int | None = None
-    """compaction 后活跃 history 目标 token。None 表示按模型工作预算自动推导。"""
+    """compaction 后活跃 history 目标 token。显式配置优先于百分比推导。"""
+
+    trigger_at_context_percent: int = Field(default=75, ge=50, le=100)
+    """未显式配置 trigger_at_tokens 时，按工作上下文预算此百分比推导触发阈值。"""
+
+    target_after_context_percent: int = Field(default=50, ge=50, le=100)
+    """未显式配置 target_after_tokens 时，按工作上下文预算此百分比推导压缩目标。"""
 
 
 class ToolResultBudgetConfig(StrictModel):
@@ -593,6 +615,56 @@ class ToolResultBudgetConfig(StrictModel):
     inline_budget_tokens: int = Field(default=800, ge=256)
     artifact_threshold_tokens: int | None = Field(default=None, ge=256)
     hard_cap_tokens: int | None = Field(default=None, ge=512)
+
+
+class ContextLengthBudgetRule(StrictModel):
+    """按 provider 预设 context_length 推导工作上下文预算的规则。"""
+
+    min_context_length_tokens: int = Field(ge=1)
+    """模型 context_length 至少达到此值时命中。"""
+
+    budget_tokens: int = Field(ge=1024)
+    """命中后使用的工作上下文预算。"""
+
+
+class ContextBudgetRecommendationConfig(StrictModel):
+    """max_context_tokens 为空时的自动推荐规则。"""
+
+    model_name_budget_tokens: dict[str, int] = Field(
+        default_factory=lambda: {
+            "deepseek-v4-pro": 350_000,
+            "deepseek-v4": 300_000,
+            "claude": 150_000,
+        }
+    )
+    """模型名包含指定片段时使用的预算。按配置顺序匹配。"""
+
+    context_length_rules: list[ContextLengthBudgetRule] = Field(
+        default_factory=lambda: [
+            ContextLengthBudgetRule(
+                min_context_length_tokens=1_000_000,
+                budget_tokens=300_000,
+            ),
+            ContextLengthBudgetRule(
+                min_context_length_tokens=200_000,
+                budget_tokens=150_000,
+            ),
+            ContextLengthBudgetRule(
+                min_context_length_tokens=128_000,
+                budget_tokens=96_000,
+            ),
+        ]
+    )
+    """provider 预设 context_length 命中规则。按配置顺序匹配。"""
+
+    context_length_scale_percent: int = Field(default=75, ge=1, le=100)
+    """低于所有阈值时，按模型 context_length 的此百分比推导。"""
+
+    min_scaled_budget_tokens: int = Field(default=4096, ge=1024)
+    """按百分比推导时的最低工作上下文预算。"""
+
+    fallback_budget_tokens: int = Field(default=96_000, ge=1024)
+    """模型名和 context_length 都无法命中时的兜底预算。"""
 
 
 def default_tool_result_budgets() -> dict[str, ToolResultBudgetConfig]:
@@ -654,14 +726,37 @@ class ContextConfig(StrictModel):
     max_context_tokens: int | None = None
     """None = 根据当前模型预设 context_length 推导工作预算。"""
 
+    recommended_context_budget: ContextBudgetRecommendationConfig = Field(
+        default_factory=ContextBudgetRecommendationConfig
+    )
+    """max_context_tokens=None 时使用的自动推荐规则。"""
+
     reserve_output_tokens: int = Field(default=8192, ge=1024)
     """为模型输出保留的 token。"""
+
+    prompt_overhead_estimate_tokens: int = Field(default=12000, ge=0)
+    """系统提示、工具 schema 等非历史内容的预估开销。"""
+
+    min_working_history_tokens: int = Field(default=4096, ge=1024)
+    """工作上下文中至少保留给活跃历史的 token 预算。"""
 
     memory_token_budget: int = Field(default=4096, ge=256)
     """长期重要记忆注入预算。Phase A 先作为预算字段预留，Phase D 精细使用。"""
 
     summary_token_budget: int = Field(default=4096, ge=256)
     """滚动摘要注入预算。"""
+
+    current_conversation_min_records: int = Field(default=8, ge=0)
+    """当前会话活跃历史至少保留的记录数。"""
+
+    runtime_record_keep_count: int = Field(default=12, ge=0)
+    """运行时记录注入时保留的最近记录数。"""
+
+    send_receipt_keep_count: int = Field(default=4, ge=0)
+    """发送回执记录注入时保留的最近记录数。"""
+
+    no_action_keep_count: int = Field(default=8, ge=0)
+    """no_action 记录注入时保留的最近记录数。"""
 
     tool_result_default_budget_tokens: int = Field(default=800, ge=256)
     """未单独配置的工具结果 inline 默认预算。"""
@@ -698,6 +793,21 @@ class BehaviorConfig(StrictModel):
     proactive_context_token_budget: int = Field(default=4096, ge=1024)
     """主动思考路由器可使用的上下文预算。默认 4K，避免后台判断吃掉过多上下文和成本。"""
 
+    proactive_router_text_limit_tokens: int = Field(default=256, ge=32)
+    """主动路由输入文本片段的截断预算。"""
+
+    proactive_router_tool_result_inline_tokens: int = Field(default=96, ge=32)
+    """主动路由工具结果内联预算。"""
+
+    proactive_router_tool_result_hard_cap_tokens: int = Field(default=160, ge=64)
+    """主动路由工具结果事故兜底上限。"""
+
+    proactive_router_summary_limit_tokens: int = Field(default=1024, ge=128)
+    """主动路由历史摘要文本上限。"""
+
+    proactive_router_history_token_budget: int = Field(default=16384, ge=1024)
+    """主动路由可读取的历史 token 预算。"""
+
     pending_request_timeout_seconds: float = Field(default=1800.0, ge=60.0)
     """好友/群加入请求暂存的过期时间（秒）。超时后未审核的请求被丢弃。"""
 
@@ -709,6 +819,14 @@ class BehaviorConfig(StrictModel):
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     summarize: SummarizeConfig = Field(default_factory=SummarizeConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_deprecated_persona_refine_history_turns(cls, data: object) -> object:
+        if isinstance(data, dict) and "persona_refine_history_turns" in data:
+            data = dict(data)
+            data.pop("persona_refine_history_turns", None)
+        return data
 
 
 # ============================================================

@@ -9,28 +9,32 @@ from __future__ import annotations
 from typing import Any
 
 from agents import build_task_context
+from app_config.loader import ConfigError, get_config
+from app_config.schema import ContextBudgetRecommendationConfig
 
 from .pipeline_history import _record_timestamp
 
 
 def _recommended_context_budget(model: str, context_length: int | None = None) -> int:
-    """按模型名推导工作上下文预算，不等于模型硬上限。"""
+    """按配置规则推导工作上下文预算，不等于模型硬上限。"""
+    try:
+        rec = get_config().behavior.context.recommended_context_budget
+    except ConfigError:
+        rec = ContextBudgetRecommendationConfig()
+
     name = (model or "").lower()
-    if "deepseek-v4-pro" in name:
-        return 350_000
-    if "deepseek-v4" in name:
-        return 300_000
+    for pattern, budget in rec.model_name_budget_tokens.items():
+        if pattern.lower() in name:
+            return budget
+
     if context_length and context_length > 0:
-        if context_length >= 1_000_000:
-            return 300_000
-        if context_length >= 200_000:
-            return 150_000
-        if context_length >= 128_000:
-            return 96_000
-        return max(4096, int(context_length * 0.75))
-    if "claude" in name:
-        return 150_000
-    return 96_000
+        for rule in rec.context_length_rules:
+            if context_length >= rule.min_context_length_tokens:
+                return rule.budget_tokens
+        scaled = int(context_length * rec.context_length_scale_percent / 100)
+        return max(rec.min_scaled_budget_tokens, scaled)
+
+    return rec.fallback_budget_tokens
 
 
 def _make_task_context_record(

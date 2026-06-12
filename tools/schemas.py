@@ -50,9 +50,16 @@ class PrivateMessageTarget(_ToolArgs):
         description="要发送的图片 URL 或 workspace 相对路径；不是表情包。content、emoji、image 三选一。",
     )
     order: int = Field(..., description="发送顺序，从小到大")
-    delay: float | None = Field(
-        default=None,
-        description="本条发出后的等待秒数。不填时按消息长度自动估算。",
+    delay: float = Field(
+        ...,
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "本条发出后到下一条发出前的等待秒数；最后一条也必须填写，可填 0；"
+            "单条消息只发一条时 delay=0 合法。第 i 条 delay 按下一条即将发送的可见内容估算，"
+            "非最后一条通常不要低于 2 秒：中文约 1.5 个中文字/秒，再加 0.5-1.5 秒自然停顿；"
+            "转折、补充、犹豫或长内容加 2-5 秒；表情包和图片按约 1.5-3 秒。"
+        ),
     )
 
     @model_validator(mode="after")
@@ -111,7 +118,7 @@ class SendPrivateArgs(_ToolArgs):
     )
     reply_to_message_id: str | None = Field(
         default=None,
-        description="可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用。",
+        description="可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用。不确定不要编造。",
     )
     reason: str | None = Field(
         default=None,
@@ -135,8 +142,16 @@ class GroupMessageTarget(_ToolArgs):
         description="要发送的图片 URL 或 workspace 相对路径；不是表情包。content、emoji、image 三选一。",
     )
     order: int = Field(..., description="发送顺序，从小到大")
-    delay: float | None = Field(
-        default=None, description="本条发出后的等待秒数。不填时按长度估算。"
+    delay: float = Field(
+        ...,
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "本条发出后到下一条发出前的等待秒数；最后一条也必须填写，可填 0；"
+            "单条消息只发一条时 delay=0 合法。第 i 条 delay 按下一条即将发送的可见内容估算，"
+            "非最后一条通常不要低于 2 秒：中文约 1.5 个中文字/秒，再加 0.5-1.5 秒自然停顿；"
+            "转折、补充、犹豫或长内容加 2-5 秒；表情包和图片按约 1.5-3 秒。"
+        ),
     )
 
     @model_validator(mode="after")
@@ -193,11 +208,18 @@ class SendGroupArgs(_ToolArgs):
     )
     responding_to_message_ids: list[str] = Field(
         default_factory=list,
-        description="可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；不确定不要编造。",
+        description=(
+            "可选：这次回复明确针对哪些消息 ID。程序用它确定 focus_user_ids；"
+            "群聊回答某个人的问题、跨消息回应或复核后提交旧内容时可填；不确定不要编造。"
+        ),
     )
     reply_to_message_id: str | None = Field(
         default=None,
-        description="可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用，适合旧回复被新消息隔开后锚定上下文。",
+        description=(
+            "可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用。"
+            "群聊中回复具体消息、回答某个人的问题、前后有多人插话、或复核后提交旧 attempt 时，"
+            "若“行/OK/可以/知道了”等短回复会产生歧义，优先填写。不要机械每条都填；不确定不要编造。"
+        ),
     )
     reason: str | None = Field(
         default=None,
@@ -227,7 +249,10 @@ class CommitSendAttemptArgs(_ToolArgs):
     )
     reply_to_message_id: str | None = Field(
         default=None,
-        description="可选：确认发送时给第一条文本消息补引用，避免被中间新消息隔开后串话。",
+        description=(
+            "可选：确认发送时给第一条文本消息补引用。群聊复核后提交旧 attempt、"
+            "中间已有多人插话或短确认会看不出回谁时优先填写；不要机械每条都填，不确定不要编造。"
+        ),
     )
     ignore_review_interrupts: bool = Field(
         default=False,
@@ -326,7 +351,11 @@ class ToolSearchArgs(_ToolArgs):
     tool_name: str = Field(
         ...,
         min_length=1,
-        description="要查询完整说明和真实参数 schema 的工具名。",
+        description="要查询说明和真实参数的工具名。",
+    )
+    detail: Literal["summary", "full"] = Field(
+        default="summary",
+        description="返回参数摘要还是完整 JSON schema。summary 默认足够直接调用；复杂嵌套时可用 full。",
     )
     intent: str | None = Field(
         default=None,

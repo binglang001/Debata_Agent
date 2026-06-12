@@ -14,8 +14,15 @@ from PySide6.QtWidgets import (
     QScrollArea,
 )
 
-from agents.persona_gen_agent import PersonaGenAgent
-from ui.wizard.context import WizardContext
+from agents.persona_gen_agent import (
+    PersonaBrief,
+    PersonaGenAgent,
+    build_persona_refine_user_message,
+)
+from ui.wizard.context import (
+    WizardContext,
+    append_persona_edit_history,
+)
 from ui.wizard.persona_creator import PersonaCreatorStepView
 
 from ..widgets import FramelessDialog, show_message
@@ -79,6 +86,8 @@ class _PersonaRefineDialog(FramelessDialog):
         self._context = context
         self._runtime = runtime
         self._agent: PersonaGenAgent | None = self._build_persona_agent()
+        self._refined_count = 0
+        self._edit_history: list[dict[str, str]] = []
 
         title = QLabel(f"当前角色：{persona_name}")
         title.setProperty("role", "title-3")
@@ -138,12 +147,22 @@ class _PersonaRefineDialog(FramelessDialog):
             provider = AnthropicProvider("dashboard_persona_refine", base_url=base_url, api_key=m.api_key, timeout=180.0)
         else:
             provider = OpenAICompatProvider("dashboard_persona_refine", base_url=base_url, api_key=m.api_key, timeout=180.0)
+        reasoning = None
+        if m.reasoning_enabled:
+            from app_config.schema import ReasoningConfig
+
+            reasoning = ReasoningConfig(
+                enabled=True,
+                budget=m.reasoning_budget,
+                max_tokens=m.reasoning_max_tokens,
+            )
         cfg = AgentConfig(
             provider=m.preset or "deepseek",
             model=m.model,
             temperature=m.temperature,
             top_p=m.top_p,
             max_tokens=max(8192, m.max_tokens),
+            reasoning=reasoning,
             first_token_timeout_seconds=60.0,
         )
         return PersonaGenAgent(
@@ -176,10 +195,25 @@ class _PersonaRefineDialog(FramelessDialog):
 
         async def _do() -> None:
             try:
-                result = await self._agent.refine(self.result_prompt or self._current_prompt, feedback)
+                current_prompt = self.result_prompt or self._current_prompt
+                brief = PersonaBrief(name=self._persona_name)
+                result = await self._agent.refine(
+                    current_prompt,
+                    feedback,
+                    refined_count=self._refined_count,
+                    edit_history=self._edit_history,
+                    current_brief=brief,
+                )
+                user_message = build_persona_refine_user_message(feedback, current_prompt)
                 self.result_prompt = result.persona_prompt
+                self._refined_count = result.refined_count
+                self._edit_history = append_persona_edit_history(
+                    self._edit_history,
+                    user_message,
+                    result.raw_response,
+                )
                 self._preview.setPlainText(self.result_prompt)
-                self._status.setText("修改版已生成。确认后会覆盖当前人格文件。")
+                self._status.setText(f"修改版已生成（第 {self._refined_count} 版）。确认后会覆盖当前人格文件。")
                 self._save_btn.setEnabled(True)
             except Exception as e:  # noqa: BLE001
                 logger.warning("修改人格生成失败", exc_info=True)
@@ -192,4 +226,3 @@ class _PersonaRefineDialog(FramelessDialog):
     def _on_accept(self) -> None:
         if self.result_prompt.strip():
             self.accept()
-

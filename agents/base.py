@@ -12,6 +12,7 @@ from providers.base import Usage
 ToolExecutor = Callable[..., Awaitable[dict[str, Any]]]
 UsageRecorder = Callable[[Usage, dict[str, Any]], Awaitable[None]]
 StatusCallback = Callable[[dict[str, Any]], None]
+RuntimeEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 FinishReason = Literal[

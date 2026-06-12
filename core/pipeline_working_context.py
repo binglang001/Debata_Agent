@@ -7,15 +7,15 @@ selection logic while moving methods.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any
 
 from utils.token_budget import TokenBudget, TokenEstimator
 
 from .pipeline_context import _recommended_context_budget
 from .pipeline_history import (
-    _WORKING_HISTORY_RECENT_RUNTIME_RECORDS,
-    _WORKING_HISTORY_SEND_RECEIPT_KEEP,
     _record_conversation_id,
     _working_history_noise_indices,
     _working_history_optional_runtime_indices,
@@ -23,9 +23,23 @@ from .pipeline_history import (
 
 logger = logging.getLogger(__name__)
 
-_PREFIX_ESTIMATE_TOKENS = 12_000
-_CURRENT_CONVERSATION_MIN_RECORDS = 8
-_PROACTIVE_ROUTER_HISTORY_BUDGET = 16_384
+_SEND_RECEIPT_BLOCK_RE = re.compile(
+    r"<send_receipt>\s*(.*?)\s*</send_receipt>",
+    re.DOTALL,
+)
+_SEND_RECEIPT_JSON_KEYS = {
+    "type",
+    "send_id",
+    "conversation_id",
+    "status",
+    "interrupted",
+    "sent",
+    "unsent",
+    "new_messages",
+    "recalled_messages",
+    "errors",
+    "accepted_messages",
+}
 
 
 class PipelineWorkingContextMixin:
@@ -174,7 +188,9 @@ class PipelineWorkingContextMixin:
             records,
             working_budget=self._working_history_budget(),
             conversation_id=conversation_id,
-            ensure_current_records=_CURRENT_CONVERSATION_MIN_RECORDS,
+            ensure_current_records=(
+                self.behavior_cfg.context.current_conversation_min_records
+            ),
             log_context=conversation_id,
             log_level=logging.INFO,
         )
@@ -186,7 +202,7 @@ class PipelineWorkingContextMixin:
             records,
             working_budget=min(
                 self._working_history_budget(),
-                _PROACTIVE_ROUTER_HISTORY_BUDGET,
+                self.behavior_cfg.proactive_router_history_token_budget,
             ),
             conversation_id=None,
             ensure_current_records=0,
@@ -196,12 +212,13 @@ class PipelineWorkingContextMixin:
 
     def _working_history_budget(self) -> int:
         budget = self._context_budget()
+        context_cfg = self.behavior_cfg.context
         return max(
-            4096,
+            context_cfg.min_working_history_tokens,
             budget.total_input_budget
             - budget.memory_token_budget
             - budget.summary_token_budget
-            - _PREFIX_ESTIMATE_TOKENS,
+            - context_cfg.prompt_overhead_estimate_tokens,
         )
 
     def _warn_context_compaction_invariants(self) -> None:
@@ -214,7 +231,11 @@ class PipelineWorkingContextMixin:
             return
         trigger = summarize.trigger_at_tokens
         if trigger is None:
-            trigger = int(self._context_budget().max_context_tokens * 0.75)
+            trigger = int(
+                self._context_budget().max_context_tokens
+                * summarize.trigger_at_context_percent
+                / 100
+            )
         if trigger >= working_budget:
             logger.warning(
                 "滚动摘要触发线高于工作窗口预算：trigger=%s working_budget=%s；"
@@ -234,16 +255,23 @@ class PipelineWorkingContextMixin:
         log_level: int,
     ) -> list[dict[str, Any]]:
         estimator = self._token_estimator()
+        context_cfg = self.behavior_cfg.context
         selected_indices: set[int] = set()
         noise_indices = _working_history_noise_indices(
             records,
             conversation_id=conversation_id,
             ensure_current_records=ensure_current_records,
+            runtime_record_keep_count=context_cfg.runtime_record_keep_count,
+            send_receipt_keep_count=context_cfg.send_receipt_keep_count,
+            no_action_keep_count=context_cfg.no_action_keep_count,
         )
         optional_runtime_indices = _working_history_optional_runtime_indices(
             records,
             conversation_id=conversation_id,
             ensure_current_records=ensure_current_records,
+            runtime_record_keep_count=context_cfg.runtime_record_keep_count,
+            send_receipt_keep_count=context_cfg.send_receipt_keep_count,
+            no_action_keep_count=context_cfg.no_action_keep_count,
         )
         used = 0
 
@@ -298,13 +326,14 @@ class PipelineWorkingContextMixin:
                 working_budget,
                 used,
             )
-        return self._filter_working_history_runtime_noise(
+        filtered = self._filter_working_history_runtime_noise(
             selected,
             conversation_id=conversation_id,
             ensure_current_records=ensure_current_records,
             log_context=log_context,
             log_level=log_level,
         )
+        return self._normalize_working_history_send_receipts(filtered)
 
     def _filter_working_history_runtime_noise(
         self,
@@ -326,10 +355,14 @@ class PipelineWorkingContextMixin:
         if not records:
             return records
 
+        context_cfg = self.behavior_cfg.context
         drop_indices = _working_history_noise_indices(
             records,
             conversation_id=conversation_id,
             ensure_current_records=ensure_current_records,
+            runtime_record_keep_count=context_cfg.runtime_record_keep_count,
+            send_receipt_keep_count=context_cfg.send_receipt_keep_count,
+            no_action_keep_count=context_cfg.no_action_keep_count,
         )
 
         if not drop_indices:
@@ -346,7 +379,75 @@ class PipelineWorkingContextMixin:
             log_context,
             len(drop_indices),
             ensure_current_records,
-            _WORKING_HISTORY_RECENT_RUNTIME_RECORDS,
-            _WORKING_HISTORY_SEND_RECEIPT_KEEP,
+            context_cfg.runtime_record_keep_count,
+            context_cfg.send_receipt_keep_count,
         )
         return filtered
+
+    def _normalize_working_history_send_receipts(
+        self,
+        records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """只归一化 prompt view 中旧版 JSON 回执，不回写原始历史。"""
+        normalized: list[dict[str, Any]] = []
+        changed = False
+        for record in records:
+            content = record.get("content")
+            if not isinstance(content, str) or "<send_receipt" not in content:
+                normalized.append(record)
+                continue
+            new_content = self._normalize_send_receipt_content(content, record)
+            if new_content == content:
+                normalized.append(record)
+                continue
+            copied = dict(record)
+            copied["content"] = new_content
+            normalized.append(copied)
+            changed = True
+        return normalized if changed else records
+
+    def _normalize_send_receipt_content(
+        self,
+        content: str,
+        record: dict[str, Any],
+    ) -> str:
+        def replace(match: re.Match[str]) -> str:
+            receipt = self._parse_legacy_send_receipt_json(match.group(1))
+            if receipt is None:
+                return match.group(0)
+            if not receipt.get("conversation_id"):
+                conversation_id = _record_conversation_id(record)
+                if conversation_id:
+                    receipt = dict(receipt)
+                    receipt["conversation_id"] = conversation_id
+            return self._format_send_receipt(receipt)
+
+        return _SEND_RECEIPT_BLOCK_RE.sub(replace, content)
+
+    @staticmethod
+    def _parse_legacy_send_receipt_json(text: str) -> dict[str, Any] | None:
+        stripped = text.strip()
+        if not stripped:
+            return None
+
+        decoder = json.JSONDecoder()
+        candidates = [stripped]
+        first_brace = stripped.find("{")
+        if first_brace > 0:
+            candidates.append(stripped[first_brace:])
+
+        for candidate in candidates:
+            if not candidate.startswith("{"):
+                continue
+            try:
+                payload, end = decoder.raw_decode(candidate)
+            except json.JSONDecodeError:
+                continue
+            if candidate[end:].strip():
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if not (_SEND_RECEIPT_JSON_KEYS & payload.keys()):
+                continue
+            return payload
+        return None

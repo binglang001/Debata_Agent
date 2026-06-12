@@ -1,6 +1,6 @@
 """消息类工具：发送私聊/群消息、撤回、上传文件。
 
-发送类工具保留 order / delay / typing_delay 的节奏。运行在 MessagePipeline
+发送类工具保留 order / delay 的节奏。运行在 MessagePipeline
 内时交给 Phase 0 异步发送队列；没有队列回调的独立调用退回同步直发兜底。
 """
 
@@ -18,7 +18,6 @@ from .message_builder import (
     MessageBuildError,
     build_message_action,
     contains_forbidden,
-    typing_delay,
 )
 from .schemas import (
     CommitSendAttemptArgs,
@@ -117,6 +116,10 @@ def _inject_context_tool_call_id(metadata: dict, ctx: ToolContext) -> dict:
     return result
 
 
+def _normalize_send_delay(model_delay: float) -> float:
+    return float(model_delay)
+
+
 def _apply_reply_to_first_text(actions: list[dict], reply_to_message_id: str | None) -> None:
     reply_to = str(reply_to_message_id or "").strip()
     if not reply_to:
@@ -173,7 +176,6 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
 
     # 按 order 升序排序，保证逐条发送顺序与 LLM 意图一致
     sorted_targets = sorted(args.targets, key=lambda t: t.order)
-
     for t in sorted_targets:
         try:
             message_action = build_message_action(
@@ -194,14 +196,7 @@ async def send_private_messages(args: SendPrivateArgs, ctx: ToolContext) -> dict
             )
             continue
 
-        delay = t.delay
-        if delay is None:
-            # 文本按长度估算延迟；表情包/图片走 0.5 秒
-            delay = typing_delay(
-                t.content or "",
-                chars_per_second=ctx.typing_chars_per_second,
-                max_delay=ctx.typing_max_delay_seconds,
-            ) if t.content else 0.5
+        delay = _normalize_send_delay(t.delay)
 
         actions.append(
             {
@@ -290,7 +285,6 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
     errors: list[str] = []
 
     sorted_targets = sorted(args.targets, key=lambda t: t.order)
-
     for t in sorted_targets:
         try:
             message_action = build_message_action(
@@ -307,13 +301,7 @@ async def send_group_message(args: SendGroupArgs, ctx: ToolContext) -> dict:
             errors.append("内容含禁止标签")
             continue
 
-        delay = t.delay
-        if delay is None:
-            delay = typing_delay(
-                t.content or "",
-                chars_per_second=ctx.typing_chars_per_second,
-                max_delay=ctx.typing_max_delay_seconds,
-            ) if t.content else 0.5
+        delay = _normalize_send_delay(t.delay)
 
         actions.append(
             {

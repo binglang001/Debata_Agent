@@ -48,12 +48,21 @@ class PipelineSummaryMixin:
         estimator = self._token_estimator()
         active_tokens = estimator.estimate_messages(records)
         budget = self._context_budget()
-        trigger = self.behavior_cfg.summarize.trigger_at_tokens
+        summarize_cfg = self.behavior_cfg.summarize
+        trigger = summarize_cfg.trigger_at_tokens
         if trigger is None:
-            trigger = int(budget.max_context_tokens * 0.75)
-        target_after = self.behavior_cfg.summarize.target_after_tokens
+            trigger = int(
+                budget.max_context_tokens
+                * summarize_cfg.trigger_at_context_percent
+                / 100
+            )
+        target_after = summarize_cfg.target_after_tokens
         if target_after is None:
-            target_after = int(budget.max_context_tokens * 0.50)
+            target_after = int(
+                budget.max_context_tokens
+                * summarize_cfg.target_after_context_percent
+                / 100
+            )
         if active_tokens < trigger:
             return
         target_after = max(1, min(target_after, active_tokens - 1))
@@ -103,23 +112,27 @@ class PipelineSummaryMixin:
             },
             updated_at=get_time(),
         )
+        saved_important_count = 0
         if isinstance(new_important_items, list) and new_important_items:
             for item in new_important_items:
                 content = (item.get("content") or "").strip() if isinstance(item, dict) else ""
                 if content:
-                    await self.important.save(content)
+                    scope = item.get("scope") if isinstance(item.get("scope"), str) else None
+                    pinned = item.get("pinned") if isinstance(item.get("pinned"), bool) else False
+                    save_result = await self.important.save(
+                        content,
+                        scope=scope,
+                        pinned=pinned,
+                    )
+                    if save_result.get("saved"):
+                        saved_important_count += 1
 
         cut_point = len(slice_records)
         await self.history.truncate_head(cut_point)
 
-        important_count = (
-            len(new_important_items)
-            if isinstance(new_important_items, list)
-            else 0
-        )
         await self.history.add_system_note(
             f"[滚动摘要] 已归档并移出活跃历史 {cut_point} 条；"
-            f"新增重要记忆 {important_count} 条"
+            f"新增重要记忆 {saved_important_count} 条"
         )
 
     @staticmethod

@@ -30,12 +30,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from agents.persona_gen_agent import PersonaBrief, PersonaGenAgent
-from app_config.schema import AgentConfig
+from agents.persona_gen_agent import (
+    PersonaBrief,
+    PersonaGenAgent,
+    build_persona_refine_user_message,
+)
+from app_config.schema import AgentConfig, ReasoningConfig
 
 from ..theme import Spacing
 from .components import SectionCard
-from .context import BaseStepView, WizardContext
+from .context import (
+    BaseStepView,
+    WizardContext,
+    append_persona_edit_history,
+)
 from .copy import COPY
 
 logger = logging.getLogger(__name__)
@@ -345,11 +353,9 @@ class PersonaCreatorStepView(BaseStepView):
             if isinstance(rb, QRadioButton) and rb.isChecked():
                 rel = rb.property("rel_value") or "creator"
                 break
-        # 「其它」时把用户写的说明拼到 relation 字段（PersonaBrief 已是 free-text）
+        relation_detail = ""
         if rel == "special":
-            extra = self._special_edit.text().strip()
-            if extra:
-                rel = f"special:{extra}"
+            relation_detail = self._special_edit.text().strip()
         admins = self._admin_entries_from_form()
         primary_admin = next((x for x in admins if x.get("qq") or x.get("name")), {})
         return PersonaBrief(
@@ -366,6 +372,7 @@ class PersonaCreatorStepView(BaseStepView):
             relation_matrix=self._relation_matrix_edit.toPlainText().strip(),
             sensitive_topics=self._sensitive_edit.toPlainText().strip(),
             relation=rel,
+            relation_detail=relation_detail,
             extra_notes=self._extra_notes_edit.toPlainText().strip(),
         )
 
@@ -396,12 +403,20 @@ class PersonaCreatorStepView(BaseStepView):
         else:
             provider = OpenAICompatProvider("wizard_persona", base_url=base_url, api_key=m.api_key, timeout=180.0)
 
+        reasoning = None
+        if m.reasoning_enabled:
+            reasoning = ReasoningConfig(
+                enabled=True,
+                budget=m.reasoning_budget,
+                max_tokens=m.reasoning_max_tokens,
+            )
         cfg = AgentConfig(
             provider=m.preset or "deepseek",
             model=m.model,
             temperature=m.temperature,
             top_p=m.top_p,
             max_tokens=max(8192, m.max_tokens),
+            reasoning=reasoning,
             first_token_timeout_seconds=60.0,
         )
         return PersonaGenAgent(
@@ -481,6 +496,8 @@ class PersonaCreatorStepView(BaseStepView):
                 self._status_label.setProperty("role", "success")
                 self.context.persona.brief = brief
                 self.context.persona.generated_xml = result.persona_prompt
+                self.context.persona.refined_count = 0
+                self.context.persona.edit_history = []
                 self.context.persona.active = brief.name
                 self.context.persona.source = "create"
                 self.context.admin_name = brief.admin_name
@@ -515,11 +532,32 @@ class PersonaCreatorStepView(BaseStepView):
             return
 
         prev = self.context.persona.generated_xml
+        refined_count = self.context.persona.refined_count
+        edit_history = list(self.context.persona.edit_history)
+        brief = self._current_brief()
         self._begin_busy("正在调整……（流式生成中）", generate=False)
         QApplication.processEvents()
-        QTimer.singleShot(0, lambda: self._start_refine_task(agent, prev, feedback))
+        QTimer.singleShot(
+            0,
+            lambda: self._start_refine_task(
+                agent,
+                prev,
+                feedback,
+                refined_count,
+                edit_history,
+                brief,
+            ),
+        )
 
-    def _start_refine_task(self, agent: PersonaGenAgent, prev: str, feedback: str) -> None:
+    def _start_refine_task(
+        self,
+        agent: PersonaGenAgent,
+        prev: str,
+        feedback: str,
+        refined_count: int,
+        edit_history: list[dict[str, str]],
+        brief: PersonaBrief,
+    ) -> None:
 
         try:
             loop = asyncio.get_event_loop()
@@ -529,11 +567,23 @@ class PersonaCreatorStepView(BaseStepView):
 
         async def _do() -> None:
             try:
-                result = await agent.refine(prev, feedback)
-                brief = self._current_brief()
+                result = await agent.refine(
+                    prev,
+                    feedback,
+                    refined_count=refined_count,
+                    edit_history=edit_history,
+                    current_brief=brief,
+                )
+                user_message = build_persona_refine_user_message(feedback, prev)
                 self._render_result(result.persona_prompt, brief)
                 self.context.persona.brief = brief
                 self.context.persona.generated_xml = result.persona_prompt
+                self.context.persona.refined_count = result.refined_count
+                self.context.persona.edit_history = append_persona_edit_history(
+                    edit_history,
+                    user_message,
+                    result.raw_response,
+                )
                 self.context.admin_name = brief.admin_name
                 self.context.admin_qq = brief.admin_qq
                 self._status_label.setText(f"调过了（第 {result.refined_count} 版）")
@@ -585,10 +635,17 @@ class PersonaCreatorStepView(BaseStepView):
             self._relation_matrix_edit.setPlainText(p.brief.relation_matrix)
             self._sensitive_edit.setPlainText(p.brief.sensitive_topics)
             self._extra_notes_edit.setPlainText(p.brief.extra_notes)
+            relation = p.brief.relation or "creator"
+            relation_detail = p.brief.relation_detail
+            if relation.startswith("special:"):
+                relation_detail = relation.split(":", 1)[1].strip()
+                relation = "special"
+            self._special_edit.setText(relation_detail)
             for rb in self._relation_group.buttons():
-                if isinstance(rb, QRadioButton) and rb.property("rel_value") == p.brief.relation:
+                if isinstance(rb, QRadioButton) and rb.property("rel_value") == relation:
                     rb.setChecked(True)
                     break
+            self._special_edit.setVisible(relation == "special")
         if p.generated_xml:
             self._preview.setPlainText(p.generated_xml)
             self._refine_btn.setEnabled(True)

@@ -16,21 +16,40 @@ import asyncio
 import logging
 import sys
 from getpass import getpass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(level: str = "INFO") -> None:
+def setup_logging(level: str = "INFO", *, project_root: Path | None = None) -> None:
     """配置标准 logging。
 
     格式：[YYYY-MM-DD HH:MM:SS] [LEVEL] [module] message
     """
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+    root = project_root or Path(__file__).resolve().parent
+    logs_dir = root / "data" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    fmt = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    file_handler = RotatingFileHandler(
+        logs_dir / "debata.log",
+        maxBytes=20 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(fmt)
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        handlers=[console, file_handler],
+        force=True,
+    )
+    for noisy_logger in ("qasync", "websockets"):
+        logging.getLogger(noisy_logger).setLevel(logging.INFO)
 
 
 def install_uvloop() -> None:
@@ -418,14 +437,13 @@ def main() -> None:
     args = parse_args()
     project_root = Path(__file__).resolve().parent
 
-    setup_logging("INFO")
-    install_uvloop()
-
     from app_config import AppPaths
 
     config_file = Path(args.config) if args.config else None
     paths = AppPaths(project_root=project_root, config_file=config_file)
     paths.ensure_data_dirs()
+    setup_logging("INFO", project_root=project_root)
+    install_uvloop()
 
     if args.napcat:
         _run_napcat_setup(paths)

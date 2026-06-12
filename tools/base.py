@@ -8,7 +8,7 @@
     3. 依赖注入：工具不再直接持有 Bot/Adapter，所有依赖通过 ToolContext 注入。
        这让工具脱离任何具体适配器，便于跨平台。
     4. schema 稳定：常驻工具集合尽量不随 feature 开关变化；低频/高风险/大 schema
-       工具以 stub 暴露名称，模型需要时通过 tool_search 获取完整参数。
+       工具以 stub 暴露名称，模型需要时通过 tool_search 获取参数摘要或完整 schema。
 
 OpenAI tool 格式参考：
     {
@@ -48,6 +48,8 @@ if TYPE_CHECKING:
     from memory import ArchiveStore, HistoryManager, ImportantMemoryManager
 
 logger = logging.getLogger(__name__)
+
+_TOOL_RESULT_FORMAT = "structured_json"
 
 
 class ToolSchemaMode(StrEnum):
@@ -172,7 +174,8 @@ class ToolContext:
     """summarize_chat_history 工具拉取群历史的默认 count 参数。"""
 
     typing_chars_per_second: float = 1.0
-    typing_max_delay_seconds: float = 2.0
+    typing_english_chars_per_second: float = 5.0
+    """遗留打字速度字段；发送工具不再读取这些字段。"""
 
     tool_result_soft_limit_tokens: int = 600
     tool_result_hard_cap_tokens: int = 1500
@@ -283,7 +286,7 @@ class ToolSpec:
                 "name": self.name,
                 "description": (
                     self.short_description
-                    or f"{self.name} 是低频工具。调用前先用 tool_search 查询完整参数和约束。"
+                    or f"{self.name} 是低频工具。调用前先用 tool_search 查询参数摘要和约束。"
                 ),
                 "parameters": _add_finish_after_success_parameter(
                     {
@@ -292,7 +295,7 @@ class ToolSpec:
                             "_tool_search_required": {
                                 "type": "boolean",
                                 "description": (
-                                    "这是占位参数。真实调用前必须先用 tool_search 查询完整参数。"
+                                    "这是占位参数。真实调用前必须先用 tool_search 查询参数摘要。"
                                 ),
                             }
                         },
@@ -308,22 +311,42 @@ class ToolSpec:
         cleaned = _strip_pydantic_metadata(_inline_refs(raw_schema))
         return _add_finish_after_success_parameter(cleaned, self.name)
 
-    def tool_search_result(self) -> dict[str, Any]:
+    def tool_search_result(self, *, detail: Literal["summary", "full"] = "summary") -> dict[str, Any]:
         parameters = self.full_parameters_schema()
-        return {
+        required_fields = parameters.get("required", [])
+        result = {
             "ok": True,
             "status": "found",
+            "result_format": _TOOL_RESULT_FORMAT,
+            "result_type": "tool_metadata",
             "tool_name": self.name,
             "description": self.description,
             "short_description": self.short_description or self.description,
-            "parameters_schema": parameters,
-            "required_fields": parameters.get("required", []),
+            "required_fields": required_fields,
             "risk_level": self.risk_level,
             "search_tags": list(self.search_tags),
             "examples": list(self.examples),
             "constraints": _tool_constraints(self),
-            "next": "已返回完整参数。若确认要使用该工具，请按 parameters_schema 调用原工具。",
         }
+        if detail == "full":
+            result["brief"] = f"已返回 {self.name} 的完整 schema；这是工具元数据。"
+            result["parameters_schema"] = parameters
+            result["next"] = "已返回完整 JSON schema。若确认要使用该工具，请按 parameters_schema 调用原工具。"
+            return result
+
+        result["brief"] = f"已返回 {self.name} 的参数摘要；这是工具元数据。"
+        summary_fields = _summarize_parameter_fields(parameters)
+        result["parameters"] = summary_fields
+        result["parameter_summary"] = {
+            "type": parameters.get("type", "object"),
+            "required_fields": required_fields,
+            "fields": summary_fields,
+        }
+        result["next"] = (
+            "已返回参数摘要，足够按字段调用原工具；需要完整 JSON schema 时，"
+            "用 detail=full 重新查询 tool_search。"
+        )
+        return result
 
 
 # ============================================================
@@ -470,7 +493,10 @@ class ToolRegistry:
         ) -> dict[str, Any]:
             spec = self._specs.get(tool_name)
             if spec is None:
-                return {"ok": False, "error": f"unknown tool: {tool_name}"}
+                return _ensure_tool_result_envelope(
+                    tool_name,
+                    {"ok": False, "error": f"unknown tool: {tool_name}"},
+                )
             finish_after_success = (
                 tool_name != "no_action"
                 and raw_args.get("finish_after_success") is True
@@ -482,20 +508,26 @@ class ToolRegistry:
                 spec.schema_mode == ToolSchemaMode.STUB
                 and tool_name not in ctx.extras.get("tool_search_approved_tools", set())
             ):
-                return {
-                    "ok": False,
-                    "status": "need_tool_search",
-                    "tool_name": tool_name,
-                    "brief": f"工具 {tool_name} 需要先查询完整说明。",
-                    "next": "请先调用 tool_search 获取完整参数和风险约束，再决定是否调用。",
-                }
+                return _ensure_tool_result_envelope(
+                    tool_name,
+                    {
+                        "ok": False,
+                        "status": "need_tool_search",
+                        "tool_name": tool_name,
+                        "brief": f"工具 {tool_name} 需要先查询完整说明。",
+                        "next": "请先调用 tool_search 获取参数摘要和风险约束，再决定是否调用。",
+                    },
+                )
 
             try:
                 args = spec.args_model.model_validate(raw_args)
             except Exception as e:
                 # Pydantic ValidationError 详情比较长，简化输出
                 logger.warning(f"工具 {tool_name} 参数校验失败: {e}")
-                return {"ok": False, "error": f"参数无效: {e}"}
+                return _ensure_tool_result_envelope(
+                    tool_name,
+                    {"ok": False, "error": f"参数无效: {e}"},
+                )
 
             try:
                 old_tool_call_id = ctx.extras.get("tool_call_id")
@@ -504,7 +536,10 @@ class ToolRegistry:
                 result = await spec.func(args, ctx)
             except Exception as e:
                 logger.exception(f"工具 {tool_name} 执行异常: {e}")
-                return {"ok": False, "error": str(e)}
+                return _ensure_tool_result_envelope(
+                    tool_name,
+                    {"ok": False, "error": str(e)},
+                )
             finally:
                 if tool_call_id:
                     if old_tool_call_id is None:
@@ -524,6 +559,7 @@ class ToolRegistry:
             from .result_shrink import shrink_tool_result
 
             shrunk = shrink_tool_result(tool_name, result, ctx)
+            shrunk = _ensure_tool_result_envelope(tool_name, shrunk)
             if finish_after_success and not _tool_result_blocks_completion(shrunk):
                 shrunk = dict(shrunk)
                 completion = dict(shrunk.get("turn_completion") or {})
@@ -535,8 +571,97 @@ class ToolRegistry:
         return executor
 
 
+def _ensure_tool_result_envelope(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
+    enveloped = dict(result)
+    if "ok" not in enveloped:
+        enveloped["ok"] = _infer_tool_result_ok(enveloped)
+    if "status" not in enveloped:
+        enveloped["status"] = (
+            "done" if _tool_result_ok_is_success(enveloped.get("ok")) else "failed"
+        )
+    enveloped["tool"] = tool_name
+    enveloped["result_format"] = _TOOL_RESULT_FORMAT
+    if not _has_readable_brief(enveloped.get("brief")):
+        enveloped["brief"] = _make_tool_result_brief(tool_name, enveloped)
+    return enveloped
+
+
+def _infer_tool_result_ok(result: dict[str, Any]) -> bool:
+    if _tool_result_has_error(result):
+        return False
+    status = result.get("status")
+    if isinstance(status, str):
+        return not _tool_status_is_failure(status)
+    if isinstance(status, (list, tuple, set)):
+        return not any(_tool_status_is_failure(str(item)) for item in status)
+    if result.get("success") is False:
+        return False
+    return True
+
+
+def _tool_result_has_error(result: dict[str, Any]) -> bool:
+    for key in ("error", "errors"):
+        value = result.get(key)
+        if value not in (None, "", [], {}):
+            return True
+    return False
+
+
+def _tool_status_is_failure(status: str) -> bool:
+    normalized = status.strip().lower()
+    failure_statuses = {
+        "denied",
+        "error",
+        "failed",
+        "need_tool_search",
+        "not_found",
+        "stale",
+        "timeout",
+        "unavailable",
+        "unsupported",
+    }
+    return (
+        normalized in failure_statuses
+        or normalized.endswith("_failed")
+        or "failed" in normalized
+        or "error" in normalized
+    )
+
+
+def _tool_result_ok_is_success(value: Any) -> bool:
+    if value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "failed", "error", "no"}
+    return True
+
+
+def _has_readable_brief(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _make_tool_result_brief(tool_name: str, result: dict[str, Any]) -> str:
+    status = str(result.get("status") or "").strip()
+    status_suffix = f"，status={status}" if status else ""
+    if result.get("ok") is False:
+        return f"{tool_name} 未完成{status_suffix}。"
+    if result.get("no_action") is True:
+        return "本轮不执行操作。"
+    sent = result.get("sent")
+    if isinstance(sent, list):
+        return f"{tool_name} 已处理 {len(sent)} 条发送结果{status_suffix}。"
+    count = result.get("count")
+    if isinstance(count, int):
+        return f"{tool_name} 返回 {count} 项{status_suffix}。"
+    if "artifact" in result or "path" in result:
+        return f"{tool_name} 已返回结果文件{status_suffix}。"
+    if status:
+        return f"{tool_name} 返回结构化结果，status={status}。"
+    return f"{tool_name} 已返回结构化结果。"
+
+
 def _tool_constraints(spec: ToolSpec) -> list[str]:
-    constraints = ["按 parameters_schema 填写真实参数；不要编造 ID、路径或目标。"]
+    constraints = ["按 tool_search 返回的参数摘要/parameters_schema 填写真实参数；不要编造 ID、路径或目标。"]
     if spec.schema_mode == ToolSchemaMode.STUB:
         constraints.append("这是 stub 工具，本轮已查询后才可调用。")
     if spec.risk_level == "high":
@@ -545,6 +670,162 @@ def _tool_constraints(spec: ToolSpec) -> list[str]:
         constraints.append("中等风险工具：调用前确认目标、范围和后果。")
     if spec.category in {"messaging", "platform"}:
         constraints.append("QQ 操作类工具只按明确上下文执行，不因玩笑或情绪话误触发。")
+    return constraints
+
+
+def _summarize_parameter_fields(schema: dict[str, Any]) -> list[dict[str, Any]]:
+    required = {str(value) for value in schema.get("required", [])}
+    properties = schema.get("properties") or {}
+    if not isinstance(properties, dict):
+        return []
+    return [
+        _summarize_schema_field(name, field_schema, required=name in required, depth=0)
+        for name, field_schema in properties.items()
+        if isinstance(field_schema, dict)
+    ]
+
+
+def _summarize_schema_field(
+    name: str,
+    schema: dict[str, Any],
+    *,
+    required: bool,
+    depth: int,
+) -> dict[str, Any]:
+    field: dict[str, Any] = {
+        "name": name,
+        "required": required,
+        "type": _schema_type_summary(schema),
+    }
+    if "description" in schema:
+        field["description"] = schema["description"]
+    if "default" in schema:
+        field["default"] = schema["default"]
+    enum_values = _schema_enum_summary(schema)
+    if enum_values is not None:
+        field["enum"] = enum_values
+    constraints = _schema_constraints_summary(schema)
+    if constraints:
+        field["constraints"] = constraints
+
+    if depth >= 3:
+        return field
+
+    variants = schema.get("anyOf") or schema.get("oneOf")
+    if isinstance(variants, list):
+        nested_variants = [
+            _summarize_schema_node(variant, depth=depth + 1)
+            for variant in variants
+            if isinstance(variant, dict) and variant.get("type") != "null"
+        ]
+        if nested_variants:
+            field["variants"] = nested_variants
+
+    if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
+        child_required = {str(value) for value in schema.get("required", [])}
+        field["fields"] = [
+            _summarize_schema_field(
+                child_name,
+                child_schema,
+                required=child_name in child_required,
+                depth=depth + 1,
+            )
+            for child_name, child_schema in schema["properties"].items()
+            if isinstance(child_schema, dict)
+        ]
+    if schema.get("type") == "array" and isinstance(schema.get("items"), dict):
+        field["items"] = _summarize_schema_node(schema["items"], depth=depth + 1)
+    return field
+
+
+def _summarize_schema_node(schema: dict[str, Any], *, depth: int) -> dict[str, Any]:
+    summary: dict[str, Any] = {"type": _schema_type_summary(schema)}
+    if "description" in schema:
+        summary["description"] = schema["description"]
+    enum_values = _schema_enum_summary(schema)
+    if enum_values is not None:
+        summary["enum"] = enum_values
+    constraints = _schema_constraints_summary(schema)
+    if constraints:
+        summary["constraints"] = constraints
+    if depth >= 3:
+        return summary
+    if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
+        required = {str(value) for value in schema.get("required", [])}
+        summary["fields"] = [
+            _summarize_schema_field(
+                name,
+                child_schema,
+                required=name in required,
+                depth=depth + 1,
+            )
+            for name, child_schema in schema["properties"].items()
+            if isinstance(child_schema, dict)
+        ]
+    if schema.get("type") == "array" and isinstance(schema.get("items"), dict):
+        summary["items"] = _summarize_schema_node(schema["items"], depth=depth + 1)
+    return summary
+
+
+def _schema_type_summary(schema: dict[str, Any]) -> str:
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str):
+        return schema_type
+    if isinstance(schema_type, list):
+        return "|".join(str(item) for item in schema_type)
+    variants = schema.get("anyOf") or schema.get("oneOf")
+    if isinstance(variants, list):
+        types = [
+            _schema_type_summary(variant)
+            for variant in variants
+            if isinstance(variant, dict)
+        ]
+        deduped = []
+        for item in types:
+            if item and item not in deduped:
+                deduped.append(item)
+        if deduped:
+            return "|".join(deduped)
+    return "unknown"
+
+
+def _schema_enum_summary(schema: dict[str, Any]) -> list[Any] | None:
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list):
+        return list(enum_values)
+    variants = schema.get("anyOf") or schema.get("oneOf")
+    if not isinstance(variants, list):
+        return None
+    merged: list[Any] = []
+    for variant in variants:
+        if not isinstance(variant, dict) or not isinstance(variant.get("enum"), list):
+            continue
+        for value in variant["enum"]:
+            if value not in merged:
+                merged.append(value)
+    return merged or None
+
+
+def _schema_constraints_summary(schema: dict[str, Any]) -> dict[str, Any]:
+    constraint_keys = (
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+    )
+    constraints = {
+        key: schema[key]
+        for key in constraint_keys
+        if key in schema
+    }
+    if schema.get("type") == "array" and "items" in schema:
+        constraints["items"] = _schema_type_summary(schema["items"])
     return constraints
 
 
