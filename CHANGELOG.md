@@ -2,31 +2,21 @@
 
 本文件记录 Debata 所有重要变更，格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased] — v0.3.0-alpha（开发中）
+## [v0.8.5-alpha] — 2026-06-11
 
 ### Added
-- Phase 2 GUI：无边框窗口 + 图形化配置向导 + 7 页仪表盘（总览/会话/记忆/日志/人格/模型管理/设置）
-- RAG 长期记忆（embedding 服务接口 + OpenAI 兼容实现 + scope/pinned 注入选择）
-- `summarize_conversation` 本地归档总结工具，私聊和群聊都可用
-- 图像识别、联网搜索、天气查询三大 feature 实装
-- VoxCPM2 本地 TTS 与本地 embedding 插件接入，模型管理页提供安装指引
-- 设置页即时保存，无需重启生效
-- 密钥解密失败时自动引导用户重新输入（不崩溃）
+- Linux/CLI 启动配置完善，补齐无头环境启动、路径与密钥处理链路
+- 上下文压缩与工作窗口机制落地，提升长对话稳定性和上下文预算控制
+- 聊天归档与实时聊天能力增强，私聊和群聊均可进行本地归档总结
+- QQ/NapCat 适配与发送工具扩展，覆盖消息发送、回执处理和平台侧历史摘要
+- RAG、长期记忆、工具预算与仪表盘能力整合，支持记忆注入、预算观测和图形化管理
 
 ### Changed
-- 配置 schema 字段重命名统一（`timeout` → `timeout_seconds` 等）
-- DeepSeek 默认模型切换为 `deepseek-v4-flash`
-- Provider import 路径统一为 `from providers import OpenAICompatProvider, AnthropicProvider`
-- 主动思考路由改用 system-only 极简上下文，避免 tool role 污染路由判断
-- `summarize_chat_history` 职责收窄为 NapCat/QQ 服务器侧近期群历史总结
-- ASR 从项目中移除，QQ 语音转写统一走 NapCat 内置 `fetch_ptt_text`
+- 发布状态整理为 v0.8.5-alpha
+- 启动配置、上下文管理、聊天工具、记忆系统和仪表盘相关变更按当前发布面重新归类
 
 ### Fixed
-- NapCat 测试连接逻辑修正（client/server 模式分别处理）
-- 向导完成后仪表盘 `runtime.paths` 为 None 的启动顺序问题
-- 发送回执 Case B 显著性不足导致模型误说”等回执”的问题
-- clean completion 与 interrupted send receipt 的语义区分
-- 多轮 UI 打磨：表情包发送语义拆分、居中内容宽度修正、表情包投放区主题色适配、仪表盘对话框拆分与本地主题样式、无边框窗口布局微调
+- 修正 Linux/CLI、NapCat 连接、发送回执、上下文压缩和仪表盘启动链路中的近期问题
 
 ## [v0.2.0-alpha] — 2026-05-24
 

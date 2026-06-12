@@ -1,7 +1,7 @@
 """加密的 API 密钥管理。
 
 三层架构：
-    1. RSA 2048 密钥对：私钥存系统 keyring（用户级访问保护），公钥存文件
+    1. RSA 2048 密钥对：私钥优先存系统 keyring（用户级访问保护），公钥存文件
     2. AES-256 主密钥（K）：随机生成，用 RSA 公钥加密后存 secrets.meta
     3. 用户密钥：每条用 K + 随机 nonce 通过 AES-GCM 加密后存 secrets.enc
 
@@ -14,10 +14,11 @@
     - AES-GCM 提供认证加密：篡改 ciphertext 会立即被发现
     - 每条密钥独立的 nonce + associated_data（key_id），防重放
     - 即使 secrets.enc 被偷走，没有 RSA 私钥无法解密
-    - RSA 私钥保存在系统密钥环，仅当前用户可访问
+    - RSA 私钥优先保存在系统密钥环，仅当前用户可访问
+    - Linux 无可用 keyring 后端时，退回 data/rsa_private.pem（0600）本地私钥文件
 
 风险提示：
-    - keyring 数据丢失（重装系统、用户删除）= 所有密钥永久无法解密
+    - keyring/本地私钥数据丢失（重装系统、用户删除）= 所有密钥永久无法解密
     - 推荐用户定期导出 RSA 私钥并妥善保管
 """
 
@@ -41,14 +42,6 @@ except ImportError:
 from .paths import AppPaths
 
 logger = logging.getLogger(__name__)
-
-
-def _ensure_keyring():
-    """检查 keyring 是否可用，不可用则抛 SecretsError。"""
-    if keyring is None:
-        raise SecretsError(
-            "当前环境无 keyring 后端。请安装 keyring 或设置 KEYRING_BACKEND 环境变量。"
-        )
 
 
 class SecretsError(Exception):
@@ -98,7 +91,8 @@ class SecretsManager:
     def reset_all(self) -> None:
         """彻底清空密钥基础设施（用于换环境/keyring 损坏导致解密失败的恢复）。
 
-        清掉：keyring 的 RSA 私钥（所有段）、rsa_public.pem、secrets.meta、secrets.enc。
+        清掉：keyring 的 RSA 私钥（所有段）、本地 RSA 私钥兜底文件、
+        rsa_public.pem、secrets.meta、secrets.enc。
         清掉后下次 initialize() 会按首次启动流程重建。
         所有用户密钥（API key 等）会丢失，需要用户重新填。
         """
@@ -108,7 +102,12 @@ class SecretsManager:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"清 keyring 时出错（忽略继续）：{e}")
         # 文件
-        for f in (self.paths.RSA_PUBLIC_KEY_FILE, self.paths.SECRETS_META_FILE, self.paths.SECRETS_FILE):
+        for f in (
+            self.paths.RSA_PUBLIC_KEY_FILE,
+            self.paths.RSA_PRIVATE_KEY_FILE,
+            self.paths.SECRETS_META_FILE,
+            self.paths.SECRETS_FILE,
+        ):
             try:
                 if f.exists():
                     f.unlink()
@@ -228,30 +227,62 @@ class SecretsManager:
             return self.paths.KEYRING_RSA_PRIVATE_KEY
         return f"{self.paths.KEYRING_RSA_PRIVATE_KEY}_part_{idx}"
 
+    def _keyring_available(self) -> bool:
+        if keyring is None:
+            return False
+        try:
+            keyring.get_password(
+                self.paths.KEYRING_SERVICE,
+                "__debata_keyring_probe__",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "系统 keyring 不可用，改用本地 RSA 私钥文件 %s: %s",
+                self.paths.RSA_PRIVATE_KEY_FILE,
+                e,
+            )
+            return False
+        return True
+
     def _save_rsa_private_to_keyring(self, private_pem: str) -> None:
-        """把 RSA 私钥分段存 keyring，绕过 Windows Credential 单条 2560 字节限制。"""
+        """保存 RSA 私钥；keyring 不可用时退回本地 PEM 文件。"""
         chunks = [
             private_pem[i : i + self._RSA_CHUNK_SIZE]
             for i in range(0, len(private_pem), self._RSA_CHUNK_SIZE)
         ]
         if not chunks:
             raise SecretsError("拒绝保存空 RSA 私钥")
+        if not self._keyring_available():
+            self._save_rsa_private_to_file(private_pem)
+            return
         # 先清旧的，避免段数变小时残留旧段
         self._clear_rsa_private_from_keyring()
-        for i, chunk in enumerate(chunks):
-            keyring.set_password(
-                self.paths.KEYRING_SERVICE,
-                self._rsa_part_name(i),
-                chunk,
+        try:
+            for i, chunk in enumerate(chunks):
+                keyring.set_password(
+                    self.paths.KEYRING_SERVICE,
+                    self._rsa_part_name(i),
+                    chunk,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "写入系统 keyring 失败，改用本地 RSA 私钥文件 %s: %s",
+                self.paths.RSA_PRIVATE_KEY_FILE,
+                e,
             )
+            self._save_rsa_private_to_file(private_pem)
+            return
+        self._delete_rsa_private_file()
 
     def _load_rsa_private_pem(self) -> str | None:
         """从 keyring 拼回完整 RSA 私钥 PEM。第 0 段不存在返回 None。"""
+        if not self._keyring_available():
+            return self._load_rsa_private_from_file()
         first = keyring.get_password(
             self.paths.KEYRING_SERVICE, self._rsa_part_name(0)
         )
         if first is None:
-            return None
+            return self._load_rsa_private_from_file()
         parts: list[str] = [first]
         i = 1
         while True:
@@ -266,6 +297,9 @@ class SecretsManager:
 
     def _clear_rsa_private_from_keyring(self) -> None:
         """删掉所有段（用于覆盖前清场或外部清理）。"""
+        if not self._keyring_available():
+            self._delete_rsa_private_file()
+            return
         i = 0
         while True:
             name = self._rsa_part_name(i)
@@ -280,11 +314,51 @@ class SecretsManager:
 
     def _rsa_keys_exist(self) -> bool:
         pub_exists = self.paths.RSA_PUBLIC_KEY_FILE.exists()
-        priv_exists = (
-            keyring.get_password(self.paths.KEYRING_SERVICE, self._rsa_part_name(0))
-            is not None
-        )
+        if self._keyring_available():
+            try:
+                priv_exists = (
+                    keyring.get_password(
+                        self.paths.KEYRING_SERVICE,
+                        self._rsa_part_name(0),
+                    )
+                    is not None
+                ) or self.paths.RSA_PRIVATE_KEY_FILE.exists()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("读取系统 keyring 失败，改用本地私钥检查: %s", e)
+                priv_exists = self.paths.RSA_PRIVATE_KEY_FILE.exists()
+        else:
+            priv_exists = self.paths.RSA_PRIVATE_KEY_FILE.exists()
         return pub_exists and priv_exists
+
+    def _save_rsa_private_to_file(self, private_pem: str) -> None:
+        self.paths.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = self.paths.RSA_PRIVATE_KEY_FILE.with_suffix(".pem.tmp")
+        tmp.write_text(private_pem, encoding="ascii")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError as e:
+            logger.warning("设置本地 RSA 私钥权限失败 %s: %s", tmp, e)
+        tmp.replace(self.paths.RSA_PRIVATE_KEY_FILE)
+        try:
+            os.chmod(self.paths.RSA_PRIVATE_KEY_FILE, 0o600)
+        except OSError as e:
+            logger.warning(
+                "设置本地 RSA 私钥权限失败 %s: %s",
+                self.paths.RSA_PRIVATE_KEY_FILE,
+                e,
+            )
+
+    def _load_rsa_private_from_file(self) -> str | None:
+        if not self.paths.RSA_PRIVATE_KEY_FILE.exists():
+            return None
+        return self.paths.RSA_PRIVATE_KEY_FILE.read_text(encoding="ascii")
+
+    def _delete_rsa_private_file(self) -> None:
+        try:
+            if self.paths.RSA_PRIVATE_KEY_FILE.exists():
+                self.paths.RSA_PRIVATE_KEY_FILE.unlink()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("删除本地 RSA 私钥文件失败：%s", e)
 
     def _generate_rsa_keys(self) -> None:
         private = rsa.generate_private_key(public_exponent=65537, key_size=2048)

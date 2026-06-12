@@ -179,3 +179,30 @@ def test_export_import_rsa_private_key(tmp_paths, fake_keyring):
     sm2.import_rsa_private_key(backup)
     sm2.initialize()
     assert sm2.get("k") == "secret"
+
+
+def test_initialize_falls_back_to_local_private_key_without_keyring(tmp_paths, monkeypatch):
+    import app_config.secrets as secrets_module
+
+    class BrokenKeyring:
+        def get_password(self, _service: str, _username: str) -> str | None:
+            raise RuntimeError("no secret service")
+
+        def set_password(self, _service: str, _username: str, _password: str) -> None:
+            raise RuntimeError("no secret service")
+
+        def delete_password(self, _service: str, _username: str) -> None:
+            raise RuntimeError("no secret service")
+
+    monkeypatch.setattr(secrets_module, "keyring", BrokenKeyring())
+
+    sm1 = SecretsManager(tmp_paths)
+    sm1.initialize()
+    sm1.set("linux_key", "secret-value")
+
+    assert tmp_paths.RSA_PRIVATE_KEY_FILE.exists()
+    assert "BEGIN PRIVATE KEY" in tmp_paths.RSA_PRIVATE_KEY_FILE.read_text(encoding="ascii")
+
+    sm2 = SecretsManager(tmp_paths)
+    sm2.initialize()
+    assert sm2.get("linux_key") == "secret-value"

@@ -40,6 +40,7 @@ personas/*/__pycache__/
 
 # === 归档（开发期间的私设、临时备份）===
 archived/
+release/
 
 # === 表情包（个人选择，不上传通用资源）===
 emoji/

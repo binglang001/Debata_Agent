@@ -30,6 +30,14 @@ python main.py
 
 环境要求：Python 3.11+，一个 LLM API 密钥（推荐 [DeepSeek](https://platform.deepseek.com)）。
 
+Linux 服务器或 SSH 环境可以直接跑纯 CLI 向导：
+
+```bash
+python main.py --no-gui --setup
+```
+
+CLI 向导覆盖主模型、子 Agent、图片理解、天气、TTS、RAG、NapCat 和人格等主要配置。密钥优先保存到系统 keyring；如果 Linux 没有可用 Secret Service，会自动退回 `data/rsa_private.pem` 本地私钥文件，并使用 0600 权限保护。
+
 ---
 
 ## 3. 走完向导
