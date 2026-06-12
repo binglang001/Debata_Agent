@@ -62,13 +62,16 @@ class PendingRequestStore:
         self._timeout = timeout_seconds
 
     def put(self, info: PendingRequestInfo) -> None:
+        """存入一条待处理请求。"""
         self._items[info.flag] = info
 
     def get(self, flag: str) -> PendingRequestInfo | None:
+        """按 flag 获取请求，查询前先清过期。"""
         self._purge_expired()
         return self._items.get(flag)
 
     def remove(self, flag: str) -> None:
+        """移除指定请求（批准/拒绝后调用）。"""
         self._items.pop(flag, None)
 
     def to_prompt_text(self) -> str:
@@ -167,8 +170,20 @@ class PendingMessageItem:
     text: str
     """重建后的可读消息文本（CQ 码解析 + 媒体 URL 标记后）"""
 
+    conversation_id: str = "legacy:unknown"
+    """当前消息所属会话标签，仅用于呈现/筛选，不拆存储。"""
+
+    inbound_seq: int = 0
+    """入站消息单调序号，用于判断回复发送前是否有群友插话。"""
+
+    received_at: float = 0.0
+    """pipeline 接收到该消息的 monotonic 时间。"""
+
     raw_event: object = field(default=None)
     """原始 IncomingMessage 引用，便于回查"""
+
+    keyword_saved: bool = False
+    """入队前是否已由关键词强制保存为长期记忆。"""
 
 
 class MessageBatch:
@@ -198,6 +213,19 @@ class MessageBatch:
             items = self._pending[:]
             self._pending.clear()
             return items
+
+    async def drain_conversation(self, conversation_id: str) -> list[PendingMessageItem]:
+        """取走指定会话的积压消息，其他会话保留。"""
+        async with self._lock:
+            matched: list[PendingMessageItem] = []
+            remaining: list[PendingMessageItem] = []
+            for item in self._pending:
+                if item.conversation_id == conversation_id:
+                    matched.append(item)
+                else:
+                    remaining.append(item)
+            self._pending = remaining
+            return matched
 
     async def peek_locked(self) -> list[PendingMessageItem]:
         """需要在外部 `async with batch.lock:` 块内调用。

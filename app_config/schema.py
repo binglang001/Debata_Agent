@@ -36,8 +36,9 @@ class StrictModel(BaseModel):
 
 
 class AppMeta(StrictModel):
-    name: str = "Diana_Agent"
+    name: str = "Debata_Agent"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    theme: Literal["auto", "light", "dark"] = "auto"
 
 
 # ============================================================
@@ -46,12 +47,12 @@ class AppMeta(StrictModel):
 
 
 class WhitelistConfig(StrictModel):
-    """白名单 / 验证模式配置。"""
+    """入站消息过滤模式。由 message_pipeline 入口检查 sender QQ / 群 ID。"""
 
-    mode: Literal["all", "verify", "whitelist"] = "verify"
-    """all = 响应所有人（不安全）;
-    verify = 当前模式（管理员审核加好友、加群）;
-    whitelist = 仅响应配置列表中的 QQ/群"""
+    mode: Literal["open", "verify", "whitelist"] = "verify"
+    """open = 对所有人开放（不安全：陌生人发消息也会触发 AI 回复，可能产生意外 API 费用）;
+    verify = 管理员审核（陌生人加好友 / 加群时由 admin 审核，已加好友的不再过滤）;
+    whitelist = 仅响应 qq_ids / group_ids 列表中的对象。"""
 
     qq_ids: list[int] = Field(default_factory=list)
     """仅在 mode=whitelist 下生效：允许的好友 QQ 号列表。"""
@@ -64,60 +65,8 @@ class NapCatAdapterConfig(StrictModel):
     type: Literal["napcat"] = "napcat"
     enabled: bool = True
 
-    @model_validator(mode="before")
-    @classmethod
-    def _migrate_legacy_fields(cls, values):
-        """兼容 V2 早期字段名 —— 旧 yaml 不需要手改，加载时自动转换。
-
-        旧 → 新：
-            mode: "reverse_ws" → "client"
-            mode: "forward_ws" → "server"
-            ws_url: "ws://host:port/path" → host + port + path（拆分）
-            listen_host / listen_port / listen_path → host / port / path
-        """
-        if not isinstance(values, dict):
-            return values
-        values = dict(values)
-
-        # mode 旧名
-        if values.get("mode") == "reverse_ws":
-            values["mode"] = "client"
-        elif values.get("mode") == "forward_ws":
-            values["mode"] = "server"
-
-        # listen_* → host/port/path
-        if "listen_host" in values:
-            values.setdefault("host", values.pop("listen_host"))
-        else:
-            values.pop("listen_host", None)
-        if "listen_port" in values:
-            values.setdefault("port", values.pop("listen_port"))
-        else:
-            values.pop("listen_port", None)
-        if "listen_path" in values:
-            values.setdefault("path", values.pop("listen_path"))
-        else:
-            values.pop("listen_path", None)
-
-        # ws_url → host/port/path（拆 URL）
-        if "ws_url" in values:
-            ws_url = values.pop("ws_url")
-            if ws_url:
-                from urllib.parse import urlparse
-
-                parsed = urlparse(ws_url)
-                if parsed.hostname and "host" not in values:
-                    values["host"] = parsed.hostname
-                if parsed.port and "port" not in values:
-                    values["port"] = parsed.port
-                # path 为空时 urlparse 给 ""，回落到 "/"
-                if "path" not in values:
-                    values["path"] = parsed.path or "/"
-
-        return values
-
     mode: Literal["client", "server"] = "client"
-    """连接模式（从 Diana_Agent 视角命名，符合直觉）：
+    """连接模式（从 Debata_Agent 视角命名，符合直觉）：
 
         - "client"：程序作为 WebSocket **客户端**，主动连 NapCat 的 WS 端口。
           对应 NapCat 那边配置「正向 WS」（NapCat 监听，等程序连入）。
@@ -133,8 +82,8 @@ class NapCatAdapterConfig(StrictModel):
     host: str = "127.0.0.1"
     port: int = 3001
     path: str = "/"
-    """WebSocket 路径。NapCat 正向 WS 默认 "/"；
-    旧 NoneBot 反向 WS 用户通常用 "/onebot/v11/ws"（与 NapCat 那边配的目标地址保持一致）。"""
+    """WebSocket 路径。client 模式（NapCat 正向 WS）默认 "/"；
+    server 模式时与 NapCat 那边配的目标地址保持一致即可。"""
 
     # 鉴权：填 SecretsManager 中的【密钥 ID】，不是 token 本身。
     # 例如 "napcat_default_token" 这种短标识，对应 secrets 中保存的实际 token。
@@ -175,8 +124,29 @@ class NapCatAdapterConfig(StrictModel):
     auto_restart: bool = True
 
     # 重连参数
-    reconnect_interval: float = 3.0
+    reconnect_interval_seconds: float = 3.0
     max_reconnect_attempts: int = -1  # -1 表示无限重连
+    reconnect_backoff_max_seconds: float = 60.0
+    """指数退避封顶。reconnect_interval_seconds * 2^n 超过此值即按此值重连。"""
+
+    # 心跳与超时（之前硬编码在 connection.py / adapter.py 里，现在统一配置）
+    ping_interval_seconds: float = 20.0
+    """WebSocket ping 间隔（秒）。NapCat 没有应用层心跳，靠 WS ping 维持。"""
+
+    ping_timeout_seconds: float = 20.0
+    """WS ping 未收到 pong 多久判定为断连。"""
+
+    initial_connect_timeout_seconds: float = 10.0
+    """初次连接等待超时（之后仍会后台重连）。"""
+
+    api_timeout_seconds: float = 30.0
+    """调用 OneBot API（send_msg / get_friend_list 等）的超时。"""
+
+    process_warmup_seconds: float = 2.0
+    """manage_process=True 时拉起 NapCat 后等待启动的时间。"""
+
+    voice_fetch_delay_seconds: float = 1.0
+    """fetch_voice_text 前等 NapCat 处理语音的延迟。"""
 
     # 白名单
     whitelist: WhitelistConfig = Field(default_factory=WhitelistConfig)
@@ -191,7 +161,9 @@ AdapterConfig = Annotated[NapCatAdapterConfig, Field(discriminator="type")]
 # ============================================================
 
 
-ProtocolType = Literal["openai_compat", "anthropic", "gemini", "volcengine"]
+ProtocolType = Literal["openai_compat", "anthropic"]
+"""支持的协议类型。其它厂商（gemini / volcengine / qwen / glm 等）都走 openai_compat。
+要新增协议须先在 providers/registry.py 的 PROTOCOL_REGISTRY 注册具体实现。"""
 
 
 class ProviderConfig(StrictModel):
@@ -206,10 +178,10 @@ class ProviderConfig(StrictModel):
     """内置预设名（providers/presets/{preset}/preset.yaml）。"""
 
     display_name: str | None = None
-    """用户友好的显示名（自定义时建议填）。"""
+    """显示名。preset 模式下若留空则取 preset.yaml 的 display_name；自定义模式建议填。"""
 
     protocol: ProtocolType | None = None
-    """协议类型。未指定 preset 时必填。"""
+    """协议类型。未指定 preset 时必填。仅支持 openai_compat / anthropic。"""
 
     base_url: str | None = None
     """API base URL。未指定 preset 时必填。"""
@@ -220,7 +192,8 @@ class ProviderConfig(StrictModel):
     extra_headers: dict[str, str] = Field(default_factory=dict)
     """额外的 HTTP 请求头（如某些代理需要）。"""
 
-    timeout: float = 120.0
+    timeout_seconds: float = 120.0
+    """整体请求超时（秒）。流式响应的首 token 超时另由 AgentConfig.first_token_timeout_seconds 控制。"""
 
     @model_validator(mode="after")
     def validate_provider(self) -> ProviderConfig:
@@ -250,7 +223,7 @@ class AgentConfig(StrictModel):
     """provider ID（必须在顶层 providers 字典中存在）"""
 
     model: str
-    """模型 ID，如 'deepseek-chat'、'claude-sonnet-4-5'、'glm-4-flash'"""
+    """模型 ID，如 'deepseek-v4-flash'、'claude-sonnet-4-5'、'glm-4.7-flash'"""
 
     temperature: float = Field(default=0.6, ge=0.0, le=2.0)
     """采样温度。聊天主体推荐 0.6；总结/路由用 0.1~0.3。"""
@@ -264,7 +237,7 @@ class AgentConfig(StrictModel):
     reasoning: ReasoningConfig | None = None
     """思考/推理配置（DeepSeek R1、Claude thinking 等）。不填则不启用。"""
 
-    first_token_timeout: float = 30.0
+    first_token_timeout_seconds: float = 30.0
     """首 token 超时（秒）。流式模式下，首字未到即超时重试。"""
 
     max_loops: int = 15
@@ -296,17 +269,26 @@ class AgentsConfig(StrictModel):
 
 
 class VisionFeatureConfig(StrictModel):
-    """图像理解。type=api 走 provider/api_key_id；type=local 走 model_dir。"""
+    """图像理解。type=api 走 provider/api_key_id；type=local 走 model_dir（P3 实装）。
+
+    enabled=True 时 Runtime 会实例化 VisionService 并注册 describe_image 工具。
+    """
 
     enabled: bool = False
     type: Literal["api", "local"] = "api"
 
     # type=api 字段
     provider: str | None = None
-    """type=api 时引用 providers 字典中的 ID（也可独立配置）。"""
+    """type=api 时引用 providers 字典中的 ID（必填）。模型见 model 字段。"""
+
     model: str = ""
+    """多模态模型 ID（如 doubao-seed-1-6-vision / glm-4v / qwen-vl-max）。"""
+
     api_key_id: str | None = None
+    """可独立指定密钥 ID（不填则用 providers[provider].api_key_id）。"""
+
     base_url: str | None = None
+    """可独立指定 base_url（不填则用 providers[provider].base_url）。"""
 
     # type=local 字段（P3 启用）
     model_dir: str = ""
@@ -325,25 +307,28 @@ class VisionFeatureConfig(StrictModel):
             if not self.model_dir:
                 raise ValueError(
                     "features.vision.enabled=True 且 type=local，但 model_dir 为空。\n"
-                    "  请填本地模型目录路径（如 F:/.models/qwen-vl/）。"
+                    "  请填本地模型目录路径（如 data/models/qwen-vl/）。"
                 )
         return self
 
 
 class ASRFeatureConfig(StrictModel):
-    """语音识别。type=api 走 provider+extra_credentials；type=local 走 local_model+model_dir。"""
+    """语音识别旧配置。
+
+    当前 QQ/NapCat 渠道统一使用 NapCat 内置 fetch_ptt_text；这些字段仅为兼容旧配置保留。
+    """
 
     enabled: bool = False
-    type: Literal["api", "local"] = "api"
+    type: Literal["api", "local"] = "local"
 
     # type=api 字段
     provider: str | None = None
-    """支持 'xfyun'、'baidu'、'mimo' 等。"""
+    """支持 'baidu'、'xfyun'、'volcengine' 等。"""
     api_key_id: str | None = None
     extra_credentials: dict[str, str] = Field(default_factory=dict)
 
     # type=local 字段
-    local_model: str = "faster-whisper-large-v3"
+    local_model: str = "large-v3"
     device: Literal["cuda", "cpu", "auto"] = "auto"
     language: str = "zh"
     model_dir: str = ""
@@ -367,23 +352,25 @@ class ASRFeatureConfig(StrictModel):
 
 
 class TTSFeatureConfig(StrictModel):
-    """语音合成。type=api 走 provider/api_key_id；type=local 走 local_model+model_dir。
-
-    默认 type=api 因为大多数用户没有 GPU 跑本地 TTS。
-    """
+    """语音合成配置。本地模式走 VoxCPM2 插件；API 模式支持百度/讯飞/火山引擎。"""
 
     enabled: bool = False
-    type: Literal["api", "local"] = "api"
+    type: Literal["api", "local"] = "local"
 
     # type=api 字段
     provider: str | None = None
     api_key_id: str | None = None
+    extra_credentials: dict[str, str] = Field(default_factory=dict)
 
     # type=local 字段
     local_model: str = "voxcpm2"
     reference_audio: str = ""
     default_prompt: str = ""
     model_dir: str = ""
+    device: Literal["cuda", "cpu", "auto"] = "auto"
+    load_denoiser: bool = False
+    cfg_value: float = Field(default=2.0, gt=0.0)
+    inference_timesteps: int = Field(default=10, ge=1)
 
     @model_validator(mode="after")
     def validate_enabled_fields(self) -> TTSFeatureConfig:
@@ -396,56 +383,71 @@ class TTSFeatureConfig(StrictModel):
                     "  请指定 provider 或填 api_key_id。"
                 )
         else:  # local
-            if not self.local_model or not self.model_dir:
+            if not self.local_model:
                 raise ValueError(
-                    "features.tts.enabled=True 且 type=local，但 local_model 或 model_dir 为空。\n"
-                    "  请填本地模型名 + 模型目录路径。"
+                    "features.tts.enabled=True 且 type=local，但 local_model 为空。"
                 )
         return self
 
 
 class WeatherFeatureConfig(StrictModel):
+    """和风天气 API。enabled=True 时 Runtime 实例化 WeatherService 并注册 get_weather 工具。"""
+
     enabled: bool = False
     api_key_id: str | None = None
-    host: str = ""
-    """和风天气 API 主机（个人版必填，免费版留空使用默认）。"""
+    """SecretsManager 中的 API 密钥 ID。enabled=True 时必填。"""
+
+    host: str = "devapi.qweather.com"
+    """和风天气 API 主机。免费版用默认 'devapi.qweather.com'；
+    商业版用控制台分配的专属域名（如 'xxx.re.qweatherapi.com'）。"""
 
     @model_validator(mode="after")
-    def validate_enabled_requires_host(self) -> WeatherFeatureConfig:
-        if self.enabled and not self.host:
+    def validate_enabled_requires_credentials(self) -> WeatherFeatureConfig:
+        if self.enabled and not self.api_key_id:
             raise ValueError(
-                "features.weather.enabled=True 但未填 host。\n"
-                "  请去 https://console.qweather.com/ 获取你的 API host "
-                "（如 'devapi.qweather.com' 或个人版自定义域名）后填入 features.weather.host。"
+                "features.weather.enabled=True 但未填 api_key_id。\n"
+                "  请去 https://console.qweather.com/ 获取 API 密钥，"
+                "用 `python main.py --setup` 保存后在此填入对应 ID。"
             )
         return self
 
 
 class WebSearchFeatureConfig(StrictModel):
+    """DuckDuckGo 网页搜索。无需 API 密钥。
+
+    enabled=True 时 Runtime 实例化 WebSearchService 并注册 web_search 工具。
+    """
+
     enabled: bool = True
     provider: Literal["ddg"] = "ddg"
+    """搜索后端。当前仅支持 DuckDuckGo。"""
+
     max_results: int = 5
+    """单次搜索返回的最大结果数。"""
+
+    timeout_seconds: float = 10.0
+    """单次搜索的网络超时。"""
 
 
 class LongTermMemoryConfig(StrictModel):
-    """长期记忆配置 —— 决定 important.json 之外是否启用 RAG（P2 实现）。"""
+    """长期记忆配置 —— 决定 important.json 之外是否启用 RAG。"""
 
     mode: Literal["file", "rag"] = "file"
-    """file = 纯文件模式（默认，零开销）;
+    """file = 纯文件模式（默认，零开销，AI 主动调 save_important_memory 工具触发）;
     rag = 文件 + 向量检索（需 features.embedding 启用，P2 才生效）"""
 
-    keyword_force_save: bool = True
-    """启用关键词强制保存（"记住"/"约定"/"我叫"等）"""
+    keyword_trigger_save: bool = True
+    """命中关键词（"记住"/"约定"/"我叫"等）时强制保存为重要记忆，不依赖 AI 主动调用工具。"""
 
     rag_top_k: int = 5
-    """RAG 模式下每次召回的相关条目数（仅 mode=rag 生效）"""
+    """RAG 模式下每次召回的相关条目数（仅 mode=rag 生效，当前未实装）"""
 
     rag_extractor_interval: int = 15
-    """被动抽取触发间隔（每 N 轮对话扫描一次，仅 mode=rag 生效）"""
+    """被动抽取触发间隔（每 N 轮对话扫描一次，仅 mode=rag 生效，当前未实装）"""
 
 
 class EmbeddingFeatureConfig(StrictModel):
-    """Embedding 服务配置（P2 实现，先占位）。"""
+    """Embedding 服务配置。API 模式复用已有 provider /embeddings，本地模式走 sentence-transformers。"""
 
     enabled: bool = False
     type: Literal["api", "local"] = "api"
@@ -478,9 +480,9 @@ class FeaturesConfig(StrictModel):
 
 
 class PersonaConfig(StrictModel):
-    active: str = "diana"
+    active: str = "debata"
     """当前激活的人格目录名。从 personas/{name}/ 加载（所有人格平级，仓库自带 + 用户自创共存）。
-    仓库自带 diana（开箱即用），用户自创的人格放同级目录。"""
+    仓库自带 debata（开箱即用），用户自创的人格放同级目录。"""
 
 
 # ============================================================
@@ -491,17 +493,17 @@ class PersonaConfig(StrictModel):
 class TypingConfig(StrictModel):
     """模拟真人打字速度（决定多条消息之间的发送间隔）。"""
 
-    chars_per_second: float = 3.0
-    """每秒打几个字。3 字/秒贴近真人正常聊天速度。"""
+    chars_per_second: float = 1.0
+    """每秒打几个字。1 字/秒贴近真人正常聊天速度（含思考停顿）。"""
 
-    max_delay: float = 2.0
+    max_delay_seconds: float = 2.0
     """单条消息最大延迟（秒）。再长的消息也不会等超过这个时间。"""
 
 
 class RateLimitConfig(StrictModel):
     """对非好友的速率限制（防被陌生人刷屏）。好友/管理员不受限。"""
 
-    window: int = 60
+    window_seconds: int = 60
     """滑动窗口（秒）。"""
 
     max_messages: int = 5
@@ -512,34 +514,10 @@ class RateLimitConfig(StrictModel):
 
 
 class SummarizeConfig(StrictModel):
-    """历史总结触发阈值（按 history 消息条数计）。
+    """历史总结触发阈值。
 
-    达到 trigger_at_messages 条记录时触发 SummaryAgent，
-    在 [range_start_messages, range_end_messages] 区间内择一个语义完整点截断。
-
-    旧版字段名（trigger_at / range_start / range_end / chat_history_count）会自动迁移。
+    Phase A 起按 token 触发 compaction；旧的消息条数字段保留为兼容配置。
     """
-
-    @model_validator(mode="before")
-    @classmethod
-    def _migrate_legacy_fields(cls, values):
-        if not isinstance(values, dict):
-            return values
-        values = dict(values)
-        # 旧字段名 → 新字段名
-        if "trigger_at" in values and "trigger_at_messages" not in values:
-            values["trigger_at_messages"] = values.pop("trigger_at")
-        else:
-            values.pop("trigger_at", None)
-        if "range_start" in values and "range_start_messages" not in values:
-            values["range_start_messages"] = values.pop("range_start")
-        else:
-            values.pop("range_start", None)
-        if "range_end" in values and "range_end_messages" not in values:
-            values["range_end_messages"] = values.pop("range_end")
-        else:
-            values.pop("range_end", None)
-        return values
 
     trigger_at_messages: int = 200
     """达到多少条 history 记录后触发总结。"""
@@ -550,23 +528,60 @@ class SummarizeConfig(StrictModel):
     range_end_messages: int = 150
     """SummaryAgent 选择 cut_point 的上限。"""
 
-    chat_history_count: int = 100
-    """获取群历史消息时的默认 count 参数（不属于总结流程）。"""
+    trigger_at_tokens: int | None = None
+    """活跃 history 估算 token 达到此值时触发 compaction。None 表示按模型工作预算自动推导。"""
+
+    target_after_tokens: int | None = None
+    """compaction 后活跃 history 目标 token。None 表示按模型工作预算自动推导。"""
+
+
+class ContextConfig(StrictModel):
+    """上下文预算配置。max_context_tokens 是工作预算，不是模型硬上限。"""
+
+    max_context_tokens: int | None = None
+    """None = 根据当前模型预设 context_length 推导工作预算。"""
+
+    reserve_output_tokens: int = Field(default=8192, ge=1024)
+    """为模型输出保留的 token。"""
+
+    memory_token_budget: int = Field(default=4096, ge=256)
+    """长期重要记忆注入预算。Phase A 先作为预算字段预留，Phase D 精细使用。"""
+
+    summary_token_budget: int = Field(default=4096, ge=256)
+    """滚动摘要注入预算。"""
+
+    tool_result_soft_limit_tokens: int = Field(default=600, ge=64)
+    """单条工具结果的软阈值；超过后按工具特定规则精简。"""
+
+    tool_result_hard_cap_tokens: int = Field(default=1500, ge=128)
+    """单条工具结果的中央硬上限；未被特判的结果超过后通用截断。"""
+
+    tool_result_soft_overrides: dict[str, int] = Field(default_factory=dict)
+    """按工具名覆盖软阈值，如 {"describe_image": 900}。"""
 
 
 class BehaviorConfig(StrictModel):
-    merge_window: float = Field(default=0.5, ge=0.0)
+    merge_window_seconds: float = Field(default=0.5, ge=0.0)
     """消息合并窗口（秒）。同一窗口内的消息合并到一次 AI 调用。"""
 
-    recall_merge_window: float = Field(default=2.0, ge=0.0)
+    recall_merge_window_seconds: float = Field(default=2.0, ge=0.0)
     """撤回事件合并窗口（秒）。"""
 
-    greeting_interval: float = Field(default=600.0, ge=10.0)
-    """主动思考间隔（秒）。"""
+    proactive_think_interval_seconds: float = Field(default=600.0, ge=10.0)
+    """主动思考间隔（秒）。每过此时长由 ProactiveAgent 判定一次是否需要主动开口。
+    主动思考依赖 agents.proactive 配置；若未配置则此字段无效。"""
+
+    pending_request_timeout_seconds: float = Field(default=1800.0, ge=60.0)
+    """好友/群加入请求暂存的过期时间（秒）。超时后未审核的请求被丢弃。"""
+
+    default_history_fetch_count: int = Field(default=100, ge=1)
+    """summarize_chat_history 工具拉取群历史的默认 count。
+    （此字段不属于历史总结流程；与 SummarizeConfig 的阈值字段无关。）"""
 
     typing: TypingConfig = Field(default_factory=TypingConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     summarize: SummarizeConfig = Field(default_factory=SummarizeConfig)
+    context: ContextConfig = Field(default_factory=ContextConfig)
 
 
 # ============================================================
@@ -614,7 +629,7 @@ class RootConfig(StrictModel):
                 )
 
         # 检查 features 中的 provider 引用（如有）
-        for feat_name, feat in [
+        for _feat_name, feat in [
             ("vision", self.features.vision),
             ("asr", self.features.asr),
             ("tts", self.features.tts),

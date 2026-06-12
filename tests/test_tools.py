@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ValidationError
 
 from tools import (
     DEFAULT_NO_FEEDBACK_TOOLS,
@@ -21,14 +21,31 @@ from tools import (
     typing_delay,
 )
 from tools.base import _inline_refs, _strip_pydantic_metadata, tool
+from tools.feature_tools import send_voice_message
 from tools.schemas import (
-    DescribeImageArgs,
-    GetWeatherArgs,
-    ListContactsArgs,
-    SaveMemoryArgs,
-    SendGroupArgs,
-    SendPrivateArgs,
+    SendVoiceMessageArgs,
 )
+
+
+class FakeSendAdapter:
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[object, str]] = []
+        self.voice_sent: list[tuple[object, Path]] = []
+        self._next_msg_id = 100
+
+    async def send_text(self, target, content: str) -> str:
+        msg_id = str(self._next_msg_id)
+        self._next_msg_id += 1
+        self.sent.append((target, content))
+        return msg_id
+
+    async def send_voice(self, target, audio_path: Path) -> str:
+        msg_id = str(self._next_msg_id)
+        self._next_msg_id += 1
+        self.voice_sent.append((target, audio_path))
+        return msg_id
 
 
 # ============================================================
@@ -104,19 +121,23 @@ def test_strip_pydantic_metadata_removes_title():
 
 
 # ============================================================
-# 所有 17 个工具注册了
+# 所有工具注册了
 # ============================================================
 
 
 def test_all_expected_tools_registered():
-    """检查 17 个工具都已通过装饰器注册到全局列表。"""
+    """检查核心工具都已通过装饰器注册到全局列表。"""
     expected = {
         "send_private_messages", "send_group_message", "recall_message", "upload_file",
         "save_important_memory", "delete_important_memory",
         "list_contacts", "get_user_info", "get_forward_msg",
         "set_friend_add_request", "set_group_add_request", "summarize_chat_history",
+        "summarize_conversation", "recall_history",
         "no_action", "schedule_wakeup",
         "describe_image", "web_search", "get_weather",
+        "send_voice_message",
+        # workspace tools
+        "read_file", "write_file", "edit_file", "list_files", "delete_file", "run_python",
     }
     actual = {s.name for s in get_default_specs()}
     assert actual == expected, f"差异：{expected ^ actual}"
@@ -128,6 +149,27 @@ def test_no_feedback_marks_correct():
     for name in DEFAULT_NO_FEEDBACK_TOOLS:
         assert name in specs
         # 不强制要求 spec.no_feedback==True 一致（runner 默认集合是兜底）
+
+
+def test_schedule_wakeup_schema_explains_delayed_wakeup():
+    specs = {s.name: s for s in get_default_specs()}
+    schema = specs["schedule_wakeup"].to_openai_schema()["function"]
+
+    desc = schema["description"]
+    props = schema["parameters"]["properties"]
+
+    assert "延迟任务" in desc
+    assert "delay_seconds 是从现在开始等待的秒数" in desc
+    assert "mode=send_message" in desc
+    assert "mode=wakeup" in desc
+    assert "发送消息" in desc
+    assert "不会重新附带完整旧聊天历史" in desc
+    assert "绝对时间字符串" in props["delay_seconds"]["description"]
+    assert "send_message" in props["mode"]["description"]
+    assert "wakeup" in props["mode"]["description"]
+    assert "固定消息正文" in props["message_text"]["description"]
+    assert "target_type" in props
+    assert "target_id" in props
 
 
 # ============================================================
@@ -172,7 +214,8 @@ def _make_config(
             web_search=WebSearchFeatureConfig(enabled=web_search_enabled),
             weather=WeatherFeatureConfig(
                 enabled=weather_enabled,
-                host="devapi.qweather.com" if weather_enabled else "",
+                api_key_id="fake_qweather" if weather_enabled else None,
+                host="devapi.qweather.com",
             ),
             long_term_memory=LongTermMemoryConfig(mode=memory_mode),
         ),
@@ -186,11 +229,11 @@ def test_registry_file_mode_includes_memory_tools():
     assert "delete_important_memory" in reg
 
 
-def test_registry_rag_mode_excludes_memory_tools():
+def test_registry_rag_mode_includes_memory_tools():
     cfg = _make_config(memory_mode="rag")
     reg = build_default_registry(cfg)
     for name in MEMORY_FILE_TOOLS:
-        assert name not in reg, f"RAG 模式下不应注册 {name}"
+        assert name in reg, f"RAG 模式下也应注册 {name}"
 
 
 def test_registry_feature_disabled_excludes_tool():
@@ -299,8 +342,6 @@ async def test_executor_exception_returns_error():
     class _Args(BaseModel):
         pass
 
-    spec_list = list(get_default_specs())
-
     @tool(name="_boom", description="boom", args_model=_Args)
     async def _boom(args, ctx):
         raise RuntimeError("boom!")
@@ -340,6 +381,68 @@ async def test_describe_image_without_vision_service():
 
 
 @pytest.mark.asyncio
+async def test_describe_image_accepts_workspace_path(tmp_path):
+    class FakeVision:
+        def __init__(self) -> None:
+            self.image_url = ""
+
+        async def describe(self, image_url: str, prompt: str = "") -> str:
+            self.image_url = image_url
+            return "ok"
+
+    workspace = tmp_path / "workspace"
+    incoming = workspace / "incoming"
+    incoming.mkdir(parents=True)
+    (incoming / "a.png").write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+    )
+
+    cfg = _make_config(vision_enabled=True)
+    reg = build_default_registry(cfg)
+    vision = FakeVision()
+    ctx = ToolContext(vision=vision, workspace_dir=workspace)
+    executor = reg.get_executor(ctx)
+    result = await executor("describe_image", {"image_url": "incoming/a.png"})
+
+    assert result["ok"] is True
+    assert vision.image_url.startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_describe_image_long_description_saved_once(tmp_path):
+    class FakeVision:
+        async def describe(self, image_url: str, prompt: str = "") -> dict:
+            return {
+                "summary": "胡桃和魈表情包",
+                "description": "完整描述 " * 500,
+            }
+
+    workspace = tmp_path / "workspace"
+    incoming = workspace / "incoming"
+    incoming.mkdir(parents=True)
+    (incoming / "a.png").write_bytes(b"fake")
+
+    cfg = _make_config(vision_enabled=True)
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        vision=FakeVision(),
+        workspace_dir=workspace,
+        tool_result_soft_overrides={"describe_image": 20},
+    )
+    executor = reg.get_executor(ctx)
+    result = await executor("describe_image", {"image_url": "incoming/a.png"})
+
+    assert result["ok"] is True
+    assert result["summary"] == "胡桃和魈表情包"
+    assert "description" not in result
+    assert result["full_saved"] == "incoming/a.desc.md"
+    assert (workspace / "incoming" / "a.desc.md").read_text(encoding="utf-8").startswith("完整描述")
+    first = dict(result)
+    second = await executor("describe_image", {"image_url": "incoming/a.png"})
+    assert second == first
+
+
+@pytest.mark.asyncio
 async def test_web_search_without_service():
     cfg = _make_config(web_search_enabled=True)
     reg = build_default_registry(cfg)
@@ -351,47 +454,112 @@ async def test_web_search_without_service():
 
 
 @pytest.mark.asyncio
+async def test_web_search_condenses_long_results():
+    class FakeSearch:
+        async def search(self, query: str) -> str:
+            return "\n\n".join(
+                f"{i}. 标题 {i}\n" + ("摘要内容 " * 80) + f"\nhttps://example.com/{i}"
+                for i in range(1, 8)
+            )
+
+    cfg = _make_config(web_search_enabled=True)
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        web_search=FakeSearch(),
+        tool_result_soft_limit_tokens=80,
+        tool_result_hard_cap_tokens=500,
+    )
+    executor = reg.get_executor(ctx)
+    result = await executor("web_search", {"query": "测试"})
+
+    assert result["ok"] is True
+    assert "preview" not in result
+    assert result["_condensed"]["reason"] == "搜索结果过长已保留高位结果摘要"
+    assert "1. 标题 1" in result["result"]
+    assert "https://example.com/1" in result["result"]
+    assert "7. 标题 7" not in result["result"]
+
+
+@pytest.mark.asyncio
 async def test_weather_without_service():
     cfg = _make_config(weather_enabled=True)
     reg = build_default_registry(cfg)
     ctx = ToolContext()
     executor = reg.get_executor(ctx)
-    result = await executor("get_weather", {"city": "宁德"})
+    result = await executor("get_weather", {"city": "北京"})
     assert result["ok"] is False
     assert "未启用" in result["error"]
 
 
+def test_send_voice_message_requires_style_prompt():
+    with pytest.raises(ValidationError):
+        SendVoiceMessageArgs.model_validate(
+            {"target_type": "private", "target_id": 1, "text": "你好"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_send_voice_message_sends_immediately(tmp_path):
+    class FakeTTS:
+        async def synthesize(self, text, *, prompt):
+            path = tmp_path / "voice.wav"
+            path.write_bytes(b"RIFF")
+            return path
+
+    adapter = FakeSendAdapter()
+    ctx = ToolContext(tts=FakeTTS(), adapter=adapter)
+    args = SendVoiceMessageArgs(
+        target_type="private",
+        target_id=123,
+        text="语音测试",
+        prompt="年轻女性，自然口语",
+    )
+
+    result = await send_voice_message(args, ctx)
+
+    assert result["ok"] is True
+    assert result["sent"]["msg_id"] == "100"
+    assert ctx.collected == []
+    assert len(adapter.voice_sent) == 1
+    target, audio_path = adapter.voice_sent[0]
+    assert target.scope == "private"
+    assert target.target_id == "123"
+    assert audio_path.name == "voice.wav"
+
+
 # ============================================================
-# Messaging 工具：collected 攒动作
+# Messaging 工具：即时发送
 # ============================================================
 
 
 @pytest.mark.asyncio
-async def test_send_private_collected(tmp_path):
-    """send_private_messages 应把动作攒到 ctx.collected。"""
+async def test_send_private_sends_immediately(tmp_path):
+    """send_private_messages 应即时发送并返回 msg_id。"""
     cfg = _make_config()
     reg = build_default_registry(cfg)
     emoji_dir = tmp_path / "emoji"
     emoji_dir.mkdir()
 
-    ctx = ToolContext(emoji_dir=emoji_dir)
+    adapter = FakeSendAdapter()
+    ctx = ToolContext(emoji_dir=emoji_dir, adapter=adapter)
     executor = reg.get_executor(ctx)
     result = await executor(
         "send_private_messages",
         {
             "targets": [
-                {"target_qq": 12345, "content": "你好", "order": 1},
-                {"target_qq": 12345, "content": "在吗", "order": 2},
+                {"target_qq": 12345, "content": "你好", "order": 1, "delay": 0},
+                {"target_qq": 12345, "content": "在吗", "order": 2, "delay": 0},
             ]
         },
     )
     assert result["ok"] is True
     assert result["count"] == 2
-    assert len(ctx.collected) == 2
-    assert ctx.collected[0]["action"] == "private"
-    assert ctx.collected[0]["target"] == "12345"
-    assert ctx.collected[0]["content"] == "你好"
-    assert ctx.collected[0]["delay"] > 0  # 自动估算的延迟
+    assert result["sent"] == [
+        {"order": 1, "target_qq": "12345", "msg_id": "100"},
+        {"order": 2, "target_qq": "12345", "msg_id": "101"},
+    ]
+    assert ctx.collected == []
+    assert [content for _, content in adapter.sent] == ["你好", "在吗"]
 
 
 @pytest.mark.asyncio
@@ -399,7 +567,7 @@ async def test_send_private_forbidden_blocked(tmp_path):
     """含 FORBIDDEN_TAGS 的内容应被拒绝。"""
     cfg = _make_config()
     reg = build_default_registry(cfg)
-    ctx = ToolContext(emoji_dir=tmp_path / "emoji")
+    ctx = ToolContext(emoji_dir=tmp_path / "emoji", adapter=FakeSendAdapter())
     executor = reg.get_executor(ctx)
     result = await executor(
         "send_private_messages",
@@ -420,21 +588,23 @@ async def test_send_group_order_sorted(tmp_path):
     """send_group_message 应按 order 升序排列动作。"""
     cfg = _make_config()
     reg = build_default_registry(cfg)
-    ctx = ToolContext(emoji_dir=tmp_path / "emoji")
+    adapter = FakeSendAdapter()
+    ctx = ToolContext(emoji_dir=tmp_path / "emoji", adapter=adapter)
     executor = reg.get_executor(ctx)
-    await executor(
+    result = await executor(
         "send_group_message",
         {
             "group_id": 100,
             "targets": [
-                {"content": "third", "order": 3},
-                {"content": "first", "order": 1},
-                {"content": "second", "order": 2},
+                {"content": "third", "order": 3, "delay": 0},
+                {"content": "first", "order": 1, "delay": 0},
+                {"content": "second", "order": 2, "delay": 0},
             ],
         },
     )
-    contents = [a["content"] for a in ctx.collected]
+    contents = [content for _, content in adapter.sent]
     assert contents == ["first", "second", "third"]
+    assert [item["msg_id"] for item in result["sent"]] == ["100", "101", "102"]
 
 
 # ============================================================
@@ -551,6 +721,241 @@ async def test_keyword_save_no_manager():
 # ============================================================
 
 
+def _simple_pdf_bytes(text: str) -> bytes:
+    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("ascii")
+    objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        (
+            b"3 0 obj\n"
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\n"
+            b"endobj\n"
+        ),
+        b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        (
+            f"5 0 obj\n<< /Length {len(stream)} >>\nstream\n".encode("ascii")
+            + stream
+            + b"\nendstream\nendobj\n"
+        ),
+    ]
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("ascii"))
+    for offset in offsets:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+    )
+    return bytes(pdf)
+
+
+@pytest.mark.asyncio
+async def test_read_file_extracts_simple_pdf_text(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pdf = workspace / "simple.pdf"
+    pdf.write_bytes(_simple_pdf_bytes("Hello PDF from workspace"))
+
+    ctx = ToolContext(workspace_dir=workspace)
+    executor = reg.get_executor(ctx)
+    result = await executor("read_file", {"path": "simple.pdf"})
+
+    assert result["ok"] is True
+    assert "Hello PDF from workspace" in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_read_file_large_text_is_paginated(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "long.txt").write_text(
+        "\n".join(f"line {i}" for i in range(300)),
+        encoding="utf-8",
+    )
+
+    ctx = ToolContext(workspace_dir=workspace)
+    executor = reg.get_executor(ctx)
+    first = await executor("read_file", {"path": "long.txt", "max_lines": 20})
+
+    assert first["ok"] is True
+    assert first["offset"] == 0
+    assert first["next_offset"] == 20
+    assert "line 0" in first["content"]
+    assert "line 25" not in first["content"]
+
+    second = await executor(
+        "read_file",
+        {"path": "long.txt", "offset": first["next_offset"], "max_lines": 20},
+    )
+    assert second["offset"] == 20
+    assert "line 20" in second["content"]
+
+
+@pytest.mark.asyncio
+async def test_read_file_condenses_content_but_keeps_paging_metadata(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "long.txt").write_text(
+        "\n".join(f"line {i} " + ("内容 " * 30) for i in range(300)),
+        encoding="utf-8",
+    )
+
+    ctx = ToolContext(
+        workspace_dir=workspace,
+        tool_result_soft_limit_tokens=80,
+        tool_result_hard_cap_tokens=500,
+    )
+    executor = reg.get_executor(ctx)
+    result = await executor("read_file", {"path": "long.txt"})
+
+    assert result["ok"] is True
+    assert result["offset"] == 0
+    assert result["next_offset"] > 0
+    assert result["total_lines"] == 300
+    assert "preview" not in result
+    assert result["_condensed"]["reason"] == "文件内容页过长已按 token 预算截断"
+    assert f"offset={result['next_offset']}" in result["_condensed"]["full"]
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_strips_binary_buffers():
+    class FakeAdapter:
+        async def get_user_info(self, user_id: str):
+            return {
+                "user_id": user_id,
+                "nickname": "冰狼",
+                "sex": "male",
+                "age": 17,
+                "extra": {
+                    "longNick": "愿岁月清净",
+                    "qqLevel": 56,
+                    "richBuffer": {"0": 1, "1": 2},
+                    "extBuffer": {"buf": "noise"},
+                },
+            }
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext(adapter=FakeAdapter()))
+    result = await executor("get_user_info", {"user_id": 123})
+
+    assert result["ok"] is True
+    assert result["info"]["nickname"] == "冰狼"
+    assert result["info"]["signature"] == "愿岁月清净"
+    dumped = str(result)
+    assert "richBuffer" not in dumped
+    assert "extBuffer" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_list_files_condenses_entries_but_keeps_count(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for i in range(60):
+        (workspace / f"{i:02d}.txt").write_text("x", encoding="utf-8")
+
+    executor = reg.get_executor(ToolContext(workspace_dir=workspace))
+    result = await executor("list_files", {"path": ".", "pattern": "*.txt"})
+
+    assert result["ok"] is True
+    assert result["count"] == 60
+    assert len(result["entries"]) == 50
+    assert "preview" not in result
+    assert "list_files" in result["_condensed"]["full"]
+
+
+@pytest.mark.asyncio
+async def test_get_forward_msg_long_content_keeps_content_field():
+    class FakeAdapter:
+        async def get_forward_msg(self, forward_id: str):
+            return [
+                {
+                    "sender": {"nickname": f"用户{i}"},
+                    "raw_message": "转发内容 " * 80,
+                }
+                for i in range(100)
+            ]
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        adapter=FakeAdapter(),
+        tool_result_soft_limit_tokens=80,
+        tool_result_hard_cap_tokens=500,
+    )
+    executor = reg.get_executor(ctx)
+    result = await executor("get_forward_msg", {"forward_id": "forward-1"})
+
+    assert result["ok"] is True
+    assert "content" in result
+    assert "preview" not in result
+    assert "forward-1" not in result["content"]
+    assert result["_condensed"]["reason"] == "工具输出过长已保留头尾"
+
+
+@pytest.mark.asyncio
+async def test_executor_hard_cap_is_creation_time_stable():
+    class _Args(BaseModel):
+        pass
+
+    @tool(name="_huge_result", description="huge", args_model=_Args)
+    async def _huge_result(args, ctx):
+        return {"ok": True, "payload": "x" * 10000}
+
+    new_spec = next(s for s in get_default_specs() if s.name == "_huge_result")
+    try:
+        reg = ToolRegistry([new_spec])
+        ctx = ToolContext(tool_result_soft_limit_tokens=100, tool_result_hard_cap_tokens=120)
+        executor = reg.get_executor(ctx)
+        first = await executor("_huge_result", {})
+        second = await executor("_huge_result", {})
+    finally:
+        from tools.base import _DEFAULT_REGISTRY
+        _DEFAULT_REGISTRY[:] = [s for s in _DEFAULT_REGISTRY if s.name != "_huge_result"]
+
+    assert first == second
+    assert first["_condensed"]["reason"].startswith("工具结果超过中央 hard cap")
+    assert "payload" not in first
+
+
+@pytest.mark.asyncio
+async def test_run_python_single_long_line_keeps_stdout_field(tmp_path):
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = ToolContext(
+        workspace_dir=workspace,
+        tool_result_soft_limit_tokens=80,
+        tool_result_hard_cap_tokens=800,
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor("run_python", {"code": "print('x' * 5000)"})
+
+    assert result["ok"] is True
+    assert "stdout" in result
+    assert "preview" not in result
+    assert len(result["stdout"]) < 5000
+    assert result["_condensed"]["reason"] == "工具输出过长已保留头尾"
+
+
 class _FakeAdapter:
     name = "fake"
     is_connected = True
@@ -571,14 +976,14 @@ async def test_upload_file_outside_whitelist_rejected(tmp_path):
     outside = tmp_path / "outside.txt"
     outside.write_text("x")
 
-    ctx = ToolContext(adapter=_FakeAdapter(), upload_allowed_dir=allowed)
+    ctx = ToolContext(adapter=_FakeAdapter(), workspace_dir=allowed)
     executor = reg.get_executor(ctx)
     result = await executor(
         "upload_file",
         {"target_type": "private", "target_id": 1, "file_path": str(outside)},
     )
     assert result["ok"] is False
-    assert "范围" in result["error"]
+    assert "workspace" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -591,7 +996,7 @@ async def test_upload_file_inside_whitelist_ok(tmp_path):
     inside.write_text("x")
 
     fake = _FakeAdapter()
-    ctx = ToolContext(adapter=fake, upload_allowed_dir=allowed)
+    ctx = ToolContext(adapter=fake, workspace_dir=allowed)
     executor = reg.get_executor(ctx)
     result = await executor(
         "upload_file",
@@ -599,6 +1004,7 @@ async def test_upload_file_inside_whitelist_ok(tmp_path):
     )
     assert result["ok"] is True
     assert len(fake.uploaded) == 1
+    assert fake.uploaded[0][2] == "x.txt"
 
 
 @pytest.mark.asyncio
@@ -635,10 +1041,10 @@ async def test_schedule_wakeup_no_callback():
 async def test_schedule_wakeup_with_callback():
     cfg = _make_config()
     reg = build_default_registry(cfg)
-    received: list[tuple[int, str]] = []
+    received: list[tuple[int, str, dict | None, str, str | None]] = []
 
-    async def cb(delay, reminder):
-        received.append((delay, reminder))
+    async def cb(delay, reminder, target=None, mode="wakeup", message_text=None):
+        received.append((delay, reminder, target, mode, message_text))
 
     ctx = ToolContext(wakeup_cb=cb)
     executor = reg.get_executor(ctx)
@@ -646,7 +1052,119 @@ async def test_schedule_wakeup_with_callback():
         "schedule_wakeup", {"delay_seconds": 10, "reminder": "test"}
     )
     assert result["ok"] is True
-    assert received == [(10, "test")]
+    assert received == [(10, "test", None, "wakeup", None)]
+
+
+@pytest.mark.asyncio
+async def test_schedule_wakeup_uses_default_reply_target():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    received: list[tuple[int, str, dict | None, str, str | None]] = []
+
+    async def cb(delay, reminder, target=None, mode="wakeup", message_text=None):
+        received.append((delay, reminder, target, mode, message_text))
+
+    ctx = ToolContext(
+        wakeup_cb=cb,
+        extras={"default_reply_target": {"target_type": "private", "target_id": 123}},
+    )
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "schedule_wakeup", {"delay_seconds": 10, "reminder": "test"}
+    )
+
+    assert result["ok"] is True
+    delay, reminder, target, mode, message_text = received[0]
+    assert delay == 10
+    assert target == {"target_type": "private", "target_id": 123}
+    assert mode == "wakeup"
+    assert message_text is None
+    assert "任务说明：test" in reminder
+    assert "提醒目标：private:123" in reminder
+    assert "不要把历史中已经完成" in reminder
+
+
+@pytest.mark.asyncio
+async def test_schedule_wakeup_includes_latest_user_message():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    received: list[tuple[int, str, dict | None, str, str | None]] = []
+
+    async def cb(delay, reminder, target=None, mode="wakeup", message_text=None):
+        received.append((delay, reminder, target, mode, message_text))
+
+    ctx = ToolContext(
+        wakeup_cb=cb,
+        extras={
+            "default_reply_target": {"target_type": "private", "target_id": 123},
+            "latest_user_message": "30秒后单独发个消息，发个“到点了”就行",
+        },
+    )
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "schedule_wakeup",
+        {"delay_seconds": 30, "reminder": "30秒后发送“到点了”"},
+    )
+
+    assert result["ok"] is True
+    reminder = received[0][1]
+    assert "设置时用户原话：30秒后单独发个消息" in reminder
+    assert "到点了" in reminder
+
+
+@pytest.mark.asyncio
+async def test_schedule_wakeup_send_message_mode_uses_default_target():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    received: list[tuple[int, str, dict | None, str, str | None]] = []
+
+    async def cb(delay, reminder, target=None, mode="wakeup", message_text=None):
+        received.append((delay, reminder, target, mode, message_text))
+
+    ctx = ToolContext(
+        wakeup_cb=cb,
+        extras={"default_reply_target": {"target_type": "private", "target_id": 123}},
+    )
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "schedule_wakeup",
+        {
+            "delay_seconds": 30,
+            "mode": "send_message",
+            "message_text": "到点了",
+        },
+    )
+
+    assert result["ok"] is True
+    delay, reminder, target, mode, message_text = received[0]
+    assert delay == 30
+    assert target == {"target_type": "private", "target_id": 123}
+    assert mode == "send_message"
+    assert message_text == "到点了"
+    assert "消息内容：到点了" in reminder
+
+
+@pytest.mark.asyncio
+async def test_schedule_wakeup_send_message_requires_target():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+
+    async def cb(*_args):
+        raise AssertionError("缺少目标时不应注册定时任务")
+
+    ctx = ToolContext(wakeup_cb=cb)
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "schedule_wakeup",
+        {
+            "delay_seconds": 30,
+            "mode": "send_message",
+            "message_text": "到点了",
+        },
+    )
+
+    assert result["ok"] is False
+    assert "mode=send_message 需要" in result["error"]
 
 
 # ============================================================
@@ -673,14 +1191,39 @@ async def test_save_memory_with_manager(tmp_path):
 
     cfg = _make_config()
     reg = build_default_registry(cfg)
-    ctx = ToolContext(important=im)
+    ctx = ToolContext(important=im, conversation_id="private:123")
     executor = reg.get_executor(ctx)
     result = await executor(
         "save_important_memory", {"memory_text": "记住张三是朋友"}
     )
     assert result["ok"] is True
     assert result["saved"] is True
+    assert result["scope"] == "user:123"
     assert len(im.items()) == 1
+    assert im.items()[0]["scope"] == "user:123"
+
+
+@pytest.mark.asyncio
+async def test_save_memory_explicit_scope_and_pinned(tmp_path):
+    from memory import ImportantMemoryManager
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(important=im, conversation_id="private:123")
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "save_important_memory",
+        {"memory_text": "全局稳定约定", "scope": "global", "pinned": True},
+    )
+
+    assert result["ok"] is True
+    assert result["scope"] == "global"
+    assert result["pinned"] is True
+    assert im.items()[0]["scope"] == "global"
+    assert im.items()[0]["pinned"] is True
 
 
 @pytest.mark.asyncio
@@ -701,6 +1244,68 @@ async def test_delete_memory_with_manager(tmp_path):
     )
     assert result["ok"] is True
     assert result["deleted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_summarize_conversation_uses_local_archive_and_history(tmp_path):
+    from memory import ArchiveStore, HistoryManager
+    from providers.base import CompletionResult
+
+    class FakeSummaryProvider:
+        timeout = 12.0
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def chat_completion(self, messages, *, model, tools=None, **kwargs):
+            self.calls.append(
+                {
+                    "messages": messages,
+                    "model": model,
+                    "tools": tools,
+                    "kwargs": kwargs,
+                }
+            )
+            return CompletionResult(content="本地摘要")
+
+    archive = ArchiveStore(tmp_path / "archive.jsonl")
+    history = HistoryManager(tmp_path / "history.jsonl")
+    await archive.append_many(
+        [
+            {
+                "role": "user",
+                "content": "归档里提到茶会安排",
+                "conversation_id": "group:42",
+            }
+        ]
+    )
+    await history.add_user_message("活跃区继续讨论茶会", conversation_id="group:42")
+    provider = FakeSummaryProvider()
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(
+        archive=archive,
+        history=history,
+        summary_provider=provider,  # type: ignore[arg-type]
+        summary_model="summary-model",
+        conversation_id="group:42",
+    )
+    executor = reg.get_executor(ctx)
+
+    result = await executor(
+        "summarize_conversation",
+        {"range_hint": "茶会", "max_tokens": 512},
+    )
+
+    assert result["ok"] is True
+    assert result["summary"] == "本地摘要"
+    assert result["count"] == 2
+    assert result["source"] == "local_archive"
+    assert provider.calls[0]["model"] == "summary-model"
+    prompt = "\n".join(m["content"] for m in provider.calls[0]["messages"])
+    assert "归档里提到茶会安排" in prompt
+    assert "活跃区继续讨论茶会" in prompt
 
 
 # ============================================================

@@ -1,4 +1,4 @@
-"""Diana_Agent Agent 层。
+"""Debata_Agent Agent 层。
 
 模块组成：
     persona_loader      —— 加载 data/personas/{name}/persona_prompt.py
@@ -13,18 +13,16 @@
 
 from .base import AgentRunResult, FinishReason, ToolExecutor
 from .behavior_prompt import (
-    BEHAVIOR_PROMPT,
     CONVERSATION_PROTOCOL,
     CORE_RULES,
     HUMAN_CHAT_PATTERNS,
-    PRO_TOOLS_PROMPT,
     QQ_FORMAT_REFERENCE,
     SELF_REFLECTION,
-    TOOL_USE_PROTOCOL,
     build_tool_use_protocol,
 )
 from .chat_agent import ChatAgent
 from .context_builder import (
+    ContextRequest,
     build_admin_info,
     build_combined_system_prompt,
     build_messages,
@@ -55,16 +53,14 @@ __all__ = [
     "validate_persona_name",
     # prompts
     "CORE_RULES",
-    "TOOL_USE_PROTOCOL",
     "CONVERSATION_PROTOCOL",
     "HUMAN_CHAT_PATTERNS",
     "SELF_REFLECTION",
     "QQ_FORMAT_REFERENCE",
-    "BEHAVIOR_PROMPT",
-    "PRO_TOOLS_PROMPT",
     "build_tool_use_protocol",
     # context
     "build_messages",
+    "ContextRequest",
     "build_combined_system_prompt",
     "build_admin_info",
     "build_task_context",

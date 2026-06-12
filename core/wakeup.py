@@ -1,26 +1,30 @@
 """定时唤醒调度中心。
 
 承担 schedule_wakeup 工具的执行：当 LLM 调用该工具时，注册一个延时任务，
-到时唤醒 ChatAgent 并把"提醒内容"传给它。
+到时按任务模式直接发送消息，或唤醒 ChatAgent 并把"提醒内容"传给它。
 
 设计：
     - 用 asyncio.Task 实现，重启程序后任务丢失（与旧版一致；持久化留到 P2）
     - 提供 callback 闭包给 ToolContext.wakeup_cb，工具调用时塞任务
-    - 真正唤醒时调用 MessagePipeline.run_wakeup_turn()，由它构造 context 调 Agent
+    - 真正触发时调用 MessagePipeline.run_wakeup_turn()，由它按模式处理
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 # 唤醒到时的回调签名（由 MessagePipeline 提供）
-# reminder: 唤醒时传给 LLM 的提醒文本
-WakeFireCallback = Callable[[str], Awaitable[None]]
+# reminder: 唤醒时的任务说明；mode=send_message 时不会传给 LLM
+WakeFireCallback = Callable[
+    [str, dict[str, Any] | None, str, str | None],
+    Awaitable[None],
+]
 
 
 class WakeupScheduler:
@@ -38,10 +42,17 @@ class WakeupScheduler:
         self._on_fire = on_fire
         self._tasks: set[asyncio.Task] = set()
 
-    async def schedule(self, delay_seconds: int, reminder: str) -> None:
+    async def schedule(
+        self,
+        delay_seconds: int,
+        reminder: str,
+        target: dict[str, Any] | None = None,
+        mode: str = "wakeup",
+        message_text: str | None = None,
+    ) -> None:
         """注册一个延时唤醒任务。
 
-        与 ToolContext.wakeup_cb 签名兼容（async (int, str) -> None）。
+        与 ToolContext.wakeup_cb 签名兼容。
         """
         if delay_seconds <= 0:
             logger.warning(
@@ -53,7 +64,7 @@ class WakeupScheduler:
             try:
                 await asyncio.sleep(delay_seconds)
                 logger.info(f"定时唤醒触发: {reminder!r}")
-                await self._on_fire(reminder)
+                await self._on_fire(reminder, target, mode, message_text)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -62,7 +73,7 @@ class WakeupScheduler:
         task = asyncio.create_task(_runner())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-        logger.info(f"已注册定时唤醒 +{delay_seconds}s: {reminder!r}")
+        logger.info(f"已注册定时任务 +{delay_seconds}s mode={mode}: {reminder!r}")
 
     def pending_count(self) -> int:
         return sum(1 for t in self._tasks if not t.done())
@@ -76,7 +87,9 @@ class WakeupScheduler:
         for t in tasks:
             try:
                 await t
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                logger.warning(f"WakeupScheduler 取消任务异常: {e}")
         self._tasks.clear()
         logger.info(f"WakeupScheduler 已取消 {len(tasks)} 个待触发任务")

@@ -118,7 +118,7 @@ class NapCatApiCaller:
 
     def discard_pending(self) -> None:
         """清空所有等待中的 Future（断线时调用，让调用方早点失败）。"""
-        for echo, fut in list(self._pending.items()):
+        for _echo, fut in list(self._pending.items()):
             if not fut.done():
                 fut.set_exception(
                     AdapterNotConnectedError("NapCat 连接已断开，请求被取消")

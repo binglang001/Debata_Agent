@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from adapters.napcat.events import _parse_raw_message, parse_napcat_event
+from adapters.napcat.events import parse_napcat_event
 from adapters.types import (
     EventType,
     IncomingMessage,
@@ -13,7 +13,7 @@ from adapters.types import (
     NoticeType,
     RequestType,
 )
-
+from utils.cq_parser import parse_raw_cq as _parse_raw_message
 
 # ============================================================
 # Message 解析
@@ -121,6 +121,28 @@ def test_parse_message_with_voice_and_file():
     types = [m.type for m in event.media]
     assert MediaType.VOICE in types
     assert MediaType.FILE in types
+
+
+def test_parse_message_string_file_cq_with_local_path():
+    raw = {
+        "post_type": "message",
+        "message_type": "private",
+        "message_id": 1,
+        "user_id": 1001,
+        "self_id": 9999,
+        "time": 1,
+        "raw_message": "[CQ:file,file=abc,file_name=问卷.pdf,url=D:\\QQ_data\\Tencent Files\\NapCat\\temp\\问卷.pdf]",
+        "message": "[CQ:file,file=abc,file_name=问卷.pdf,url=D:\\QQ_data\\Tencent Files\\NapCat\\temp\\问卷.pdf]",
+        "sender": {"user_id": 1001, "nickname": "Alice"},
+    }
+
+    event = parse_napcat_event("nc", raw)
+
+    assert event is not None
+    assert event.media[0].type == MediaType.FILE
+    assert event.media[0].file_id == "abc"
+    assert event.media[0].name == "问卷.pdf"
+    assert event.media[0].url == "D:\\QQ_data\\Tencent Files\\NapCat\\temp\\问卷.pdf"
 
 
 def test_parse_message_with_reply():

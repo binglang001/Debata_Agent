@@ -11,7 +11,7 @@
             logs/                   <- 结构化日志
             emoji/                  <- 表情包资源
         personas/{name}/            <- 所有人格平级（仓库自带 + 用户自创共存）
-                                       仓库自带的（如 diana/）入 git
+                                       仓库自带的（如 debata/）入 git
                                        用户自创的由 .gitignore 排除
         providers/presets/          <- 提供商预设（git 追踪）
 
@@ -29,10 +29,10 @@ class AppPaths:
     通过依赖注入传递给需要路径的模块，便于测试时替换为临时目录。
     """
 
-    KEYRING_SERVICE: str = "Diana_Agent"
+    KEYRING_SERVICE: str = "Debata_Agent"
     KEYRING_RSA_PRIVATE_KEY: str = "rsa_private_key"
 
-    def __init__(self, project_root: Path | None = None) -> None:
+    def __init__(self, project_root: Path | None = None, *, config_file: Path | None = None) -> None:
         if project_root is None:
             # app_config/paths.py → app_config/ → 项目根
             project_root = Path(__file__).resolve().parent.parent
@@ -40,7 +40,7 @@ class AppPaths:
 
         # === 运行时数据目录（gitignore） ===
         self.DATA_DIR: Path = project_root / "data"
-        self.CONFIG_FILE: Path = self.DATA_DIR / "config.yaml"
+        self.CONFIG_FILE: Path = config_file if config_file is not None else self.DATA_DIR / "config.yaml"
         self.SECRETS_FILE: Path = self.DATA_DIR / "secrets.enc"
         self.SECRETS_META_FILE: Path = self.DATA_DIR / "secrets.meta"
         self.RSA_PUBLIC_KEY_FILE: Path = self.DATA_DIR / "rsa_public.pem"
@@ -48,20 +48,18 @@ class AppPaths:
         self.MEMORY_DIR: Path = self.DATA_DIR / "memory"
         self.LOGS_DIR: Path = self.DATA_DIR / "logs"
         self.EMOJI_DIR: Path = self.DATA_DIR / "emoji"
-        self.UPLOADS_DIR: Path = self.DATA_DIR / "uploads"
+        self.MODELS_DIR: Path = self.DATA_DIR / "models"
+        # AI 可读写的工作目录（替代旧 uploads/）。
+        # 用户发送的文件 / 图片 / 语音会自动落地到这里；
+        # AI 可通过 read/write/edit/list/delete/upload_file/run_python 工具操作其中文件。
+        self.WORKSPACE_DIR: Path = self.DATA_DIR / "workspace"
 
         # === 仓库内 personas/ —— 所有人格平级（仓库自带 + 用户自创共存）===
-        # 仓库自带（如 diana/）入 git，其它由 .gitignore 排除
+        # 仓库自带（如 debata/）入 git，其它由 .gitignore 排除
         self.PERSONAS_DIR: Path = project_root / "personas"
 
         # === 仓库内置资源（git 追踪） ===
         self.PROVIDER_PRESETS_DIR: Path = project_root / "providers" / "presets"
-
-        # === 旧路径（仅用于一次性迁移） ===
-        self.LEGACY_ENV_FILE: Path = project_root / ".env"
-        self.LEGACY_CONFIG_FILE: Path = project_root / "config.yaml"
-        self.LEGACY_PERSONAS_DIR: Path = project_root / "personas"
-        self.LEGACY_EMOJI_DIR: Path = project_root / "emoji"
 
     def ensure_data_dirs(self) -> None:
         """确保所有 data 子目录存在。幂等。"""
@@ -70,7 +68,8 @@ class AppPaths:
             self.MEMORY_DIR,
             self.LOGS_DIR,
             self.EMOJI_DIR,
-            self.UPLOADS_DIR,
+            self.MODELS_DIR,
+            self.WORKSPACE_DIR,
         ):
             d.mkdir(parents=True, exist_ok=True)
         # PERSONAS_DIR 在仓库根目录，必然存在（init 时已 ensure）

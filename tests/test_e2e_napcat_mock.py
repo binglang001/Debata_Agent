@@ -40,7 +40,6 @@ from memory import HistoryManager, ImportantMemoryManager
 from providers.base import CompletionResult, IProvider, ToolCall, Usage
 from tools import build_default_registry
 
-
 # ============================================================
 # Fakes
 # ============================================================
@@ -129,7 +128,7 @@ def _make_persona() -> Persona:
 def _make_agent_cfg() -> AgentConfig:
     return AgentConfig(
         provider="fake", model="fake-1", temperature=0.6, max_tokens=512,
-        max_loops=2, refocus_interval=0, first_token_timeout=5.0,
+        max_loops=2, refocus_interval=0, first_token_timeout_seconds=5.0,
     )
 
 
@@ -142,20 +141,20 @@ def _make_config() -> RootConfig:
         adapters={"fake": NapCatAdapterConfig()},
         agents=AgentsConfig(chat=_make_agent_cfg()),
         features=FeaturesConfig(
-            long_term_memory=LongTermMemoryConfig(mode="file", keyword_force_save=True),
+            long_term_memory=LongTermMemoryConfig(mode="file", keyword_trigger_save=True),
         ),
         persona=PersonaConfig(active="test"),
         behavior=BehaviorConfig(
-            merge_window=0.05,
-            recall_merge_window=0.05,
-            greeting_interval=600.0,
-            typing=TypingConfig(chars_per_second=999.0, max_delay=0.01),
-            rate_limit=RateLimitConfig(window=60, max_messages=100, enabled=False),
+            merge_window_seconds=0.05,
+            recall_merge_window_seconds=0.05,
+            proactive_think_interval_seconds=600.0,
+            default_history_fetch_count=100,
+            typing=TypingConfig(chars_per_second=999.0, max_delay_seconds=0.01),
+            rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
             summarize=SummarizeConfig(
                 trigger_at_messages=99999,
                 range_start_messages=50,
                 range_end_messages=150,
-                chat_history_count=100,
             ),
         ),
     )
@@ -233,14 +232,16 @@ async def test_private_message_napcat_json_to_send(tmp_path):
     registry = build_default_registry(cfg)
     adapter = E2EFakeAdapter("fake")
 
-    scheduler = WakeupScheduler(on_fire=lambda r: asyncio.sleep(0))
+    scheduler = WakeupScheduler(
+        on_fire=lambda r, target=None, mode="wakeup", message_text=None: asyncio.sleep(0)
+    )
     pipeline = MessagePipeline(
         adapter=adapter, chat_agent=chat_agent, persona=persona,
         history=history, important=important, tool_registry=registry,
         wakeup_scheduler=scheduler,
         pending_requests=PendingRequestStore(),
         behavior_cfg=cfg.behavior, features_cfg=cfg.features,
-        emoji_dir=None, upload_allowed_dir=None,
+        emoji_dir=None, workspace_dir=None,
         rate_limiter=None, summary_agent=None,
     )
     scheduler._on_fire = pipeline.run_wakeup_turn
@@ -299,7 +300,8 @@ async def test_group_message_napcat_json_to_send(tmp_path):
     persona = _make_persona()
     history = HistoryManager(tmp_path / "history.jsonl")
     important = ImportantMemoryManager(tmp_path / "important.json")
-    await history.load(); await important.load()
+    await history.load()
+    await important.load()
 
     chat_agent = ChatAgent(provider, cfg.agents.chat)
     registry = build_default_registry(cfg)
@@ -308,10 +310,12 @@ async def test_group_message_napcat_json_to_send(tmp_path):
     pipeline = MessagePipeline(
         adapter=adapter, chat_agent=chat_agent, persona=persona,
         history=history, important=important, tool_registry=registry,
-        wakeup_scheduler=WakeupScheduler(on_fire=lambda r: asyncio.sleep(0)),
+        wakeup_scheduler=WakeupScheduler(
+            on_fire=lambda r, target=None, mode="wakeup", message_text=None: asyncio.sleep(0)
+        ),
         pending_requests=PendingRequestStore(),
         behavior_cfg=cfg.behavior, features_cfg=cfg.features,
-        emoji_dir=None, upload_allowed_dir=None,
+        emoji_dir=None, workspace_dir=None,
         rate_limiter=None, summary_agent=None,
     )
 

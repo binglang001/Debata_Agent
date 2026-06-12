@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from adapters.registry import register_adapter_type, known_adapter_types
+from adapters.registry import known_adapter_types, register_adapter_type
 
 from .adapter import NapCatAdapter
 from .api_call import NapCatApiCaller

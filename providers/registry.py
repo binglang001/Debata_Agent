@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from app_config.schema import ProviderConfig
 from app_config.secrets import SecretsManager
@@ -48,6 +50,15 @@ def known_protocols() -> list[str]:
     return list(PROTOCOL_REGISTRY.keys())
 
 
+def normalize_base_url(url: str, protocol: str) -> str:
+    """OpenAI 兼容协议的 base_url 若不以 /v{N} 结尾则自动补 /v1。"""
+    if protocol == "openai_compat":
+        url = url.rstrip("/")
+        if not re.search(r"/v\d+$", url):
+            url += "/v1"
+    return url
+
+
 # ============================================================
 # 构造逻辑
 # ============================================================
@@ -76,6 +87,7 @@ def build_provider(
     base_url = cfg.base_url or (preset.base_url if preset else None)
     if not base_url:
         raise ProviderError(f"provider {provider_id} 缺 base_url")
+    base_url = normalize_base_url(base_url, protocol)
 
     factory = PROTOCOL_REGISTRY.get(protocol)
     if factory is None:
@@ -96,13 +108,17 @@ def build_provider(
         "name": provider_id,
         "base_url": base_url,
         "api_key": api_key,
-        "timeout": cfg.timeout,
+        "timeout": cfg.timeout_seconds,
         "extra_headers": dict(cfg.extra_headers),
     }
 
     # openai_compat 专属参数
     if protocol == "openai_compat" and preset is not None:
         kwargs["reasoning_style"] = preset.reasoning_style
+        kwargs["known_model_ids"] = {m.id for m in preset.models}
+        kwargs["reasoning_model_ids"] = {
+            m.id for m in preset.models if "reasoning" in m.capabilities
+        }
 
     return factory(**kwargs)
 

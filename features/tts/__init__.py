@@ -1,0 +1,75 @@
+"""TTS（文字转语音）feature 模块。
+
+接口在此定义，具体实现由插件提供：
+    - plugins/voxcpm2/voxcpm_impl.py（基于清华开源 VoxCPM2，DeepSeek 实装）
+
+启用时 tools/feature_tools.py 会注册 send_voice_message 工具，
+让 LLM 可主动调用合成并发送到 NapCat。
+
+预热同 ASR：Runtime 启动后后台加载模型，第一次合成时若未就绪 await ready。
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from pathlib import Path
+
+
+class TTSError(Exception):
+    """TTS 调用相关异常。"""
+
+
+class ITTSService(ABC):
+    """文字转语音的抽象接口。
+
+    实装约定：
+        - 实例化时**不**加载模型
+        - warmup 同步加载模型，幂等
+        - synthesize 返回生成的音频文件路径（wav 优先，便于 NapCat 转码）
+        - reference_audio 是 voice cloning 用的参考音频，可选
+        - prompt 可选，部分模型支持用「温柔语气」之类的引导做音色/风格控制
+        - aclose 释放底层资源
+    """
+
+    @abstractmethod
+    async def warmup(self) -> None:
+        """加载模型到内存。重复调用应幂等。Runtime 启动后 fire-and-forget 调一次。"""
+
+    @abstractmethod
+    async def synthesize(
+        self,
+        text: str,
+        *,
+        reference_audio: str | Path | None = None,
+        prompt: str = "",
+    ) -> Path:
+        """合成语音，返回音频文件路径。失败 raise TTSError。
+        若 warmup 未完成，内部应 await。"""
+
+    @abstractmethod
+    async def aclose(self) -> None:
+        """释放底层资源。可幂等。"""
+
+
+__all__ = [
+    "TTSError",
+    "ITTSService",
+    "BaiduTTSService",
+    "iFlytekTTSService",
+    "VolcengineTTSService",
+]
+
+
+def _get_baidu_service():
+    from .baidu_service import BaiduTTSService
+    return BaiduTTSService
+
+
+def _get_iflytek_service():
+    from .iflytek_service import iFlytekTTSService
+    return iFlytekTTSService
+
+
+def _get_volcengine_service():
+    from .volcengine_service import VolcengineTTSService
+    return VolcengineTTSService

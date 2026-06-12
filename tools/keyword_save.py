@@ -5,7 +5,7 @@
 
 设计：
     - 纯函数，不绑死消息管道，便于复用
-    - 是否启用由调用方决定（按 features.long_term_memory.keyword_force_save）
+    - 是否启用由调用方决定（按 features.long_term_memory.keyword_trigger_save）
     - 关键词列表透传到 ImportantMemoryManager.force_save_from_keyword，
       不在这里重复一遍（避免两处定义漂移）
 """
@@ -25,13 +25,14 @@ async def try_save_from_user(
     *,
     enabled: bool = True,
     keywords: list[str] | None = None,
+    scope: str | None = None,
 ) -> dict | None:
     """如果命中关键词，强制保存到重要记忆。
 
     Args:
         text: 用户消息文本
         important: 重要记忆管理器（None / 未启用 keyword 时跳过）
-        enabled: features.long_term_memory.keyword_force_save 的值
+        enabled: features.long_term_memory.keyword_trigger_save 的值
         keywords: 自定义关键词列表。None 表示用 ImportantMemoryManager 内置默认列表。
 
     Returns:
@@ -42,7 +43,7 @@ async def try_save_from_user(
         return None
 
     try:
-        result = await important.force_save_from_keyword(text, keywords)
+        result = await important.force_save_from_keyword(text, keywords, scope=scope)
     except RuntimeError as e:
         # ImportantMemoryManager 未 load
         logger.warning(f"关键词保存跳过（重要记忆未加载）: {e}")

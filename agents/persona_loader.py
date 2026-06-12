@@ -6,7 +6,7 @@
     icon.ico             （可选）
 
 所有人格平级放在 personas/{name}/ 下：
-    - 仓库自带的（如 diana/）随仓库一起发布
+    - 仓库自带的（如 debata/）随仓库一起发布
     - 用户自创的由 .gitignore 排除，不上传
     程序加载时无差别对待。
 """
@@ -24,7 +24,14 @@ from app_config.paths import AppPaths
 
 logger = logging.getLogger(__name__)
 
-_PERSONA_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+# 人格名允许：中英文 / 数字 / 下划线 / 连字符。
+# 禁止 OS 路径敏感字符（/ \ : * ? " < > | 等），避免目录名引发问题。
+_PERSONA_NAME_RE = re.compile(
+    r"^[\w一-龥㐀-䶿＀-￯-]{1,64}$"
+)
+"""\\w 已含 [A-Za-z0-9_]；后两段覆盖中日韩统一汉字与扩展 A 区 + 全角符号区。
+连字符单独列出（不在 \\w 内）。明确禁止 / \\ : * ? " < > | 等路径敏感字符。
+"""
 
 
 @dataclass(slots=True)
@@ -118,6 +125,6 @@ def list_available_personas(paths: AppPaths) -> list[str]:
     if not found:
         logger.warning(
             f"personas 目录 {base} 下没有任何可用人格。"
-            f"请克隆仓库自带的 diana/ 或新建一个（参考 docs/persona_writing_guide.md）。"
+            f"请克隆仓库自带的 debata/ 或新建一个（参考 docs/persona_writing_guide.md）。"
         )
     return sorted(found)

@@ -24,13 +24,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
-
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from agents.behavior_prompt import (
-    CORE_RULES,
     CONVERSATION_PROTOCOL,
+    CORE_RULES,
     HUMAN_CHAT_PATTERNS,
     QQ_FORMAT_REFERENCE,
     SELF_REFLECTION,
@@ -39,6 +38,16 @@ from agents.behavior_prompt import (
 from agents.persona_loader import Persona
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class ContextRequest:
+    """构建上下文时的轻量请求对象。"""
+
+    view: Literal["main_reply", "wakeup", "proactive_router", "recall", "request"]
+    conversation_id: str | None = None
+    current_input: str = ""
+    token_budget: Any | None = None
 
 
 def build_combined_system_prompt(
@@ -51,7 +60,7 @@ def build_combined_system_prompt(
 
     Args:
         persona: 已加载的人格
-        important_memory_text: 重要记忆文本（仅文件模式下从 ImportantMemoryManager.text() 拼接）
+        important_memory_text: 已按当前会话 scope / RAG 规则选出的重要记忆文本
         memory_mode: "file" = 文件模式（默认）；"rag" = RAG 模式（不告诉 AI 主动保存）
 
     稳定性递减顺序：
@@ -142,6 +151,7 @@ def build_messages(
     persona: Persona,
     history: list[dict[str, Any]],
     important_memory_text: str = "",
+    rolling_summary_text: str = "",
     current_context: str = "",
     system_override: str | None = None,
     *,
@@ -152,7 +162,7 @@ def build_messages(
     Args:
         persona: 已加载的人格
         history: 历史对话（来自 HistoryManager）
-        important_memory_text: 重要记忆（文件模式下来自 ImportantMemoryManager.text()）
+        important_memory_text: 已按当前会话 scope / RAG 规则选出的重要记忆文本
         current_context: 本次调用的临时上下文（时间、表情包等）
         system_override: 完全自定义的 system prompt（仅特殊用途，如 proactive 路由）
         memory_mode: "file" / "rag"，决定 tool_use_protocol 内的 memory 块写法
@@ -178,6 +188,18 @@ def build_messages(
     admin_info = build_admin_info(persona)
     if admin_info:
         messages.append({"role": "system", "content": admin_info})
+
+    if rolling_summary_text:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    '<rolling_conversation_summary priority="medium">\n'
+                    f"{rolling_summary_text.strip()}\n"
+                    "</rolling_conversation_summary>"
+                ),
+            }
+        )
 
     messages.extend(history)
 

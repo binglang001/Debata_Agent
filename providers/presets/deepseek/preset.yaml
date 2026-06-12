@@ -1,17 +1,28 @@
 id: deepseek
 display_name: DeepSeek
 protocol: openai_compat
-base_url: https://api.deepseek.com
+base_url: https://api.deepseek.com/v1
 registration_url: https://platform.deepseek.com
 reasoning_style: thinking_extra_body
 
 models:
+  - id: deepseek-v4-flash
+    display_name: DeepSeek V4 Flash（推荐 · 1M 上下文）
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 1000000
+
+  - id: deepseek-v4-pro
+    display_name: DeepSeek V4 Pro（重推理）
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 1000000
+
+  # 以下两个 legacy ID 在 DeepSeek 官方 2026-07-24 后已停用，仅用于历史配置兼容。
   - id: deepseek-chat
-    display_name: DeepSeek V4
+    display_name: DeepSeek Chat（legacy，已停用）
     capabilities: [chat, tool_call, reasoning]
     context_length: 128000
 
   - id: deepseek-reasoner
-    display_name: DeepSeek Reasoner
+    display_name: DeepSeek Reasoner（legacy，已停用）
     capabilities: [chat, tool_call, reasoning]
     context_length: 128000

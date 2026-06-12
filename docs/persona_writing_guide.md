@@ -218,6 +218,6 @@ ta 不会做什么，比 ta 能做什么更定义这个人。**必写。**
 
 ## 进阶：手写完整人格
 
-参考 `personas/diana/persona_prompt.py`（Diana）——这是项目自带的内置示范，包含完整的所有段落。
+参考 `personas/debata/persona_prompt.py`（Debata）——这是项目自带的内置示范，包含完整的所有段落。
 
 不建议从零开始手写。AI 辅助生成的版本通常已经覆盖了基础规范，你在它上面调整比从头写效率高得多。

@@ -1,4 +1,4 @@
-"""Diana_Agent 工具系统。
+"""Debata_Agent 工具系统。
 
 模块组成：
     base                —— ITool / ToolContext / ToolRegistry / @tool 装饰器
@@ -7,7 +7,8 @@
     messaging           —— send_private / send_group / recall / upload_file
     memory_tools        —— save / delete_important_memory（仅 file 模式）
     platform_tools      —— list_contacts / get_user_info / get_forward_msg /
-                           set_*_add_request / summarize_chat_history
+                           set_*_add_request / summarize_chat_history /
+                           summarize_conversation / recall_history
     control_tools       —— no_action / schedule_wakeup
     feature_tools       —— describe_image / web_search / get_weather
     keyword_save        —— 关键词强制保存联动
@@ -32,6 +33,7 @@ from . import (  # noqa: F401
     memory_tools,
     messaging,
     platform_tools,
+    workspace_tools,
 )
 from .base import (
     DEFAULT_NO_FEEDBACK_TOOLS,
@@ -86,6 +88,7 @@ __all__ = [
     # factory
     "build_default_registry",
     "MEMORY_FILE_TOOLS",
+    "MEMORY_TOOLS",
     "PLATFORM_OPTIONAL_TOOLS",
     "FEATURE_TOOL_FEATURES",
 ]
@@ -96,11 +99,14 @@ __all__ = [
 # ============================================================
 
 
-MEMORY_FILE_TOOLS: set[str] = {
+MEMORY_TOOLS: set[str] = {
     "save_important_memory",
     "delete_important_memory",
 }
-"""仅在 long_term_memory.mode == "file" 时启用的工具。"""
+"""长期记忆工具。file 与 RAG 模式都会启用；RAG 保存时会同步索引向量。"""
+
+# 兼容旧测试/旧导入名。不要再用于过滤。
+MEMORY_FILE_TOOLS = MEMORY_TOOLS
 
 
 PLATFORM_OPTIONAL_TOOLS: set[str] = {
@@ -115,6 +121,7 @@ FEATURE_TOOL_FEATURES: dict[str, str] = {
     "describe_image": "vision",
     "web_search": "web_search",
     "get_weather": "weather",
+    "send_voice_message": "tts",
 }
 """feature 工具名 → features 字典里的字段名。"""
 
@@ -128,8 +135,8 @@ def build_default_registry(
 
     规则：
         - messaging 工具（send_*/recall）：始终启用
-        - upload_file：默认启用（受 ctx.upload_allowed_dir 进一步限制）
-        - memory 工具：仅 file 模式启用
+        - upload_file：默认启用（受 ctx.workspace_dir 进一步限制）
+        - memory 工具：file 与 RAG 模式都启用
         - platform 工具：始终启用（按需）
         - control 工具：始终启用
         - feature 工具：按 features.{vision,web_search,weather}.enabled
@@ -147,18 +154,14 @@ def build_default_registry(
 
     enabled: list[ToolSpec] = []
     for spec in specs:
-        # 1. memory 工具按 mode 切换
-        if spec.name in MEMORY_FILE_TOOLS and memory_mode != "file":
-            continue
-
-        # 2. feature 工具按 enabled 开关
+        # 1. feature 工具按 enabled 开关
         if spec.name in FEATURE_TOOL_FEATURES:
             feat_name = FEATURE_TOOL_FEATURES[spec.name]
             feat_cfg = getattr(features, feat_name, None)
             if feat_cfg is None or not feat_cfg.enabled:
                 continue
 
-        # 3. upload_file 按调用方意愿
+        # 2. upload_file 按调用方意愿
         if spec.name == "upload_file" and not include_upload_file:
             continue
 

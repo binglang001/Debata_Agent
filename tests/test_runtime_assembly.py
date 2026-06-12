@@ -10,15 +10,95 @@
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 import yaml
 
 from core.runtime import Runtime
 
-
 # ============================================================
 # 准备一个最小可用的项目根（personas + config + secrets）
 # ============================================================
+
+
+def test_provider_health_model_maps_include_feature_providers():
+    from app_config.schema import (
+        AgentConfig,
+        AgentsConfig,
+        EmbeddingFeatureConfig,
+        FeaturesConfig,
+        LongTermMemoryConfig,
+        ProviderConfig,
+        RootConfig,
+        VisionFeatureConfig,
+    )
+
+    cfg = RootConfig(
+        providers={
+            "chat_p": ProviderConfig(protocol="openai_compat", base_url="https://chat.example.com"),
+            "vision_p": ProviderConfig(protocol="openai_compat", base_url="https://vision.example.com"),
+            "embedding_p": ProviderConfig(protocol="openai_compat", base_url="https://embedding.example.com"),
+        },
+        agents=AgentsConfig(chat=AgentConfig(provider="chat_p", model="chat-model")),
+        features=FeaturesConfig(
+            vision=VisionFeatureConfig(enabled=True, provider="vision_p", model="vision-model"),
+            embedding=EmbeddingFeatureConfig(
+                enabled=True,
+                type="api",
+                provider="embedding_p",
+                api_model="embedding-model",
+            ),
+            long_term_memory=LongTermMemoryConfig(mode="rag"),
+        ),
+    )
+    rt = object.__new__(Runtime)
+    rt.config = cfg
+
+    assert Runtime._provider_chat_model_map(rt) == {
+        "chat_p": "chat-model",
+        "vision_p": "vision-model",
+    }
+    assert Runtime._provider_embedding_model_map(rt) == {
+        "embedding_p": "embedding-model",
+    }
+
+
+def test_feature_provider_overrides_apply_before_provider_build():
+    from app_config.schema import (
+        AgentConfig,
+        AgentsConfig,
+        FeaturesConfig,
+        ProviderConfig,
+        RootConfig,
+        VisionFeatureConfig,
+    )
+
+    cfg = RootConfig(
+        providers={
+            "chat_p": ProviderConfig(protocol="openai_compat", base_url="https://chat.example.com"),
+            "vision_p": ProviderConfig(protocol="openai_compat", base_url="https://vision.example.com"),
+        },
+        agents=AgentsConfig(chat=AgentConfig(provider="chat_p", model="chat-model")),
+        features=FeaturesConfig(
+            vision=VisionFeatureConfig(
+                enabled=True,
+                provider="vision_p",
+                model="vision-model",
+                api_key_id="vision_key",
+                base_url="https://vision-override.example.com/v1",
+            ),
+        ),
+    )
+    rt = object.__new__(Runtime)
+    rt.config = cfg
+
+    Runtime._apply_feature_provider_overrides(rt)
+
+    provider = cfg.providers["vision_p"]
+    assert provider.api_key_id == "vision_key"
+    assert provider.base_url == "https://vision-override.example.com/v1"
 
 
 def _write_minimal_persona(personas_dir):
@@ -36,7 +116,7 @@ def _write_minimal_config(paths):
     """写一份能跑通 Runtime 装配的最小 config.yaml。"""
     data = {
         "version": 2,
-        "app": {"name": "Diana_Agent", "log_level": "INFO"},
+        "app": {"name": "Debata_Agent", "log_level": "INFO"},
         "adapters": {
             "default": {
                 "type": "napcat",
@@ -56,7 +136,7 @@ def _write_minimal_config(paths):
                 "protocol": "openai_compat",
                 "base_url": "https://example.com",
                 "api_key_id": None,
-                "timeout": 120.0,
+                "timeout_seconds": 120.0,
             }
         },
         "agents": {
@@ -67,7 +147,7 @@ def _write_minimal_config(paths):
                 "max_tokens": 1024,
                 "max_loops": 3,
                 "refocus_interval": 0,
-                "first_token_timeout": 5.0,
+                "first_token_timeout_seconds": 5.0,
             },
             "proactive": {
                 "provider": "fake_main",
@@ -83,15 +163,15 @@ def _write_minimal_config(paths):
             },
         },
         "features": {
-            "long_term_memory": {"mode": "file", "keyword_force_save": True},
+            "long_term_memory": {"mode": "file", "keyword_trigger_save": True},
             "web_search": {"enabled": False},
         },
         "persona": {"active": "test_bot"},
         "behavior": {
-            "merge_window": 0.05,
-            "recall_merge_window": 0.05,
-            "greeting_interval": 9999.0,
-            "rate_limit": {"window": 60, "max_messages": 100, "enabled": False},
+            "merge_window_seconds": 0.05,
+            "recall_merge_window_seconds": 0.05,
+            "proactive_think_interval_seconds": 9999.0,
+            "rate_limit": {"window_seconds": 60, "max_messages": 100, "enabled": False},
         },
     }
     paths.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -155,6 +235,8 @@ async def test_runtime_start_assembles_all_components(assembled_project):
         assert rt.history is not None
         assert rt.important is not None
         assert "fake_main" in rt.providers, "provider 未实例化"
+        assert rt.provider_health["fake_main"].status == "error"
+        assert "缺 API 密钥" in rt.provider_health["fake_main"].message
         assert rt.chat_agent is not None
         assert rt.proactive_agent is not None
         assert rt.summary_agent is not None, "summary_agent 应该实例化（config 已给）"
@@ -179,6 +261,163 @@ async def test_runtime_start_assembles_all_components(assembled_project):
 
 
 @pytest.mark.asyncio
+async def test_runtime_ignores_configured_asr_and_uses_napcat(
+    assembled_project, fake_keyring
+):
+    """ASR 配置不再实例化 Whisper/云端服务，语音识别交给 NapCat fallback。"""
+    project_root, paths = assembled_project
+
+    from app_config import SecretsManager
+
+    sm = SecretsManager(paths)
+    sm.initialize()
+    sm.set("asr_xfyun", "asr-api-key")
+
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data.setdefault("features", {})["asr"] = {
+        "enabled": True,
+        "type": "api",
+        "provider": "xfyun",
+        "api_key_id": "asr_xfyun",
+        "extra_credentials": {
+            "app_id": "app-123",
+            "api_secret": "secret-456",
+        },
+    }
+    with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+
+        assert rt.asr is None
+        assert rt.pipeline.asr is None
+    finally:
+        await rt.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_asr_ignore_does_not_record_failure(
+    assembled_project, fake_keyring
+):
+    project_root, paths = assembled_project
+
+    from app_config import SecretsManager
+
+    sm = SecretsManager(paths)
+    sm.initialize()
+    sm.set("asr_xfyun", "asr-api-key")
+
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data.setdefault("features", {})["asr"] = {
+        "enabled": True,
+        "type": "api",
+        "provider": "xfyun",
+        "api_key_id": "asr_xfyun",
+        "extra_credentials": {
+            "app_id": "app-123",
+            "api_secret": "secret-456",
+        },
+    }
+    with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+        assert "asr" not in rt.feature_failures
+        assert rt.config.features.asr.enabled is True
+        assert rt.pipeline.asr is None
+    finally:
+        await rt.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_starts_local_tts_warmup_in_background(
+    assembled_project, monkeypatch
+):
+    project_root, paths = assembled_project
+
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data.setdefault("features", {})["tts"] = {
+        "enabled": True,
+        "type": "local",
+        "local_model": "voxcpm2",
+        "model_dir": "data/models/VoxCPM2",
+        "device": "cuda",
+        "load_denoiser": False,
+        "cfg_value": 2.0,
+        "inference_timesteps": 10,
+    }
+    with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+    class FakeTTS:
+        def __init__(self):
+            self.warmups = 0
+            self.closed = False
+
+        async def warmup(self):
+            self.warmups += 1
+
+        async def synthesize(self, text, *, reference_audio=None, prompt=""):
+            return paths.WORKSPACE_DIR / "fake.wav"
+
+        async def aclose(self):
+            self.closed = True
+
+    fake_tts = FakeTTS()
+    build_configs = []
+
+    class FakePluginManager:
+        def __init__(self, plugins_dir):
+            self.plugins_dir = plugins_dir
+
+        def scan(self):
+            pass
+
+        def list_all(self):
+            return [SimpleNamespace(meta=SimpleNamespace(name="voxcpm2"))]
+
+        def get(self, name):
+            return object() if name == "voxcpm2" else None
+
+        def build(self, name, config):
+            build_configs.append((name, config))
+            return fake_tts
+
+        async def shutdown_all(self):
+            pass
+
+    import plugins
+
+    monkeypatch.setattr(plugins, "PluginManager", FakePluginManager)
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+        for _ in range(50):
+            if fake_tts.warmups:
+                break
+            await asyncio.sleep(0.02)
+
+        assert rt.tts is fake_tts
+        assert rt.pipeline.tts is fake_tts
+        assert fake_tts.warmups == 1
+        assert build_configs[0][0] == "voxcpm2"
+        assert build_configs[0][1]["device"] == "cuda"
+        assert build_configs[0][1]["load_denoiser"] is False
+        assert build_configs[0][1]["cfg_value"] == 2.0
+        assert build_configs[0][1]["inference_timesteps"] == 10
+    finally:
+        await rt.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_runtime_shutdown_cleanly(assembled_project):
     """shutdown 应能按相反顺序关闭所有组件，不抛异常。"""
     project_root, _ = assembled_project
@@ -194,7 +433,7 @@ async def test_runtime_handles_missing_provider_reference(assembled_project):
     project_root, paths = assembled_project
 
     # 改 config.yaml 让 chat.provider 指向不存在的 ID
-    with open(paths.CONFIG_FILE, "r", encoding="utf-8") as f:
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
         data = yaml.safe_load(f)
     data["agents"]["chat"]["provider"] = "ghost_provider"
     with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:

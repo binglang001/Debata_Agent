@@ -1,5 +1,5 @@
 # ============================================================
-# Diana_Agent .gitignore
+# Debata_Agent .gitignore
 # ============================================================
 
 # === Python ===
@@ -30,25 +30,16 @@ data/
 !data/.gitkeep
 
 # === 用户人格（个人私设，不上传）===
-# 所有人格平级放 personas/ 下。仓库自带的（diana）入 git，其余排除。
+# 所有人格平级放 personas/ 下。仓库自带的（debata）入 git，其余排除。
 personas/*
 !personas/__init__.py
-!personas/diana/
-!personas/diana/**
+!personas/debata/
+!personas/debata/**
 # 上面 negate 会把 __pycache__ 也带入，显式排除
 personas/*/__pycache__/
 
-# === 归档（V1 时期的私设、旧备份）===
+# === 归档（开发期间的私设、临时备份）===
 archived/
-
-# === 旧版残留（Phase 1 完成后清理）===
-diana_agent/__pycache__/
-backups/
-memory.json
-memory_test.json
-important_memory.json
-important_memory_test.json
-uploads/
 
 # === 表情包（个人选择，不上传通用资源）===
 emoji/
@@ -60,7 +51,6 @@ emoji/
 *.safetensors
 *.onnx
 *.gguf
-F:/.models/
 
 # === IDE / 编辑器 ===
 .vscode/
@@ -78,6 +68,10 @@ Desktop.ini
 .claude/
 .aider*
 .cursor*
+# 项目级 AI 接续指南（私有，不上传）
+CLAUDE.md
+# DeepSeek 写 UI 前的 config 备份
+data/config.yaml.before-p0-fix
 
 # === 日志 / 临时 ===
 *.log

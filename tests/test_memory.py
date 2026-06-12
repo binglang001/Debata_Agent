@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from memory import (
@@ -13,7 +11,6 @@ from memory import (
     JsonStore,
     StoreError,
 )
-
 
 # ============================================================
 # JsonStore
@@ -182,6 +179,18 @@ async def test_history_basic_operations(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_history_preserves_empty_reasoning_content(tmp_path):
+    h = HistoryManager(tmp_path / "history.jsonl")
+
+    await h.add_assistant_message("hello", reasoning_content="")
+
+    records = await h.records()
+    assert records == [
+        {"role": "assistant", "content": "hello", "reasoning_content": ""}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_history_truncate(tmp_path):
     h = HistoryManager(tmp_path / "history.jsonl")
     for i in range(20):
@@ -328,6 +337,79 @@ async def test_important_handles_legacy_dict_format(tmp_path):
     im = ImportantMemoryManager(path)
     await im.load()
     assert im.items() == []
+
+
+@pytest.mark.asyncio
+async def test_important_loads_legacy_items_with_default_metadata(tmp_path):
+    import orjson
+
+    path = tmp_path / "imp.json"
+    path.write_bytes(orjson.dumps([{"timestamp": "T1", "content": "旧记忆"}]))
+
+    im = ImportantMemoryManager(path)
+    await im.load()
+
+    item = im.items()[0]
+    assert item["scope"] == "global"
+    assert item["pinned"] is False
+
+
+@pytest.mark.asyncio
+async def test_important_text_for_context_filters_scope_and_keeps_pinned(tmp_path):
+    counter = [0]
+
+    def now() -> str:
+        counter[0] += 1
+        return f"T{counter[0]:04d}"
+
+    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=now)
+    await im.load()
+    await im.save("全局记忆", scope="global")
+    await im.save("私聊 A 记忆", scope="user:A")
+    await im.save("群 B 记忆", scope="group:B")
+    await im.save("群 C 记忆", scope="group:C")
+    await im.save("置顶私聊记忆", scope="user:A", pinned=True)
+
+    out = im.text_for_context("group:B")
+
+    assert "置顶私聊记忆" in out
+    assert "全局记忆" in out
+    assert "群 B 记忆" in out
+    assert "私聊 A 记忆" not in out
+    assert "群 C 记忆" not in out
+
+
+@pytest.mark.asyncio
+async def test_important_budget_keeps_pinned(tmp_path):
+    class TinyEstimator:
+        def estimate_text(self, text: str) -> int:
+            return len(text)
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+    await im.save("这条置顶必须保留", pinned=True)
+    await im.save("这条普通记忆可以被预算裁掉")
+
+    out = im.text_for_context(None, token_budget=8, estimator=TinyEstimator())  # type: ignore[arg-type]
+
+    assert "这条置顶必须保留" in out
+    assert "这条普通记忆可以被预算裁掉" not in out
+
+
+@pytest.mark.asyncio
+async def test_important_update_metadata_persists(tmp_path):
+    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=lambda: "T1")
+    await im.load()
+    await im.save("可编辑记忆")
+    item_id = im.items()[0]["timestamp"]
+
+    assert await im.update_metadata(item_id, scope="group:42", pinned=True) is True
+
+    im2 = ImportantMemoryManager(tmp_path / "imp.json")
+    await im2.load()
+    item = im2.items()[0]
+    assert item["scope"] == "group:42"
+    assert item["pinned"] is True
 
 
 # ============================================================

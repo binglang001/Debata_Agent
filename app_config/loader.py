@@ -30,6 +30,20 @@ logger = logging.getLogger(__name__)
 _active_config: RootConfig | None = None
 
 
+def _user_error_text(e: Exception) -> str:
+    """Pydantic ValidationError → 带字段详情；其它异常 → 原样截断 500 字。"""
+    if isinstance(e, ValidationError):
+        lines = ["配置校验未通过："]
+        for err in e.errors():
+            loc = " → ".join(str(p) for p in err["loc"]) if err.get("loc") else "顶层"
+            lines.append(f"  · {loc}：{err.get('msg', '未知错误')}")
+        return "\n".join(lines[:20])  # 最多展示 20 条
+    msg = str(e).strip()
+    if len(msg) > 500:
+        msg = msg[:500] + "..."
+    return msg
+
+
 class ConfigError(Exception):
     """配置相关错误。"""
 
@@ -50,7 +64,7 @@ def load_config(paths: AppPaths, set_global: bool = True) -> RootConfig:
         )
 
     try:
-        with open(paths.CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(paths.CONFIG_FILE, encoding="utf-8") as f:
             raw: Any = yaml.safe_load(f)
     except yaml.YAMLError as e:
         raise ConfigError(f"YAML 解析失败: {paths.CONFIG_FILE}\n{e}") from e
@@ -61,7 +75,7 @@ def load_config(paths: AppPaths, set_global: bool = True) -> RootConfig:
     try:
         cfg = RootConfig.model_validate(raw)
     except ValidationError as e:
-        raise ConfigError(f"配置校验失败:\n{e}") from e
+        raise ConfigError(_user_error_text(e)) from e
 
     if set_global:
         _active_config = cfg

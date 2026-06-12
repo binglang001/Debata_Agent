@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Literal
 
 # 工具执行器签名
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -37,6 +38,9 @@ class AgentRunResult:
 
     reasoning_logs: list[str] = field(default_factory=list)
     """每轮 reasoning_content 的拼接（用于 UI 展示思考过程）"""
+
+    prompt_tokens: int = 0
+    """本轮所有模型调用累计的 prompt token，用于上下文估算校准。"""
 
     def has_records(self) -> bool:
         return bool(self.records)

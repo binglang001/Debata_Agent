@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from contextlib import suppress
 from pathlib import Path
@@ -42,8 +43,9 @@ class Runtime:
         await rt.shutdown()
     """
 
-    def __init__(self, project_root: Path) -> None:
+    def __init__(self, project_root: Path, config_file: Path | None = None) -> None:
         self.project_root = project_root
+        self._config_file = config_file
         self._stop_event = asyncio.Event()
 
         # 组件占位（在 start() 中实例化）
@@ -53,6 +55,8 @@ class Runtime:
         self.persona: Any = None
         self.history: Any = None
         self.important: Any = None
+        self.archive: Any = None
+        self.rolling_summary: Any = None
         self.adapter: Any = None
         self.provider_registry: Any = None
         self.providers: dict[str, Any] = {}
@@ -72,6 +76,15 @@ class Runtime:
         self.vision: Any = None
         self.web_search: Any = None
         self.weather: Any = None
+        self.embedding_service: Any = None
+        self.rag_store: Any = None
+        self.plugin_manager: Any = None
+        self.asr: Any = None
+        self.tts: Any = None
+        self.provider_health: dict[str, Any] = {}
+        self.feature_failures: dict[str, str] = {}
+        self._shutdown_started = False
+        self._shutdown_complete = False
 
     # ============================================================
     # 启动流程
@@ -79,16 +92,28 @@ class Runtime:
 
     async def start(self) -> None:
         """按顺序装配并启动所有组件。"""
+        self._stop_event = asyncio.Event()
+        self._shutdown_started = False
+        self._shutdown_complete = False
         logger.info("Runtime 启动中...")
 
         # ----- 1. 路径与配置 -----
         from app_config import AppPaths, SecretsManager, load_config
 
-        self.paths = AppPaths(project_root=self.project_root)
+        self.paths = AppPaths(project_root=self.project_root, config_file=self._config_file)
         self.paths.ensure_data_dirs()
+        os.environ.setdefault("DEBATA_MODELS_DIR", str(self.paths.MODELS_DIR.resolve()))
         self.secrets = SecretsManager(self.paths)
         self.secrets.initialize()
         self.config = load_config(self.paths)
+        self._apply_feature_provider_overrides()
+        # 按 config 调整全局日志级别（main.py 启动时只设了 INFO）
+        try:
+            logging.getLogger().setLevel(
+                getattr(logging, self.config.app.log_level, logging.INFO)
+            )
+        except Exception:
+            logger.warning(f"无效的日志级别: {self.config.app.log_level}，回退 INFO")
         logger.debug(f"配置已加载（persona={self.config.persona.active}）")
 
         # ----- 2. 人格 -----
@@ -112,14 +137,23 @@ class Runtime:
         logger.debug(f"人格已加载: {self.persona.name}")
 
         # ----- 3. 记忆 -----
-        from memory import HistoryManager, ImportantMemoryManager
+        from memory import (
+            ArchiveStore,
+            HistoryManager,
+            ImportantMemoryManager,
+            RollingSummaryStore,
+        )
 
         mem_dir = self.paths.memory_dir_for(self.persona.name)
         mem_dir.mkdir(parents=True, exist_ok=True)
         self.history = HistoryManager(mem_dir / "history.jsonl")
         self.important = ImportantMemoryManager(mem_dir / "important.json")
+        self.archive = ArchiveStore(mem_dir / "archive.jsonl")
+        self.rolling_summary = RollingSummaryStore(mem_dir / "rolling_summary.json")
         await self.history.load()
         await self.important.load()
+        await self.archive.load()
+        await self.rolling_summary.load()
         self._hist_len = await self.history.length()
         logger.debug(
             f"记忆已加载（history={self._hist_len} 条，important={len(self.important.items())} 条）"
@@ -171,7 +205,60 @@ class Runtime:
                 self.config.behavior.summarize,
             )
 
-        # ----- 6. Features (P1.8 留 None；P2/3 实装 vision/web_search/weather)-----
+        await self._check_provider_health()
+
+        # ----- 6. Features service（按 enabled 实例化）-----
+        from features import VisionService, WeatherService, WebSearchService
+
+        if self.config.features.vision.enabled:
+            vcfg = self.config.features.vision
+            if vcfg.type != "api":
+                logger.warning(
+                    "features.vision.type=local 当前未实装（P3），vision 服务跳过实例化"
+                )
+            elif vcfg.provider and vcfg.provider in self.providers:
+                self.vision = VisionService(
+                    provider=self.providers[vcfg.provider],
+                    model=vcfg.model or "",
+                )
+                logger.info(
+                    f"VisionService 已启用：provider={vcfg.provider}, model={vcfg.model}"
+                )
+            else:
+                logger.warning(
+                    f"features.vision.enabled=True 但 provider={vcfg.provider!r} "
+                    f"不在 providers 中，vision 服务跳过实例化"
+                )
+
+        if self.config.features.web_search.enabled:
+            wscfg = self.config.features.web_search
+            self.web_search = WebSearchService(
+                max_results=wscfg.max_results,
+                timeout_seconds=wscfg.timeout_seconds,
+            )
+            logger.info("WebSearchService 已启用（DuckDuckGo）")
+
+        if self.config.features.weather.enabled:
+            wcfg = self.config.features.weather
+            api_key = self.secrets.get(wcfg.api_key_id) if wcfg.api_key_id else None
+            if api_key:
+                self.weather = WeatherService(
+                    api_key=api_key,
+                    host=wcfg.host,
+                )
+                logger.info(f"WeatherService 已启用：host={wcfg.host}")
+            else:
+                logger.warning(
+                    f"features.weather.enabled=True 但 api_key_id={wcfg.api_key_id!r} "
+                    f"没找到密钥，weather 服务跳过实例化"
+                )
+
+        # ----- 6.5 RAG 长期记忆（embedding + 向量存储）-----
+        if self.config.features.long_term_memory.mode == "rag":
+            await self._setup_rag(mem_dir)
+
+        # ----- 6.6 插件扫描（ASR / TTS / 本地 embedding，按需）-----
+        await self._setup_plugins()
 
         # ----- 7. Adapter -----
         from adapters.napcat.adapter import NapCatAdapter
@@ -203,13 +290,18 @@ class Runtime:
         self.pending_requests = PendingRequestStore()
         if self.config.behavior.rate_limit.enabled:
             self.rate_limiter = RateLimiter(
-                window_seconds=self.config.behavior.rate_limit.window,
+                window_seconds=self.config.behavior.rate_limit.window_seconds,
                 max_messages=self.config.behavior.rate_limit.max_messages,
                 whitelist_provider=self._friend_whitelist_provider,
             )
 
         # ----- 10. WakeupScheduler（双向依赖：先用占位构造，pipeline 实例化后回填）-----
-        async def _wakeup_placeholder(_reminder: str) -> None:
+        async def _wakeup_placeholder(
+            _reminder: str,
+            _target: dict[str, Any] | None = None,
+            _mode: str = "wakeup",
+            _message_text: str | None = None,
+        ) -> None:
             logger.warning("wakeup 触发时 pipeline 尚未就绪，跳过")
 
         self.wakeup_scheduler = WakeupScheduler(on_fire=_wakeup_placeholder)
@@ -217,24 +309,31 @@ class Runtime:
         # ----- 11. Pipeline -----
         from .message_pipeline import MessagePipeline
 
+        chat_context_length = self._model_context_length(chat_cfg.provider, chat_cfg.model)
         self.pipeline = MessagePipeline(
             adapter=self.adapter,
             chat_agent=self.chat_agent,
             persona=self.persona,
             history=self.history,
             important=self.important,
+            archive=self.archive,
+            rolling_summary=self.rolling_summary,
             tool_registry=self.tool_registry,
             wakeup_scheduler=self.wakeup_scheduler,
             pending_requests=self.pending_requests,
             behavior_cfg=self.config.behavior,
             features_cfg=self.config.features,
+            whitelist=adapter_cfg.whitelist,
             emoji_dir=self.paths.EMOJI_DIR,
-            upload_allowed_dir=self.paths.UPLOADS_DIR,
+            workspace_dir=self.paths.WORKSPACE_DIR,
             rate_limiter=self.rate_limiter,
             summary_agent=self.summary_agent,
+            model_context_length=chat_context_length,
             vision=self.vision,
             web_search=self.web_search,
             weather=self.weather,
+            asr=self.asr,
+            tts=self.tts,
         )
         # 回填 wakeup 双向依赖
         self.wakeup_scheduler._on_fire = self.pipeline.run_wakeup_turn
@@ -274,6 +373,26 @@ class Runtime:
 
         logger.info("Runtime 启动完成")
 
+    def _model_context_length(self, provider_id: str, model_id: str) -> int | None:
+        """从 provider preset 中读取模型上下文硬上限，找不到则返回 None。"""
+        try:
+            provider_cfg = self.config.providers.get(provider_id)
+            preset_id = provider_cfg.preset.lower() if provider_cfg and provider_cfg.preset else ""
+            preset = self.provider_registry.presets.get(preset_id) if preset_id else None
+            if preset is None:
+                return None
+            for model in preset.models:
+                if model.id == model_id:
+                    return model.context_length or None
+        except Exception:
+            logger.debug(
+                "读取模型上下文窗口失败：provider=%s model=%s",
+                provider_id,
+                model_id,
+                exc_info=True,
+            )
+        return None
+
     # ============================================================
     # 等待停止信号（SIGINT / SIGTERM）
     # ============================================================
@@ -298,11 +417,30 @@ class Runtime:
 
     async def shutdown(self) -> None:
         """按相反顺序关闭所有组件，单个失败不影响其它。"""
+        if self._shutdown_complete:
+            return
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        self.request_stop()
         logger.info("Runtime 关闭中...")
 
-        async def _close(label: str, coro_factory) -> None:
+        warmup_tasks = getattr(self, "_warmup_tasks", set())
+        for task in list(warmup_tasks):
+            if task and not task.done():
+                task.cancel()
+        if warmup_tasks:
+            with suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.gather(*list(warmup_tasks), return_exceptions=True),
+                    timeout=2.0,
+                )
+
+        async def _close(label: str, coro_factory, timeout: float = 8.0) -> None:
             try:
-                await coro_factory()
+                await asyncio.wait_for(coro_factory(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"关闭 {label} 超时，跳过")
             except Exception as e:
                 logger.warning(f"关闭 {label} 失败: {e}")
 
@@ -316,9 +454,18 @@ class Runtime:
             await _close("wakeup_scheduler", self.wakeup_scheduler.cancel_all)
         if self.pipeline is not None:
             await _close("pipeline", self.pipeline.shutdown)
+        if self.embedding_service is not None:
+            await _close("embedding_service", self.embedding_service.aclose)
+        if self.asr is not None:
+            await _close("asr", self.asr.aclose)
+        if self.tts is not None:
+            await _close("tts", self.tts.aclose)
+        if self.plugin_manager is not None:
+            await _close("plugin_manager", self.plugin_manager.shutdown_all)
         if self.provider_registry is not None:
             await _close("provider_registry", self.provider_registry.close_all)
 
+        self._shutdown_complete = True
         logger.info("Runtime 已停止")
 
     # ============================================================
@@ -335,3 +482,359 @@ class Runtime:
         except Exception as e:
             logger.warning(f"获取好友列表失败: {e}")
             return set()
+
+    async def _setup_rag(self, mem_dir) -> None:
+        """RAG 模式装配 EmbeddingService + RagStore，并 attach 到 important。
+
+        失败仅 warn，不阻塞主流程（pipeline 会自动 fallback 到 text() 全部注入）。
+        """
+        ecfg = self.config.features.embedding
+        if not ecfg.enabled:
+            logger.warning("long_term_memory.mode=rag 但 features.embedding.enabled=False；RAG 召回不可用")
+            return
+        if ecfg.type == "local":
+            try:
+                from features.embedding import get_local_service
+
+                model_dir = ecfg.local_model_dir
+                if not model_dir:
+                    if ecfg.local_quality == "quality":
+                        model_dir = "data/models/embedding/bge-large-zh-v1.5"
+                    else:
+                        model_dir = "data/models/embedding/all-MiniLM-L6-v2"
+                model_dir = self._resolve_project_path(model_dir)
+                self.embedding_service = get_local_service(model_dir)
+                from memory.rag_store import RagStore
+
+                self.rag_store = RagStore(mem_dir / "rag.jsonl")
+                await self.rag_store.load()
+                self.important.attach_rag(self.embedding_service, self.rag_store)
+                self._fire_warmup("embedding", self.embedding_service)
+                logger.info(
+                    f"RAG 已就位（本地 embedding）：quality={ecfg.local_quality}, "
+                    f"索引条目={len(self.rag_store)}"
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"本地 embedding 初始化失败，fallback 到 text() 模式：{e}")
+                self._disable_feature_after_failure("embedding", e)
+                self.embedding_service = None
+                self.rag_store = None
+        elif ecfg.type == "api":
+            if not ecfg.provider or ecfg.provider not in self.providers:
+                logger.warning(
+                    f"features.embedding.provider={ecfg.provider!r} 未在 providers 中；RAG 召回跳过"
+                )
+                self._disable_feature_after_failure(
+                    "embedding",
+                    RuntimeError(f"provider={ecfg.provider!r} 未在 providers 中"),
+                )
+                return
+            api_key = self.secrets.get(ecfg.api_key_id) if ecfg.api_key_id else None
+            if ecfg.api_key_id and not api_key:
+                logger.warning(f"embedding api_key_id={ecfg.api_key_id!r} 找不到密钥；RAG 召回跳过")
+                self._disable_feature_after_failure(
+                    "embedding",
+                    RuntimeError(f"api_key_id={ecfg.api_key_id!r} 找不到密钥"),
+                )
+                return
+            try:
+                from features.embedding import OpenAICompatEmbeddingService
+                provider = self.providers[ecfg.provider]
+                base_url = getattr(provider, "base_url", None) or ""
+                if not api_key:
+                    api_key = getattr(provider, "api_key", "") or ""
+                self.embedding_service = OpenAICompatEmbeddingService(
+                    base_url=base_url,
+                    api_key=api_key or "",
+                    model=ecfg.api_model or "text-embedding-v1",
+                )
+                from memory.rag_store import RagStore
+                self.rag_store = RagStore(mem_dir / "rag.jsonl")
+                await self.rag_store.load()
+                self.important.attach_rag(self.embedding_service, self.rag_store)
+                logger.info(
+                    f"RAG 已就位：provider={ecfg.provider}, model={ecfg.api_model}, "
+                    f"索引条目={len(self.rag_store)}"
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"RAG 装配失败，fallback 到 text() 模式：{e}")
+                self._disable_feature_after_failure("embedding", e)
+                self.embedding_service = None
+                self.rag_store = None
+
+    async def _setup_plugins(self) -> None:
+        """扫描 plugins/ 并按 features.asr/tts 决定要不要 build。
+
+        失败仅 warn，不阻塞主流程。
+        """
+        from plugins import PluginManager
+
+        plugins_dir = self.project_root / "plugins"
+        self.plugin_manager = PluginManager(plugins_dir)
+        try:
+            self.plugin_manager.scan()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"插件扫描失败：{e}")
+            return
+        records = self.plugin_manager.list_all()
+        if records:
+            logger.info(f"已扫描 {len(records)} 个插件：{[r.meta.name for r in records]}")
+
+        # ASR：不再加载 Whisper/云端 ASR。NapCat 自带 fetch_ptt_text 足够覆盖 QQ 语音。
+        acfg = self.config.features.asr
+        if acfg.enabled:
+            logger.info("ASR 本地/API 配置已忽略：使用 NapCat 内置语音转文字")
+            self.asr = None
+
+        # TTS：同理
+        tcfg = self.config.features.tts
+        if tcfg.enabled and tcfg.type == "local":
+            plugin_name = tcfg.local_model.lower()
+            if not self.plugin_manager.get(plugin_name):
+                plugin_name = "voxcpm2"
+            try:
+                self.tts = self.plugin_manager.build(
+                    plugin_name,
+                    {
+                        "model_dir": self._resolve_project_path(
+                            tcfg.model_dir or "data/models/VoxCPM2"
+                        ),
+                        "reference_audio": tcfg.reference_audio,
+                        "default_prompt": tcfg.default_prompt,
+                        "device": tcfg.device,
+                        "load_denoiser": tcfg.load_denoiser,
+                        "cfg_value": tcfg.cfg_value,
+                        "inference_timesteps": tcfg.inference_timesteps,
+                    },
+                )
+                self._fire_warmup("tts", self.tts)
+                logger.info(f"TTS 插件已启用：{plugin_name}（后台预热中）")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"TTS 插件 {plugin_name!r} 启用失败：{e}")
+                self._disable_feature_after_failure("tts", e)
+        elif tcfg.enabled and tcfg.type == "api":
+            api_key = self.secrets.get(tcfg.api_key_id) if tcfg.api_key_id else None
+            if tcfg.provider == "baidu":
+                try:
+                    from features.tts import _get_baidu_service
+                    secret_key = tcfg.extra_credentials.get("secret_key", "")
+                    self.tts = _get_baidu_service()(
+                        api_key=api_key or "",
+                        secret_key=secret_key,
+                    )
+                    logger.info("TTS 已启用：百度云端")
+                    self._fire_warmup("tts", self.tts)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"百度 TTS 初始化失败：{e}")
+                    self._disable_feature_after_failure("tts", e)
+            elif tcfg.provider == "xfyun":
+                try:
+                    from features.tts import _get_iflytek_service
+                    self.tts = _get_iflytek_service()(
+                        app_id=tcfg.extra_credentials.get("app_id", ""),
+                        api_key=api_key or "",
+                        api_secret=tcfg.extra_credentials.get("api_secret", ""),
+                    )
+                    logger.info("TTS 已启用：讯飞云端")
+                    self._fire_warmup("tts", self.tts)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"讯飞 TTS 初始化失败：{e}")
+                    self._disable_feature_after_failure("tts", e)
+            elif tcfg.provider == "volcengine":
+                try:
+                    from features.tts import _get_volcengine_service
+                    self.tts = _get_volcengine_service()(
+                        app_id=tcfg.extra_credentials.get("app_id", ""),
+                        access_token=api_key or "",
+                    )
+                    logger.info("TTS 已启用：火山引擎云端")
+                    self._fire_warmup("tts", self.tts)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"火山引擎 TTS 初始化失败：{e}")
+                    self._disable_feature_after_failure("tts", e)
+            else:
+                logger.warning(f"TTS provider={tcfg.provider!r} 未知，跳过")
+                self._disable_feature_after_failure(
+                    "tts", RuntimeError(f"TTS provider={tcfg.provider!r} 未知")
+                )
+
+        # 本地模型在 Runtime 启动后后台预热；首次调用若未完成则等待同一个加载任务。
+
+    def _fire_warmup(self, label: str, service: Any) -> None:
+        """fire-and-forget 调 service.warmup()，加载模型到内存。
+
+        失败仅 warn，绝不影响 Runtime 启动流程。
+        task 引用保留在 self._warmup_tasks，避免被 GC。
+        """
+        warmup = getattr(service, "warmup", None)
+        if warmup is None or not callable(warmup):
+            return
+        if not hasattr(self, "_warmup_tasks"):
+            self._warmup_tasks: set[asyncio.Task] = set()
+
+        async def _do() -> None:
+            import time
+            start = time.monotonic()
+            try:
+                await warmup()
+                logger.info(f"{label} 预热完成（耗时 {time.monotonic() - start:.1f}s）")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"{label} 预热失败：{e}")
+                self._disable_feature_after_failure(label, e)
+
+        task = asyncio.create_task(_do(), name=f"warmup-{label}")
+        self._warmup_tasks.add(task)
+        task.add_done_callback(self._warmup_tasks.discard)
+
+    def _resolve_project_path(self, path: str) -> str:
+        p = Path(path)
+        if p.is_absolute():
+            return str(p)
+        return str((self.project_root / p).resolve())
+
+    async def _check_provider_health(self) -> None:
+        """启动时并发做短超时 provider 检测，供总览页/设置页显示。"""
+        if not self.providers:
+            return
+
+        from providers.health import (
+            ProviderHealth,
+            probe_embedding_provider_instance,
+            probe_provider_instance,
+        )
+
+        chat_models = self._provider_chat_model_map()
+        embedding_models = self._provider_embedding_model_map()
+        for name in self.providers:
+            self.provider_health[name] = ProviderHealth("checking", "检测中")
+
+        async def _one(name: str, provider: Any) -> None:
+            try:
+                model = chat_models.get(name, "")
+                is_embedding_probe = False
+                if not model and name in embedding_models:
+                    model = embedding_models[name]
+                    is_embedding_probe = True
+                if not model:
+                    self.provider_health[name] = ProviderHealth("error", "没有绑定模型")
+                    return
+                api_key = getattr(provider, "api_key", "") or ""
+                if is_embedding_probe:
+                    ecfg = self.config.features.embedding
+                    if ecfg.api_key_id:
+                        api_key = self.secrets.get(ecfg.api_key_id) or api_key
+                if not api_key:
+                    self.provider_health[name] = ProviderHealth("error", "缺 API 密钥")
+                    return
+                if is_embedding_probe:
+                    result = await probe_embedding_provider_instance(
+                        provider,
+                        model=model,
+                        api_key=api_key,
+                        timeout_seconds=8.0,
+                    )
+                else:
+                    protocol = self._provider_protocol(name)
+                    result = await probe_provider_instance(
+                        provider,
+                        model=model,
+                        protocol=protocol,
+                        timeout_seconds=8.0,
+                    )
+                self.provider_health[name] = result
+            except Exception as e:  # noqa: BLE001
+                self.provider_health[name] = ProviderHealth("error", f"检测失败：{e}")
+
+        await asyncio.gather(
+            *(_one(name, provider) for name, provider in self.providers.items()),
+            return_exceptions=True,
+        )
+
+    def _provider_chat_model_map(self) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for _name, agent in self.config._iter_agents():
+            result.setdefault(agent.provider, agent.model)
+        vision = self.config.features.vision
+        if vision.enabled and vision.type == "api" and vision.provider and vision.model:
+            result.setdefault(vision.provider, vision.model)
+        return result
+
+    def _provider_embedding_model_map(self) -> dict[str, str]:
+        result: dict[str, str] = {}
+        embedding = self.config.features.embedding
+        if (
+            self.config.features.long_term_memory.mode == "rag"
+            and embedding.enabled
+            and embedding.type == "api"
+            and embedding.provider
+            and embedding.api_model
+        ):
+            result.setdefault(embedding.provider, embedding.api_model)
+        return result
+
+    def _apply_feature_provider_overrides(self) -> None:
+        """把 feature 独立密钥/地址同步到 provider 构造配置。
+
+        设置页允许在 Vision/Embedding 功能里单独填密钥。Provider 实例构造发生在
+        Runtime 启动早期，因此要在 build_from_config 前把这些覆盖项合入对应 provider。
+        """
+        vision = self.config.features.vision
+        if (
+            vision.enabled
+            and vision.type == "api"
+            and vision.provider
+            and vision.provider in self.config.providers
+        ):
+            pcfg = self.config.providers[vision.provider]
+            if vision.api_key_id:
+                pcfg.api_key_id = vision.api_key_id
+            if vision.base_url:
+                pcfg.base_url = vision.base_url
+
+        embedding = self.config.features.embedding
+        if (
+            self.config.features.long_term_memory.mode == "rag"
+            and embedding.enabled
+            and embedding.type == "api"
+            and embedding.provider
+            and embedding.provider.startswith("embedding_")
+            and embedding.provider in self.config.providers
+            and embedding.api_key_id
+        ):
+            self.config.providers[embedding.provider].api_key_id = embedding.api_key_id
+
+    def _provider_protocol(self, name: str) -> str:
+        cfg = self.config.providers.get(name)
+        if cfg is None:
+            return "openai_compat"
+        if cfg.protocol:
+            return cfg.protocol
+        preset_name = (cfg.preset or "").lower()
+        preset = getattr(self.provider_registry, "presets", {}).get(preset_name)
+        return getattr(preset, "protocol", "openai_compat")
+
+    def _disable_feature_after_failure(self, label: str, exc: BaseException) -> None:
+        """本地/云端能力加载失败后禁用配置，避免下次启动继续卡住。"""
+        if label not in {"asr", "tts", "embedding"}:
+            return
+        message = str(exc)
+        self.feature_failures[label] = message
+        try:
+            if label == "embedding":
+                self.config.features.embedding.enabled = False
+                self.config.features.long_term_memory.mode = "file"
+                self.embedding_service = None
+                self.rag_store = None
+                if self.important is not None:
+                    self.important._embedding = None
+                    self.important._rag_store = None
+            else:
+                getattr(self.config.features, label).enabled = False
+                setattr(self, label, None)
+                if self.pipeline is not None:
+                    setattr(self.pipeline, label, None)
+            from app_config.loader import save_config
+
+            save_config(self.paths, self.config)
+        except Exception as save_exc:  # noqa: BLE001
+            logger.warning(f"{label} 加载失败后禁用配置未能保存：{save_exc}")

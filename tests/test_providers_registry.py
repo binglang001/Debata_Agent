@@ -47,7 +47,7 @@ def test_build_from_preset_openai_compat(builtin_presets, secrets):
     provider = build_provider("ds_main", cfg, secrets, builtin_presets)
     assert isinstance(provider, OpenAICompatProvider)
     assert provider.name == "ds_main"
-    assert provider.base_url == "https://api.deepseek.com"
+    assert provider.base_url == "https://api.deepseek.com/v1"
     assert provider.api_key == "sk-test123"
 
 
@@ -101,6 +101,9 @@ def test_build_passes_reasoning_style(builtin_presets, secrets):
     provider = build_provider("qwen", cfg, secrets, builtin_presets)
     assert isinstance(provider, OpenAICompatProvider)
     assert provider.reasoning_style == "qwen_enable_thinking"
+    assert "qwen3-max" in provider.reasoning_model_ids
+    assert "qwen3-turbo" in provider.known_model_ids
+    assert "qwen3-turbo" not in provider.reasoning_model_ids
 
 
 # ============================================================

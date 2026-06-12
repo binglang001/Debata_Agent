@@ -5,8 +5,8 @@ base_url: https://api.anthropic.com
 registration_url: https://console.anthropic.com
 
 models:
-  - id: claude-opus-4-7
-    display_name: Claude Opus 4.7
+  - id: claude-opus-4-8
+    display_name: Claude Opus 4.8
     capabilities: [chat, tool_call, reasoning, vision]
     context_length: 1000000
 

@@ -57,7 +57,7 @@ class NapCatProcessManager:
     async def start(self) -> None:
         """启动 NapCat 进程并开始监控。"""
         if not self.executable.exists():
-            raise FileNotFoundError(f"NapCat 可执行文件不存在: {self.executable}")
+            raise FileNotFoundError(f"NapCat 启动文件不存在: {self.executable}")
         if self._process is not None:
             logger.warning("NapCat 进程已在运行")
             return
@@ -105,7 +105,7 @@ class NapCatProcessManager:
 
     async def _spawn_once(self) -> None:
         """启动一次进程（不带重启逻辑）。"""
-        cmd = [str(self.executable), *self.args]
+        cmd = self._build_command()
         logger.info(f"启动 NapCat: {cmd} (cwd={self.cwd})")
 
         kwargs: dict = {
@@ -131,6 +131,14 @@ class NapCatProcessManager:
                 self._pipe_logs(self._process.stdout),
                 name=f"napcat-stdout-{self._process.pid}",
             )
+
+    def _build_command(self) -> list[str]:
+        """返回可被 create_subprocess_exec 启动的命令。"""
+        suffix = self.executable.suffix.lower()
+        if sys.platform == "win32" and suffix in {".bat", ".cmd"}:
+            shell = os.environ.get("COMSPEC") or "cmd.exe"
+            return [shell, "/c", str(self.executable), *self.args]
+        return [str(self.executable), *self.args]
 
     async def _pipe_logs(self, stream: asyncio.StreamReader) -> None:
         """把 NapCat 输出转发到日志系统。"""

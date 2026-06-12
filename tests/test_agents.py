@@ -5,8 +5,6 @@ from __future__ import annotations
 import pytest
 
 from agents.behavior_prompt import (
-    CORE_RULES,
-    TOOL_USE_PROTOCOL,
     build_tool_use_protocol,
 )
 from agents.context_builder import (
@@ -15,6 +13,13 @@ from agents.context_builder import (
     build_messages,
     build_task_context,
 )
+from agents.persona_gen_agent import (
+    PERSONA_GEN_SYSTEM_PROMPT,
+    PERSONA_REFINE_SYSTEM_PROMPT,
+    PersonaBrief,
+    PersonaGenResult,
+    render_persona_file,
+)
 from agents.persona_loader import (
     Persona,
     find_persona_dir,
@@ -22,7 +27,9 @@ from agents.persona_loader import (
     load_persona,
     validate_persona_name,
 )
-
+from agents.proactive_agent import ProactiveRouterAgent, _is_action_decision
+from app_config.schema import AgentConfig
+from providers.base import CompletionResult
 
 # ============================================================
 # persona_loader
@@ -32,10 +39,15 @@ from agents.persona_loader import (
 def test_validate_persona_name_ok():
     validate_persona_name("yuexi")
     validate_persona_name("a_b-c123")
+    # 中文与混合应通过（人格名常用中文）
+    validate_persona_name("小明")
+    validate_persona_name("寒月-01")
+    validate_persona_name("小桃")
 
 
 def test_validate_persona_name_rejects_bad():
-    for bad in ["", "..", "hi/x", "中文", "a" * 65, "with space"]:
+    # 拒：空 / 长 / 路径敏感字符 / 空格 / 特殊符号
+    for bad in ["", "..", "hi/x", "a\\b", "a:b", 'a"b', "a*b", "a?b", "a<b", "a|b", "a b", "a" * 65]:
         with pytest.raises(ValueError):
             validate_persona_name(bad)
 
@@ -119,9 +131,9 @@ def test_tool_use_protocol_file_mode():
 
 def test_tool_use_protocol_rag_mode():
     s = build_tool_use_protocol("rag")
-    assert "不需要主动调用" in s
-    assert "自动管理" in s
-    assert "必须主动保存" not in s
+    assert "RAG 语义检索" in s
+    assert "save_important_memory" in s
+    assert "必须主动保存" in s
 
 
 def test_tool_use_protocol_default_is_file():
@@ -132,11 +144,6 @@ def test_tool_use_protocol_unknown_mode_defaults_to_file():
     """未知 mode 应回退到 file 模式（健壮性）。"""
     s = build_tool_use_protocol("nonexistent")
     assert "必须主动保存" in s
-
-
-def test_legacy_tool_use_protocol_constant_is_file_mode():
-    """向后兼容：TOOL_USE_PROTOCOL 常量等同于 file 模式。"""
-    assert TOOL_USE_PROTOCOL == build_tool_use_protocol("file")
 
 
 def test_emoji_hint_in_protocol():
@@ -152,11 +159,11 @@ def test_emoji_hint_in_protocol():
 # ============================================================
 
 
-def _persona(prompt: str = "你是 Diana", admins: list[dict] | None = None) -> Persona:
+def _persona(prompt: str = "你是 Debata", admins: list[dict] | None = None) -> Persona:
     return Persona(
         name="test",
         prompt=prompt,
-        vars={"name": "Diana", "admins": admins or []},
+        vars={"name": "Debata", "admins": admins or []},
     )
 
 
@@ -205,8 +212,9 @@ def test_build_combined_system_prompt_memory_mode_default():
 def test_build_combined_system_prompt_rag_mode_no_active_save():
     p = _persona()
     sys = build_combined_system_prompt(p, memory_mode="rag")
-    assert "必须主动保存" not in sys
-    assert "自动管理" in sys
+    assert "RAG 语义检索" in sys
+    assert "save_important_memory" in sys
+    assert "必须主动保存" in sys
 
 
 def test_build_combined_system_prompt_with_important_memory():
@@ -236,6 +244,36 @@ def test_build_admin_info_with_admins():
     assert "123" in info
     assert "creator" in info
     assert '<admin_info priority="high">' in info
+
+
+def test_persona_brief_includes_admin_info():
+    brief = PersonaBrief(name="Mika", admin_name="Lily", admin_qq="123456")
+    block = brief.to_brief_block()
+    assert "管理员/用户信息" in block
+    assert "Lily" in block
+    assert "123456" in block
+
+
+def test_render_persona_file_writes_admins():
+    brief = PersonaBrief(name="Mika")
+    result = PersonaGenResult(persona_prompt="<identity>Mika</identity>", display_name="Mika")
+    text = render_persona_file(
+        result,
+        brief,
+        admins=[{"qq": 123456, "name": "Lily", "role": "owner"}],
+    )
+    assert '"admins":' in text
+    assert '"qq": 123456' in text
+    assert '"name": "Lily"' in text
+
+
+def test_persona_generation_prompt_requires_second_person():
+    assert "第二人称硬要求" in PERSONA_GEN_SYSTEM_PROMPT
+    assert "写\"你是……\"、\"你习惯……\"、\"你不会……\"" in PERSONA_GEN_SYSTEM_PROMPT
+    assert "不要写\"她/他/ta 是……\"" in PERSONA_GEN_SYSTEM_PROMPT
+    assert "<identity>\n你是[角色名]" in PERSONA_GEN_SYSTEM_PROMPT
+    assert "你不会做的事：" in PERSONA_GEN_SYSTEM_PROMPT
+    assert "仍必须使用第二人称描述角色本人" in PERSONA_REFINE_SYSTEM_PROMPT
 
 
 def test_build_task_context_empty():
@@ -305,7 +343,8 @@ def test_build_messages_memory_mode_propagates():
     p = _persona()
     msgs_rag = build_messages(p, [], memory_mode="rag")
     msgs_file = build_messages(p, [], memory_mode="file")
-    assert "自动管理" in msgs_rag[0]["content"]
+    assert "RAG 语义检索" in msgs_rag[0]["content"]
+    assert "必须主动保存" in msgs_rag[0]["content"]
     assert "必须主动保存" in msgs_file[0]["content"]
 
 
@@ -395,6 +434,11 @@ async def test_important_force_save_keyword(tmp_path):
     assert result["saved"] is True
     assert result["matched_keyword"] == "记住"
 
+    result_note = await im.force_save_from_keyword("记一下：7月7日参加选拔赛")
+    assert result_note["saved"] is True
+    assert result_note["matched_keyword"] == "记一下"
+    assert result_note["content"] == "7月7日参加选拔赛"
+
     # 未命中
     result2 = await im.force_save_from_keyword("今天天气真好")
     assert result2["saved"] is False
@@ -442,7 +486,7 @@ def test_schema_long_term_memory_config_defaults():
 
     c = LongTermMemoryConfig()
     assert c.mode == "file"
-    assert c.keyword_force_save is True
+    assert c.keyword_trigger_save is True
     assert c.rag_top_k == 5
 
 
@@ -460,3 +504,56 @@ def test_schema_refocus_interval_default():
 
     c = AgentConfig(provider="x", model="y")
     assert c.refocus_interval == 5
+
+
+def test_runner_assistant_record_preserves_empty_reasoning_with_blocks():
+    from agents.runner import AgentRunner
+    from providers.base import CompletionResult
+
+    result = CompletionResult(
+        content="ok",
+        reasoning_content="",
+        reasoning_blocks=[
+            {"type": "thinking", "thinking": "", "signature": "sig"}
+        ],
+    )
+
+    record = AgentRunner._build_assistant_record(result)
+
+    assert record["reasoning_content"] == ""
+    assert record["reasoning_blocks"] == [
+        {"type": "thinking", "thinking": "", "signature": "sig"}
+    ]
+
+
+def test_runner_assistant_record_preserves_reasoning_content():
+    from agents.runner import AgentRunner
+    from providers.base import CompletionResult
+
+    record = AgentRunner._build_assistant_record(
+        CompletionResult(content="ok", reasoning_content="plan")
+    )
+
+    assert record["reasoning_content"] == "plan"
+
+
+def test_proactive_router_treats_only_clean_take_actions_as_action():
+    assert _is_action_decision("TAKE_ACTIONS") is True
+    assert _is_action_decision(" TAKE_ACTIONS ") is True
+    assert _is_action_decision("<｜｜DSML｜｜TOOL_CALLS>\n<｜｜DSML｜｜INVOKE NAME=send_private_messages>") is False
+    assert _is_action_decision("两分钟到了，提醒用户。\n\n<｜｜DSML｜｜TOOL_CALLS>") is False
+    assert _is_action_decision("NO_ACTIONS") is False
+
+
+@pytest.mark.asyncio
+async def test_proactive_router_provider_dsml_content_returns_false():
+    class FakeProvider:
+        async def chat_completion(self, *_args, **_kwargs):
+            return CompletionResult(content="<｜｜DSML｜｜TOOL_CALLS>\n<｜｜DSML｜｜INVOKE NAME=send_group_message>")
+
+    agent = ProactiveRouterAgent(
+        FakeProvider(),
+        AgentConfig(provider="fake", model="router", max_tokens=64),
+    )
+
+    assert await agent.should_act([]) is False

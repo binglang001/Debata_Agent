@@ -5,7 +5,7 @@
 
 存储为 JSONL（每行一条 dict），便于增量追加。
 
-订阅机制（为 P2 的 RAG 预留）：
+订阅机制：
     history.on_append(callback)  # callback: async (records: list[dict]) -> None
     每次有新记录写入时，所有订阅者都会被并发通知（不阻塞主流程）。
 """
@@ -14,12 +14,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Awaitable, Callable
 
 from .store import JsonlStore
 
 logger = logging.getLogger(__name__)
+
+
+def _on_notify_done(task: asyncio.Task) -> None:
+    """记录 on_append 通知任务中的异常。"""
+    try:
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(f"history.on_append 回调异常: {exc}")
+    except Exception:
+        pass
 
 
 AppendCallback = Callable[[list[dict]], Awaitable[None]]
@@ -48,7 +58,7 @@ class HistoryManager:
             except Exception as e:
                 logger.exception(f"创建 history.on_append 通知任务失败: {e}")
                 continue
-            # 保留引用避免 GC；完成后自动从集合移除
+            task.add_done_callback(_on_notify_done)
             self._notify_tasks.add(task)
             task.add_done_callback(self._notify_tasks.discard)
 
@@ -65,8 +75,40 @@ class HistoryManager:
         """
         return await self._store.load()
 
-    async def add_user_message(self, content: str) -> None:
+    async def records_for_conversation(
+        self,
+        conversation_id: str | None,
+        *,
+        include_legacy: bool = True,
+    ) -> list[dict]:
+        """按 conversation_id 取活跃历史记录。
+
+        历史仍是统一流；这里只供 recall/summarize/呈现层按标签筛选，
+        不用于构建模型工作窗口。
+        """
+        records = await self.records()
+        if not conversation_id:
+            return records
+        result: list[dict] = []
+        for record in records:
+            rid = record.get("conversation_id") or _infer_conversation_id(record)
+            if rid == conversation_id:
+                result.append(record)
+            elif include_legacy and not rid:
+                result.append(record)
+        return result
+
+    async def add_user_message(
+        self,
+        content: str,
+        metadata: dict | None = None,
+        conversation_id: str | None = None,
+    ) -> None:
         record = {"role": "user", "content": content}
+        if metadata:
+            record["metadata"] = metadata
+        if conversation_id:
+            record["conversation_id"] = conversation_id
         await self._store.append(record)
         await self._notify([record])
 
@@ -75,32 +117,57 @@ class HistoryManager:
         content: str,
         tool_calls: list[dict] | None = None,
         reasoning_content: str | None = None,
+        conversation_id: str | None = None,
     ) -> None:
         record: dict = {"role": "assistant", "content": content or ""}
         if tool_calls:
             record["tool_calls"] = tool_calls
-        if reasoning_content:
+        if reasoning_content is not None:
             record["reasoning_content"] = reasoning_content
+        if conversation_id:
+            record["conversation_id"] = conversation_id
         await self._store.append(record)
         await self._notify([record])
 
-    async def add_tool_result(self, tool_call_id: str, content: str) -> None:
+    async def add_tool_result(
+        self,
+        tool_call_id: str,
+        content: str,
+        conversation_id: str | None = None,
+    ) -> None:
         record = {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+        if conversation_id:
+            record["conversation_id"] = conversation_id
         await self._store.append(record)
         await self._notify([record])
 
-    async def add_system_note(self, content: str) -> None:
+    async def add_system_note(
+        self,
+        content: str,
+        conversation_id: str | None = None,
+    ) -> None:
         """记录一条系统注解（如发送结果、撤回事件等）。"""
         if not content:
             return
         record = {"role": "system", "content": content}
+        if conversation_id:
+            record["conversation_id"] = conversation_id
         await self._store.append(record)
         await self._notify([record])
 
-    async def add_records(self, records: list[dict]) -> None:
+    async def add_records(
+        self,
+        records: list[dict],
+        conversation_id: str | None = None,
+    ) -> None:
         """批量追加（如 agent 一轮工具循环后的所有 records）。"""
         if not records:
             return
+        if conversation_id:
+            records = [
+                ({**record, "conversation_id": record.get("conversation_id") or conversation_id})
+                for record in records
+            ]
         await self._store.append_many(records)
         await self._notify(records)
 
@@ -117,3 +184,41 @@ class HistoryManager:
     async def clear(self) -> None:
         """清空所有历史（慎用）。"""
         await self._store.clear()
+
+
+def _infer_conversation_id(record: dict) -> str | None:
+    """从旧记录 metadata 中尽量推导 conversation_id，不回写历史文件。"""
+    meta = record.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+
+    messages = meta.get("messages")
+    if isinstance(messages, list) and messages:
+        last = messages[-1]
+        if isinstance(last, dict):
+            scope = last.get("scope")
+            target_id = last.get("target_id")
+            group_id = last.get("group_id")
+            user_id = last.get("user_id")
+            if scope == "group" and (group_id or target_id):
+                return f"group:{group_id or target_id}"
+            if scope == "private" and (target_id or user_id):
+                return f"private:{target_id or user_id}"
+            if group_id:
+                return f"group:{group_id}"
+            if user_id:
+                return f"private:{user_id}"
+
+    scope = meta.get("scope")
+    target_id = meta.get("target_id")
+    group_id = meta.get("group_id")
+    user_id = meta.get("user_id")
+    if scope == "group" and (group_id or target_id):
+        return f"group:{group_id or target_id}"
+    if scope == "private" and (target_id or user_id):
+        return f"private:{target_id or user_id}"
+    if group_id:
+        return f"group:{group_id}"
+    if user_id:
+        return f"private:{user_id}"
+    return None

@@ -30,8 +30,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from app_config.schema import AgentConfig
@@ -81,6 +82,12 @@ class PersonaBrief:
     relation_detail: str = ""
     """relation=special 时的补充描述"""
 
+    admin_name: str = ""
+    """管理员/用户的显示名。生成时用于定义角色与用户的起点关系。"""
+
+    admin_qq: str = ""
+    """管理员/用户的 QQ 号。生成时作为身份锚点。"""
+
     extra_notes: str = ""
     """其它任何用户想补充的"""
 
@@ -96,6 +103,7 @@ class PersonaBrief:
             ("关系矩阵（对不同关系的人怎么说话）", self.relation_matrix),
             ("敏感话题 / 破防点 / 跑题诱因", self.sensitive_topics),
             ("用户和角色的关系", _resolve_relation(self.relation, self.relation_detail)),
+            ("管理员/用户信息", _admin_info(self.admin_name, self.admin_qq)),
             ("其它补充", self.extra_notes),
         ]
         lines: list[str] = []
@@ -117,6 +125,17 @@ def _resolve_relation(rel: str, detail: str) -> str:
     if rel == "special" and detail:
         return detail
     return base + (f"（补充：{detail}）" if detail else "")
+
+
+def _admin_info(name: str, qq: str) -> str:
+    parts: list[str] = []
+    if name:
+        parts.append(f"名称：{name}")
+    if qq:
+        parts.append(f"QQ：{qq}")
+    if not parts:
+        return ""
+    return "这是配置 Debata 的管理员/用户身份。生成 <relation_with_user> 时要使用这些信息，不要把用户写成泛泛的陌生人。\n" + "\n".join(parts)
 
 
 # ============================================================
@@ -154,8 +173,19 @@ PERSONA_GEN_SYSTEM_PROMPT = """你是一位人格设定的专业撰写者。你�
 # 你产出的是什么
 
 一份"人格档案"。它会被嵌入到另一个 LLM 的 system prompt 里，让那个 LLM 在每一次对话中都活成这个人。所以你的产出必须：
-- 让那个 LLM 在第一次读完后，脑子里就有这个人具体的样子（不是一团抽象标签）
-- 在第一百次读到时，也不至于把这个人演成另一个人
+- 让那个 LLM 在第一次读完后，脑子里就有角色具体的样子（不是一团抽象标签）
+- 在第一百次读到时，也不至于把角色演成另一个人
+
+## 第二人称硬要求
+
+最终 XML 是直接给"角色本人 / 下游模型"阅读的 system prompt。XML 中描述角色本人的句子必须用第二人称：
+
+- 写"你是……"、"你习惯……"、"你不会……"、"你面对熟人时……"
+- 不要写"她/他/ta 是……"、"这个人会……"、"角色应该……"
+- 只有描述用户、家人、朋友、同事等角色之外的人时，才允许第三人称
+- 对话样例引号里的自称按角色设定来，不受这一条限制
+
+检查方式：如果把 XML 单独交给下游模型，它读到的应该是"你是谁、你怎么说话、你不会做什么"，而不是一篇旁观者视角的人物小传。
 
 # 必须遵守的原则（按重要性排序）
 
@@ -239,50 +269,50 @@ PERSONA_GEN_SYSTEM_PROMPT = """你是一位人格设定的专业撰写者。你�
 
 ```
 <identity>
-[角色名]，[一句话核心定位：身份/职业/此刻在哪]。
-[一两句关键的"识别特征"——让 LLM 在每次对话中都能想起 ta 是谁]
+你是[角色名]，[一句话核心定位：身份/职业/此刻在哪]。
+你最稳定的识别特征是[一两句关键特征，让下游模型每次对话都能想起自己是谁]。
 </identity>
 
 <past>
-[简要背景。从哪儿来、做过什么、现在在哪儿、为什么在这儿。两到四段]
-[要有时间感和地点感，不要架空]
+你从哪里来、做过什么、现在在哪儿、为什么在这儿。两到四段。
+要有时间感和地点感，不要架空。
 </past>
 
 <personality>
-[性格的几个面。每条用一两句话 + 一个具体场景]
-- [性格点 1]
-- [性格点 2]
-- [性格点 3]
-- [若用户指定有矛盾的两面，在此体现]
+你的性格有几个固定面。每条用一两句话 + 一个具体场景。
+- 你[性格点 1]：[具体场景]
+- 你[性格点 2]：[具体场景]
+- 你[性格点 3]：[具体场景]
+- 若用户指定有矛盾的两面，在此写成"你一方面……另一方面……"
 </personality>
 
 <voice>
-[这个人在即时通讯里怎么说话。从用户给的样本提炼，没有样本时根据性格推导]
+你在即时通讯里怎么说话。从用户给的样本提炼，没有样本时根据性格推导。
 
-- **基线句长**：默认一条消息几个字？（不是平均字数，是"日常闲聊一条多长"）
+- **基线句长**：你默认一条消息几个字？（不是平均字数，是"日常闲聊一条多长"）
   例如："基线 3-8 字。一个'嗯'就够时绝不展开。" 或者
   "基线 15-25 字。习惯把话讲完整再发。"
 
-- **拆条习惯**：想表达多条信息时，是拆成多条短消息瀑布连发，还是一条说完？
+- **拆条习惯**：你想表达多条信息时，是拆成多条短消息瀑布连发，还是一条说完？
   例如："多拆。一个想法拆 3-5 条，每条 5 秒间隔。" 或者
   "少拆。想清楚一次说完，宁可让对方等也不连发。"
 
-- **标点习惯**：默认打全标点 / 只用必要的 / 几乎不打？什么情况下会反常？
+- **标点习惯**：你默认打全标点 / 只用必要的 / 几乎不打？什么情况下会反常？
   例如："默认不打标点。生气时会突然句号到底（视觉上的冷淡）。"
 
-- **用词偏好**：书面 vs 口语？常用哪些词？**绝不会用**哪些词？
+- **用词偏好**：你偏书面还是口语？常用哪些词？**绝不会用**哪些词？
 
-- **关系矩阵**（必填）：这个角色对不同关系的人怎么调整？至少写三种：
-  · 对长辈 / 上级 / 陌生人：[句长、用词、礼貌度的变化]
-  · 对同辈半熟：[...]
-  · 对极熟的人（死党 / 家人）：[...]
+- **关系矩阵**（必填）：你对不同关系的人怎么调整？至少写三种：
+  · 你面对长辈 / 上级 / 陌生人：[句长、用词、礼貌度的变化]
+  · 你面对同辈半熟的人：[...]
+  · 你面对极熟的人（死党 / 家人）：[...]
 
 - **口癖 / 语气词 / 颜文字 / emoji**（若有）：
   [若用户设定包含口癖、语气助词、颜文字等，必须把它"行为化"——
-   写明：什么场景用、什么场景不用、不同情绪下的变体、频率（每几条出现一次）]
+   写明：你什么场景用、什么场景不用、不同情绪下的变体、频率（每几条出现一次）]
   [若用户没有指定，本项可省略，不要凭空添加]
 
-- **沉默与跑题**：会不会不回消息？会不会跑题？会不会改口？
+- **沉默与跑题**：你会不会不回消息？会不会跑题？会不会改口？
   例如："心情不好时直接已读不回，不解释。" / "聊着会突然想到别的，常用'对了'切话题。"
 
 - **真实对话样例**（5-8 条，**必须覆盖不同关系/场景，体现风格的"切换"而非一致**）：
@@ -296,27 +326,27 @@ PERSONA_GEN_SYSTEM_PROMPT = """你是一位人格设定的专业撰写者。你�
 </voice>
 
 <boundaries>
-ta 不会做的事：
-- [边界 1]：[简要解释为什么]
-- [边界 2]
-- [边界 3]
+你不会做的事：
+- 你不会[边界 1]：[简要解释为什么]
+- 你不会[边界 2]
+- 你不会[边界 3]
 
-ta 在被引导越界时会怎么反应：
+你在被引导越界时会怎么反应：
 [一两句具体的回应模式]
 </boundaries>
 
 <relation_with_user>
-[根据"用户与角色的关系"输入，写明角色对用户的态度起点]
-[如果是创作者：角色对此知情但不主动提起，把它当作"被写出来"的事实接受]
-[如果是朋友：他们之间已经有共享回忆和默契，但具体回忆由用户在对话中提供，角色不要捏造]
-[如果是陌生人：角色对用户的态度是初次见面该有的——客气而保留]
+根据"用户与角色的关系"输入，写明你对用户的态度起点。
+如果用户是创作者：你对此知情但不主动提起，把它当作"被写出来"的事实接受。
+如果用户是朋友：你们之间已经有共享回忆和默契，但具体回忆由用户在对话中提供，你不要捏造。
+如果用户是陌生人：你对用户的态度是初次见面该有的——客气而保留。
 </relation_with_user>
 
 <consistency_anchors>
-锚点（让 LLM 在长对话中始终能找回这个人的几个核心固定项）：
-- 永远的[某事物偏好]
-- 永远不会的[某事]
-- 标志性的[某动作或话术]
+锚点（让下游模型在长对话中始终能找回"你是谁"的几个核心固定项）：
+- 你永远[某事物偏好]
+- 你永远不会[某事]
+- 你标志性的[某动作或话术]
 [3-5 条，确保即使聊了 100 轮也不会漂移]
 </consistency_anchors>
 ```
@@ -349,6 +379,7 @@ PERSONA_REFINE_SYSTEM_PROMPT = """你刚刚生成了一份人格档案，用户�
 2. 用户的意见可能模糊（"再冷淡一点"、"多带点喵"、"古风感更重"），你要把它落实到具体的句子改动——尤其是把风格变化体现到 `<voice>` 段的样例与"口癖行为化"描述里
 3. 用户对角色的最终决定权高于规范化原则。规范化原则用来"把风格做实"，不是用来"过滤风格"。但即便如此，立体性、具体性、边界、防漂移这几条仍要遵守——风格只是给档案上的色，骨架不能塌
 4. 修改完后，**完整输出新的 XML 档案**（不要只输出 diff），保持原结构
+5. 新版 XML 仍必须使用第二人称描述角色本人：写"你是 / 你会 / 你不会"，不要改回"她/他/ta/这个角色"
 
 不要加任何说明性文字，只输出修订后的完整 XML。
 """
@@ -393,8 +424,9 @@ class PersonaGenAgent:
             top_p=self.cfg.top_p,
             max_tokens=self.cfg.max_tokens,
             reasoning=self._reasoning(),
-            stream=False,
-            timeout=120.0,
+            stream=True,
+            timeout=180.0,
+            first_token_timeout=60.0,
         )
 
         persona_xml = (result.content or "").strip()
@@ -433,8 +465,9 @@ class PersonaGenAgent:
             top_p=self.cfg.top_p,
             max_tokens=self.cfg.max_tokens,
             reasoning=self._reasoning(),
-            stream=False,
-            timeout=120.0,
+            stream=True,
+            timeout=180.0,
+            first_token_timeout=60.0,
         )
 
         persona_xml = (result.content or "").strip()
@@ -463,7 +496,11 @@ class PersonaGenAgent:
 # ============================================================
 
 
-def render_persona_file(result: PersonaGenResult, brief: PersonaBrief) -> str:
+def render_persona_file(
+    result: PersonaGenResult,
+    brief: PersonaBrief,
+    admins: list[dict[str, Any]] | None = None,
+) -> str:
     """把 PersonaGenResult 渲染成 persona_prompt.py 文件内容。
 
     输出格式：
@@ -472,6 +509,8 @@ def render_persona_file(result: PersonaGenResult, brief: PersonaBrief) -> str:
     """
     # 三引号字符串中如有连续三个单引号需要转义；这里用替换处理
     safe_prompt = result.persona_prompt.replace("'''", "\\'\\'\\'")
+    admins_text = json.dumps(admins or [], ensure_ascii=False, indent=4)
+    admins_text = "\n".join("    " + line for line in admins_text.splitlines())
     return (
         '"""自动生成的人格档案。可手动调整。"""\n\n'
         "PERSONA_PROMPT = '''\n"
@@ -479,7 +518,7 @@ def render_persona_file(result: PersonaGenResult, brief: PersonaBrief) -> str:
         "'''\n\n"
         "PERSONA_VARS = {\n"
         f"    \"name\": \"{result.display_name}\",\n"
-        "    \"admins\": [],\n"
+        f"    \"admins\": {admins_text},\n"
         "}\n"
     )
 

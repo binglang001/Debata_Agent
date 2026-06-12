@@ -18,9 +18,9 @@ from typing import Any
 
 import httpx
 from anthropic import (
-    AsyncAnthropic,
     APIError,
     APITimeoutError,
+    AsyncAnthropic,
     AuthenticationError,
     RateLimitError,
 )
@@ -177,6 +177,16 @@ class AnthropicProvider(IProvider):
 
             if role == "assistant":
                 blocks: list[dict[str, Any]] = []
+                blocks.extend(
+                    _normalize_reasoning_blocks(m.get("reasoning_blocks"))
+                )
+                if not blocks and "reasoning_content" in m:
+                    blocks.append(
+                        {
+                            "type": "thinking",
+                            "thinking": str(m.get("reasoning_content") or ""),
+                        }
+                    )
                 if content:
                     blocks.append({"type": "text", "text": content})
                 # 处理 tool_calls
@@ -240,26 +250,28 @@ class AnthropicProvider(IProvider):
         kwargs["stream"] = True
 
         events: list[Any] = []
-        got_first = False
-
-        async def _collect() -> None:
-            nonlocal got_first
-            async with self._client.messages.stream(**kwargs) as stream:
-                async for event in stream:
-                    if not got_first:
-                        got_first = True
-                    events.append(event)
 
         try:
-            if first_token_timeout is not None:
-                await asyncio.wait_for(_collect(), timeout=first_token_timeout)
-            else:
-                await _collect()
+            async with self._client.messages.stream(**kwargs) as stream:
+                iterator = stream.__aiter__()
+                try:
+                    if first_token_timeout is not None:
+                        first_event = await asyncio.wait_for(
+                            anext(iterator), timeout=first_token_timeout
+                        )
+                    else:
+                        first_event = await anext(iterator)
+                except StopAsyncIteration:
+                    first_event = None
+
+                if first_event is not None:
+                    events.append(first_event)
+                    async for event in iterator:
+                        events.append(event)
         except asyncio.TimeoutError:
-            if not got_first:
-                raise ProviderTimeoutError(
-                    f"{self.name}: 首 token 超时 ({first_token_timeout}s)"
-                ) from None
+            raise ProviderTimeoutError(
+                f"{self.name}: 首 token 超时 ({first_token_timeout}s)"
+            ) from None
 
         return self._assemble_from_events(events, kwargs.get("model", ""))
 
@@ -270,6 +282,7 @@ class AnthropicProvider(IProvider):
     def _build_result_from_response(self, response: Any, model: str) -> CompletionResult:
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
+        reasoning_blocks: list[dict[str, Any]] = []
         tool_calls: list[ToolCall] = []
         import json
 
@@ -278,7 +291,17 @@ class AnthropicProvider(IProvider):
             if btype == "text":
                 text_parts.append(getattr(block, "text", "") or "")
             elif btype == "thinking":
-                reasoning_parts.append(getattr(block, "thinking", "") or "")
+                thinking = getattr(block, "thinking", "") or ""
+                reasoning_parts.append(thinking)
+                out_block = {"type": "thinking", "thinking": thinking}
+                signature = getattr(block, "signature", None)
+                if signature:
+                    out_block["signature"] = signature
+                reasoning_blocks.append(out_block)
+            elif btype == "redacted_thinking":
+                data = getattr(block, "data", "") or ""
+                out_block = {"type": "redacted_thinking", "data": data}
+                reasoning_blocks.append(out_block)
             elif btype == "tool_use":
                 tool_calls.append(
                     ToolCall(
@@ -301,6 +324,7 @@ class AnthropicProvider(IProvider):
             content="".join(text_parts),
             tool_calls=tool_calls,
             reasoning_content="".join(reasoning_parts),
+            reasoning_blocks=reasoning_blocks,
             finish_reason=getattr(response, "stop_reason", "") or "",
             usage=usage,
             model=getattr(response, "model", "") or model,
@@ -313,6 +337,7 @@ class AnthropicProvider(IProvider):
         # 这里我们没有保留 stream context，所以从 events 中重建
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
+        reasoning_blocks_by_index: dict[int, dict[str, Any]] = {}
         tool_calls_by_index: dict[int, dict[str, Any]] = {}
         finish_reason = ""
         prompt_tokens = 0
@@ -326,7 +351,18 @@ class AnthropicProvider(IProvider):
                 block = getattr(ev, "content_block", None)
                 if block is None:
                     continue
-                if getattr(block, "type", "") == "tool_use":
+                btype = getattr(block, "type", "")
+                if btype == "thinking":
+                    reasoning_blocks_by_index[current_tool_index] = {
+                        "type": "thinking",
+                        "thinking": getattr(block, "thinking", "") or "",
+                    }
+                elif btype == "redacted_thinking":
+                    reasoning_blocks_by_index[current_tool_index] = {
+                        "type": "redacted_thinking",
+                        "data": getattr(block, "data", "") or "",
+                    }
+                elif btype == "tool_use":
                     tool_calls_by_index[current_tool_index] = {
                         "id": getattr(block, "id", ""),
                         "name": getattr(block, "name", ""),
@@ -340,12 +376,26 @@ class AnthropicProvider(IProvider):
                 if dtype == "text_delta":
                     text_parts.append(getattr(delta, "text", "") or "")
                 elif dtype == "thinking_delta":
-                    reasoning_parts.append(getattr(delta, "thinking", "") or "")
+                    thinking = getattr(delta, "thinking", "") or ""
+                    reasoning_parts.append(thinking)
+                    block = reasoning_blocks_by_index.setdefault(
+                        current_tool_index,
+                        {"type": "thinking", "thinking": ""},
+                    )
+                    block["thinking"] = str(block.get("thinking", "")) + thinking
                 elif dtype == "input_json_delta":
                     if current_tool_index in tool_calls_by_index:
                         tool_calls_by_index[current_tool_index]["arguments"] += (
                             getattr(delta, "partial_json", "") or ""
                         )
+                elif dtype == "signature_delta":
+                    block = reasoning_blocks_by_index.setdefault(
+                        current_tool_index,
+                        {"type": "thinking", "thinking": ""},
+                    )
+                    signature = getattr(delta, "signature", "") or ""
+                    if signature:
+                        block["signature"] = signature
             elif ev_type == "content_block_stop":
                 current_tool_index += 1
             elif ev_type == "message_delta":
@@ -376,6 +426,13 @@ class AnthropicProvider(IProvider):
                 if v["name"]
             ],
             reasoning_content="".join(reasoning_parts),
+            reasoning_blocks=[
+                v
+                for _, v in sorted(reasoning_blocks_by_index.items())
+                if v.get("type") == "redacted_thinking"
+                or v.get("thinking")
+                or "signature" in v
+            ],
             finish_reason=finish_reason,
             usage=Usage(
                 prompt_tokens=prompt_tokens,
@@ -385,3 +442,30 @@ class AnthropicProvider(IProvider):
             model=model,
             raw=None,
         )
+
+
+def _normalize_reasoning_blocks(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    blocks: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        btype = item.get("type")
+        if btype == "thinking":
+            block = {
+                "type": "thinking",
+                "thinking": str(item.get("thinking") or ""),
+            }
+            signature = item.get("signature")
+            if signature:
+                block["signature"] = str(signature)
+            blocks.append(block)
+        elif btype == "redacted_thinking":
+            blocks.append(
+                {
+                    "type": "redacted_thinking",
+                    "data": str(item.get("data") or ""),
+                }
+            )
+    return blocks

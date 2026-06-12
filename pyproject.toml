@@ -1,7 +1,7 @@
 [project]
-name = "diana_agent"
+name = "debata_agent"
 version = "0.2.0-dev"
-description = "Diana_Agent —— 让虚拟角色真正活过来的通用聊天智能体框架"
+description = "Debata_Agent —— 让虚拟角色真正活过来的通用聊天智能体框架"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "binglang" }]
@@ -23,6 +23,7 @@ dependencies = [
     "pydantic-settings>=2.2.0",
     "pyyaml>=6.0.1",
     "orjson>=3.10.0",         # 高速 JSON
+    "tiktoken>=0.7.0",        # 上下文 token 预算估算
 
     # === 加密与密钥管理 ===
     "cryptography>=42.0.0",   # AES-GCM + RSA
@@ -32,9 +33,9 @@ dependencies = [
     "ddgs>=8.0.0",            # DuckDuckGo 搜索
     "platformdirs>=4.2.0",    # 跨平台用户数据目录
     "python-dotenv>=1.0.0",   # 旧 .env 迁移时使用
+    "pypdf>=4.0.0",           # workspace 内 PDF 文件文本抽取
 
-    # === GUI（Phase 2 引入，先列出占位）===
-    # "PySide6>=6.7.0",
+    # GUI 依赖放在 optional-dependencies.gui，服务器/无头部署可不安装 Qt。
 ]
 
 [project.optional-dependencies]
@@ -43,14 +44,26 @@ perf = [
     "uvloop>=0.19.0 ; sys_platform != 'win32'",
 ]
 
-# 本地 ASR 插件（Phase 3）
+# 本地 ASR 插件依赖。也会在用户打开模型安装指引时按需后台安装。
 asr-local = [
-    "faster-whisper>=1.0.0",
 ]
 
-# 本地 TTS 插件（Phase 3）
+# 本地 TTS 插件依赖。也会在用户打开模型安装指引时按需后台安装。
 tts-local = [
-    # VoxCPM2 依赖按需安装
+    "voxcpm>=2.0.0",
+    "soundfile>=0.12.1",
+]
+
+# 本地 Embedding 插件依赖。也会在用户打开模型安装指引时按需后台安装。
+embedding-local = [
+    "sentence-transformers>=2.7.0",
+]
+
+# 一次性安装全部本地模型运行依赖。
+local-models = [
+    "voxcpm>=2.0.0",
+    "soundfile>=0.12.1",
+    "sentence-transformers>=2.7.0",
 ]
 
 # GUI（Phase 2）
@@ -64,27 +77,49 @@ dev = [
     "ruff>=0.5.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "setuptools>=65",
 ]
 
 [project.scripts]
-diana = "main:main"
+debata = "main:main"
 
 [build-system]
 requires = ["setuptools>=65", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = [
-    "core",
-    "adapters", "adapters.napcat",
-    "providers", "providers.protocols",
-    "agents",
-    "memory",
-    "features", "features.vision", "features.asr", "features.tts",
-    "features.weather", "features.web_search",
-    "tools",
-    "app_config",
-    "ui", "ui.dashboard", "ui.wizard", "ui.settings",
+[tool.setuptools.packages.find]
+include = [
+    "adapters*",
+    "agents*",
+    "app_config*",
+    "core*",
+    "features*",
+    "memory*",
+    "plugins*",
+    "providers*",
+    "tools*",
+    "ui*",
+    "utils*",
+]
+exclude = [
+    "data*",
+    "docs*",
+    "personas*",
+    "tests*",
+]
+
+[tool.setuptools.package-data]
+providers = [
+    "presets/*/preset.yaml",
+    "presets/*/tutorial/*.md",
+    "presets/*/tutorial/.gitkeep",
+    "presets/*/icon.png",
+]
+plugins = [
+    "PLUGIN_SPEC.md",
+    "voxcpm2/*.py",
+    "embedding_bge_zh/*.py",
+    "embedding_minilm/*.py",
 ]
 
 [tool.ruff]

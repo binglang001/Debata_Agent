@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 
 import pytest
@@ -12,15 +11,13 @@ from adapters.base import AdapterAPIError, AdapterNotConnectedError
 from adapters.napcat.adapter import NapCatAdapter
 from adapters.napcat.api_call import NapCatApiCaller
 from adapters.napcat.connection import NapCatConnection
+from adapters.napcat.process import NapCatProcessManager
 from adapters.types import (
     FriendInfo,
     GroupInfo,
-    GroupMemberInfo,
     IncomingMessage,
-    NoticeType,
     Target,
 )
-
 
 # ============================================================
 # FakeConnection：内存版连接，不开真实 WebSocket
@@ -66,6 +63,22 @@ class FakeConnection(NapCatConnection):
     async def simulate_receive(self, data: dict) -> None:
         """模拟从 NapCat 收到一条消息。"""
         await self._dispatch(data)
+
+
+def test_process_manager_uses_cmd_for_windows_bat(tmp_path, monkeypatch):
+    script = tmp_path / "start.bat"
+    script.write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setattr("adapters.napcat.process.sys.platform", "win32")
+    monkeypatch.setenv("COMSPEC", "C:\\Windows\\System32\\cmd.exe")
+
+    manager = NapCatProcessManager(script, args=["--demo"])
+
+    assert manager._build_command() == [
+        "C:\\Windows\\System32\\cmd.exe",
+        "/c",
+        str(script),
+        "--demo",
+    ]
 
 
 # ============================================================
@@ -466,3 +479,61 @@ async def test_adapter_get_file_url_failure_returns_none():
     asyncio.create_task(respond_failed())
     url = await adapter.get_file_url("missing")
     assert url is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_voice_text_retries_pending_result():
+    conn = FakeConnection()
+    adapter = NapCatAdapter("napcat_test", conn, voice_fetch_delay_seconds=0)
+    await adapter.start()
+
+    async def respond():
+        while len(conn.sent) < 1:
+            await asyncio.sleep(0.001)
+        await conn._dispatch({
+            "status": "failed",
+            "retcode": 1200,
+            "message": "获取语音转文字结果失败",
+            "echo": conn.sent[-1]["echo"],
+        })
+        while len(conn.sent) < 2:
+            await asyncio.sleep(0.001)
+        await conn._dispatch({
+            "status": "ok",
+            "retcode": 0,
+            "data": {"text": "识别好了"},
+            "echo": conn.sent[-1]["echo"],
+        })
+
+    asyncio.create_task(respond())
+    text = await adapter.fetch_voice_text("123")
+
+    assert text == "识别好了"
+    assert [c["action"] for c in conn.sent] == ["fetch_ptt_text", "fetch_ptt_text"]
+
+
+@pytest.mark.asyncio
+async def test_send_voice_timeout_is_treated_as_possible_success(tmp_path):
+    conn = FakeConnection()
+    adapter = NapCatAdapter("napcat_test", conn)
+    await adapter.start()
+    wav = tmp_path / "voice.wav"
+    wav.write_bytes(b"RIFF")
+
+    async def respond_timeout():
+        while not conn.sent:
+            await asyncio.sleep(0.001)
+        await conn._dispatch({
+            "status": "failed",
+            "retcode": 1200,
+            "message": "Timeout: NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg",
+            "echo": conn.sent[-1]["echo"],
+        })
+
+    asyncio.create_task(respond_timeout())
+    mid = await adapter.send_voice(
+        Target(adapter="napcat_test", scope="private", target_id="10001"),
+        wav,
+    )
+
+    assert mid is None

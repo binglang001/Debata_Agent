@@ -31,8 +31,8 @@ def test_reasoning_config_defaults():
     assert rc.budget is None
 
 
-def test_normalize_messages_strips_extras():
-    """未知字段（如 'reasoning_content' on assistant）应被剔除。"""
+def test_normalize_messages_strips_extras_by_default():
+    """默认仍剔除 provider 专属字段，避免发给不支持的 SDK。"""
     messages = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "hi", "extra_field": "boom"},
@@ -48,6 +48,20 @@ def test_normalize_messages_strips_extras():
     assert "extra_field" not in out[1]
     assert "reasoning_content" not in out[2]
     assert "weird" not in out[2]
+
+
+def test_normalize_messages_can_preserve_assistant_reasoning_content():
+    """DeepSeek/Qwen 思考模式多轮回放需要保留 reasoning_content，含空字符串。"""
+    messages = [
+        {"role": "user", "content": "hi", "reasoning_content": "ignore"},
+        {"role": "assistant", "content": "ok", "reasoning_content": ""},
+        {"role": "assistant", "content": "done", "reasoning_content": "I think"},
+    ]
+    out = normalize_messages(messages, preserve_reasoning_content=True)
+
+    assert "reasoning_content" not in out[0]
+    assert out[1]["reasoning_content"] == ""
+    assert out[2]["reasoning_content"] == "I think"
 
 
 def test_normalize_messages_preserves_tool_call_structure():

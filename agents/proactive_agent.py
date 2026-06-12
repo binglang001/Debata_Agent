@@ -1,7 +1,7 @@
 """主动思考路由 Agent —— 用小模型判断是否需要主动发言。
 
 行为（沿用 V1 语义）：
-    每隔 greeting_interval 触发一次。给模型当前历史 + "想聊天就回 TAKE_ACTIONS"。
+    每隔 behavior.proactive_think_interval_seconds 触发一次。给模型当前历史 + "想聊天就回 TAKE_ACTIONS"。
     如果模型说 TAKE_ACTIONS，再用主 ChatAgent 跑一次完整循环。
 
 为了节省 token，proactive 用单次（非工具循环）调用，不带 tools。
@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 ROUTER_INSTRUCTION = (
     "你现在处于后台主动思考模式。快速判断：是否需要发消息给任何人？"
+    "如果历史里有人明确要求你在“下次主动思考”时发消息、提醒用户或执行明确操作，"
+    "本轮就是执行时机，应回复 TAKE_ACTIONS。"
     "只回复 TAKE_ACTIONS（需要）或 NO_ACTIONS（不需要）。不要解释。"
 )
 
@@ -53,9 +55,9 @@ class ProactiveRouterAgent:
                 top_p=self.cfg.top_p,
                 max_tokens=self.cfg.max_tokens,
                 reasoning=self._to_provider_reasoning(),
-                stream=False,
-                timeout=self.cfg.first_token_timeout * 2,
-                first_token_timeout=self.cfg.first_token_timeout,
+                stream=True,
+                timeout=self.cfg.first_token_timeout_seconds * 2,
+                first_token_timeout=self.cfg.first_token_timeout_seconds,
             )
         except ProviderError as e:
             logger.warning(f"主动路由判断失败: {e}，默认不操作")
@@ -65,7 +67,7 @@ class ProactiveRouterAgent:
             return False
 
         text = (result.content or "").strip().upper()
-        decision = "TAKE_ACTIONS" in text
+        decision = _is_action_decision(text)
         logger.info(f"主动路由: text={text[:40]!r}, decision={decision}")
         return decision
 
@@ -77,3 +79,17 @@ class ProactiveRouterAgent:
             budget=self.cfg.reasoning.budget,
             max_tokens=self.cfg.reasoning.max_tokens,
         )
+
+
+def _is_action_decision(text: str) -> bool:
+    """解析主动路由输出。
+
+    主动路由只能接受干净的 TAKE_ACTIONS。模型吐 DSML / 工具标记时属于
+    无工具调用场景下的畸形输出，不能当作需要行动，否则会周期性空跑主模型。
+    """
+    normalized = (text or "").strip().upper()
+    if normalized == "TAKE_ACTIONS":
+        return True
+    if normalized == "NO_ACTIONS":
+        return False
+    return False

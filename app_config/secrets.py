@@ -33,11 +33,22 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-import keyring
+try:
+    import keyring
+except ImportError:
+    keyring = None  # type: ignore[assignment]
 
 from .paths import AppPaths
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_keyring():
+    """检查 keyring 是否可用，不可用则抛 SecretsError。"""
+    if keyring is None:
+        raise SecretsError(
+            "当前环境无 keyring 后端。请安装 keyring 或设置 KEYRING_BACKEND 环境变量。"
+        )
 
 
 class SecretsError(Exception):
@@ -84,6 +95,31 @@ class SecretsManager:
         self._initialized = True
         logger.info(f"密钥管理器已加载，{len(self._records)} 条密钥")
 
+    def reset_all(self) -> None:
+        """彻底清空密钥基础设施（用于换环境/keyring 损坏导致解密失败的恢复）。
+
+        清掉：keyring 的 RSA 私钥（所有段）、rsa_public.pem、secrets.meta、secrets.enc。
+        清掉后下次 initialize() 会按首次启动流程重建。
+        所有用户密钥（API key 等）会丢失，需要用户重新填。
+        """
+        # keyring 中的 RSA 私钥分段
+        try:
+            self._clear_rsa_private_from_keyring()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"清 keyring 时出错（忽略继续）：{e}")
+        # 文件
+        for f in (self.paths.RSA_PUBLIC_KEY_FILE, self.paths.SECRETS_META_FILE, self.paths.SECRETS_FILE):
+            try:
+                if f.exists():
+                    f.unlink()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"删除 {f} 失败：{e}")
+        # 内存状态
+        self._aes_key = None
+        self._records = {}
+        self._initialized = False
+        logger.info("SecretsManager 已重置，下次 initialize() 会全部重建")
+
     def set(self, key_id: str, plaintext: str) -> None:
         """加密并保存一条密钥。已存在则覆盖。"""
         self._require_initialized()
@@ -121,7 +157,7 @@ class SecretsManager:
                 nonce, ciphertext, associated_data=key_id.encode("utf-8")
             ).decode("utf-8")
         except Exception as e:
-            logger.error(f"密钥 {key_id} 解密失败: {type(e).__name__}")
+            logger.error(f"密钥 {key_id} 解密失败: {type(e).__name__}: {e}")
             return None
 
     def get_required(self, key_id: str) -> str:

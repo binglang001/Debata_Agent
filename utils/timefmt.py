@@ -1,4 +1,4 @@
-"""时间格式化辅助。从旧 diana_agent/utils.py 迁移。"""
+"""时间格式化辅助。从旧 debata_agent/utils.py 迁移。"""
 
 from __future__ import annotations
 

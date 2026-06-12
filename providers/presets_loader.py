@@ -33,6 +33,7 @@ from pathlib import Path
 import yaml
 
 logger = logging.getLogger(__name__)
+_PRESETS_CACHE: dict[Path, dict[str, ProviderPreset]] = {}
 
 
 @dataclass(slots=True)
@@ -73,7 +74,7 @@ class ProviderPreset:
 
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> ProviderPreset:
-        with open(yaml_path, "r", encoding="utf-8") as f:
+        with open(yaml_path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
 
         if not data.get("id"):
@@ -99,11 +100,15 @@ class ProviderPreset:
         return [m.id for m in self.models]
 
 
-def load_all_presets(presets_dir: Path) -> dict[str, ProviderPreset]:
+def load_all_presets(presets_dir: Path, *, force_reload: bool = False) -> dict[str, ProviderPreset]:
     """扫描 providers/presets/ 下的所有目录，加载每个的 preset.yaml。
 
     返回 {id: ProviderPreset}。重复 id 会报错。
     """
+    presets_dir = presets_dir.resolve()
+    if not force_reload and presets_dir in _PRESETS_CACHE:
+        return dict(_PRESETS_CACHE[presets_dir])
+
     if not presets_dir.exists():
         logger.warning(f"预设目录不存在: {presets_dir}")
         return {}
@@ -125,5 +130,6 @@ def load_all_presets(presets_dir: Path) -> dict[str, ProviderPreset]:
             logger.warning(f"预设 ID 重复，覆盖: {preset.id} ({d})")
         result[preset.id] = preset
 
+    _PRESETS_CACHE[presets_dir] = dict(result)
     logger.info(f"加载 {len(result)} 个预设: {sorted(result.keys())}")
-    return result
+    return dict(result)

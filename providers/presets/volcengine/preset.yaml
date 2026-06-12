@@ -6,6 +6,11 @@ registration_url: https://www.volcengine.com/product/ark
 reasoning_style: thinking_extra_body
 
 models:
+  - id: doubao-seed-2-0-lite-260428
+    display_name: 豆包 Seed 2.0 Lite
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 256000
+
   - id: doubao-seed-1-6-vision-250815
     display_name: 豆包 Seed 1.6 Vision
     capabilities: [chat, vision]

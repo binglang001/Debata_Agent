@@ -3,7 +3,7 @@
 NapCat 上报符合 OneBot V11 规范的 JSON。这里负责：
     1. 识别 post_type（message / notice / request / meta_event）
     2. 提取关键字段（user_id / group_id / message_id 等）
-    3. 用 _parse_raw_message 解析 CQ 码（保留位置和重复 @ 等细节）
+    3. 用 utils.parse_raw_cq 解析 CQ 码（与 message_pipeline 共用一份实现）
     4. 提取 media segments（图片/语音/文件 等），便于业务层统一处理
 """
 
@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
 from adapters.types import (
     AnyEvent,
-    EventType,
     IncomingMessage,
     IncomingNotice,
     IncomingRequest,
@@ -25,6 +25,7 @@ from adapters.types import (
     NoticeType,
     RequestType,
 )
+from utils import parse_raw_cq
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +75,13 @@ def _parse_message(adapter_name: str, raw: dict[str, Any]) -> IncomingMessage | 
     group_id = str(raw["group_id"]) if msg_type == "group" else None
 
     raw_message_str = raw.get("raw_message", "") or ""
-    message_segments = raw.get("message", []) or []
+    message_payload = raw.get("message", []) or []
+    message_segments = message_payload if isinstance(message_payload, list) else []
 
     # 提取媒体段
     media = _extract_media(message_segments)
+    if not media and raw_message_str:
+        media = _extract_media_from_cq(raw_message_str)
 
     # 提取 reply_to（如果有）
     reply_to: str | None = None
@@ -89,8 +93,8 @@ def _parse_message(adapter_name: str, raw: dict[str, Any]) -> IncomingMessage | 
                 break
 
     # 重建可读文本（保留 @、表情、reply 等结构化标记）
-    self_qq_for_display = self_id
-    text = _parse_raw_message(raw_message_str, self_qq_for_display)
+    # 与 message_pipeline._build_readable_text 用同一份实现，避免漂移
+    text = parse_raw_cq(raw_message_str, self_id)
 
     return IncomingMessage(
         adapter=adapter_name,
@@ -144,12 +148,15 @@ def _extract_media(segments: list[Any]) -> list[MediaSegment]:
                 )
             )
         elif seg_type == "file":
+            url = data.get("url") or data.get("path") or data.get("file_path")
+            file_id = data.get("file_id") or data.get("file")
+            name = data.get("file_name") or data.get("name") or _basename(url or file_id)
             out.append(
                 MediaSegment(
                     type=MediaType.FILE,
-                    file_id=data.get("file") or data.get("file_id"),
-                    name=data.get("file_name") or data.get("name"),
-                    url=data.get("url"),
+                    file_id=file_id,
+                    name=name,
+                    url=url,
                 )
             )
         elif seg_type == "forward":
@@ -160,6 +167,85 @@ def _extract_media(segments: list[Any]) -> list[MediaSegment]:
                 )
             )
     return out
+
+
+_CQ_SEGMENT_RE = re.compile(r"\[CQ:(?P<body>[^\]]+)\]")
+_PARAM_SPLIT_RE = re.compile(r",(?=\w+=)")
+
+
+def _extract_media_from_cq(raw_message: str) -> list[MediaSegment]:
+    """兼容 message 为字符串时的 CQ 媒体段。
+
+    NapCat/OneBot 可以按字符串或数组上报 message。数组模式会带结构化 data；
+    字符串模式只能从 raw_message 的 CQ 参数兜底提取 file/url/name。
+    """
+    out: list[MediaSegment] = []
+    for match in _CQ_SEGMENT_RE.finditer(raw_message):
+        body = match.group("body")
+        if "," in body:
+            cq_type, params_str = body.split(",", 1)
+        else:
+            cq_type, params_str = body, ""
+        params = _parse_cq_params(params_str)
+        if cq_type == "image":
+            file_id = params.get("file")
+            out.append(
+                MediaSegment(
+                    type=MediaType.IMAGE,
+                    file_id=file_id,
+                    url=params.get("url") or file_id,
+                )
+            )
+        elif cq_type == "record":
+            file_id = params.get("file")
+            out.append(
+                MediaSegment(
+                    type=MediaType.VOICE,
+                    file_id=file_id,
+                    url=params.get("url"),
+                )
+            )
+        elif cq_type == "video":
+            file_id = params.get("file")
+            out.append(
+                MediaSegment(
+                    type=MediaType.VIDEO,
+                    file_id=file_id,
+                    url=params.get("url"),
+                )
+            )
+        elif cq_type == "file":
+            url = params.get("url") or params.get("path") or params.get("file_path")
+            file_id = params.get("file_id") or params.get("file")
+            name = params.get("file_name") or params.get("name") or _basename(url or file_id)
+            out.append(
+                MediaSegment(
+                    type=MediaType.FILE,
+                    file_id=file_id,
+                    name=name,
+                    url=url,
+                )
+            )
+    return out
+
+
+def _parse_cq_params(params_str: str) -> dict[str, str]:
+    if not params_str:
+        return {}
+    params: dict[str, str] = {}
+    for part in _PARAM_SPLIT_RE.split(params_str):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            params[key] = value
+    return params
+
+
+def _basename(value: str | None) -> str | None:
+    if not value:
+        return None
+    if "\\" in value or re.match(r"^[A-Za-z]:", value):
+        return PureWindowsPath(value).name
+    return PurePosixPath(value).name
 
 
 # ============================================================
@@ -174,13 +260,20 @@ _NOTICE_TYPE_MAP: dict[str, NoticeType] = {
     "group_decrease": NoticeType.GROUP_DECREASE,
     "group_admin": NoticeType.GROUP_ADMIN,
     "friend_add": NoticeType.FRIEND_ADD,
-    "notify": NoticeType.POKE,  # sub_type=poke 时
 }
 
 
 def _parse_notice(adapter_name: str, raw: dict[str, Any]) -> IncomingNotice | None:
     nt_raw = raw.get("notice_type", "")
-    nt = _NOTICE_TYPE_MAP.get(nt_raw, NoticeType.OTHER)
+    if nt_raw == "notify":
+        # notify 下还有 sub_type 进一步细分（poke / lucky_king / honor / ...）
+        sub_type = raw.get("sub_type", "")
+        if sub_type == "poke":
+            nt = NoticeType.POKE
+        else:
+            nt = NoticeType.OTHER
+    else:
+        nt = _NOTICE_TYPE_MAP.get(nt_raw, NoticeType.OTHER)
 
     return IncomingNotice(
         adapter=adapter_name,
@@ -243,85 +336,6 @@ def _parse_meta(adapter_name: str, raw: dict[str, Any]) -> MetaEvent:
         sub_type=raw.get("sub_type", ""),
         raw=raw,
     )
-
-
-# ============================================================
-# CQ 码解析（从旧 handler.py:_parse_raw_cq 迁移并增强）
-# ============================================================
-
-
-_CQ_PARAM_SPLIT = re.compile(r",(?=\w+=)")
-
-
-def _parse_raw_message(raw: str, bot_qq: str) -> str:
-    """把 CQ 码字符串解析为人类可读文本。
-
-    保留：
-        - @ 的精确位置和重复（绕过 NoneBot 适配器的合并优化）
-        - reply 信息（提取到开头作为 [引用msg_id=xxx]）
-        - 表情/图片/语音等占位
-
-    这是从旧实现（handler.py:_parse_raw_cq）原样迁移过来的逻辑，仅作了输入参数化。
-    """
-    if not raw:
-        return ""
-
-    result: list[str] = []
-    i = 0
-    while i < len(raw):
-        if raw[i : i + 4] == "[CQ:":
-            end = raw.find("]", i)
-            if end == -1:
-                result.append(raw[i:])
-                break
-            cq = raw[i + 4 : end]
-            if "," in cq:
-                cq_type = cq[: cq.index(",")]
-                params_str = cq[cq.index(",") + 1 :]
-            else:
-                cq_type = cq
-                params_str = ""
-
-            params: dict[str, str] = {}
-            if params_str:
-                for p in _CQ_PARAM_SPLIT.split(params_str):
-                    if "=" in p:
-                        k, v = p.split("=", 1)
-                        params[k] = v
-
-            if cq_type == "at":
-                qq = params.get("qq", "")
-                if qq == "all":
-                    result.append("@全体成员")
-                elif qq == bot_qq:
-                    result.append("@我")
-                else:
-                    result.append(f"@QQ{qq}")
-            elif cq_type == "reply":
-                msg_id = params.get("id", "")
-                result.insert(0, f"[引用msg_id={msg_id}]")
-            elif cq_type == "image":
-                result.append("[图片]")
-            elif cq_type == "record":
-                result.append("[语音]")
-            elif cq_type == "video":
-                result.append("[视频]")
-            elif cq_type == "face":
-                face_id = params.get("id", "")
-                result.append(f"[表情{face_id}]")
-            elif cq_type == "forward":
-                fid = params.get("id", "")
-                result.append(f"[合并转发 id={fid}]")
-            elif cq_type == "file":
-                result.append("[文件]")
-            else:
-                result.append(f"[{cq_type}]")
-            i = end + 1
-        else:
-            result.append(raw[i])
-            i += 1
-
-    return "".join(result).strip()
 
 
 # ============================================================

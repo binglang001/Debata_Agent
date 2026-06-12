@@ -1,6 +1,6 @@
 # 架构总览
 
-Diana_Agent 各模块职责与依赖关系。
+Debata_Agent 各模块职责与依赖关系。
 
 ---
 
@@ -28,13 +28,13 @@ MessagePipeline / RecallHandler / RequestHandler
   ↓
 ChatAgent.run(messages, tools, executor)
   ├─ IProvider.chat_completion() → 多轮工具循环
-  └─ ToolRegistry.executor → 工具执行（17 个工具）
-       ├─ messaging tools → ctx.collected
-       ├─ memory tools → ImportantMemoryManager
+  └─ ToolRegistry.executor → 工具执行（按配置启用）
+       ├─ messaging tools → MessagePipeline 异步发送队列
+       ├─ memory tools → ImportantMemoryManager（scope / pinned 元数据）
        ├─ platform tools → IAdapter.list_friends / get_user_info / ...
        └─ feature tools → IVisionService / IWebSearchService / ...
   ↓
-MessagePipeline._execute_collected()（真实发送 + 中断检测）
+MessagePipeline.SendManager（真实发送 + 中断检测 + send_receipt）
   ↓
 IAdapter.send_text() → 用户收到消息
 ```
@@ -47,13 +47,14 @@ IAdapter.send_text() → 用户收到消息
 |------|------|------|---------|
 | `app_config` | - | `RootConfig`, `AppPaths`, `SecretsManager` | ✅ |
 | `adapters` | `app_config` | `IAdapter`, `NapCatAdapter`, `Target`, `IncomingMessage` | ✅ |
-| `providers` | - | `IProvider`, `build_provider()`, 10 个预设 | ✅ |
+| `providers` | - | `IProvider`, `build_provider()`, 13 个预设 | ✅ |
 | `memory` | - | `HistoryManager`, `ImportantMemoryManager` | ✅ |
 | `agents` | `providers`, `memory`, `app_config` | `ChatAgent`, `Persona`, `build_messages()`, prompts | ✅ |
 | `tools` | `adapters`, `memory`, `providers`, `app_config` | `ToolRegistry`, `ToolContext`, `build_default_registry()` | ✅ |
-| `core` | 上面全部 | `Runtime`, `MessagePipeline`, `EventBus` | 🚧 P1.8 |
-| `features` | `providers` | `IVisionService`, ... | 🚧 P2 |
-| `ui` | `core`, `app_config` | `WizardWindow`, `DashboardWindow`, `Tray` | 🚧 P2 |
+| `core` | 上面全部 | `Runtime`, `MessagePipeline`, `EventBus` | ✅ |
+| `features` | `providers` | `IVisionService`, `IWebSearchService`, `IWeatherService`, `IEmbeddingService`, `IASRService`, `ITTSService` | ✅（Vision/WebSearch/Weather/Embedding 已实装；TTS 支持 API 与本地 VoxCPM2；ASR 支持 API，Whisper 本地插件预留） |
+| `plugins` | `features` | `PluginManager`, `PluginMeta`, `PluginStatus` | ✅（VoxCPM2 与本地 embedding 已接入；Whisper 本地 ASR 待插件实装） |
+| `ui` | `core`, `app_config` | `WizardWindow`, `DashboardWindow`, `Tray` | ✅ |
 | `utils` | - | `parse_raw_cq`, `MetricsProvider`, `get_time` | ✅ |
 
 ---
@@ -87,14 +88,91 @@ IAdapter.send_text() → 用户收到消息
 
 ---
 
+## 工具结果创建即定型
+
+工具结果只在刚返回时做一次精简，写入 `history` 后不再回改。这样旧 `tool` record 的字节稳定，避免为了清理长结果而破坏 KV 缓存前缀。
+
+入口：
+
+- 工具内部做语义明确的精简，例如 `describe_image` 保存完整描述、`get_user_info` 丢弃二进制 buffer、`read_file` 分页。
+- `tools.result_shrink.shrink_tool_result()` 在 `ToolRegistry` executor 出口做统一兜底，例如搜索结果、合并转发、Python 输出、超长未知工具结果。
+
+相关配置位于 `behavior.context`：
+
+- `tool_result_soft_limit_tokens`：默认 600，超过后走工具特定精简策略。
+- `tool_result_hard_cap_tokens`：默认 1500，超过后做中央 head/tail 截断。
+- `tool_result_soft_overrides`：按工具名覆盖软阈值，如 `describe_image=900`。
+
+设置页「高级 → 上下文预算」提供对应入口。
+
+---
+
 ## 长期记忆双模式
 
 `features.long_term_memory.mode`：
 
 - **`file`**（默认）：AI 主动调 `save_important_memory` + 关键词强制保存（"记住"/"约定"/"我叫"）。零开销、完全透明。
-- **`rag`**（P2）：被动抽取 + 向量库 + 语义检索。AI 不调主动保存工具。需要 `features.embedding` 启用。
+- **`rag`**：同样保存重要记忆，并给新条目维护向量索引；上下文注入时按语义检索相关条目。需要 `features.embedding` 启用。
 
-切换模式时，`build_tool_use_protocol(memory_mode)` 会动态注入不同的工具说明，避免在 RAG 模式下还告诉 AI 主动保存。
+切换模式时，`build_tool_use_protocol(memory_mode)` 会动态注入不同的工具说明，区分文件直写与 RAG 语义检索的使用方式。
+
+重要记忆是一份全局存储，不按会话拆库。每条记忆有两个呈现层元数据：
+
+- `scope`：`global` / `user:{qq}` / `group:{gid}`，只决定当前轮优先注入哪些记忆。
+- `pinned`：置顶记忆永远注入，不受当前会话 scope 过滤；普通记忆受 `memory_token_budget` 控制。
+
+`MessagePipeline` 会把当前 `conversation_id` 映射到记忆 scope：`private:123 → user:123`，`group:456 → group:456`。关键词保存与 `save_important_memory` 默认使用当前会话 scope，除非工具参数显式指定。
+
+### RAG 装配
+
+`core/runtime.py::_setup_rag` 在 `mode=rag` 时按顺序装：
+
+```
+features.embedding.provider → 复用现有 LLM provider 的 base_url
+                            → OpenAICompatEmbeddingService(base_url, key, model)
+mem_dir / rag.jsonl         → RagStore（cosine top-k 检索）
+ImportantMemoryManager.attach_rag(svc, store)
+```
+
+之后 `ImportantMemoryManager.save()` 会自动给新条目算 embedding 并存 rag.jsonl。
+`message_pipeline` 拼上下文时用最后一条用户消息当 query 调 `retrieve_for_query()`：
+先按当前 scope 过滤候选，再做 cosine top-k，最后合并 pinned 常驻记忆，省 token 且减少跨群/私聊误召回。
+
+向量算法（`memory/rag_store.cosine_similarity`）固定用余弦相似度；
+不做归一化（外面传进来的向量保留原长度，cosine 公式自带归一化）。
+
+---
+
+## 本地归档总结
+
+`recall_history` 和 `summarize_conversation` 读取本地 `ArchiveStore` + 当前活跃 `HistoryManager`：
+
+- `recall_history` 返回匹配原文片段，用于找旧 msg_id、旧约定或精确上下文。
+- `summarize_conversation(conversation_id?, range_hint?, goal?, max_tokens?)` 用总结模型整理本地归档，私聊和群聊都可用。
+
+`summarize_chat_history` 是另一个工具：它通过 NapCat/QQ 服务器侧接口拉取指定群的近期群消息，只适合补充本地归档以外的群历史，不支持私聊。
+
+---
+
+## 插件机制
+
+`plugins/` 给「重依赖 / 本地模型」类能力一个统一安装入口。Runtime 启动时扫描 `plugins/{name}/__plugin__.py`，
+按 `features.{tts,embedding}.type=local` 决定要不要 build 实例并注入运行时。
+
+```
+plugins/{name}/
+  __plugin__.py    # PLUGIN_META + build(config) -> service
+  voxcpm_impl.py   # 真正的实现（lazy import 重依赖）
+data/models/{name}/  # 模型文件，不入仓库
+```
+
+主程序只依赖 `features/` 的轻量接口（`ITTSService` / `IEmbeddingService`），
+插件实现这些接口即可。完整规格见 [plugins/PLUGIN_SPEC.md](../plugins/PLUGIN_SPEC.md)。
+
+UI 入口在仪表盘「模型管理」页：列表 + 详情 + 安装指引。实际启用与参数配置在设置页对应 feature 区域完成。
+
+工具系统挂钩：TTS 启用时 `tools/feature_tools.send_voice_message` 才生效。
+ASR 不出现在工具里。QQ/NapCat 渠道使用 NapCat 内置 `fetch_ptt_text`。
 
 ---
 
@@ -109,6 +187,8 @@ main.py → Runtime.start()
   5. build providers (各 LLM)
   6. ChatAgent / ProactiveRouterAgent / SummaryAgent
   7. features 服务（vision/web_search/weather, 按配置）
+  7.5 RAG（embedding + rag_store）若 mode=rag
+  7.6 PluginManager.scan() + build TTS/Embedding（若 type=local）
   8. NapCatAdapter
   9. ToolRegistry（按 features 启用）
   10. WakeupScheduler / PendingRequestStore / RateLimiter
@@ -128,15 +208,15 @@ Runtime.shutdown() → 反序关闭
 
 ## 测试策略
 
-- **单元测试**（`tests/`）：每模块独立，用 fake 替身注入依赖
-- **集成测试**（P1.10 待做）：跑完整 message pipeline，验证收消息 → Agent → 发消息全链路
+- **单元 / 集成测试**（`tests/`）：每模块独立测试，同时覆盖完整 message pipeline、工具执行、发送队列、RAG、UI 配置等链路
 - **Live 测试**（`tests/test_kv_cache_real.py`）：需真实 API 密钥，标记 `@pytest.mark.live`。默认不跑
-- **KV 缓存命中率实测**（P1.10 必做）：验证连续 10 轮对话整体命中率 > 90%
+- **KV 缓存命中率实测**：验证稳定 system 前缀、tools 参数、变化 task_context 等场景的缓存命中情况
 
 跑测试：
 
 ```bash
-venv/Scripts/python -m pytest tests/ -q
+pip install -e ".[dev,gui]"
+venv/Scripts/python -m pytest tests/ -q --ignore=tests/test_kv_cache_real.py
 ```
 
 ---
@@ -150,4 +230,4 @@ venv/Scripts/python -m pytest tests/ -q
 - **KV 缓存前缀稳定**（context_builder）
 - **WebSocket 长连接 + 心跳**（NapCatAdapter）
 
-详见 Phase 1.9 完成后的实测数据。
+详见 [KV 缓存基准](kv_cache_benchmark.md)。

@@ -1,12 +1,13 @@
 """重要记忆类工具：save / delete。
 
-仅在 features.long_term_memory.mode == "file" 时注册到 ToolRegistry。
-RAG 模式下由后台抽取代替，避免给 AI 暴露混乱的两套机制。
+file 与 RAG 模式都会注册。RAG 模式下 save/delete 会同步维护向量索引。
 """
 
 from __future__ import annotations
 
 import logging
+
+from memory.important import normalize_scope, scope_from_conversation_id
 
 from .base import ToolContext, tool
 from .schemas import DeleteMemoryArgs, SaveMemoryArgs
@@ -16,18 +17,27 @@ logger = logging.getLogger(__name__)
 
 @tool(
     name="save_important_memory",
-    description="永久保存重要记忆（人物、约定、秘密等）",
+    description=(
+        "保存一条长期重要记忆，只用于稳定信息：人物身份、偏好、约定、长期目标、需要以后一直参考的事实。"
+        "不要保存日常寒暄、临时请求、工具执行结果或已经过期的信息。"
+    ),
     args_model=SaveMemoryArgs,
     category="memory",
-    feature="long_term_memory_file",
     no_feedback=True,
 )
 async def save_important_memory(args: SaveMemoryArgs, ctx: ToolContext) -> dict:
     if ctx.important is None:
         return {"ok": False, "error": "重要记忆管理器未注入"}
 
+    scope = normalize_scope(args.scope) if args.scope else (
+        scope_from_conversation_id(ctx.conversation_id) or "global"
+    )
     try:
-        result = await ctx.important.save(args.memory_text)
+        result = await ctx.important.save(
+            args.memory_text,
+            scope=scope,
+            pinned=args.pinned,
+        )
     except RuntimeError as e:
         return {"ok": False, "error": str(e)}
 
@@ -35,6 +45,8 @@ async def save_important_memory(args: SaveMemoryArgs, ctx: ToolContext) -> dict:
         "ok": True,
         "saved": result["saved"],
         "duplicate": result.get("duplicate", False),
+        "scope": scope,
+        "pinned": args.pinned,
     }
 
 
@@ -46,7 +58,6 @@ async def save_important_memory(args: SaveMemoryArgs, ctx: ToolContext) -> dict:
     ),
     args_model=DeleteMemoryArgs,
     category="memory",
-    feature="long_term_memory_file",
     no_feedback=True,
 )
 async def delete_important_memory(args: DeleteMemoryArgs, ctx: ToolContext) -> dict:

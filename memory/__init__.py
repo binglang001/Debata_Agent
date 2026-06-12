@@ -1,8 +1,10 @@
-"""Diana_Agent 记忆系统。
+"""Debata_Agent 记忆系统。
 
 公开 API：
     HistoryManager            —— 对话历史（JSONL 增量追加）
     ImportantMemoryManager    —— 重要记忆（整体 JSON）
+    ArchiveStore              —— 被压缩出活跃区的原始历史归档
+    RollingSummaryStore       —— 全局滚动会话摘要
     JsonStore / JsonlStore    —— 底层存储基类（如有特殊需求可直接用）
 
 per-persona 实例化：
@@ -13,14 +15,18 @@ per-persona 实例化：
     await important.load()
 """
 
+from .archive import ArchiveStore
+from .conversation_summary import RollingSummaryStore
 from .history import HistoryManager
 from .important import ImportantMemoryManager
-from .store import JsonStore, JsonlStore, StoreError
+from .store import JsonlStore, JsonStore, StoreError
 
 __all__ = [
+    "ArchiveStore",
     "HistoryManager",
     "ImportantMemoryManager",
     "JsonStore",
     "JsonlStore",
+    "RollingSummaryStore",
     "StoreError",
 ]

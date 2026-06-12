@@ -6,14 +6,39 @@ registration_url: https://platform.openai.com
 reasoning_style: openai_native
 
 models:
+  - id: gpt-5.5
+    display_name: GPT-5.5
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 400000
+
+  - id: gpt-5.4-mini
+    display_name: GPT-5.4 mini
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 400000
+
+  - id: gpt-5.4-nano
+    display_name: GPT-5.4 nano
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 400000
+
+  - id: gpt-5.2
+    display_name: GPT-5.2
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 400000
+
+  - id: gpt-5.2-pro
+    display_name: GPT-5.2 Pro
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 400000
+
   - id: gpt-5
     display_name: GPT-5
-    capabilities: [chat, tool_call, reasoning]
+    capabilities: [chat, tool_call, reasoning, vision]
     context_length: 400000
 
   - id: gpt-5-mini
     display_name: GPT-5 mini
-    capabilities: [chat, tool_call, reasoning]
+    capabilities: [chat, tool_call, reasoning, vision]
     context_length: 400000
 
   - id: gpt-4o

@@ -1,6 +1,6 @@
 """OneBot CQ 码解析 —— 从原始 raw_message 字符串恢复人类可读文本。
 
-源自旧 diana_agent/handler.py:_parse_raw_cq。功能与旧版完全一致：
+源自旧 debata_agent/handler.py:_parse_raw_cq。功能与旧版完全一致：
     - 保留原始 @ 顺序和重复
     - 区分 @ 全体、@ 机器人自身、@ 普通用户
     - 把图片/语音/视频/合并转发/文件转成可读占位
@@ -19,6 +19,9 @@ _PARAM_SPLIT_RE = re.compile(r",(?=\w+=)")
 def parse_raw_cq(raw: str, bot_qq: str) -> str:
     """把含 CQ 码的 raw_message 转成人类可读文本。
 
+    reply 段会被提到结果最前面（旧 handler 一致行为）——
+    让模型一眼看到"这是回复哪条"再看到正文。
+
     Args:
         raw: OneBot 上报的原始消息字符串（含 [CQ:xxx,k=v] 标记）
         bot_qq: 机器人自身 QQ 号（用于把 @ 机器人识别为 "@我"）
@@ -32,22 +35,27 @@ def parse_raw_cq(raw: str, bot_qq: str) -> str:
     if not raw:
         return ""
 
-    result: list[str] = []
+    head: list[str] = []  # reply 段提到首位
+    body: list[str] = []
     i = 0
     while i < len(raw):
         if raw[i : i + 4] == "[CQ:":
             end = raw.find("]", i)
             if end == -1:
                 # 未闭合，剩余原样追加
-                result.append(raw[i:])
+                body.append(raw[i:])
                 break
             cq = raw[i + 4 : end]
-            result.append(_render_cq_segment(cq, bot_qq))
+            cq_type = cq.split(",", 1)[0]
+            if cq_type == "reply":
+                head.append(_render_cq_segment(cq, bot_qq))
+            else:
+                body.append(_render_cq_segment(cq, bot_qq))
             i = end + 1
         else:
-            result.append(raw[i])
+            body.append(raw[i])
             i += 1
-    return "".join(result)
+    return "".join(head + body)
 
 
 def _render_cq_segment(cq: str, bot_qq: str) -> str:

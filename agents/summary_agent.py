@@ -38,6 +38,76 @@ class SummaryAgent:
         self.cfg = cfg
         self.summarize_cfg = summarize_cfg
 
+    async def summarize_rolling(
+        self,
+        history_slice: list[dict[str, Any]],
+        existing_summary_text: str,
+        existing_important_text: str,
+    ) -> dict[str, Any] | None:
+        """把一段旧历史并入全局滚动摘要。
+
+        返回 {"summary_text": str, "new_important": [{"timestamp","content"}, ...]}。
+        """
+        if not history_slice:
+            return None
+
+        history_text = "\n".join(
+            f"[{m.get('role', '?')}] {m.get('content', '') or ''}"
+            for m in history_slice
+        )
+        prompt = (
+            "你是当前角色的记忆管理系统。请把一段旧对话历史并入全局滚动摘要。\n\n"
+            f"<现有滚动摘要>\n{existing_summary_text or '（无）'}\n</现有滚动摘要>\n\n"
+            f"<现存重要记忆>\n{existing_important_text or '（无）'}\n</现存重要记忆>\n\n"
+            f"<待归档对话>\n{history_text}\n</待归档对话>\n\n"
+            "<任务>\n"
+            "1. 输出合并后的滚动摘要，保留人物关系、长期约定、未完成事项、关键决定和跨会话背景。\n"
+            "2. 不要逐条流水复述，不要保留一次性工具执行细节。\n"
+            "3. 提取少量值得长期保存的新重要记忆；没有则返回空数组。\n"
+            "</任务>\n\n"
+            "返回 JSON：\n"
+            "```json\n"
+            '{"summary_text": "合并后的滚动摘要", '
+            '"new_important": [{"timestamp": "时间", "content": "一句话描述"}, ...]}\n'
+            "```"
+        )
+
+        try:
+            result = await self.provider.chat_completion(
+                [
+                    {
+                        "role": "system",
+                        "content": "你是当前角色的记忆管理系统。负责滚动压缩旧对话。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                model=self.cfg.model,
+                tools=None,
+                temperature=self.cfg.temperature,
+                top_p=self.cfg.top_p,
+                max_tokens=self.cfg.max_tokens,
+                reasoning=self._to_provider_reasoning(),
+                stream=True,
+                timeout=self.cfg.first_token_timeout_seconds * 6 + 60.0,
+                first_token_timeout=self.cfg.first_token_timeout_seconds * 2,
+            )
+        except ProviderError as e:
+            logger.error(f"滚动摘要失败（API）: {e}")
+            return None
+        except Exception as e:
+            logger.exception(f"滚动摘要异常: {e}")
+            return None
+
+        parsed = _parse_json_object(result.content or "")
+        if not parsed:
+            logger.error(f"滚动摘要返回无 JSON：{(result.content or '')[:200]}")
+            return None
+        summary_text = str(parsed.get("summary_text") or "").strip()
+        new_important = parsed.get("new_important", [])
+        if not isinstance(new_important, list):
+            new_important = []
+        return {"summary_text": summary_text, "new_important": new_important}
+
     async def summarize(
         self,
         history_slice: list[dict[str, Any]],
@@ -74,6 +144,7 @@ class SummaryAgent:
         )
 
         try:
+            # 总结一次性吐 8k+ tokens，整体 timeout 比首 token 宽得多
             result = await self.provider.chat_completion(
                 [
                     {
@@ -89,9 +160,9 @@ class SummaryAgent:
                 top_p=self.cfg.top_p,
                 max_tokens=self.cfg.max_tokens,
                 reasoning=self._to_provider_reasoning(),
-                stream=False,
-                timeout=180.0,
-                first_token_timeout=60.0,
+                stream=True,
+                timeout=self.cfg.first_token_timeout_seconds * 6 + 60.0,
+                first_token_timeout=self.cfg.first_token_timeout_seconds * 2,
             )
         except ProviderError as e:
             logger.error(f"记忆总结失败（API）: {e}")
@@ -100,17 +171,9 @@ class SummaryAgent:
             logger.exception(f"记忆总结异常: {e}")
             return None
 
-        text = (result.content or "").strip()
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start == -1 or end <= start:
-            logger.error(f"总结返回无 JSON：{text[:200]}")
-            return None
-
-        try:
-            parsed = json.loads(text[start:end])
-        except json.JSONDecodeError as e:
-            logger.error(f"总结 JSON 解析失败: {e}, raw={text[start:end][:200]}")
+        parsed = _parse_json_object(result.content or "")
+        if not parsed:
+            logger.error(f"总结返回无 JSON：{(result.content or '')[:200]}")
             return None
 
         cut_point = parsed.get("cut_point")
@@ -166,17 +229,18 @@ class DuplicateChecker:
         )
 
         try:
+            # 去重判定只要一个布尔结果，用 cfg 的温度和窗口
             result = await self.provider.chat_completion(
                 [{"role": "user", "content": prompt}],
                 model=self.cfg.model,
                 tools=None,
-                temperature=0.1,
-                top_p=1.0,
+                temperature=self.cfg.temperature,
+                top_p=self.cfg.top_p,
                 max_tokens=64,
                 reasoning=None,
-                stream=False,
-                timeout=20.0,
-                first_token_timeout=15.0,
+                stream=True,
+                timeout=self.cfg.first_token_timeout_seconds,
+                first_token_timeout=self.cfg.first_token_timeout_seconds,
             )
         except Exception as e:
             logger.warning(f"去重检查失败: {e}，默认不跳过")
@@ -184,3 +248,17 @@ class DuplicateChecker:
 
         text = (result.content or "").strip().lower()
         return '"duplicate": true' in text or '"duplicate":true' in text
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    text = (text or "").strip()
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(text[start:end])
+    except json.JSONDecodeError as e:
+        logger.error(f"总结 JSON 解析失败: {e}, raw={text[start:end][:200]}")
+        return None
+    return parsed if isinstance(parsed, dict) else None

@@ -1,6 +1,6 @@
 """NapCat WebSocket 连接管理。
 
-两种连接模式（在配置中通过 mode 字段选择，命名从 Diana_Agent 视角）：
+两种连接模式（在配置中通过 mode 字段选择，命名从 Debata_Agent 视角）：
 
     client（推荐）：
         程序作为 WS 客户端，主动连 NapCat 的 WS 服务（如 ws://127.0.0.1:3001）。
@@ -24,7 +24,7 @@ import asyncio
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 import websockets
 from websockets.asyncio.client import ClientConnection as _WSClient
@@ -79,6 +79,7 @@ class ReverseWSConnection(NapCatConnection):
         *,
         reconnect_interval: float = 3.0,
         max_reconnect_attempts: int = -1,
+        reconnect_backoff_max: float = 60.0,
         ping_interval: float = 20.0,
         ping_timeout: float = 20.0,
         initial_connect_timeout: float = 10.0,
@@ -88,6 +89,7 @@ class ReverseWSConnection(NapCatConnection):
         self.access_token = access_token
         self.reconnect_interval = reconnect_interval
         self.max_reconnect_attempts = max_reconnect_attempts
+        self.reconnect_backoff_max = reconnect_backoff_max
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.initial_connect_timeout = initial_connect_timeout
@@ -107,6 +109,8 @@ class ReverseWSConnection(NapCatConnection):
         self._loop_task = asyncio.create_task(self._run_forever(), name="napcat-reverse-ws")
 
         # 等待首次连接成功（不强求，超时也继续——会持续重连）
+        if self.initial_connect_timeout <= 0:
+            return
         try:
             await asyncio.wait_for(
                 self._connected_event.wait(), timeout=self.initial_connect_timeout
@@ -203,7 +207,7 @@ class ReverseWSConnection(NapCatConnection):
                 break  # stop 信号到达
             except asyncio.TimeoutError:
                 pass
-            backoff = min(backoff * 2, 60.0)
+            backoff = min(backoff * 2, self.reconnect_backoff_max)
 
 
 class ForwardWSConnection(NapCatConnection):
