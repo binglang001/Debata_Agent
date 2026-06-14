@@ -1,0 +1,2474 @@
+"""人格状态管理 Agent。"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import inspect
+import json
+import logging
+import time
+from dataclasses import asdict, fields, is_dataclass, replace
+from datetime import datetime
+from typing import Any
+from uuid import uuid4
+
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+from mind import Cue, DecayEngine, Effect, PersonaState, Todo, UserProfile, clamp_percent
+from providers.base import ProviderError, ReasoningConfig
+
+from .base import StatusCallback, UsageRecorder
+
+logger = logging.getLogger(__name__)
+
+_RESTING_ACTIONS = {"sleeping", "eating", "collapsing"}
+_TODO_CLOSED_STATUS_VALUES = {
+    "completed",
+    "complete",
+    "done",
+    "finished",
+    "closed",
+    "cancelled",
+    "canceled",
+    "missed",
+}
+_TODO_OPEN_STATUS_VALUES = {
+    "open",
+    "pending",
+    "active",
+    "todo",
+    "new",
+    "in_progress",
+    "in-progress",
+}
+
+
+class _EffectUpdate(BaseModel):
+    id: str | None = None
+    name: str = ""
+    effect_type: str = "mood"
+    intensity: float = 0.0
+    prompt_hint: str = ""
+    source_detail: str = ""
+    duration_minutes: float | None = Field(default=None, ge=0.0)
+    created_at: float | None = None
+    expires_at: float | None = None
+
+    @field_validator("intensity", mode="before")
+    @classmethod
+    def normalize_intensity(cls, value: object) -> object:
+        return _coerce_level_value(value, default=value, low=25.0, medium=50.0, high=75.0)
+
+    @field_validator("created_at", "expires_at", mode="before")
+    @classmethod
+    def normalize_timestamps(cls, value: object) -> object:
+        return _coerce_model_timestamp(value)
+
+
+class _TodoUpdate(BaseModel):
+    id: str | None = None
+    title: str = ""
+    reason: str = ""
+    priority: int = 1
+    scope: str = "persona"
+    created_at: float | None = None
+    expires_at: float | None = None
+    status: str | None = None
+    completed: Any = None
+    done: Any = None
+    finished: Any = None
+    cancelled: Any = None
+    canceled: Any = None
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def normalize_priority(cls, value: object) -> object:
+        return _coerce_level_value(value, default=value, low=2, medium=5, high=8)
+
+    @field_validator("created_at", "expires_at", mode="before")
+    @classmethod
+    def normalize_timestamps(cls, value: object) -> object:
+        return _coerce_model_timestamp(value)
+
+
+class _CueUpdate(BaseModel):
+    id: str | None = None
+    cue_type: str = "conversation"
+    summary: str
+    conversation_id: str | None = None
+    created_at: float | None = None
+    expires_at: float | None = None
+
+    @field_validator("created_at", "expires_at", mode="before")
+    @classmethod
+    def normalize_timestamps(cls, value: object) -> object:
+        return _coerce_model_timestamp(value)
+
+
+class _ProfileUpdate(BaseModel):
+    user_id: str | None = None
+    display_name: str = ""
+    affinity: float | None = None
+    affinity_delta: float | None = None
+    summary: str = ""
+    traits: list[str] = Field(default_factory=list)
+    interaction_count: int | None = None
+    last_interaction_at: float | None = None
+
+
+class _RelationshipUpdate(BaseModel):
+    user_id: str | None = None
+    display_name: str = ""
+    affinity: float | None = None
+    affinity_delta: float | None = None
+    summary: str = ""
+    traits: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
+class _TurnUpdate(BaseModel):
+    mood: float | None = None
+    mood_delta: float | None = None
+    social_need: float | None = None
+    social_need_delta: float | None = None
+    latest_monologue: str = ""
+    effects: list[_EffectUpdate] = Field(default_factory=list)
+    profiles: list[_ProfileUpdate] = Field(default_factory=list)
+    relationships: list[_RelationshipUpdate] = Field(default_factory=list)
+    todos: list[_TodoUpdate] = Field(default_factory=list)
+    cues: list[_CueUpdate] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_singular_fields(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        _append_singular(normalized, "effect", "effects")
+        _append_singular(normalized, "todo", "todos")
+        _append_singular(normalized, "cue", "cues")
+
+        profile = normalized.pop("profile", None)
+        if profile is not None and "profiles" not in normalized:
+            normalized["profiles"] = profile if isinstance(profile, list) else [profile]
+        for singular in ("relationship", "relationship_update", "affinity_update"):
+            value = normalized.pop(singular, None)
+            if value is not None and "relationships" not in normalized:
+                normalized["relationships"] = value if isinstance(value, list) else [value]
+        for plural in ("relationship_updates", "affinity_updates"):
+            value = normalized.pop(plural, None)
+            if value is not None and "relationships" not in normalized:
+                normalized["relationships"] = value
+        return normalized
+
+
+class _RecoveryEstimate(BaseModel):
+    energy: float | None = None
+    satiety: float | None = None
+    mood: float | None = None
+    social_need: float | None = None
+    latest_monologue: str = ""
+    reason: str = ""
+
+    @field_validator("energy", "satiety", "mood", "social_need", mode="before")
+    @classmethod
+    def normalize_percent(cls, value: object) -> object:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+
+class _RecoveryResult(BaseModel):
+    estimate: _RecoveryEstimate = Field(default_factory=_RecoveryEstimate)
+    source: str = "fallback_formula"
+    error: str = ""
+
+
+class PersonaAgent:
+    """维护人格运行时状态、短期效果和后台线索。"""
+
+    def __init__(
+        self,
+        db: Any,
+        provider: Any,
+        cfg: Any,
+        pm_cfg: Any,
+        age_profile: Any,
+        decay: DecayEngine,
+        consolidation: Any,
+        persona: Any,
+        *,
+        usage_recorder: UsageRecorder | None = None,
+        status_callback: StatusCallback | None = None,
+        subconscious_starter: Any = None,
+    ) -> None:
+        self.db = db
+        self.provider = provider
+        self.cfg = cfg
+        self.pm_cfg = pm_cfg
+        self.age_profile = age_profile
+        self.decay = decay
+        self.consolidation = consolidation
+        self.persona = persona
+        self.usage_recorder = usage_recorder
+        self.status_callback = status_callback
+        self.subconscious_starter = subconscious_starter
+
+        self._state = PersonaState()
+        self._effects: list[Effect] = []
+        self._todos: list[Todo] = []
+        self._cues: list[Cue] = []
+        self._profiles: dict[str, UserProfile] = {}
+        self._state_lock = asyncio.Lock()
+        self._timer_task: asyncio.Task[None] | None = None
+        self._active_sleep_record_id: str | None = None
+        self._active_sleep_record: dict[str, Any] | None = None
+        self._active_eat_record: dict[str, Any] | None = None
+        self._last_daily_consolidation_date: str | None = None
+
+    async def start(self) -> None:
+        """加载人格状态并启动定时维护任务。"""
+
+        async with self._state_lock:
+            await _maybe_await_call(self.db, "load")
+            loaded = await _maybe_await_call(self.db, "get_state", default=None)
+            self._state = _coerce_state(loaded)
+            self._active_sleep_record_id = self._state.active_sleep_record_id
+            now = time.time()
+            await self._mark_expired_todos_missed_locked(now)
+            self._effects = await self._load_effects(now)
+            self._todos = await self._load_todos()
+            self._cues = await self._load_cues(now)
+            self._profiles = await self._load_profiles()
+            startup_previous = replace(self._state)
+            await self._reconcile_physiology_locked(
+                now,
+                recovery_source_hint="offline_reconcile",
+            )
+            await self._append_startup_reconcile_log_locked(startup_previous, now)
+            await self._complete_active_resting_action_todos_locked(now)
+            await self._save_state_locked()
+
+        if self._timer_task is None or self._timer_task.done():
+            self._timer_task = asyncio.create_task(self._timer_loop())
+
+    async def shutdown(self) -> None:
+        """停止定时任务并保存最后的人格状态。"""
+
+        task = self._timer_task
+        self._timer_task = None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        async with self._state_lock:
+            await self._save_state_locked()
+
+    def get_state_snapshot(self) -> PersonaState:
+        """返回当前人格状态的同步拷贝。"""
+
+        return replace(self._state)
+
+    def get_context_for_chat(self, conversation_id: str) -> str:
+        """构造注入聊天 Agent 的人格状态上下文。"""
+
+        state = self.get_state_snapshot()
+        lines = [
+            "<人格状态>",
+            f"- 心情: {state.mood:.1f}/100",
+            f"- 社交需求: {state.social_need:.1f}/100",
+        ]
+        if self._energy_mode() == "tool":
+            energy_line = f"- 精力: {state.energy:.1f}/100"
+            if state.energy <= 30:
+                energy_line += "。精力偏低，可能会累。"
+            lines.append(energy_line)
+        if self._satiety_mode() == "tool":
+            satiety_line = f"- 饱腹: {state.satiety:.1f}/100"
+            if state.satiety <= 30:
+                satiety_line += "。饱腹偏低，可能会饿。"
+            lines.append(satiety_line)
+        if self.age_profile is not None:
+            lines.extend(self._format_age_lines())
+        action_context = _format_action_context(state, time.time())
+        if action_context:
+            lines.append(action_context)
+        if state.latest_monologue:
+            lines.append(f"- 最近内心独白: {state.latest_monologue}")
+
+        hints = [effect.prompt_hint for effect in self._effects if effect.prompt_hint]
+        if hints:
+            lines.append("- 当前短期影响: " + "；".join(hints[:5]))
+
+        profile = self._profile_for_conversation(conversation_id)
+        if profile is not None:
+            profile_text = profile.summary or profile.display_name
+            if profile_text:
+                lines.append(f"- 当前对象画像: {profile_text}")
+
+        open_todos = self.get_todos_for_proactive()
+        if open_todos:
+            lines.append("- 待办: " + "；".join(todo.title for todo in open_todos[:5]))
+
+        cues = self.get_cues()
+        if cues:
+            lines.append("- 线索: " + "；".join(cue.summary for cue in cues[:5]))
+        lines.append("</人格状态>")
+        return "\n".join(lines)
+
+    def get_todos_for_proactive(self) -> list[Todo]:
+        """返回可供主动行为消费的待办拷贝。"""
+
+        now = time.time()
+        self._drop_expired_todo_cache(now)
+        open_todos = list(self._todos)
+        return [replace(todo) for todo in sorted(open_todos, key=_todo_sort_key)]
+
+    def get_cues(self) -> list[Cue]:
+        """返回当前有效线索拷贝。"""
+
+        return [replace(cue) for cue in self._cues]
+
+    def is_resting(self) -> bool:
+        if self._state.current_action not in _RESTING_ACTIONS:
+            return False
+        action_until = _optional_float(self._state.action_until)
+        return action_until is not None and action_until > time.time()
+
+    @property
+    def physiology_energy_mode(self) -> str:
+        return self._energy_mode()
+
+    @property
+    def physiology_satiety_mode(self) -> str:
+        return self._satiety_mode()
+
+    async def after_turn(
+        self,
+        conversation_id: str,
+        participants: Any,
+        chat_summary: str,
+        eat_event: Any = None,
+    ) -> None:
+        """在一轮对话后异步维护人格状态。调用方可 fire-and-forget。"""
+
+        fallback = False
+        try:
+            async with self._state_lock:
+                if self.is_resting():
+                    await self._append_state_log_locked(
+                        {
+                            "event": "after_turn",
+                            "conversation_id": conversation_id,
+                            "skipped": True,
+                            "skip_reason": "persona_resting",
+                        }
+                    )
+                    await self._save_state_locked()
+                    self._emit_status("idle", "人格休息中，跳过普通状态更新")
+                    return
+                update = await self._llm_turn_update(
+                    conversation_id,
+                    participants,
+                    chat_summary,
+                    eat_event,
+                )
+                fallback = update is None
+                if update is None:
+                    update = _TurnUpdate()
+                await self._apply_turn_update_locked(
+                    update,
+                    conversation_id,
+                    participants,
+                )
+                await self._append_state_log_locked(
+                    {
+                        "event": "after_turn",
+                        "conversation_id": conversation_id,
+                        "fallback": fallback,
+                    }
+                )
+                await self._save_state_locked()
+            self._emit_status(
+                "idle",
+                "人格状态更新跳过" if fallback else "人格状态更新完成",
+            )
+        except Exception:
+            logger.exception("人格管理 after_turn 异常")
+
+    async def periodic_tick(self) -> None:
+        """推进定时衰减、过期清理和兜底整理。"""
+
+        fallback = False
+        try:
+            async with self._state_lock:
+                now = time.time()
+                await self._expire_runtime_records_locked(now)
+                await self._mark_expired_todos_missed_locked(now)
+                mood_previous_tick_at = self._state.last_tick_at
+                finished_action = await self._reconcile_physiology_locked(now)
+                update = await self._llm_periodic_update(now)
+                fallback = update is None
+                if update is None:
+                    update = _TurnUpdate()
+                await self._apply_turn_update_locked(
+                    update,
+                    "system:periodic",
+                    [],
+                    touch_profile=False,
+                )
+                if (
+                    finished_action is None
+                    and self._state.current_action == "awake"
+                    and update.mood is None
+                    and update.mood_delta is None
+                ):
+                    self._apply_mood_baseline_drift_locked(now, mood_previous_tick_at)
+                await self._maybe_daily_consolidation(now)
+                await self._append_state_log_locked(
+                    {
+                        "event": "periodic_tick",
+                        "fallback": fallback,
+                    }
+                )
+                await self._save_state_locked()
+            self._emit_status(
+                "idle",
+                "人格定时维护跳过" if fallback else "人格定时维护完成",
+            )
+        except Exception:
+            logger.exception("人格管理定时维护异常")
+            self._emit_status("idle", "人格定时维护异常")
+
+    async def on_sleep_start(self, duration_minutes: float) -> dict[str, Any]:
+        """记录开始睡眠。仅精力工具模式生效。"""
+
+        if self._energy_mode() != "tool":
+            return {"status": "disabled"}
+
+        now = time.time()
+        duration = _bounded_duration(
+            duration_minutes,
+            _read_number(self.pm_cfg, "physiology", "energy", "max_sleep_minutes", default=720),
+        )
+        action_until = now + duration * 60.0
+        record = {
+            "id": f"sleep_{uuid4().hex}",
+            "started_at": now,
+            "planned_duration_minutes": duration,
+            "action_until": action_until,
+            "status": "active",
+        }
+        async with self._state_lock:
+            await self._settle_current_action_for_replacement_locked(now)
+            self._state.current_action = "sleeping"
+            self._state.action_until = action_until
+            self._state.last_sleep_at = now
+            self._active_sleep_record_id = await _maybe_await_call(
+                self.db,
+                "add_sleep_record",
+                record,
+                default=record["id"],
+            )
+            self._active_sleep_record = dict(record)
+            self._state.active_sleep_record_id = self._active_sleep_record_id
+            self._state.active_eat_record_id = None
+            self._active_eat_record = None
+            await self._complete_current_action_todos_locked("sleep", now)
+            await self._append_state_log_locked({"event": "sleep_start", **record})
+            await self._save_state_locked()
+
+        threshold = _read_number(
+            self.pm_cfg,
+            "physiology",
+            "energy",
+            "long_sleep_threshold_minutes",
+            default=120,
+        )
+        if duration >= threshold:
+            current_monologue = self._state.latest_monologue
+            current_monologue_at = self._state.last_monologue_at
+            consolidation_result = await self._run_consolidation("long_sleep")
+            await self._restore_current_monologue_after_sleep_consolidation(
+                current_monologue,
+                current_monologue_at,
+                consolidation_result,
+            )
+            await self._start_subconscious(
+                {
+                    "event": "sleep_start",
+                    "sleep_type": "long_sleep",
+                    "duration_minutes": duration,
+                }
+            )
+
+        return {
+            "status": "started",
+            "duration_minutes": duration,
+            "action_until": action_until,
+            "record_id": self._active_sleep_record_id,
+        }
+
+    async def on_wakeup(self, reason: str) -> PersonaState:
+        """从睡眠或休息状态醒来，并按实际睡眠时间恢复基础精力。"""
+
+        now = time.time()
+        async with self._state_lock:
+            state = self._state
+            await self._reconcile_physiology_locked(now, allow_collapse=False)
+            previous_action = state.current_action
+            state.current_action = "awake"
+            state.action_until = None
+            state.last_tick_at = now
+            await self._finish_active_record_locked(
+                previous_action,
+                now,
+                {"wakeup_reason": reason},
+            )
+            await self._append_state_log_locked(
+                {"event": "wakeup", "reason": reason, "previous_action": previous_action}
+            )
+            await self._save_state_locked()
+            return replace(state)
+
+    async def on_eat_start(
+        self,
+        meal_type: str,
+        duration_minutes: float,
+        description: str,
+    ) -> dict[str, Any]:
+        """记录开始进食。仅饱腹工具模式生效。"""
+
+        if self._satiety_mode() != "tool":
+            return {"status": "disabled"}
+
+        now = time.time()
+        duration = _bounded_duration(
+            duration_minutes,
+            _read_number(self.pm_cfg, "physiology", "satiety", "max_eat_minutes", default=60),
+        )
+        action_until = now + duration * 60.0
+        record = {
+            "id": f"eat_{uuid4().hex}",
+            "meal_type": str(meal_type or ""),
+            "description": str(description or ""),
+            "started_at": now,
+            "duration_minutes": duration,
+            "action_until": action_until,
+            "status": "active",
+        }
+        async with self._state_lock:
+            await self._settle_current_action_for_replacement_locked(now)
+            self._state.current_action = "eating"
+            self._state.action_until = action_until
+            self._state.last_eat_at = now
+            self._state.active_sleep_record_id = None
+            self._active_sleep_record = None
+            self._state.active_eat_record_id = record["id"]
+            self._active_eat_record = dict(record)
+            row_id = await _maybe_await_call(
+                self.db,
+                "add_eat_record",
+                record,
+                default=None,
+            )
+            await self._append_state_log_locked({"event": "eat_start", **record})
+            await self._complete_current_action_todos_locked("eat", now)
+            await self._save_state_locked()
+
+        return {
+            "status": "started",
+            "duration_minutes": duration,
+            "action_until": action_until,
+            "record_id": record["id"],
+            "row_id": row_id,
+        }
+
+    async def trigger_collapse(self) -> dict[str, Any]:
+        """立即触发精力耗尽昏睡。"""
+
+        if self._energy_mode() != "tool":
+            return {"status": "disabled"}
+        async with self._state_lock:
+            now = time.time()
+            await self._settle_current_action_for_replacement_locked(now)
+            self._trigger_collapse_locked(now)
+            await self._append_state_log_locked({"event": "collapse"})
+            await self._save_state_locked()
+            return {
+                "status": "collapsing",
+                "action_until": self._state.action_until,
+            }
+
+    async def _timer_loop(self) -> None:
+        interval_seconds = max(
+            1.0,
+            _read_number(
+                self.pm_cfg,
+                "persona_agent",
+                "timer_interval_minutes",
+                default=30,
+            )
+            * 60.0,
+        )
+        while True:
+            await asyncio.sleep(interval_seconds)
+            await self.periodic_tick()
+
+    async def _llm_turn_update(
+        self,
+        conversation_id: str,
+        participants: Any,
+        chat_summary: str,
+        eat_event: Any,
+    ) -> _TurnUpdate | None:
+        for attempt in range(2):
+            try:
+                self._emit_status("thinking", "人格状态更新中")
+                result = await self.provider.chat_completion(
+                    self._build_turn_messages(
+                        conversation_id,
+                        participants,
+                        chat_summary,
+                        eat_event,
+                        retry=attempt > 0,
+                    ),
+                    model=self.cfg.model,
+                    tools=None,
+                    temperature=self.cfg.temperature,
+                    top_p=self.cfg.top_p,
+                    max_tokens=self.cfg.max_tokens,
+                    reasoning=self._to_provider_reasoning(),
+                    stream=True,
+                    timeout=self.cfg.first_token_timeout_seconds * 6 + 60.0,
+                    first_token_timeout=self.cfg.first_token_timeout_seconds * 2,
+                )
+                await self._record_usage(
+                    _read_field(result, "usage"),
+                    operation="persona_after_turn",
+                )
+            except ProviderError as exc:
+                logger.warning("人格状态更新模型调用失败: %s", exc)
+                self._emit_status("error", "人格状态更新失败")
+                continue
+            except Exception:
+                logger.exception("人格状态更新模型调用异常")
+                self._emit_status("error", "人格状态更新异常")
+                continue
+
+            parsed = _parse_json_object(str(_read_field(result, "content") or ""))
+            if parsed is None:
+                logger.warning("人格状态更新返回无有效 JSON")
+                continue
+            try:
+                return _TurnUpdate.model_validate(parsed)
+            except ValidationError:
+                logger.warning("人格状态更新 JSON 校验失败", exc_info=True)
+                continue
+        return None
+
+    async def _llm_periodic_update(self, now: float) -> _TurnUpdate | None:
+        for attempt in range(2):
+            try:
+                self._emit_status("thinking", "人格定时维护中")
+                result = await self.provider.chat_completion(
+                    self._build_periodic_messages(now, retry=attempt > 0),
+                    model=self.cfg.model,
+                    tools=None,
+                    temperature=self.cfg.temperature,
+                    top_p=self.cfg.top_p,
+                    max_tokens=self.cfg.max_tokens,
+                    reasoning=self._to_provider_reasoning(),
+                    stream=True,
+                    timeout=self.cfg.first_token_timeout_seconds * 6 + 60.0,
+                    first_token_timeout=self.cfg.first_token_timeout_seconds * 2,
+                )
+                await self._record_usage(
+                    _read_field(result, "usage"),
+                    operation="persona_periodic",
+                )
+            except ProviderError as exc:
+                logger.warning("人格定时维护模型调用失败: %s", exc)
+                self._emit_status("error", "人格定时维护失败")
+                continue
+            except Exception:
+                logger.exception("人格定时维护模型调用异常")
+                self._emit_status("error", "人格定时维护异常")
+                continue
+
+            parsed = _parse_json_object(str(_read_field(result, "content") or ""))
+            if parsed is None:
+                logger.warning("人格定时维护返回无有效 JSON")
+                continue
+            try:
+                return _TurnUpdate.model_validate(parsed)
+            except ValidationError:
+                logger.warning("人格定时维护 JSON 校验失败", exc_info=True)
+                continue
+        return None
+
+    async def _llm_recovery_estimate(
+        self,
+        action: str,
+        ended_at: float,
+        extra_updates: dict[str, Any],
+    ) -> _RecoveryEstimate | None:
+        for attempt in range(2):
+            try:
+                self._emit_status("thinking", "人格恢复评估中")
+                result = await self.provider.chat_completion(
+                    self._build_recovery_messages(
+                        action,
+                        ended_at,
+                        extra_updates,
+                        retry=attempt > 0,
+                    ),
+                    model=self.cfg.model,
+                    tools=None,
+                    temperature=self.cfg.temperature,
+                    top_p=self.cfg.top_p,
+                    max_tokens=self.cfg.max_tokens,
+                    reasoning=self._to_provider_reasoning(),
+                    stream=True,
+                    timeout=self.cfg.first_token_timeout_seconds * 6 + 60.0,
+                    first_token_timeout=self.cfg.first_token_timeout_seconds * 2,
+                )
+                await self._record_usage(
+                    _read_field(result, "usage"),
+                    operation="persona_recovery_eval",
+                    action=action,
+                )
+            except ProviderError as exc:
+                logger.warning("人格恢复评估模型调用失败: %s", exc)
+                self._emit_status("error", "人格恢复评估失败")
+                continue
+            except Exception:
+                logger.exception("人格恢复评估模型调用异常")
+                self._emit_status("error", "人格恢复评估异常")
+                continue
+
+            parsed = _parse_json_object(str(_read_field(result, "content") or ""))
+            if parsed is None:
+                logger.warning("人格恢复评估返回无有效 JSON")
+                continue
+            try:
+                return _RecoveryEstimate.model_validate(parsed)
+            except ValidationError:
+                logger.warning("人格恢复评估 JSON 校验失败", exc_info=True)
+                continue
+        return None
+
+    def _build_recovery_messages(
+        self,
+        action: str,
+        ended_at: float,
+        extra_updates: dict[str, Any],
+        *,
+        retry: bool,
+    ) -> list[dict[str, Any]]:
+        retry_text = "上一次输出无法解析，请只返回一个 JSON 对象。" if retry else ""
+        prompt = (
+            "请评估角色完成一次进食、睡眠或昏睡恢复后的状态。\n"
+            "只返回 JSON 对象，不要解释。可用字段："
+            "energy、satiety、mood、social_need、latest_monologue、reason。\n"
+            "energy、satiety、mood、social_need 都是 0-100 的目标值；"
+            "social_need 表示社交未满足度：高=缺社交、孤独、需要陪伴；"
+            "被关心、亲密互动、有效交流后通常下降，长时间无人互动或被忽视后上升。"
+            "想继续聊或亲近感不要写进 social_need，可写 reason 或交给关系画像。\n"
+            "只在你能根据时长、动作和当前状态判断时填写。"
+            "不确定的字段省略，系统会保留公式兜底结果。\n"
+            "latest_monologue 写醒来或吃完后的短句内心状态；不要编造外部事件。\n"
+            f"{retry_text}\n\n"
+            f"<action>{action}</action>\n"
+            f"<ended_at>{ended_at}</ended_at>\n"
+            f"<finish_updates>{json.dumps(extra_updates, ensure_ascii=False, default=str)}</finish_updates>\n"
+            f"<当前状态>\n{json.dumps(asdict(self._state), ensure_ascii=False)}\n</当前状态>"
+        )
+        return [
+            {
+                "role": "system",
+                "content": "你是当前角色的生理恢复评估系统，只评估恢复后的状态。",
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+    def _build_periodic_messages(self, now: float, *, retry: bool) -> list[dict[str, Any]]:
+        retry_text = "上一次输出无法解析，请只返回一个 JSON 对象。" if retry else ""
+        prompt = (
+            "请根据当前人格状态做一次后台定时维护。\n"
+            "这不是用户新消息，不要编造新的外部事件；只处理自然状态变化、过期线索、必要待办和简短内心独白。\n"
+            "只返回 JSON 对象，不要解释。可用字段同 after_turn："
+            "mood、mood_delta、social_need、social_need_delta、latest_monologue、effects、profiles、relationships、todos、cues。\n"
+            "social_need 表示社交未满足度：高=缺社交、孤独、需要陪伴；"
+            "被关心、亲密互动、有效交流后通常下降，长时间无人互动或被忽视后上升。"
+            "想继续聊、社交兴奋或亲近感不要挤到 social_need，可用 relationship/effects 表达。\n"
+            "如果没有明确变化，返回空对象 {}。\n"
+            "latest_monologue 只写此刻内心或身体状态；不要写成刚收到用户消息。\n"
+            "todos 只保留真正需要后续行动的事项；普通观察、泛泛提醒、已过期或已完成事项不要新增。\n"
+            "priority 必须是 0-10 整数；时间必须是 unix timestamp 数字。\n"
+            f"{retry_text}\n\n"
+            f"<now>{now}</now>\n"
+            f"<当前状态>\n{json.dumps(asdict(self._state), ensure_ascii=False)}\n</当前状态>\n"
+            f"<待办>\n{json.dumps([asdict(todo) for todo in self._todos], ensure_ascii=False, default=str)}\n</待办>\n"
+            f"<线索>\n{json.dumps([asdict(cue) for cue in self._cues], ensure_ascii=False, default=str)}\n</线索>\n"
+            f"<短期影响>\n{json.dumps([asdict(effect) for effect in self._effects], ensure_ascii=False, default=str)}\n</短期影响>"
+        )
+        return [
+            {
+                "role": "system",
+                "content": "你是当前角色的人格定时维护系统，只维护后台状态，不进行聊天。",
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+    def _build_turn_messages(
+        self,
+        conversation_id: str,
+        participants: Any,
+        chat_summary: str,
+        eat_event: Any,
+        *,
+        retry: bool,
+    ) -> list[dict[str, Any]]:
+        retry_text = "上一次输出无法解析，请只返回一个 JSON 对象。" if retry else ""
+        prompt = (
+            "请根据一轮对话摘要，更新角色的人格运行状态。\n"
+            "只返回 JSON 对象，不要解释。\n"
+            "可用字段：mood、mood_delta、social_need、social_need_delta、"
+            "latest_monologue、effects、profile/profiles、relationship/relationships、todos、cues。\n"
+            "mood 和 social_need 是 0-100 分；delta 是在当前值上的增减。\n"
+            "social_need 表示社交未满足度：高=缺社交、孤独、需要陪伴；"
+            "被关心、亲密互动、有效交流后通常下降，长时间无人互动或被忽视后上升。"
+            "想继续聊、社交兴奋或亲近感不要挤到 social_need，可用 affinity/relationship/effects 表达。\n"
+            "归因规则：助手、assistant、当前回复、角色刚说的话，都是当前人格自己的发言；"
+            "只有用户消息或明确外部事件才算别人输入。\n"
+            "latest_monologue 必须是一人称内心状态，只写我此刻的感受、念头或身体状态；"
+            "不得把助手刚说的话改写成用户、对方或外部人物的经历。\n"
+            "effects[] 需要 name/effect_type/intensity/prompt_hint/source_detail/"
+            "duration_minutes 或 expires_at；intensity 必须是 0-100 数字，不要写 low/medium/high。\n"
+            "当用户透露稳定偏好、称呼、长期习惯、关系变化、新印象或可复用的相处信息时，使用 profile/profiles 实时更新用户画像；"
+            "profile 字段包括 user_id、display_name、summary、traits、affinity。私聊可省略 user_id 由系统推断，群聊必须带 user_id；"
+            "affinity 是 0-100 的绝对亲近度，不是 0-1，也不是 1-10；"
+            "刻度锚点：0=陌生/排斥，30=疏离，50=普通熟人，70=信任友好，85=亲近在意，95=核心亲密关系。"
+            "profile 事实仍不要塞短期情绪、一次性事件或临时状态。\n"
+            "当一轮互动让关系变好/变坏、有新印象、亲近度变化时，使用 relationship/relationships；"
+            "relationship 可含 user_id、display_name、summary、traits、affinity 或 affinity_delta、reason。"
+            "relationship/affinity_delta 是本轮增减分，普通一轮互动通常 -5 到 +5；强烈事件可更大，但要写 reason。"
+            "若已有关系只是本轮变好/变坏，优先用 affinity_delta，不要随意用低 absolute affinity 覆盖。"
+            "这类关系更新不要求同时写长期画像事实；私聊可省略 user_id 由系统推断。\n"
+            "todos[] 只用于明确未来动作、生理必要动作、用户明确要求、或确实需要唤醒/提醒的事项；"
+            "普通情绪、关系画像、观察线索、已发生事件、泛泛改善建议都不要建 todo。\n"
+            "每轮最多新增 1 条 todo，除非用户同一轮明确提出多个具体事项；多余事项忽略。\n"
+            "todo 必须有可执行标题、scope、priority、触发/过期信息（schema 支持时用 expires_at）；"
+            "不要写“关注/记得/继续观察/留意一下”这类泛泛标题。\n"
+            "todos[] 需要 title，可选 reason/priority/scope/expires_at；已有 todo 可用 id 加 status/completed/done/cancelled 标记完成或取消；priority 必须是 0-10 整数，不要写 low/medium/high。\n"
+            "cues[] 需要 summary，可选 cue_type/conversation_id/expires_at。\n"
+            f"{retry_text}\n\n"
+            f"<当前状态>\n{json.dumps(asdict(self._state), ensure_ascii=False)}\n</当前状态>\n"
+            f"<conversation_id>{conversation_id}</conversation_id>\n"
+            f"<participants>{json.dumps(participants, ensure_ascii=False, default=str)}</participants>\n"
+            f"<eat_event>{json.dumps(eat_event, ensure_ascii=False, default=str)}</eat_event>\n"
+            f"<对话摘要>\n{chat_summary or ''}\n</对话摘要>"
+        )
+        return [
+            {
+                "role": "system",
+                "content": "你是当前角色的人格管理系统，负责维护状态和短期记忆。",
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+    async def _apply_turn_update_locked(
+        self,
+        update: _TurnUpdate,
+        conversation_id: str,
+        participants: Any,
+        *,
+        touch_profile: bool = True,
+    ) -> None:
+        now = time.time()
+        state = self._state
+        if update.mood is not None:
+            state.mood = clamp_percent(update.mood)
+        if update.mood_delta is not None:
+            state.mood = clamp_percent(state.mood + update.mood_delta)
+        if update.social_need is not None:
+            state.social_need = clamp_percent(update.social_need)
+        if update.social_need_delta is not None:
+            state.social_need = clamp_percent(state.social_need + update.social_need_delta)
+        if update.latest_monologue:
+            state.latest_monologue = update.latest_monologue.strip()
+            state.last_monologue_at = now
+            await _maybe_await_call(
+                self.db,
+                "add_monologue",
+                {"text": state.latest_monologue, "created_at": now},
+            )
+
+        for effect_update in update.effects:
+            effect = _effect_from_update(effect_update, now)
+            self._upsert_effect_cache(effect)
+            await _maybe_await_call(self.db, "add_effect", effect)
+
+        inferred_user_id = _infer_user_id(conversation_id, participants)
+        if touch_profile and inferred_user_id:
+            await self._touch_profile_locked(inferred_user_id, now, participants)
+        for relationship_update in update.relationships:
+            profile = self._profile_from_relationship_update(
+                relationship_update,
+                inferred_user_id,
+                now,
+            )
+            if profile is None:
+                await self._append_state_log_locked(
+                    {
+                        "event": "profile_update_dropped",
+                        "drop_reason": "missing_user_id",
+                        "source": "relationship",
+                        "conversation_id": conversation_id,
+                    }
+                )
+                continue
+            self._profiles[profile.user_id] = profile
+            await _maybe_await_call(self.db, "upsert_profile", profile)
+        for profile_update in update.profiles:
+            profile = self._profile_from_update(profile_update, inferred_user_id, now)
+            if profile is None:
+                await self._append_state_log_locked(
+                    {
+                        "event": "profile_update_dropped",
+                        "drop_reason": "missing_user_id",
+                        "source": "profile",
+                        "conversation_id": conversation_id,
+                    }
+                )
+                continue
+            self._profiles[profile.user_id] = profile
+            await _maybe_await_call(self.db, "upsert_profile", profile)
+
+        for todo_update in self._filter_todo_updates(update.todos):
+            existing = self._find_todo(todo_update.id)
+            record = _todo_record_from_update(todo_update, now, existing)
+            if _todo_record_is_closed(record):
+                self._remove_todo_cache(record["id"])
+                await _maybe_await_call(self.db, "upsert_todo", record)
+                continue
+            todo = _coerce_todo(record)
+            if todo is None:
+                continue
+            self._upsert_todo_cache(todo)
+            await _maybe_await_call(self.db, "upsert_todo", record)
+
+        for cue_update in update.cues:
+            cue = _cue_from_update(cue_update, conversation_id, now)
+            self._upsert_cue_cache(cue)
+            await _maybe_await_call(self.db, "upsert_cue", cue)
+
+        state.mood = clamp_percent(state.mood)
+        state.social_need = clamp_percent(state.social_need)
+
+    async def _expire_runtime_records_locked(self, now: float) -> None:
+        await _maybe_await_call(self.db, "expire_effects", now)
+        await _maybe_await_call(self.db, "expire_cues", now)
+        self._effects = [effect for effect in self._effects if effect.expires_at > now]
+        self._cues = [cue for cue in self._cues if cue.expires_at > now]
+
+    async def _reconcile_physiology_locked(
+        self,
+        now: float,
+        *,
+        allow_collapse: bool = True,
+        recovery_source_hint: str | None = None,
+    ) -> str | None:
+        state = self._state
+        energy_mode = self._energy_mode()
+        satiety_mode = self._satiety_mode()
+        physiology_enabled = energy_mode != "disabled" or satiety_mode != "disabled"
+        finished_action: str | None = None
+
+        if physiology_enabled:
+            last_tick_at = state.last_tick_at
+            action_until = _optional_float(state.action_until)
+            if (
+                state.current_action in _RESTING_ACTIONS
+                and action_until is not None
+                and action_until <= last_tick_at
+                and action_until <= now
+            ):
+                finished_action = await self._maybe_finish_action_locked(
+                    action_until,
+                    recovery_source_hint=recovery_source_hint,
+                )
+                self._apply_physiology_segment_locked(
+                    last_tick_at,
+                    now,
+                    state.current_action,
+                    energy_mode,
+                    satiety_mode,
+                )
+            elif (
+                state.current_action in _RESTING_ACTIONS
+                and action_until is not None
+                and last_tick_at < action_until < now
+            ):
+                self._apply_physiology_segment_locked(
+                    last_tick_at,
+                    action_until,
+                    state.current_action,
+                    energy_mode,
+                    satiety_mode,
+                )
+                finished_action = await self._maybe_finish_action_locked(
+                    action_until,
+                    recovery_source_hint=recovery_source_hint,
+                )
+                self._apply_physiology_segment_locked(
+                    state.last_tick_at,
+                    now,
+                    state.current_action,
+                    energy_mode,
+                    satiety_mode,
+                )
+            else:
+                self._apply_physiology_segment_locked(
+                    last_tick_at,
+                    now,
+                    state.current_action,
+                    energy_mode,
+                    satiety_mode,
+                )
+                finished_action = await self._maybe_finish_action_locked(
+                    now,
+                    recovery_source_hint=recovery_source_hint,
+                )
+
+            self._refresh_energy_critical_since(now)
+            is_resting = (
+                state.current_action in _RESTING_ACTIONS
+                and not _action_until_expired(state.action_until, now)
+            )
+            if (
+                not is_resting
+                and allow_collapse
+                and finished_action != "collapsing"
+                and self._should_collapse(now)
+            ):
+                self._trigger_collapse_locked(now)
+                return "collapsing"
+            return finished_action
+
+        finished_action = await self._maybe_finish_action_locked(
+            now,
+            recovery_source_hint=recovery_source_hint,
+        )
+        if finished_action is not None:
+            state.last_tick_at = now
+        return finished_action
+
+    def _apply_mood_baseline_drift_locked(
+        self,
+        now: float,
+        previous_tick_at: float,
+    ) -> None:
+        baseline = 65.0
+        current = self._state.mood
+        if abs(current - baseline) < 0.01:
+            return
+        if previous_tick_at <= 0:
+            return
+        elapsed_hours = _elapsed_hours(previous_tick_at, now)
+        if elapsed_hours <= 0:
+            interval_minutes = _read_number(
+                self.pm_cfg,
+                "persona_agent",
+                "timer_interval_minutes",
+                default=30,
+            )
+            elapsed_hours = max(0.0, min(interval_minutes / 60.0, 0.5))
+        step = (
+            _read_number(self.pm_cfg, "mood", "decay_per_hour", default=0.5)
+            * elapsed_hours
+        )
+        if step <= 0:
+            return
+        if current > baseline:
+            self._state.mood = clamp_percent(max(baseline, current - step))
+        else:
+            self._state.mood = clamp_percent(min(baseline, current + step))
+        if self._energy_mode() == "disabled" and self._satiety_mode() == "disabled":
+            self._state.last_tick_at = now
+
+    def _apply_physiology_segment_locked(
+        self,
+        start_at: float,
+        end_at: float,
+        current_action: str,
+        energy_mode: str,
+        satiety_mode: str,
+    ) -> None:
+        elapsed_hours = _elapsed_hours(start_at, end_at)
+        if end_at <= start_at:
+            return
+        self._state.last_tick_at = end_at
+        if elapsed_hours <= 0:
+            return
+
+        now_hour = _hour_of_day(end_at)
+        hours_since_sleep = _hours_since(self._state.last_sleep_at, end_at)
+        hours_since_eat = _hours_since(self._state.last_eat_at, end_at)
+        recovery_action = "sleeping" if current_action == "collapsing" else current_action
+        self._state.energy = self.decay.tick_energy(
+            self._state.energy,
+            elapsed_hours,
+            recovery_action,
+            hours_since_sleep,
+            now_hour,
+            mode=energy_mode,
+        )
+        self._state.satiety = self.decay.tick_satiety(
+            self._state.satiety,
+            elapsed_hours,
+            current_action,
+            hours_since_eat,
+            now_hour,
+            mode=satiety_mode,
+        )
+
+    async def _settle_current_action_for_replacement_locked(self, now: float) -> None:
+        await self._reconcile_physiology_locked(now, allow_collapse=False)
+        await self._finish_active_record_locked(
+            self._state.current_action,
+            now,
+            {"finish_reason": "replaced"},
+        )
+
+    async def _maybe_finish_action_locked(
+        self,
+        now: float,
+        *,
+        recovery_source_hint: str | None = None,
+    ) -> str | None:
+        if not _action_until_expired(self._state.action_until, now):
+            return None
+        if self._state.current_action not in _RESTING_ACTIONS:
+            return None
+        previous = self._state.current_action
+        self._state.current_action = "awake"
+        self._state.action_until = None
+        if previous == "collapsing":
+            self._state.energy_critical_since = now if self._state.energy <= 0 else None
+        extra_updates = {"finish_reason": "action_until"}
+        if recovery_source_hint:
+            extra_updates["_recovery_source_hint"] = recovery_source_hint
+        await self._finish_active_record_locked(previous, now, extra_updates)
+        await self._append_state_log_locked(
+            {"event": "action_finished", "previous_action": previous}
+        )
+        return previous
+
+    async def _maybe_daily_consolidation(self, now: float) -> None:
+        fallback_hour = int(
+            _read_number(
+                self.pm_cfg,
+                "consolidation",
+                "daily_fallback_hour",
+                default=4,
+            )
+        )
+        local_dt = datetime.fromtimestamp(now)
+        date_key = local_dt.date().isoformat()
+        if local_dt.hour != fallback_hour:
+            return
+        if self._last_daily_consolidation_date == date_key:
+            return
+        if await self._has_daily_consolidation_record(date_key):
+            self._last_daily_consolidation_date = date_key
+            return
+        consolidation_result = await self._run_consolidation("daily")
+        await self._apply_consolidation_result_locked(consolidation_result)
+        self._last_daily_consolidation_date = date_key
+
+    async def _has_daily_consolidation_record(self, date_key: str) -> bool:
+        try:
+            trajectories = await _maybe_await_call(
+                self.db,
+                "recent_trajectories",
+                20,
+                default=[],
+            )
+            for trajectory in _iter_records(trajectories):
+                if _record_date_key(trajectory) == date_key:
+                    return True
+
+            monologues = await _maybe_await_call(
+                self.db,
+                "recent_monologues",
+                20,
+                default=[],
+            )
+            for monologue in _iter_records(monologues):
+                if _record_sleep_type(monologue) != "daily":
+                    continue
+                if _record_date_key(monologue) == date_key:
+                    return True
+        except Exception:
+            logger.debug("读取每日整理去重记录失败", exc_info=True)
+        return False
+
+    async def _run_consolidation(self, sleep_type: str) -> Any:
+        if self.consolidation is None:
+            return None
+        run = getattr(self.consolidation, "run", None)
+        if run is None:
+            return None
+        state_snapshot = self.get_state_snapshot()
+        recent_history: list[Any] = []
+        try:
+            result = run(state_snapshot, recent_history, sleep_type)
+        except TypeError:
+            try:
+                result = run(state_snapshot, recent_history, sleep_type=sleep_type)
+            except TypeError:
+                try:
+                    result = run(sleep_type=sleep_type)
+                except TypeError:
+                    result = run({"sleep_type": sleep_type})
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def _apply_consolidation_result(self, result: Any) -> None:
+        monologue = _consolidation_monologue(result)
+        if not monologue:
+            return
+        async with self._state_lock:
+            await self._apply_consolidation_result_locked(result)
+            await self._save_state_locked()
+
+    async def _apply_consolidation_result_locked(self, result: Any) -> None:
+        monologue = _consolidation_monologue(result)
+        if not monologue:
+            return
+        self._state.latest_monologue = monologue
+        self._state.last_monologue_at = time.time()
+
+    async def _restore_current_monologue_after_sleep_consolidation(
+        self,
+        monologue: str,
+        monologue_at: float | None,
+        result: Any,
+    ) -> None:
+        if not _consolidation_monologue(result):
+            return
+        async with self._state_lock:
+            self._state.latest_monologue = monologue
+            self._state.last_monologue_at = monologue_at
+            await self._save_state_locked()
+
+    async def _start_subconscious(self, event: dict[str, Any]) -> None:
+        if self.subconscious_starter is None:
+            return
+        try:
+            starter = self.subconscious_starter
+            prefer_state_snapshot = False
+            if not callable(starter):
+                starter = (
+                    getattr(starter, "start", None)
+                    or getattr(starter, "run", None)
+                    or getattr(starter, "trigger", None)
+                )
+                prefer_state_snapshot = True
+            if starter is None:
+                return
+            result = _call_subconscious_starter(
+                starter,
+                self.get_state_snapshot(),
+                event,
+                prefer_state_snapshot=prefer_state_snapshot,
+            )
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("启动潜意识任务失败", exc_info=True)
+
+    async def _save_state_locked(self) -> None:
+        await _maybe_await_call(self.db, "save_state", replace(self._state))
+
+    async def _append_state_log_locked(self, entry: dict[str, Any]) -> None:
+        await _maybe_await_call(
+            self.db,
+            "append_state_log",
+            {"state": asdict(self._state), **entry, "created_at": time.time()},
+        )
+
+    async def _append_startup_reconcile_log_locked(
+        self,
+        previous: PersonaState,
+        now: float,
+    ) -> None:
+        current = self._state
+        if asdict(previous) == asdict(current):
+            return
+        source = "startup_reconciled"
+        crossed_action_until = (
+            previous.current_action in _RESTING_ACTIONS
+            and _optional_float(previous.action_until) is not None
+            and float(_optional_float(previous.action_until) or 0.0) <= now
+        )
+        await self._append_state_log_locked(
+            {
+                "event": source,
+                "reconcile_source": "offline_reconcile" if crossed_action_until else source,
+                "previous_action": previous.current_action,
+                "current_action": current.current_action,
+                "previous_action_until": previous.action_until,
+                "current_action_until": current.action_until,
+                "previous": asdict(previous),
+                "final": asdict(current),
+            }
+        )
+
+    async def _finish_active_record_locked(
+        self,
+        action: str,
+        ended_at: float,
+        extra_updates: dict[str, Any] | None = None,
+    ) -> None:
+        extra = dict(extra_updates or {})
+        source_hint = str(extra.pop("_recovery_source_hint", "") or "").strip()
+        recovery = await self._evaluate_recovery_locked(action, ended_at, extra)
+        recovery_source = source_hint or recovery.source
+        updates = {
+            "ended_at": ended_at,
+            "status": "finished",
+            **extra,
+            "recovery_source": recovery_source,
+        }
+        recovery_payload = _recovery_estimate_payload(recovery.estimate)
+        if recovery_payload:
+            updates["recovery_estimate"] = recovery_payload
+        if action in {"sleeping", "collapsing"}:
+            record_id = self._state.active_sleep_record_id or self._active_sleep_record_id
+            self._active_sleep_record_id = None
+            self._state.active_sleep_record_id = None
+            self._active_sleep_record = None
+            if record_id:
+                await _maybe_await_call(
+                    self.db,
+                    "update_sleep_record",
+                    record_id,
+                    updates,
+                )
+            return
+        if action == "eating":
+            record_id = self._state.active_eat_record_id
+            self._state.active_eat_record_id = None
+            self._active_eat_record = None
+            if record_id:
+                await _maybe_await_call(
+                    self.db,
+                    "update_eat_record",
+                    record_id,
+                    updates,
+                )
+
+    async def _evaluate_recovery_locked(
+        self,
+        action: str,
+        ended_at: float,
+        extra_updates: dict[str, Any],
+    ) -> _RecoveryResult:
+        if action not in _RESTING_ACTIONS:
+            return _RecoveryResult()
+        estimate = await self._llm_recovery_estimate(action, ended_at, extra_updates)
+        source = "persona_eval"
+        error = ""
+        if estimate is None:
+            estimate = self._fallback_recovery_estimate(action)
+            source = "fallback_formula"
+            error = "persona_eval_unavailable"
+        self._apply_recovery_estimate_locked(estimate, ended_at)
+        if estimate.latest_monologue:
+            await _maybe_await_call(
+                self.db,
+                "add_monologue",
+                {"text": estimate.latest_monologue.strip(), "created_at": ended_at},
+            )
+        await self._append_state_log_locked(
+            {
+                "event": "recovery_evaluated",
+                "action": action,
+                "ended_at": ended_at,
+                "recovery_source": source,
+                "recovery_error": error or None,
+                "recovery_estimate": _recovery_estimate_payload(estimate),
+            }
+        )
+        return _RecoveryResult(estimate=estimate, source=source, error=error)
+
+    def _apply_recovery_estimate_locked(
+        self,
+        estimate: _RecoveryEstimate,
+        now: float,
+    ) -> None:
+        state = self._state
+        if estimate.energy is not None and self._energy_mode() != "disabled":
+            state.energy = clamp_percent(estimate.energy)
+        if estimate.satiety is not None and self._satiety_mode() != "disabled":
+            state.satiety = clamp_percent(estimate.satiety)
+        if estimate.mood is not None:
+            state.mood = clamp_percent(estimate.mood)
+        if estimate.social_need is not None:
+            state.social_need = clamp_percent(estimate.social_need)
+        if estimate.latest_monologue:
+            state.latest_monologue = estimate.latest_monologue.strip()
+            state.last_monologue_at = now
+
+    def _fallback_recovery_estimate(self, action: str) -> _RecoveryEstimate:
+        if action == "eating":
+            meal_type = str(_record_field(self._active_eat_record, "meal_type") or "").strip()
+            description = str(_record_field(self._active_eat_record, "description") or "").strip()
+            duration = _optional_float(_record_field(self._active_eat_record, "duration_minutes"))
+            if _is_substantial_meal(meal_type, description, duration):
+                return _RecoveryEstimate(
+                    satiety=max(self._state.satiety, _meal_satiety_target(meal_type, duration)),
+                    latest_monologue="吃完后饱了一些，状态更稳了。",
+                    reason="按餐次和时长进行保守恢复估计。",
+                )
+        if action in {"sleeping", "collapsing"}:
+            duration = _optional_float(
+                _record_field(self._active_sleep_record, "planned_duration_minutes")
+            )
+            if duration is not None and duration >= 60:
+                return _RecoveryEstimate(
+                    energy=max(self._state.energy, min(90.0, 45.0 + duration / 6.0)),
+                    latest_monologue="醒来后精神恢复了一些。",
+                    reason="按睡眠时长进行保守恢复估计。",
+                )
+        return _RecoveryEstimate()
+
+    async def _load_effects(self, now: float) -> list[Effect]:
+        raw = await _maybe_await_call(self.db, "get_active_effects", now, default=[])
+        effects: list[Effect] = []
+        for item in raw or []:
+            effect = _coerce_effect(item)
+            if effect is not None:
+                effects.append(effect)
+        return effects
+
+    async def _load_todos(self) -> list[Todo]:
+        raw = await _maybe_await_call(self.db, "get_todos", False, default=[])
+        todos: list[Todo] = []
+        now = time.time()
+        for item in raw or []:
+            todo = _coerce_todo(item)
+            if todo is not None and not _todo_is_expired(todo, now):
+                todos.append(todo)
+        return todos
+
+    async def _load_cues(self, now: float) -> list[Cue]:
+        raw = await _maybe_await_call(self.db, "get_cues", now, default=[])
+        cues: list[Cue] = []
+        for item in raw or []:
+            cue = _coerce_cue(item)
+            if cue is not None:
+                cues.append(cue)
+        return cues
+
+    async def _load_profiles(self) -> dict[str, UserProfile]:
+        raw = await _maybe_await_call(self.db, "all_profiles", default=[])
+        profiles = [_coerce_profile(item) for item in raw or []]
+        return {profile.user_id: profile for profile in profiles if profile is not None}
+
+    async def _touch_profile_locked(
+        self,
+        user_id: str,
+        now: float,
+        participants: Any,
+    ) -> None:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return
+        existing = self._profiles.get(user_id, UserProfile(user_id=user_id))
+        profile = UserProfile(
+            user_id=user_id,
+            display_name=_participant_display_name(participants, user_id) or existing.display_name,
+            affinity=existing.affinity,
+            summary=existing.summary,
+            traits=list(existing.traits),
+            interaction_count=existing.interaction_count + 1,
+            last_interaction_at=now,
+        )
+        self._profiles[user_id] = profile
+        await _maybe_await_call(self.db, "upsert_profile", profile)
+
+    def _profile_from_update(
+        self,
+        update: _ProfileUpdate,
+        inferred_user_id: str | None,
+        now: float,
+    ) -> UserProfile | None:
+        user_id = (update.user_id or inferred_user_id or "").strip()
+        if not user_id:
+            return None
+        existing = self._profiles.get(user_id, UserProfile(user_id=user_id))
+        affinity = existing.affinity
+        if update.affinity is not None:
+            affinity = update.affinity
+        elif update.affinity_delta is not None:
+            affinity = existing.affinity + update.affinity_delta
+        return UserProfile(
+            user_id=user_id,
+            display_name=update.display_name or existing.display_name,
+            affinity=clamp_percent(affinity),
+            summary=update.summary or existing.summary,
+            traits=update.traits or list(existing.traits),
+            interaction_count=(
+                update.interaction_count
+                if update.interaction_count is not None
+                else _next_profile_interaction_count(existing, now)
+            ),
+            last_interaction_at=update.last_interaction_at or now,
+        )
+
+    def _profile_from_relationship_update(
+        self,
+        update: _RelationshipUpdate,
+        inferred_user_id: str | None,
+        now: float,
+    ) -> UserProfile | None:
+        user_id = (update.user_id or inferred_user_id or "").strip()
+        if not user_id:
+            return None
+        existing = self._profiles.get(user_id, UserProfile(user_id=user_id))
+        affinity = existing.affinity
+        if update.affinity is not None:
+            affinity = update.affinity
+        elif update.affinity_delta is not None:
+            affinity = existing.affinity + update.affinity_delta
+        return UserProfile(
+            user_id=user_id,
+            display_name=update.display_name or existing.display_name,
+            affinity=clamp_percent(affinity),
+            summary=update.summary or existing.summary,
+            traits=update.traits or list(existing.traits),
+            interaction_count=_next_profile_interaction_count(existing, now),
+            last_interaction_at=now,
+        )
+
+    def _upsert_effect_cache(self, effect: Effect) -> None:
+        self._effects = [item for item in self._effects if item.id != effect.id]
+        self._effects.append(effect)
+
+    def _upsert_todo_cache(self, todo: Todo) -> None:
+        self._todos = [item for item in self._todos if item.id != todo.id]
+        self._todos.append(todo)
+
+    def _remove_todo_cache(self, todo_id: str) -> None:
+        self._todos = [item for item in self._todos if item.id != todo_id]
+
+    async def _complete_current_action_todos_locked(self, action_type: str, now: float) -> None:
+        for todo in list(self._todos):
+            if not _todo_matches_current_action_start(todo, action_type):
+                continue
+            self._remove_todo_cache(todo.id)
+            record = asdict(todo)
+            record["status"] = "completed"
+            record["completed"] = True
+            record["completed_at"] = now
+            await _maybe_await_call(self.db, "upsert_todo", record)
+
+    async def _complete_active_resting_action_todos_locked(self, now: float) -> None:
+        current_action = str(self._state.current_action or "").strip().lower()
+        if current_action not in _RESTING_ACTIONS:
+            return
+        action_until = _optional_float(self._state.action_until)
+        if action_until is None or action_until <= now:
+            return
+        action_type = "eat" if current_action == "eating" else "sleep"
+        await self._complete_current_action_todos_locked(action_type, now)
+
+    async def _mark_expired_todos_missed_locked(self, now: float) -> None:
+        self._drop_expired_todo_cache(now)
+        await _maybe_await_call(self.db, "mark_expired_todos_missed", now)
+
+    def _drop_expired_todo_cache(self, now: float) -> None:
+        self._todos = [todo for todo in self._todos if not _todo_is_expired(todo, now)]
+
+    def _find_todo(self, todo_id: str | None) -> Todo | None:
+        if not todo_id:
+            return None
+        for todo in self._todos:
+            if todo.id == todo_id:
+                return todo
+        return None
+
+    def _filter_todo_updates(self, todos: list[_TodoUpdate]) -> list[_TodoUpdate]:
+        filtered: list[_TodoUpdate] = []
+        existing_by_id = {todo.id: todo for todo in self._todos}
+        existing_ids = set(existing_by_id)
+        key_by_id = {todo.id: _todo_dedupe_key(todo.scope, todo.title) for todo in self._todos}
+        existing_keys = set(key_by_id.values())
+        seen_new_keys: set[tuple[str, str]] = set()
+        accepted_new_count = 0
+        for todo in todos:
+            if todo.id and todo.id in existing_ids:
+                if _todo_update_status(todo) is not None:
+                    filtered.append(todo)
+                    continue
+                existing = existing_by_id[todo.id]
+                effective_title = _todo_patch_text(todo, "title", existing.title)
+                if not effective_title.strip():
+                    continue
+                effective_scope = _todo_patch_text(todo, "scope", existing.scope)
+                key = _todo_dedupe_key(effective_scope, effective_title)
+                other_existing_keys = existing_keys - {key_by_id[todo.id]}
+                if key in other_existing_keys or key in seen_new_keys:
+                    continue
+                filtered.append(todo)
+                existing_keys.discard(key_by_id[todo.id])
+                existing_keys.add(key)
+                key_by_id[todo.id] = key
+                continue
+            status = _todo_update_status(todo)
+            if status in _TODO_CLOSED_STATUS_VALUES:
+                continue
+            if not todo.title.strip():
+                continue
+            if accepted_new_count >= 1:
+                continue
+            key = _todo_dedupe_key(todo.scope, todo.title)
+            if key in existing_keys or key in seen_new_keys:
+                continue
+            filtered.append(todo)
+            seen_new_keys.add(key)
+            accepted_new_count += 1
+        return filtered
+
+    def _upsert_cue_cache(self, cue: Cue) -> None:
+        self._cues = [item for item in self._cues if item.id != cue.id]
+        self._cues.append(cue)
+
+    def _refresh_energy_critical_since(self, now: float) -> None:
+        if self._energy_mode() != "tool":
+            self._state.energy_critical_since = None
+            return
+        if self._state.energy <= 0:
+            if self._state.energy_critical_since is None:
+                self._state.energy_critical_since = now
+        else:
+            self._state.energy_critical_since = None
+
+    def _should_collapse(self, now: float) -> bool:
+        grace_seconds = (
+            _read_number(
+                self.pm_cfg,
+                "physiology",
+                "energy",
+                "collapse",
+                "grace_minutes",
+                default=60,
+            )
+            * 60.0
+        )
+        return self.decay.check_collapse(
+            self._state.energy,
+            self._state.energy_critical_since,
+            now,
+            grace_seconds,
+            mode=self._energy_mode(),
+        )
+
+    def _trigger_collapse_locked(self, now: float) -> None:
+        sleep_hours = _read_number(
+            self.pm_cfg,
+            "physiology",
+            "energy",
+            "collapse",
+            "sleep_hours",
+            default=12.0,
+        )
+        mood_penalty = _read_number(
+            self.pm_cfg,
+            "physiology",
+            "energy",
+            "collapse",
+            "mood_penalty",
+            default=20.0,
+        )
+        self._state.current_action = "collapsing"
+        self._state.action_until = now + sleep_hours * 3600.0
+        self._state.last_sleep_at = now
+        self._state.mood = clamp_percent(self._state.mood - mood_penalty)
+
+    def _profile_for_conversation(self, conversation_id: str) -> UserProfile | None:
+        user_id = _user_id_from_conversation(conversation_id)
+        if not user_id:
+            return None
+        return self._profiles.get(user_id)
+
+    def _format_age_lines(self) -> list[str]:
+        profile = self.age_profile
+        lines = [
+            f"- 年龄档位: {profile.bracket}（{profile.age}岁）",
+        ]
+        if profile.emotional_hint:
+            lines.append(f"- 年龄情绪提示: {profile.emotional_hint}")
+        if profile.social_hint:
+            lines.append(f"- 年龄社交提示: {profile.social_hint}")
+        if profile.monologue_style:
+            lines.append(f"- 内心独白风格: {profile.monologue_style}")
+        return lines
+
+    def _energy_mode(self) -> str:
+        return str(_read_field(self.pm_cfg, "physiology", "energy", "mode") or "disabled")
+
+    def _satiety_mode(self) -> str:
+        return str(_read_field(self.pm_cfg, "physiology", "satiety", "mode") or "disabled")
+
+    def _to_provider_reasoning(self) -> ReasoningConfig | None:
+        reasoning = getattr(self.cfg, "reasoning", None)
+        if reasoning is None:
+            return None
+        return ReasoningConfig(
+            enabled=reasoning.enabled,
+            budget=reasoning.budget,
+            max_tokens=reasoning.max_tokens,
+        )
+
+    async def _record_usage(self, usage: Any, **metadata: Any) -> None:
+        if self.usage_recorder is None:
+            return
+        try:
+            await self.usage_recorder(
+                usage,
+                {
+                    "provider": getattr(self.provider, "name", ""),
+                    "model": self.cfg.model,
+                    "agent": "人格管理",
+                    **metadata,
+                },
+            )
+        except Exception:
+            logger.debug("记录人格管理模型用量失败", exc_info=True)
+
+    def _emit_status(self, state: str, text: str) -> None:
+        if self.status_callback is None:
+            return
+        try:
+            self.status_callback(
+                {
+                    "state": state,
+                    "text": text,
+                    "model": self.cfg.model,
+                    "agent": "人格管理",
+                }
+            )
+        except Exception:
+            logger.debug("更新人格管理状态失败", exc_info=True)
+
+
+def _append_singular(data: dict[str, Any], singular: str, plural: str) -> None:
+    value = data.pop(singular, None)
+    if value is None or plural in data:
+        return
+    data[plural] = value if isinstance(value, list) else [value]
+
+
+def _iter_records(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list | tuple):
+        return list(value)
+    return [value]
+
+
+def _record_field(record: Any, *names: str) -> Any:
+    if isinstance(record, dict):
+        for name in names:
+            if name in record:
+                return record[name]
+        return None
+    for name in names:
+        if hasattr(record, name):
+            return getattr(record, name)
+    if is_dataclass(record) and not isinstance(record, type):
+        return _record_field(asdict(record), *names)
+    model_dump = getattr(record, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump()
+        if isinstance(dumped, dict):
+            return _record_field(dumped, *names)
+    return None
+
+
+def _record_sleep_type(record: Any) -> str:
+    return str(_record_field(record, "sleep_type", "type") or "").strip()
+
+
+def _record_date_key(record: Any) -> str:
+    explicit = _record_field(record, "date", "day", "target_date")
+    parsed = _date_key_from_value(explicit)
+    if parsed:
+        return parsed
+    for name in ("created_at", "timestamp", "ended_at", "started_at"):
+        parsed = _date_key_from_value(_record_field(record, name))
+        if parsed:
+            return parsed
+    return ""
+
+
+def _date_key_from_value(value: Any) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, int | float):
+        try:
+            return datetime.fromtimestamp(float(value)).date().isoformat()
+        except (OSError, OverflowError, ValueError):
+            return ""
+    text = str(value).strip()
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        return text[:10]
+    return ""
+
+
+def _consolidation_monologue(result: Any) -> str:
+    if result is None:
+        return ""
+    value = _record_field(result, "tomorrow_monologue", "latest_monologue")
+    return str(value or "").strip()
+
+
+def _recovery_estimate_payload(estimate: _RecoveryEstimate) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in estimate.model_dump(exclude_none=True).items()
+        if value != ""
+    }
+
+
+def _is_substantial_meal(
+    meal_type: str,
+    description: str,
+    duration_minutes: float | None,
+) -> bool:
+    meal_text = f"{meal_type} {description}".lower()
+    if any(token in meal_text for token in ("snack", "点心", "零食", "小吃", "垫肚子")):
+        return False
+    substantial_tokens = (
+        "breakfast",
+        "lunch",
+        "dinner",
+        "meal",
+        "正餐",
+        "早餐",
+        "午餐",
+        "晚餐",
+        "早饭",
+        "午饭",
+        "晚饭",
+        "米饭",
+        "面",
+        "饭",
+        "菜",
+    )
+    return (duration_minutes is not None and duration_minutes >= 25) or any(
+        token in meal_text for token in substantial_tokens
+    )
+
+
+def _meal_satiety_target(meal_type: str, duration_minutes: float | None) -> float:
+    meal = meal_type.strip().lower()
+    base = 68.0
+    if meal in {"lunch", "dinner", "午餐", "晚餐", "午饭", "晚饭", "正餐"}:
+        base = 78.0
+    elif meal in {"breakfast", "早餐", "早饭"}:
+        base = 72.0
+    if duration_minutes is not None:
+        base += min(max(duration_minutes - 25.0, 0.0) * 0.4, 8.0)
+    return clamp_percent(base)
+
+
+async def _maybe_await_call(
+    target: Any,
+    method_name: str,
+    *args: Any,
+    default: Any = None,
+    **kwargs: Any,
+) -> Any:
+    method = getattr(target, method_name, None)
+    if method is None:
+        return default
+    try:
+        result = method(*args, **kwargs)
+    except TypeError:
+        if args or kwargs:
+            result = method()
+        else:
+            raise
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _call_subconscious_starter(
+    starter: Any,
+    state_snapshot: PersonaState,
+    event: dict[str, Any],
+    *,
+    prefer_state_snapshot: bool,
+) -> Any:
+    try:
+        signature = inspect.signature(starter)
+    except (TypeError, ValueError):
+        return _call_subconscious_starter_fallback(
+            starter,
+            state_snapshot,
+            event,
+            prefer_state_snapshot=prefer_state_snapshot,
+        )
+
+    parameters = list(signature.parameters.values())
+    accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters)
+    accepts_varargs = any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in parameters)
+    positional = [
+        param
+        for param in parameters
+        if param.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    names = {param.name for param in parameters}
+
+    if accepts_kwargs or "trigger_event" in names:
+        return starter(state_snapshot, trigger_event=event)
+    if accepts_varargs or len(positional) >= 2:
+        return starter(state_snapshot, event)
+    if len(positional) == 0:
+        return starter()
+
+    first_name = positional[0].name.lower()
+    if prefer_state_snapshot or "state" in first_name or "snapshot" in first_name:
+        return starter(state_snapshot)
+    return starter(event)
+
+
+def _call_subconscious_starter_fallback(
+    starter: Any,
+    state_snapshot: PersonaState,
+    event: dict[str, Any],
+    *,
+    prefer_state_snapshot: bool,
+) -> Any:
+    try:
+        return starter(state_snapshot, trigger_event=event)
+    except TypeError:
+        try:
+            return starter(state_snapshot, event)
+        except TypeError:
+            return starter(state_snapshot if prefer_state_snapshot else event)
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    if start == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(raw[start:end])
+    except json.JSONDecodeError:
+        logger.debug("人格管理 JSON 解析失败", exc_info=True)
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _coerce_level_value(
+    value: object,
+    *,
+    default: object,
+    low: float | int,
+    medium: float | int,
+    high: float | int,
+) -> object:
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if not normalized:
+        return default
+    mapping = {
+        "low": low,
+        "minor": low,
+        "weak": low,
+        "small": low,
+        "light": low,
+        "轻": low,
+        "低": low,
+        "弱": low,
+        "轻微": low,
+        "medium": medium,
+        "mid": medium,
+        "moderate": medium,
+        "normal": medium,
+        "average": medium,
+        "中": medium,
+        "中等": medium,
+        "一般": medium,
+        "适中": medium,
+        "普通": medium,
+        "high": high,
+        "major": high,
+        "strong": high,
+        "large": high,
+        "important": high,
+        "高": high,
+        "强": high,
+        "强烈": high,
+        "重要": high,
+        "urgent": high,
+        "critical": high,
+        "very_high": high,
+        "极高": high,
+        "紧急": high,
+    }
+    return mapping.get(normalized, default)
+
+
+def _todo_dedupe_key(scope: str, title: str) -> tuple[str, str]:
+    normalized_scope = " ".join(str(scope or "persona").strip().lower().split()) or "persona"
+    normalized_title = " ".join(str(title or "").strip().lower().split())
+    normalized_title = normalized_title.rstrip("。.!！?？；;，,")
+    return normalized_scope, normalized_title
+
+
+_ACTION_TODO_SCOPE_BY_TYPE = {
+    "sleep": {"", "persona", "sleep", "sleeping", "rest", "energy", "physiological", "short_term"},
+    "eat": {"", "persona", "eat", "eating", "meal", "food", "satiety", "drink", "water", "physiological", "short_term"},
+}
+_ACTION_TODO_INCLUDE_BY_TYPE = {
+    "sleep": ("睡", "睡觉", "睡眠", "休息", "休眠", "补觉", "躺下", "小睡"),
+    "eat": ("吃饭", "吃点", "吃东西", "进食", "用餐", "喝水", "喝点", "喝饮料", "吃早餐", "吃午饭", "吃晚饭", "觅食", "填饱肚子"),
+}
+_ACTION_TODO_EXCLUDE = (
+    "提醒用户",
+    "提醒对方",
+    "提醒主人",
+    "提醒我",
+    "提醒一下我",
+    "提醒下我",
+    "叫我",
+    "叫一下我",
+    "叫下我",
+    "通知我",
+    "通知本人",
+    "通知一下我",
+    "通知下我",
+    "喊我",
+    "一会提醒我",
+    "一会儿提醒我",
+    "待会提醒我",
+    "到点提醒我",
+    "叫醒用户",
+    "叫醒对方",
+    "叫醒主人",
+    "明早",
+    "明天",
+    "稍后",
+    "后续",
+)
+_ACTION_TODO_TITLE_EXCLUDE = (
+    "用户",
+    "主人",
+)
+_ACTION_TODO_MEDICINE_EXCLUDE = (
+    "吃药",
+    "用药",
+    "服药",
+    "药",
+)
+
+
+def _todo_matches_current_action_start(todo: Todo, action_type: str) -> bool:
+    scope = str(todo.scope or "").strip().lower()
+    allowed_scopes = _ACTION_TODO_SCOPE_BY_TYPE.get(action_type, set())
+    if scope not in allowed_scopes:
+        return False
+
+    title = str(todo.title or "")
+    text = f"{title} {todo.reason or ''}".strip()
+    if not text:
+        return False
+    compact_text = "".join(text.split())
+    if any(excluded in text or excluded in compact_text for excluded in _ACTION_TODO_EXCLUDE):
+        return False
+    if action_type in {"eat", "sleep"} and any(excluded in text for excluded in _ACTION_TODO_MEDICINE_EXCLUDE):
+        return False
+    if any(excluded in title for excluded in _ACTION_TODO_TITLE_EXCLUDE):
+        return False
+    return any(included in text for included in _ACTION_TODO_INCLUDE_BY_TYPE.get(action_type, ()))
+
+
+def _action_until_expired(action_until: Any, now: float) -> bool:
+    if action_until is None:
+        return False
+    try:
+        return float(action_until) <= now
+    except (TypeError, ValueError):
+        return False
+
+
+def _format_action_context(state: PersonaState, now: float) -> str:
+    action = str(state.current_action or "").strip().lower()
+    if not action:
+        return ""
+    label_by_action = {
+        "awake": "清醒",
+        "sleeping": "睡眠中",
+        "collapsing": "体力崩溃休息中",
+        "eating": "进食中",
+    }
+    label = label_by_action.get(action, state.current_action)
+    parts = [f"- 当前动作: {label}"]
+    action_until = _optional_float(state.action_until)
+    if action_until is not None and action_until > now:
+        remaining_minutes = max(1, int((action_until - now + 59) // 60))
+        ends_at = datetime.fromtimestamp(action_until).strftime("%Y-%m-%d %H:%M:%S")
+        parts.append(f"预计结束: {ends_at}")
+        parts.append(f"剩余约 {remaining_minutes} 分钟")
+        if action in {"sleeping", "collapsing"}:
+            parts.append("尚未醒来，普通入站消息只记录到潜意识，不应当表现为刚醒")
+        elif action == "eating":
+            parts.append("尚未结束进食，普通入站消息只记录到潜意识缓冲，不应在当前动作结束前回复或表现为已结束")
+    elif action_until is not None:
+        parts.append("预计结束时间已到，等待睡眠结束/状态结算逻辑处理")
+    return "；".join(parts)
+
+
+def _coerce_model_timestamp(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        return datetime.fromisoformat(iso_text).timestamp()
+    except ValueError:
+        return None
+
+
+def _todo_is_expired(todo: Todo, now: float) -> bool:
+    if todo.expires_at is None:
+        return False
+    try:
+        return float(todo.expires_at) <= now
+    except (TypeError, ValueError):
+        return False
+
+
+def _todo_sort_key(todo: Todo) -> tuple[Any, ...]:
+    return (
+        -_int_sort_value(todo.priority),
+        _time_sort_value(todo.expires_at),
+        _time_sort_value(todo.created_at),
+        str(todo.id or ""),
+    )
+
+
+def _int_sort_value(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _time_sort_value(value: Any) -> tuple[int, float | str]:
+    parsed = _optional_float(value)
+    if parsed is not None:
+        return (0, parsed)
+    if value is None:
+        return (1, "")
+    return (1, str(value).strip())
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _todo_patch_text(update: _TodoUpdate, field_name: str, default: str) -> str:
+    if field_name in update.model_fields_set:
+        return str(getattr(update, field_name) or "")
+    return default
+
+
+def _coerce_state(value: Any) -> PersonaState:
+    if isinstance(value, PersonaState):
+        return replace(value)
+    if isinstance(value, dict):
+        return PersonaState(**_filter_dataclass_fields(PersonaState, value))
+    return PersonaState()
+
+
+def _effect_from_update(update: _EffectUpdate, now: float) -> Effect:
+    created_at = update.created_at or now
+    expires_at = update.expires_at
+    if expires_at is None:
+        duration = update.duration_minutes if update.duration_minutes is not None else 60.0
+        expires_at = created_at + duration * 60.0
+    return Effect(
+        id=update.id or f"effect_{uuid4().hex}",
+        name=update.name or update.effect_type,
+        effect_type=update.effect_type,
+        intensity=update.intensity,
+        prompt_hint=update.prompt_hint,
+        source_detail=update.source_detail,
+        created_at=created_at,
+        expires_at=expires_at,
+    )
+
+
+def _todo_from_update(update: _TodoUpdate, now: float) -> Todo:
+    return Todo(
+        id=update.id or f"todo_{uuid4().hex}",
+        title=update.title,
+        reason=update.reason,
+        priority=update.priority,
+        scope=update.scope,
+        created_at=update.created_at or now,
+        expires_at=update.expires_at,
+    )
+
+
+def _todo_record_from_update(
+    update: _TodoUpdate,
+    now: float,
+    existing: Todo | None,
+) -> dict[str, Any]:
+    status = _todo_update_status(update)
+    fields_set = update.model_fields_set
+    if existing is not None:
+        record = asdict(existing)
+        for field_name in ("title", "reason", "priority", "scope", "created_at", "expires_at"):
+            if field_name in fields_set:
+                record[field_name] = getattr(update, field_name)
+    elif status is None or status in _TODO_OPEN_STATUS_VALUES:
+        record = asdict(_todo_from_update(update, now))
+    else:
+        record = {"id": update.id or f"todo_{uuid4().hex}"}
+        for field_name in ("title", "reason", "priority", "scope", "created_at", "expires_at"):
+            if field_name in fields_set:
+                record[field_name] = getattr(update, field_name)
+
+    record["id"] = str(update.id or record.get("id") or f"todo_{uuid4().hex}")
+    if status is not None:
+        record["status"] = status
+        record["completed"] = status in _TODO_CLOSED_STATUS_VALUES
+    return record
+
+
+def _todo_update_status(update: _TodoUpdate) -> str | None:
+    fields_set = update.model_fields_set
+    if "status" in fields_set and update.status is not None:
+        return _normalize_todo_status(update.status)
+    for field_name in ("completed", "done", "finished"):
+        if field_name in fields_set:
+            return "completed" if _truthy_todo_state(getattr(update, field_name)) else "open"
+    for field_name in ("cancelled", "canceled"):
+        if field_name in fields_set:
+            return "cancelled" if _truthy_todo_state(getattr(update, field_name)) else "open"
+    return None
+
+
+def _todo_record_is_closed(record: dict[str, Any]) -> bool:
+    status = _normalize_todo_status(record.get("status"))
+    if status in _TODO_CLOSED_STATUS_VALUES:
+        return True
+    for field_name in ("completed", "done", "finished", "cancelled", "canceled"):
+        if field_name in record and _truthy_todo_state(record.get(field_name)):
+            return True
+    return False
+
+
+def _normalize_todo_status(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text == "canceled":
+        return "cancelled"
+    if text in {"complete", "finished", "closed"}:
+        return "completed"
+    return text
+
+
+def _truthy_todo_state(value: Any) -> bool:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TODO_CLOSED_STATUS_VALUES or text in {"1", "true", "yes", "y"}:
+            return True
+        if text in _TODO_OPEN_STATUS_VALUES or text in {"0", "false", "no", "n", ""}:
+            return False
+    return bool(value)
+
+
+def _cue_from_update(update: _CueUpdate, conversation_id: str, now: float) -> Cue:
+    return Cue(
+        id=update.id or f"cue_{uuid4().hex}",
+        cue_type=update.cue_type,
+        summary=update.summary,
+        conversation_id=update.conversation_id or conversation_id,
+        created_at=update.created_at or now,
+        expires_at=update.expires_at or now + 24 * 3600.0,
+    )
+
+
+def _coerce_effect(value: Any) -> Effect | None:
+    return _coerce_dataclass(Effect, value)
+
+
+def _coerce_todo(value: Any) -> Todo | None:
+    return _coerce_dataclass(Todo, value)
+
+
+def _coerce_cue(value: Any) -> Cue | None:
+    return _coerce_dataclass(Cue, value)
+
+
+def _coerce_profile(value: Any) -> UserProfile | None:
+    return _coerce_dataclass(UserProfile, value)
+
+
+def _coerce_dataclass(cls: Any, value: Any) -> Any | None:
+    if isinstance(value, cls):
+        return replace(value)
+    if isinstance(value, dict):
+        try:
+            return cls(**_filter_dataclass_fields(cls, value))
+        except TypeError:
+            return None
+    if is_dataclass(value):
+        try:
+            return cls(**_filter_dataclass_fields(cls, asdict(value)))
+        except TypeError:
+            return None
+    return None
+
+
+def _filter_dataclass_fields(cls: Any, data: dict[str, Any]) -> dict[str, Any]:
+    names = {field.name for field in fields(cls)}
+    return {key: value for key, value in data.items() if key in names}
+
+
+def _read_number(source: Any, *path: str, default: float) -> float:
+    value = _read_field(source, *path)
+    if value is None or isinstance(value, bool):
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _read_field(source: Any, *path: str) -> Any:
+    current = source
+    for name in path:
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            current = current.get(name)
+            continue
+        current = getattr(current, name, None)
+    return current
+
+
+def _elapsed_hours(last_tick_at: float, now: float) -> float:
+    if last_tick_at <= 0 or now <= last_tick_at:
+        return 0.0
+    return (now - last_tick_at) / 3600.0
+
+
+def _hours_since(timestamp: float | None, now: float) -> float:
+    if timestamp is None or timestamp <= 0 or now <= timestamp:
+        return 0.0
+    return (now - timestamp) / 3600.0
+
+
+def _hour_of_day(timestamp: float) -> float:
+    local = datetime.fromtimestamp(timestamp)
+    return local.hour + local.minute / 60.0
+
+
+def _bounded_duration(value: float, maximum: float) -> float:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        duration = 0.0
+    return max(0.0, min(duration, float(maximum)))
+
+
+def _infer_user_id(conversation_id: str, participants: Any) -> str | None:
+    from_conversation = _user_id_from_conversation(conversation_id)
+    if from_conversation:
+        return from_conversation
+    if isinstance(participants, list) and participants:
+        for item in participants:
+            user_id = _participant_user_id(item)
+            if user_id:
+                return user_id
+    return None
+
+
+def _user_id_from_conversation(conversation_id: str) -> str | None:
+    raw = str(conversation_id or "")
+    if raw.startswith("private:"):
+        value = raw.split(":", 1)[1].strip()
+        return value or None
+    return None
+
+
+def _participant_user_id(participant: Any) -> str | None:
+    if isinstance(participant, dict):
+        for key in ("user_id", "id", "qq", "focus_user_id", "target_user_id"):
+            value = participant.get(key)
+            if value:
+                return str(value).strip() or None
+        return None
+    if participant:
+        return str(participant).strip() or None
+    return None
+
+
+def _participant_display_name(participants: Any, user_id: str) -> str:
+    if not isinstance(participants, list):
+        return ""
+    for item in participants:
+        if _participant_user_id(item) != user_id:
+            continue
+        if not isinstance(item, dict):
+            return ""
+        for key in ("display_name", "nickname", "name", "card"):
+            value = item.get(key)
+            if value:
+                return str(value).strip()
+    return ""
+
+
+def _next_profile_interaction_count(existing: UserProfile, now: float) -> int:
+    if existing.last_interaction_at == now:
+        return existing.interaction_count
+    return existing.interaction_count + 1

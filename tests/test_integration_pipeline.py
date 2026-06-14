@@ -273,6 +273,11 @@ def build_pipeline(tmp_path):
         workspace_dir=None,
         rate_limiter=None,
         event_store=None,
+        persona_agent=None,
+        subconscious_agent=None,
+        persona_db=None,
+        eat_tool=False,
+        sleep_tool=False,
     ):
         cfg = _make_root_config()
         provider = ScriptedProvider(script)
@@ -310,6 +315,11 @@ def build_pipeline(tmp_path):
             rate_limiter=rate_limiter,
             summary_agent=None,
             event_store=event_store,
+            persona_agent=persona_agent,
+            subconscious_agent=subconscious_agent,
+            persona_db=persona_db,
+            eat_tool=eat_tool,
+            sleep_tool=sleep_tool,
         )
         scheduler._on_fire = pipeline.run_wakeup_turn  # 双向依赖回填
         return pipeline, provider, adapter, history, important
@@ -430,6 +440,62 @@ async def _wait_until(predicate, max_wait: float = 1.0) -> None:
     raise AssertionError("等待条件超时")
 
 
+class RecordingPersonaAgent:
+    def __init__(
+        self,
+        context: str = "",
+        *,
+        current_action: str = "awake",
+        action_until: float | None = None,
+    ) -> None:
+        self.context = context
+        self.current_action = current_action
+        self.action_until = action_until
+        self.context_calls: list[str | None] = []
+        self.after_turn_calls: list[dict[str, Any]] = []
+
+    def get_context_for_chat(self, conversation_id: str | None) -> str:
+        self.context_calls.append(conversation_id)
+        return self.context
+
+    def is_resting(self) -> bool:
+        if self.current_action not in {"eating", "sleeping", "collapsing"}:
+            return False
+        return self.action_until is None or self.action_until > time.time()
+
+    async def after_turn(
+        self,
+        conversation_id: str,
+        participants: Any,
+        chat_summary: str,
+    ) -> None:
+        self.after_turn_calls.append(
+            {
+                "conversation_id": conversation_id,
+                "participants": participants,
+                "chat_summary": chat_summary,
+            }
+        )
+
+
+class RecordingSubconsciousAgent:
+    def __init__(self, *, active: bool = True) -> None:
+        self.is_active = active
+        self.message_calls: list[tuple[str, str, float]] = []
+        self.stop_calls = 0
+
+    async def on_message(
+        self,
+        text: str,
+        sender_id: str,
+        profile_affinity: float,
+    ) -> None:
+        self.message_calls.append((text, sender_id, profile_affinity))
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+
+
 async def _add_history_until_active_tokens(
     pipeline: MessagePipeline,
     history: HistoryManager,
@@ -477,6 +543,302 @@ async def test_main_reply_persists_task_context_snapshot_for_kv_prefix(build_pip
     assert first_call[1]["role"] == "user"
     assert first_call[2]["role"] == "user"
     assert first_call[2]["content"] == records[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_tool_context_injects_persona_runtime_dependencies(
+    build_pipeline,
+):
+    persona_agent = RecordingPersonaAgent()
+    subconscious_agent = RecordingSubconsciousAgent()
+    persona_db = object()
+    pipeline, _, _, _, _ = await build_pipeline(
+        [],
+        persona_agent=persona_agent,
+        subconscious_agent=subconscious_agent,
+        persona_db=persona_db,
+    )
+
+    ctx = pipeline._build_tool_context(conversation_id="private:123")
+
+    assert ctx.persona_agent is persona_agent
+    assert ctx.subconscious_agent is subconscious_agent
+    assert ctx.persona_db is persona_db
+
+
+@pytest.mark.asyncio
+async def test_task_context_persists_persona_context_snapshot(build_pipeline):
+    persona_agent = RecordingPersonaAgent(
+        "<人格状态>\n- 当前对象画像: 亲密朋友\n</人格状态>"
+    )
+    pipeline, provider, _, history, _ = await build_pipeline(
+        [_ai_no_action()],
+        persona_agent=persona_agent,
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="测人格上下文", message_id="persona-ctx"))
+    await _drain_pipeline(pipeline)
+
+    records = await history.records()
+    task_context_record = next(
+        record
+        for record in records
+        if record.get("metadata", {}).get("kind") == "task_context_snapshot"
+    )
+    assert "当前对象画像: 亲密朋友" in task_context_record["content"]
+    assert persona_agent.context_calls == ["private:123"]
+    assert any(
+        message.get("content") == task_context_record["content"]
+        for message in provider.calls[0]["messages"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_passes_persona_tool_flags_to_build_messages(
+    build_pipeline,
+    monkeypatch,
+):
+    import core.message_pipeline as message_pipeline_module
+    import core.pipeline_turns as pipeline_turns_module
+
+    main_calls: list[tuple[bool | None, bool | None]] = []
+    turn_calls: list[tuple[bool | None, bool | None]] = []
+    real_main_build_messages = message_pipeline_module.build_messages
+    real_turn_build_messages = pipeline_turns_module.build_messages
+
+    def capture_main_build_messages(*args: Any, **kwargs: Any):
+        main_calls.append((kwargs.get("eat_tool"), kwargs.get("sleep_tool")))
+        kwargs.pop("eat_tool", None)
+        kwargs.pop("sleep_tool", None)
+        return real_main_build_messages(*args, **kwargs)
+
+    def capture_turn_build_messages(*args: Any, **kwargs: Any):
+        turn_calls.append((kwargs.get("eat_tool"), kwargs.get("sleep_tool")))
+        kwargs.pop("eat_tool", None)
+        kwargs.pop("sleep_tool", None)
+        return real_turn_build_messages(*args, **kwargs)
+
+    monkeypatch.setattr(
+        message_pipeline_module,
+        "build_messages",
+        capture_main_build_messages,
+    )
+    monkeypatch.setattr(
+        pipeline_turns_module,
+        "build_messages",
+        capture_turn_build_messages,
+    )
+    pipeline, _, _, _, _ = await build_pipeline(
+        [_ai_no_action(), _ai_no_action()],
+        eat_tool=True,
+        sleep_tool=True,
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="测工具开关", message_id="flags-1"))
+    await _drain_pipeline(pipeline)
+    await pipeline.run_one_turn(
+        "单轮工具开关",
+        user_event="触发单轮",
+        conversation_id="private:123",
+    )
+
+    assert main_calls == [(True, True)]
+    assert turn_calls == [(True, True)]
+
+
+@pytest.mark.asyncio
+async def test_after_turn_runs_after_normal_batch(build_pipeline):
+    persona_agent = RecordingPersonaAgent()
+    pipeline, _, _, _, _ = await build_pipeline(
+        [_ai_send_private(target_qq="123", content="人格回复")],
+        persona_agent=persona_agent,
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="你好人格", message_id="after-1"))
+    await _drain_pipeline(pipeline)
+    await _wait_until(lambda: bool(persona_agent.after_turn_calls))
+
+    call = persona_agent.after_turn_calls[0]
+    assert call["conversation_id"] == "private:123"
+    assert call["participants"] == [{"user_id": "123", "nickname": "用户"}]
+    assert "你好人格" in call["chat_summary"]
+    assert "人格回复" in call["chat_summary"]
+
+
+@pytest.mark.asyncio
+async def test_after_turn_runs_after_run_one_turn(build_pipeline):
+    persona_agent = RecordingPersonaAgent()
+    pipeline, _, _, _, _ = await build_pipeline(
+        [_ai_no_action()],
+        persona_agent=persona_agent,
+    )
+
+    await pipeline.run_one_turn(
+        "单轮人格上下文",
+        user_event="系统事件触发",
+        conversation_id="private:123",
+        history_conversation_id="system:proactive",
+    )
+    await _wait_until(lambda: bool(persona_agent.after_turn_calls))
+
+    call = persona_agent.after_turn_calls[0]
+    assert call["conversation_id"] == "private:123"
+    assert call["participants"] == [{"user_id": "123"}]
+    assert "系统事件触发" in call["chat_summary"]
+    assert "单轮人格上下文" in call["chat_summary"]
+
+
+@pytest.mark.asyncio
+async def test_after_turn_run_one_turn_system_global_uses_default_private_target(
+    build_pipeline,
+):
+    persona_agent = RecordingPersonaAgent()
+    pipeline, _, _, _, _ = await build_pipeline(
+        [_ai_no_action()],
+        persona_agent=persona_agent,
+    )
+
+    await pipeline.run_one_turn(
+        "全局系统事件",
+        user_event="后台任务实际面向私聊用户",
+        default_target=Target(
+            adapter="unit",
+            scope="private",
+            target_id="456",
+        ),
+        conversation_id=None,
+        history_conversation_id="system:proactive",
+    )
+    await _wait_until(lambda: bool(persona_agent.after_turn_calls))
+
+    call = persona_agent.after_turn_calls[0]
+    assert call["conversation_id"] == "system:global"
+    assert call["participants"] == [{"user_id": "456"}]
+    assert "后台任务实际面向私聊用户" in call["chat_summary"]
+
+
+@pytest.mark.asyncio
+async def test_resting_run_one_turn_skips_model_send_and_after_turn(build_pipeline):
+    persona_agent = RecordingPersonaAgent(current_action="sleeping")
+    pipeline, provider, adapter, history, _ = await build_pipeline(
+        [_ai_send_private(target_qq="123", content="不应发送")],
+        persona_agent=persona_agent,
+    )
+
+    await pipeline.run_one_turn(
+        "睡眠中的系统轮",
+        user_event="这轮不应调用主模型",
+        as_system_note="睡眠中的系统事件仍应记录",
+        conversation_id="private:123",
+        history_conversation_id="system:proactive",
+    )
+
+    records = await history.records()
+    assert provider.calls == []
+    assert adapter.sent == []
+    assert persona_agent.after_turn_calls == []
+    assert any(
+        record.get("role") == "system"
+        and "睡眠中的系统事件仍应记录" in str(record.get("content") or "")
+        for record in records
+    )
+    assert any(
+        record.get("role") == "system"
+        and "persona_resting" in str(record.get("content") or "")
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_resting_inbound_is_recorded_and_buffered_without_main_provider(
+    build_pipeline,
+    tmp_path,
+):
+    event_store = EventStore(tmp_path / "resting-events.sqlite3")
+    persona_agent = RecordingPersonaAgent(current_action="eating")
+    subconscious_agent = RecordingSubconsciousAgent(active=True)
+    pipeline, provider, _, _, _ = await build_pipeline(
+        [_ai_no_action()],
+        event_store=event_store,
+        persona_agent=persona_agent,
+        subconscious_agent=subconscious_agent,
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="吃饭中仍入站", message_id="sub-1"))
+    await _drain_pipeline(pipeline)
+    assert await event_store.wait_projected(timeout=1.0)
+    events = await event_store.events_by_type("qq_message_received", limit=10)
+
+    assert subconscious_agent.message_calls == [("吃饭中仍入站", "123", 0.0)]
+    assert len(events) == 1
+    assert events[0]["payload"]["content"] == "吃饭中仍入站"
+    assert provider.calls == []
+    assert pipeline.batch.is_empty_unsafe()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["sleeping", "collapsing"])
+async def test_resting_inbound_without_subconscious_does_not_call_provider(
+    build_pipeline,
+    action,
+):
+    _ = action
+    persona_agent = RecordingPersonaAgent(current_action=action)
+    pipeline, provider, _, history, _ = await build_pipeline(
+        [_ai_no_action()],
+        persona_agent=persona_agent,
+        subconscious_agent=None,
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="休息中普通消息", message_id="rest-1"))
+    await _drain_pipeline(pipeline)
+
+    records = await history.records()
+    assert provider.calls == []
+    assert any(
+        record.get("role") == "user"
+        and "休息中普通消息" in str(record.get("content") or "")
+        and record.get("metadata", {}).get("suppressed_reason") == "persona_resting"
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbound_after_resting_ends_calls_main_provider(build_pipeline):
+    persona_agent = RecordingPersonaAgent(current_action="eating")
+    pipeline, provider, _, _, _ = await build_pipeline(
+        [_ai_no_action()],
+        persona_agent=persona_agent,
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="吃饭中普通消息", message_id="rest-1"))
+    await _drain_pipeline(pipeline)
+    assert provider.calls == []
+
+    persona_agent.current_action = "awake"
+    await pipeline.enqueue(_msg(user_id="123", text="吃完了再聊", message_id="awake-1"))
+    await _drain_pipeline(pipeline)
+
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_inbound_expired_resting_action_does_not_suppress_provider(build_pipeline):
+    persona_agent = RecordingPersonaAgent(current_action="eating", action_until=0.0)
+    pipeline, provider, _, history, _ = await build_pipeline(
+        [_ai_no_action()],
+        persona_agent=persona_agent,
+    )
+
+    await pipeline.enqueue(_msg(user_id="123", text="吃饭时间已过", message_id="rest-expired-1"))
+    await _drain_pipeline(pipeline)
+
+    records = await history.records()
+    assert len(provider.calls) == 1
+    assert not any(
+        record.get("metadata", {}).get("suppressed_reason") == "persona_resting"
+        for record in records
+    )
 
 
 @pytest.mark.asyncio
@@ -1510,6 +1872,33 @@ async def test_proactive_router_skips_runtime_user_context_records(build_pipelin
 
 
 @pytest.mark.asyncio
+async def test_proactive_router_includes_persona_todo_context(build_pipeline):
+    persona_agent = RecordingPersonaAgent(
+        "<人格状态>\n- 待办: 主动提醒主人喝水\n</人格状态>"
+    )
+    pipeline, _, _, _, _ = await build_pipeline(
+        [],
+        persona_agent=persona_agent,
+    )
+    router = FakeProactiveRouter(False)
+    loop = ProactiveLoop(
+        pipeline=pipeline,
+        proactive_agent=router,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+    pipeline.last_activity_at = time.monotonic() - (
+        pipeline.behavior_cfg.proactive_think_interval_seconds + 1
+    )
+
+    await loop._maybe_act()
+
+    assert persona_agent.context_calls == [None]
+    joined = "\n".join(str(m.get("content", "")) for m in router.calls[0])
+    assert "<persona_proactive_context" in joined
+    assert "主动提醒主人喝水" in joined
+
+
+@pytest.mark.asyncio
 async def test_proactive_skips_when_reply_lock_busy(build_pipeline):
     pipeline, _, _, _, _ = await build_pipeline([])
     router = FakeProactiveRouter(True)
@@ -1591,6 +1980,94 @@ async def test_proactive_action_runs_under_acquired_lock(build_pipeline):
     assert "start_agent_task" in names
     assert "summarize_conversation" in names
     assert "summarize_chat_history" in names
+
+
+@pytest.mark.asyncio
+async def test_proactive_action_after_turn_uses_global_when_no_target(build_pipeline):
+    persona_agent = RecordingPersonaAgent()
+    pipeline, _, _, history, _ = await build_pipeline(
+        [_ai_no_action()],
+        persona_agent=persona_agent,
+    )
+    router = FakeProactiveRouter(True)
+    loop = ProactiveLoop(
+        pipeline=pipeline,
+        proactive_agent=router,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+    pipeline.last_activity_at = time.monotonic() - (
+        pipeline.behavior_cfg.proactive_think_interval_seconds + 1
+    )
+
+    await loop._maybe_act()
+    await _wait_until(lambda: bool(persona_agent.after_turn_calls))
+
+    records = await history.records()
+    assert any(record.get("conversation_id") == "system:proactive" for record in records)
+    assert persona_agent.after_turn_calls[0]["conversation_id"] == "system:global"
+
+
+@pytest.mark.asyncio
+async def test_proactive_send_anchors_seen_seq_for_old_private_inbound(build_pipeline):
+    pipeline, provider, adapter, history, _ = await build_pipeline(
+        [_ai_no_action(), _ai_send_private(target_qq="123", content="主动补充")]
+    )
+    await pipeline.enqueue(
+        _msg(user_id="123", text="旧私聊消息", message_id="proactive-old")
+    )
+    await _drain_pipeline(pipeline)
+    router = FakeProactiveRouter(True)
+    loop = ProactiveLoop(
+        pipeline=pipeline,
+        proactive_agent=router,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+    pipeline.last_activity_at = time.monotonic() - (
+        pipeline.behavior_cfg.proactive_think_interval_seconds + 1
+    )
+
+    await loop._maybe_act()
+
+    assert adapter.sent[-1][1] == "主动补充"
+    records = await history.records()
+    tool_results = [
+        json.loads(record["content"])
+        for record in records
+        if record.get("role") == "tool" and record.get("tool_call_id") == "tc-1"
+    ]
+    assert tool_results
+    assert tool_results[-1]["status"] == "sent"
+    assert all(result.get("status") != "needs_review" for result in tool_results)
+    assert len(provider.calls) >= 2
+
+
+@pytest.mark.asyncio
+async def test_proactive_action_round_includes_same_persona_todo_context(build_pipeline):
+    persona_context = "<人格状态>\n- 待办: 主动提醒主人喝水\n</人格状态>"
+    persona_agent = RecordingPersonaAgent(persona_context)
+    pipeline, provider, _, _, _ = await build_pipeline(
+        [_ai_no_action()],
+        persona_agent=persona_agent,
+    )
+    router = FakeProactiveRouter(True)
+    loop = ProactiveLoop(
+        pipeline=pipeline,
+        proactive_agent=router,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+    pipeline.last_activity_at = time.monotonic() - (
+        pipeline.behavior_cfg.proactive_think_interval_seconds + 1
+    )
+
+    await loop._maybe_act()
+
+    router_joined = "\n".join(str(m.get("content", "")) for m in router.calls[0])
+    action_joined = "\n".join(
+        str(m.get("content", "")) for m in provider.calls[0]["messages"]
+    )
+    assert persona_agent.context_calls == [None]
+    assert persona_context in router_joined
+    assert persona_context in action_joined
 
 
 @pytest.mark.asyncio
@@ -4487,7 +4964,7 @@ async def test_voice_message_falls_back_to_adapter_when_asr_fails(
 async def test_multi_turn_tool_loop(build_pipeline):
     """非 no_action 工具默认把结果回填给模型，不再因 no_feedback 隐式结束。"""
     # 工具参数字段名是 memory_text 不是 content（被集成测试抓出来的）
-    save_args = {"memory_text": "用户喜欢咖啡"}
+    save_args = {"memory_text": "用户喜欢咖啡", "scope": "user:12345"}
     save_tc = ToolCall(id="tc-s", name="save_important_memory", arguments=json.dumps(save_args))
     pipeline, provider, adapter, _, important = await build_pipeline(
         [CompletionResult(tool_calls=[save_tc], finish_reason="tool_calls")]

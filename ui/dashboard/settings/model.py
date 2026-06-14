@@ -41,9 +41,17 @@ from .widgets import CollapsibleSection
 def _agent_label(agent_name: str) -> str:
     return {
         "chat": "主聊天",
-        "proactive": "主动思考",
+        "proactive": "社交决策",
         "summary": "历史总结",
         "persona_gen": "人格生成",
+    }.get(agent_name, agent_name)
+
+
+def _persona_management_agent_label(agent_name: str) -> str:
+    return {
+        "persona_agent": "人格分析",
+        "social_agent": "社交决策",
+        "subconscious": "潜意识",
     }.get(agent_name, agent_name)
 
 
@@ -491,11 +499,14 @@ class SettingsModelMixin:
         for an in ("chat", "proactive", "summary", "persona_gen"):
             a = getattr(self._cfg().agents, an, None)
             if a and a.provider == name:
-                refs.append(an)
+                refs.append(_agent_label(an))
+        for an, agent in self._cfg()._iter_persona_management_agents():
+            if agent and getattr(agent, "provider", "") == name:
+                refs.append(_persona_management_agent_label(an))
         if refs:
             show_message(
                 self, "无法删除",
-                f"provider [{name}] 仍被 agents 引用：{', '.join(refs)}\n请先把这些 agent 换成别的 provider。",
+                f"provider [{name}] 仍被以下配置引用：{', '.join(refs)}\n请先把这些配置换成别的 provider。",
             )
             return
         if len(self._cfg().providers) <= 1:

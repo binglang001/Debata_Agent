@@ -33,6 +33,7 @@ from .logs_page import LogsPage
 from .memory_page import MemoryPage
 from .models_page import ModelsPage
 from .overview_page import OverviewPage
+from .persona_mind_page import PersonaMindPage
 from .personas_page import PersonasPage
 from .settings_page import SettingsPage
 
@@ -129,6 +130,7 @@ class DashboardWindow(QMainWindow):
             "overview": OverviewPage(runtime),
             "chats": ChatsPage(runtime),
             "memory": MemoryPage(runtime),
+            "persona_mind": PersonaMindPage(runtime),
             "logs": LogsPage(runtime),
             "personas": PersonasPage(runtime),
             "models": ModelsPage(runtime),

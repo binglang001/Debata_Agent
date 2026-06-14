@@ -86,6 +86,37 @@ def test_load_persona_basic(tmp_paths):
     assert p.display_name() == "Alice"
 
 
+@pytest.mark.parametrize(
+    ("raw_age", "expected"),
+    [
+        (18, 18),
+        (0, 0),
+        (-1, None),
+        ("18", 18),
+        (" 18 ", 18),
+        ("0018", 18),
+        ("0", 0),
+        ("", None),
+        ("   ", None),
+        ("18.5", None),
+        ("abc", None),
+        ("-1", None),
+        (None, None),
+    ],
+)
+def test_persona_get_age_parses_int_and_string_cases(raw_age, expected):
+    persona = Persona(name="alice", prompt="你是 Alice", vars={"age": raw_age})
+
+    assert persona.get_age() == expected
+
+
+@pytest.mark.parametrize("raw_age", [True, False])
+def test_persona_get_age_rejects_bool(raw_age):
+    persona = Persona(name="alice", prompt="你是 Alice", vars={"age": raw_age})
+
+    assert persona.get_age() is None
+
+
 def test_load_persona_missing_prompt_raises(tmp_paths):
     (tmp_paths.PERSONAS_DIR / "bad").mkdir(parents=True)
     (tmp_paths.PERSONAS_DIR / "bad" / "persona_prompt.py").write_text(
@@ -149,6 +180,45 @@ def test_tool_use_protocol_default_is_file():
     assert build_tool_use_protocol() == build_tool_use_protocol("file")
 
 
+def test_tool_use_protocol_default_has_no_physiology_block():
+    s = build_tool_use_protocol("file")
+    assert "<physiology>" not in s
+    assert "meal_type" not in s
+    assert "duration_minutes 填 1-720 分钟" not in s
+
+
+def test_tool_use_protocol_includes_static_physiology_block_when_enabled():
+    s = build_tool_use_protocol("file", eat_tool=True, sleep_tool=True)
+
+    assert "<physiology>" in s
+    assert "</physiology>" in s
+    assert "meal_type" in s
+    assert "description" in s
+    assert "duration_minutes 填 1-720 分钟" in s
+    assert "reason" in s
+    assert "期间入站消息只会记录和进入潜意识缓冲" in s
+    assert "调用 eat / sleep 前先发送自然收尾消息" in s
+    assert "不要硬套固定话术" in s
+    assert "尽量不要再主动抛问题、索要选择" in s
+    assert "调用前先可见地自然告知要去吃饭" in s
+    assert "调用前先可见地自然告知要去睡觉或休息" in s
+    assert s.index("</memory>") < s.index("<physiology>") < s.index("<no_action>")
+
+
+def test_tool_use_protocol_physiology_block_follows_individual_switches():
+    eat_only = build_tool_use_protocol("file", eat_tool=True)
+    sleep_only = build_tool_use_protocol("file", sleep_tool=True)
+
+    assert "### eat" in eat_only
+    assert "meal_type" in eat_only
+    assert "### sleep" not in eat_only
+    assert "duration_minutes 填 1-720 分钟" not in eat_only
+    assert "### sleep" in sleep_only
+    assert "reason" in sleep_only
+    assert "### eat" not in sleep_only
+    assert "meal_type" not in sleep_only
+
+
 def test_tool_use_protocol_unknown_mode_defaults_to_file():
     """未知 mode 应回退到 file 模式（健壮性）。"""
     s = build_tool_use_protocol("nonexistent")
@@ -190,12 +260,14 @@ def test_tool_use_protocol_documents_runtime_contracts_without_legacy_terms():
     assert "复核后重新调用发送工具改写新消息时，先复核新消息" in s
     assert "commit_send_attempt 的 ignore_review_interrupts 保持旧 attempt 复核语义" in s
     assert "复核旧回复是否会脱离上下文" in s
-    assert "群聊里不要机械每条引用" in s
+    assert "私聊/群聊都不要机械每条引用" in s
     assert "普通顺序闲聊、紧邻上一条且无歧义时自然回复即可" in s
-    assert "群聊回复对象不是紧邻上一条、多人连续插话、回答被引用的消息" in s
+    assert "延迟回复、吃饭睡觉后接旧话、主动思考接旧话" in s
+    assert "回复非最新消息、多人连续插话、回答被引用的消息" in s
     assert "没有可靠消息 ID 时不要伪造" in s
     assert '"行/OK/可以/知道了/不要"这类简短确认' in s
-    assert "只要可能不清楚回谁，就引用、@ 或点名" in s
+    assert "只要可能不清楚回谁，就引用、@、点名或自然语言锚定" in s
+    assert "私聊里隔了一段时间才接旧话" in s
     assert "中文约 1.5 字/秒" in s
     assert "每条 target 都必须填写 delay" in s
     assert "本条发出后到下一条发出前的等待秒数" in s
@@ -233,6 +305,22 @@ def test_tool_use_protocol_documents_runtime_contracts_without_legacy_terms():
     assert "send_only" not in s
     assert "no-feedback" not in lower
     assert "no_feedback" not in lower
+
+
+def test_tool_use_protocol_requires_semantic_memory_scope():
+    s = build_tool_use_protocol("file")
+
+    assert "save_important_memory 必须显式填写 scope" in s
+    assert "系统不会按当前会话自动推断" in s
+    assert "global=跨场景都应参考的事实" in s
+    assert "user:QQ号=只适用于该用户本人" in s
+    assert "group:群号=只适用于该群" in s
+    assert "提到某用户不等于 user scope" in s
+    assert "冰狼正在做短中期项目" in s
+    assert "不要把 private:QQ 当 scope 返回" in s
+    assert "修改内容时重新判断 scope" in s
+    assert "仍适用原范围可不传 scope" in s
+    assert "scope 通常留空" not in s
 
 
 def test_tool_use_protocol_documents_tool_result_json_contract():
@@ -349,7 +437,7 @@ def test_group_reply_reference_rules_are_conditional():
     assert "回答被引用的消息" in sys
     assert "目标不是紧邻上一条、前后有多人插话" in sys
     assert "复核/被打断后继续提交旧回复" in sys
-    assert "如果短回复会产生歧义，要引用、@ 或点名" in sys
+    assert "如果短回复会产生歧义，要引用、@、点名或自然语言锚定" in sys
     assert '"行/OK/可以/知道了/不要"这类简短确认尤其如此' in sys
     assert "不要机械每条都引用" in sys
     assert "上下文清楚、上一句就是目标消息时自然短回即可" in sys
@@ -501,6 +589,14 @@ def test_build_combined_system_prompt_memory_mode_default():
     assert "必须主动保存" in sys  # 文件模式默认
 
 
+def test_build_combined_system_prompt_propagates_physiology_tools():
+    p = _persona()
+    sys = build_combined_system_prompt(p, eat_tool=True, sleep_tool=True)
+    assert "<physiology>" in sys
+    assert "meal_type" in sys
+    assert "duration_minutes 填 1-720 分钟" in sys
+
+
 def test_build_combined_system_prompt_rag_mode_keeps_important_memory():
     p = _persona()
     sys = build_combined_system_prompt(p, important_memory_text="历史片段", memory_mode="rag")
@@ -548,18 +644,28 @@ def test_persona_brief_includes_admin_info():
     brief = PersonaBrief(
         name="Mika",
         gender="female",
+        age=18,
         admins=[{"name": "Lily", "qq": "123456", "relation": "创作者"}],
     )
     block = brief.to_brief_block()
     assert "熟悉的人（管理员）" in block
     assert "性别" in block
+    assert "年龄" in block
+    assert "18 岁" in block
     assert "Lily" in block
     assert "123456" in block
     assert "创作者" in block
 
 
+def test_persona_brief_skips_missing_age():
+    brief = PersonaBrief(name="Mika", gender="female", age=None)
+    block = brief.to_brief_block()
+    assert "性别" in block
+    assert "年龄" not in block
+
+
 def test_render_persona_file_writes_admins():
-    brief = PersonaBrief(name="Mika", gender="female")
+    brief = PersonaBrief(name="Mika", gender="female", age=18)
     result = PersonaGenResult(persona_prompt="<identity>Mika</identity>", display_name="Mika")
     text = render_persona_file(
         result,
@@ -570,6 +676,14 @@ def test_render_persona_file_writes_admins():
     assert "'qq': 123456" in text
     assert "'name': 'Lily'" in text
     assert "'gender': 'female'" in text
+    assert "'age': 18" in text
+
+
+def test_render_persona_file_skips_missing_age():
+    brief = PersonaBrief(name="Mika", age=None)
+    result = PersonaGenResult(persona_prompt="<identity>Mika</identity>", display_name="Mika")
+    text = render_persona_file(result, brief)
+    assert "'age'" not in text
 
 
 def test_persona_generation_prompt_requires_second_person():
@@ -740,6 +854,16 @@ def test_build_task_context_with_refocus():
     assert "Lily" in s
 
 
+def test_build_task_context_with_persona_context():
+    s = build_task_context(
+        "现在是 2026 年 5 月",
+        persona_context="<persona_context>精力变化摘要</persona_context>",
+    )
+    assert "现在是 2026 年 5 月" in s
+    assert "<persona_context>精力变化摘要</persona_context>" in s
+    assert "不是用户新发言" in s
+
+
 def test_build_messages_structure():
     p = _persona(admins=[{"qq": 1, "name": "A"}])
     history = [
@@ -794,6 +918,25 @@ def test_build_messages_memory_mode_propagates():
     assert "RAG 会话向量检索" in msgs_rag[0]["content"]
     assert "必须主动保存" not in msgs_rag[0]["content"]
     assert "必须主动保存" in msgs_file[0]["content"]
+
+
+def test_build_messages_propagates_persona_context_and_physiology_tools():
+    p = _persona()
+    msgs = build_messages(
+        p,
+        [],
+        current_context="现在是 10:00",
+        persona_context="<persona_context>动态人格状态</persona_context>",
+        eat_tool=True,
+        sleep_tool=True,
+    )
+
+    assert "<physiology>" in msgs[0]["content"]
+    assert "meal_type" in msgs[0]["content"]
+    assert "duration_minutes 填 1-720 分钟" in msgs[0]["content"]
+    assert msgs[-1]["role"] == "user"
+    assert "现在是 10:00" in msgs[-1]["content"]
+    assert "<persona_context>动态人格状态</persona_context>" in msgs[-1]["content"]
 
 
 def test_build_messages_rag_memory_is_tail_context_for_cache_stability():
@@ -857,6 +1000,42 @@ def test_build_messages_can_reuse_persisted_task_context_record_for_prefix_stabi
 
     assert normalize_messages(current[:3]) == normalize_messages(next_turn[:3])
     assert current[2]["content"] == task_record["content"]
+
+
+def test_build_messages_does_not_duplicate_persona_context_with_task_record():
+    p = _persona()
+    task_record = {
+        "role": "user",
+        "content": "<task_context priority=\"medium\">\n已持久化上下文\n</task_context>",
+        "metadata": {"kind": "task_context_snapshot"},
+        "conversation_id": "private:1",
+    }
+
+    msgs = build_messages(
+        p,
+        [],
+        current_context_record=task_record,
+        persona_context="<persona_context>不应重复追加</persona_context>",
+    )
+
+    assert msgs[-1]["content"] == task_record["content"]
+    assert "不应重复追加" not in "\n".join(str(msg["content"]) for msg in msgs)
+
+
+def test_turn_summary_labels_assistant_as_current_persona_reply():
+    from core.pipeline_task_context import _compact_chat_summary
+
+    summary = _compact_chat_summary(
+        user_or_event_text="[系统事件] 主动思考触发",
+        task_context="人格待办：提醒主人喝水",
+        records=[{"role": "assistant", "content": "该去喝水了"}],
+    )
+
+    assert "外部输入/系统事件：[系统事件] 主动思考触发" in summary
+    assert "系统上下文：人格待办：提醒主人喝水" in summary
+    assert "当前人格自己的回复：该去喝水了" in summary
+    assert "用户/事件：" not in summary
+    assert "助手：" not in summary
 
 
 def test_build_messages_preserves_complete_tool_call_group():

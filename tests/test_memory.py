@@ -507,6 +507,36 @@ async def test_important_text_for_context_filters_scope_and_keeps_pinned(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_important_text_for_context_user_scope_in_group_with_member_qqs(tmp_path):
+    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=lambda: "T1")
+    await im.load()
+    await im.save("全局记忆", scope="global")
+    await im.save("用户 A 记忆", scope="user:12345")
+    await im.save("用户 B 记忆", scope="user:99999")
+    await im.save("群 G 记忆", scope="group:G")
+
+    out = im.text_for_context("group:G", member_qqs={12345})
+
+    assert "全局记忆" in out
+    assert "群 G 记忆" in out
+    assert "用户 A 记忆" in out
+    assert "用户 B 记忆" not in out
+
+
+@pytest.mark.asyncio
+async def test_important_text_for_context_user_not_in_group_excluded(tmp_path):
+    im = ImportantMemoryManager(tmp_path / "imp.json", now_fn=lambda: "T1")
+    await im.load()
+    await im.save("全局记忆", scope="global")
+    await im.save("用户 A 记忆", scope="user:12345")
+
+    out = im.text_for_context("group:G", member_qqs=set())
+
+    assert "全局记忆" in out
+    assert "用户 A 记忆" not in out
+
+
+@pytest.mark.asyncio
 async def test_important_text_for_context_includes_stable_ids(tmp_path):
     im = ImportantMemoryManager(tmp_path / "imp.json")
     await im.load()
@@ -580,3 +610,41 @@ async def test_jsonl_concurrent_appends(tmp_path):
     # 重新加载验证
     store2 = JsonlStore(tmp_path / "h.jsonl")
     assert len(await store2.load()) == 100
+
+
+@pytest.mark.asyncio
+async def test_important_manager_with_sqlite_store_save_update_delete_context_items(tmp_path):
+    from mind.important_store import SqliteImportantStore
+
+    db_path = tmp_path / "persona.sqlite"
+    store = SqliteImportantStore(db_path)
+    im = ImportantMemoryManager(
+        tmp_path / "unused.json",
+        now_fn=lambda: "2026-06-12 10:00:00",
+        store=store,
+    )
+    await im.load()
+
+    saved = await im.save("张三是朋友", scope="user:1")
+    pinned = await im.save("置顶记忆", scope="group:42", pinned=True)
+    assert await store.db.important_count() == 2
+    assert [item["content"] for item in im.items()] == ["张三是朋友", "置顶记忆"]
+
+    updated = await im.update(saved["id"], "张三是朋友，生日是7月8日", scope="group:42")
+    assert updated["updated"] is True
+
+    context = im.text_for_context("group:42")
+    assert "张三是朋友，生日是7月8日" in context
+    assert "置顶记忆" in context
+    assert f"[{saved['id']}]" in context
+
+    assert await im.delete_by_id(pinned["id"]) is True
+    assert [item["content"] for item in im.items()] == ["张三是朋友，生日是7月8日"]
+
+    im2 = ImportantMemoryManager(
+        tmp_path / "unused.json",
+        store=SqliteImportantStore(db_path),
+    )
+    await im2.load()
+    assert im2.items()[0]["content"] == "张三是朋友，生日是7月8日"
+    assert "置顶记忆" not in im2.text()

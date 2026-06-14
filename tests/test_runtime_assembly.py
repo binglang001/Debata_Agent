@@ -247,6 +247,14 @@ async def test_runtime_start_assembles_all_components(assembled_project):
         assert rt.chat_agent is not None
         assert rt.proactive_agent is not None
         assert rt.summary_agent is not None, "summary_agent 应该实例化（config 已给）"
+        assert rt.persona_agent is None
+        assert rt.social_agent is None
+        assert rt.subconscious_agent is None
+        assert rt.persona_db is None
+        from memory.store import JsonStore
+
+        assert isinstance(rt.important._store, JsonStore)
+        assert not (paths.memory_dir_for("test_bot") / "persona.db").exists()
         assert rt.adapter is not None
         assert rt.tool_registry is not None
         assert rt.pending_requests is not None
@@ -256,6 +264,7 @@ async def test_runtime_start_assembles_all_components(assembled_project):
         assert rt.request_handler is not None
         assert rt.event_bus is not None
         assert rt.proactive_loop is not None
+        assert rt.proactive_loop.proactive_agent is rt.proactive_agent
 
         # 验证 wakeup 双向依赖已回填
         assert rt.wakeup_scheduler._on_fire == rt.pipeline.run_wakeup_turn
@@ -263,6 +272,124 @@ async def test_runtime_start_assembles_all_components(assembled_project):
         # 验证 pipeline 拿到了 summary_agent
         assert rt.pipeline.summary_agent is rt.summary_agent
 
+    finally:
+        await rt.shutdown()
+
+
+def test_runtime_idle_model_activity_text_is_realtime_idle(tmp_path):
+    rt = Runtime(project_root=tmp_path)
+
+    rt._update_model_activity(
+        {
+            "state": "idle",
+            "text": "社交决策完成",
+            "model": "unit-model",
+            "agent": "社交决策",
+        }
+    )
+
+    assert rt.model_activity["state"] == "idle"
+    assert rt.model_activity["text"] == "空闲"
+    assert rt.model_activity["model"] == "unit-model"
+    assert rt.model_activity["agent"] == "社交决策"
+
+
+def test_persona_management_agent_config_inherits_only_provider_and_model():
+    from app_config.schema import AgentConfig, PersonaManagementPersonaAgentConfig
+
+    chat_cfg = AgentConfig(
+        provider="fake_main",
+        model="fake-chat",
+        temperature=1.4,
+        top_p=0.2,
+        max_tokens=777,
+        first_token_timeout_seconds=4.0,
+    )
+    persona_cfg = PersonaManagementPersonaAgentConfig(provider="", model="")
+
+    resolved = Runtime._resolve_persona_management_agent_config(persona_cfg, chat_cfg)
+
+    assert resolved.provider == "fake_main"
+    assert resolved.model == "fake-chat"
+    assert resolved.temperature == persona_cfg.temperature
+    assert resolved.top_p == persona_cfg.top_p
+    assert resolved.max_tokens == persona_cfg.max_tokens
+    assert resolved.reasoning == persona_cfg.reasoning
+    assert (
+        resolved.first_token_timeout_seconds
+        == persona_cfg.first_token_timeout_seconds
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_persona_management_assembles_agents_and_pipeline(
+    assembled_project,
+):
+    project_root, paths = assembled_project
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data["persona_management"] = {
+        "enabled": True,
+        "persona_agent": {
+            "provider": "",
+            "model": "",
+            "temperature": 0.2,
+            "max_tokens": 321,
+            "first_token_timeout_seconds": 7.0,
+        },
+        "social_agent": {
+            "enabled": True,
+            "provider": "",
+            "model": "",
+        },
+        "subconscious": {
+            "enabled": True,
+            "provider": "",
+            "model": "",
+        },
+        "physiology": {
+            "energy": {"mode": "tool"},
+            "satiety": {"mode": "tool"},
+        },
+    }
+    with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+
+        persona_db_path = paths.memory_dir_for("test_bot") / "persona.db"
+        assert persona_db_path.exists()
+        assert rt.persona_db is not None
+        assert rt.persona_agent is not None
+        assert rt.social_agent is not None
+        assert rt.subconscious_agent is not None
+        assert rt.age_profile is None
+
+        from mind.important_store import SqliteImportantStore
+
+        assert isinstance(rt.important._store, SqliteImportantStore)
+        assert rt.persona_agent.cfg.provider == "fake_main"
+        assert rt.persona_agent.cfg.model == "fake-chat"
+        assert rt.persona_agent.cfg.temperature == 0.2
+        assert rt.persona_agent.cfg.max_tokens == 321
+        assert rt.persona_agent.cfg.first_token_timeout_seconds == 7.0
+        assert rt.social_agent.cfg.provider == "fake_main"
+        assert rt.social_agent.cfg.model == "fake-chat"
+        assert rt.subconscious_agent.cfg.provider == "fake_main"
+        assert rt.subconscious_agent.cfg.model == "fake-chat"
+
+        assert "eat" in rt.tool_registry
+        assert "sleep" in rt.tool_registry
+        assert rt.eat_tool is True
+        assert rt.sleep_tool is True
+        assert rt.pipeline.persona_agent is rt.persona_agent
+        assert rt.pipeline.subconscious_agent is rt.subconscious_agent
+        assert rt.pipeline.persona_db is rt.persona_db
+        assert rt.pipeline.eat_tool is True
+        assert rt.pipeline.sleep_tool is True
+        assert rt.proactive_loop.proactive_agent is rt.social_agent
     finally:
         await rt.shutdown()
 

@@ -169,3 +169,82 @@ async def test_build_readable_text_exposes_file_workspace_path(tmp_path):
 
     assert "workspace=incoming/问卷.pdf" in text
     assert (pipeline.workspace_dir / "incoming" / "问卷.pdf").read_bytes() == b"%PDF-demo"
+
+
+@pytest.mark.asyncio
+async def test_build_readable_text_appends_forward_placeholder_when_text_empty(tmp_path):
+    pipeline = MessagePipeline.__new__(MessagePipeline)
+    pipeline.workspace_dir = tmp_path / "workspace"
+    pipeline.asr = None
+    pipeline.adapter = object()
+
+    event = IncomingMessage(
+        adapter="napcat",
+        timestamp=0,
+        self_id="1",
+        message_id="42",
+        scope="private",
+        user_id="10001",
+        nickname="Alice",
+        text="",
+        raw_message="",
+        media=[MediaSegment(type=MediaType.FORWARD, file_id="fwd123")],
+    )
+
+    text = await MessagePipeline._build_readable_text(pipeline, event)
+
+    assert "[合并转发 id=fwd123]" in text
+    assert 'get_forward_msg(forward_id="fwd123")' in text
+
+
+@pytest.mark.asyncio
+async def test_build_readable_text_includes_forward_node_preview(tmp_path):
+    class FakeAdapter:
+        async def get_forward_msg(self, forward_id: str):
+            assert forward_id == "fwd123"
+            return [
+                {
+                    "sender": {"nickname": "Alice", "user_id": "10001"},
+                    "message_id": "node-1",
+                    "message": [
+                        {"type": "text", "data": {"text": "转发里的第一条"}},
+                    ],
+                },
+                {
+                    "sender": {"nickname": "Bob", "user_id": "10002"},
+                    "message_id": "node-2",
+                    "raw_message": "转发里的第二条",
+                },
+            ]
+
+    pipeline = MessagePipeline.__new__(MessagePipeline)
+    pipeline.workspace_dir = tmp_path / "workspace"
+    pipeline.adapter = FakeAdapter()
+    pipeline.asr = None
+
+    event = IncomingMessage(
+        adapter="napcat",
+        timestamp=0,
+        self_id="1",
+        message_id="42",
+        scope="private",
+        user_id="10001",
+        nickname="Alice",
+        text="[合并转发 id=fwd123 title=聊天记录]",
+        raw_message="",
+        media=[
+            MediaSegment(
+                type=MediaType.FORWARD,
+                file_id="fwd123",
+                extra={"title": "聊天记录"},
+            )
+        ],
+    )
+
+    text = await MessagePipeline._build_readable_text(pipeline, event)
+
+    assert "[合并转发 id=fwd123 title=聊天记录]" in text
+    assert "节点预览" in text
+    assert "转发里的第一条" in text
+    assert "转发里的第二条" in text
+    assert 'get_forward_msg(forward_id="fwd123")' in text

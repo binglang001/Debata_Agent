@@ -607,6 +607,7 @@ def _normalize_forward_message(raw: Any, *, index: int) -> dict[str, Any]:
     }
     raw_message = raw_dict.get("raw_message")
     content = raw_dict.get("content")
+    message = raw_dict.get("message")
     if raw_message in (None, "") and isinstance(content, str):
         raw_message = content
     return {
@@ -615,11 +616,18 @@ def _normalize_forward_message(raw: Any, *, index: int) -> dict[str, Any]:
         "time": raw_dict.get("time") or raw_dict.get("timestamp"),
         "message_id": raw_dict.get("message_id") or raw_dict.get("msg_id"),
         "raw_message": str(raw_message or ""),
-        "segments": _forward_segments(raw_message, content),
+        "segments": _forward_segments(raw_message, content, message),
     }
 
 
-def _forward_segments(raw_message: Any, content: Any) -> list[dict[str, Any]]:
+def _forward_segments(
+    raw_message: Any,
+    content: Any,
+    message: Any = None,
+) -> list[dict[str, Any]]:
+    if isinstance(message, list):
+        segments = [_segment_from_onebot(seg) for seg in message]
+        return [seg for seg in segments if seg]
     if isinstance(content, list):
         segments = [_segment_from_onebot(seg) for seg in content]
         return [seg for seg in segments if seg]

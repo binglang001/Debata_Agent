@@ -55,6 +55,23 @@ class Persona:
     def display_name(self) -> str:
         return self.vars.get("name", self.name) or self.name
 
+    def get_age(self) -> int | None:
+        age = self.vars.get("age")
+        if isinstance(age, bool):
+            return None
+        if isinstance(age, int):
+            return age if age >= 0 else None
+        if isinstance(age, str):
+            stripped = age.strip()
+            if not stripped:
+                return None
+            try:
+                parsed = int(stripped, 10)
+            except ValueError:
+                return None
+            return parsed if parsed >= 0 else None
+        return None
+
 
 def validate_persona_name(name: str) -> None:
     if not _PERSONA_NAME_RE.match(name):
