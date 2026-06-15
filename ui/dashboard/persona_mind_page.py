@@ -259,6 +259,14 @@ class PersonaMindPage(QWidget):
         self.destroyed.connect(self._on_destroyed)
         self.refresh()
 
+    def on_shown(self) -> None:
+        if not self._timer.isActive():
+            self._timer.start()
+        self.refresh()
+
+    def on_hidden(self) -> None:
+        self._timer.stop()
+
     def refresh(self) -> None:
         if self._closed:
             return

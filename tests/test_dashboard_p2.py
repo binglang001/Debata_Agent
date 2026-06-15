@@ -62,7 +62,7 @@ from ui.dashboard.chats_page import (
     normalize_history_records,
 )
 from ui.dashboard.layout import DEFAULT_LAYOUT
-from ui.dashboard.logs_page import _format_record
+from ui.dashboard.logs_page import LogsPage, _format_record
 from ui.dashboard.main_window import DashboardWindow
 from ui.dashboard.memory_page import MemoryPage
 from ui.dashboard.overview_page import OverviewPage
@@ -3723,6 +3723,32 @@ def test_log_detail_format_includes_exception():
     assert "RuntimeError: boom" in text
 
 
+def test_logs_page_trims_visible_items_to_max_buffer(qapp):
+    page = LogsPage(None)
+    logger = logging.getLogger("tests.dashboard.logs")
+    old_level = logger.level
+    old_propagate = logger.propagate
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(page._handler)
+    try:
+        for i in range(3000):
+            logger.info("dense log %s", i)
+        for _ in range(10):
+            qapp.processEvents()
+
+        assert page._list.count() <= page.MAX_BUFFER
+        assert len(page._records) <= page.MAX_BUFFER
+        assert "dense log 1000" in page._list.item(0).text()
+        assert "dense log 2999" in page._list.item(page._list.count() - 1).text()
+    finally:
+        logger.removeHandler(page._handler)
+        logger.setLevel(old_level)
+        logger.propagate = old_propagate
+        page.close()
+        page.deleteLater()
+
+
 def test_welcome_requires_explicit_path_choice(qapp):
     view = WelcomeStepView(WizardContext())
     errors: list[str] = []
@@ -4153,6 +4179,60 @@ def test_dashboard_navigation_contains_persona_mind_page(qapp, tmp_paths):
 
         assert window._stack.currentWidget() is window._pages["persona_mind"]
         assert window._nav_buttons["persona_mind"].property("active") == "true"
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_dashboard_switching_stops_hidden_timers_and_releases_animations(qapp, tmp_paths):
+    window = DashboardWindow(_dashboard_runtime(tmp_paths))
+    try:
+        for _ in range(20):
+            qapp.processEvents()
+
+        overview = window._pages["overview"]
+        settings = window._pages["settings"]
+        calls: list[str] = []
+        original_overview_hidden = overview.on_hidden
+        original_settings_shown = settings.on_shown
+
+        def overview_hidden() -> None:
+            calls.append("overview:hidden")
+            original_overview_hidden()
+
+        def settings_shown() -> None:
+            calls.append("settings:shown")
+            original_settings_shown()
+
+        overview.on_hidden = overview_hidden
+        settings.on_shown = settings_shown
+
+        timer_count = len(window.findChildren(QtCore.QTimer))
+        window._switch_to("settings")
+        qapp.processEvents()
+
+        assert calls == ["overview:hidden", "settings:shown"]
+        assert not overview._timer.isActive()
+        assert settings._provider_status_timer.isActive()
+
+        for key in ("overview", "persona_mind", "chats", "settings") * 12:
+            window._switch_to(key)
+            qapp.processEvents()
+
+        window._switch_to("overview")
+        for _ in range(30):
+            qapp.processEvents()
+
+        assert len(window.findChildren(QtCore.QTimer)) == timer_count
+        assert window._pages["overview"]._timer.isActive()
+        assert not window._pages["persona_mind"]._timer.isActive()
+        assert not window._pages["settings"]._provider_status_timer.isActive()
+        assert not window._pages["settings"]._settings_content_sync_timer.isActive()
+        assert not window._pages["chats"]._timer.isActive()
+        assert not window._pages["chats"]._refresh_debounce_timer.isActive()
+        assert not window._pages["chats"]._search_debounce_timer.isActive()
+        assert len(window.findChildren(QtCore.QPropertyAnimation)) <= 1
+        assert len(window.findChildren(QtWidgets.QGraphicsOpacityEffect)) <= 1
     finally:
         window.close()
         window.deleteLater()

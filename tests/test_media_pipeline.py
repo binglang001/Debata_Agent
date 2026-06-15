@@ -132,6 +132,74 @@ async def test_build_readable_text_prefers_adapter_image_file_over_remote_url(
 
 
 @pytest.mark.asyncio
+async def test_build_readable_text_falls_back_to_remote_url_when_adapter_image_file_missing(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    remote_url = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=x&rkey=y"
+    seen: list[str] = []
+
+    class FakeAdapter:
+        async def get_image_url(self, file_id):
+            assert file_id == "abc.jpg"
+            return "abc.jpg"
+
+    class FakeResponse:
+        content = b"image-bytes"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            seen.append(url)
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", FakeClient)
+
+    pipeline = MessagePipeline.__new__(MessagePipeline)
+    pipeline.workspace_dir = tmp_path / "workspace"
+    pipeline.adapter = FakeAdapter()
+    pipeline.asr = None
+
+    event = IncomingMessage(
+        adapter="napcat",
+        timestamp=0,
+        self_id="1",
+        message_id="42",
+        scope="group",
+        user_id="10001",
+        nickname="Alice",
+        group_id="20002",
+        text="[图片]",
+        raw_message="[CQ:image,file=abc.jpg,url=https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=x&rkey=y]",
+        media=[
+            MediaSegment(
+                type=MediaType.IMAGE,
+                file_id="abc.jpg",
+                url=remote_url,
+            )
+        ],
+    )
+
+    text = await MessagePipeline._build_readable_text(pipeline, event)
+
+    assert seen == [remote_url]
+    assert text.startswith("[图片 workspace=incoming/img_42.jpg url=https://multimedia.nt.qq.com.cn/")
+    assert (pipeline.workspace_dir / "incoming" / "img_42.jpg").read_bytes() == b"image-bytes"
+
+
+@pytest.mark.asyncio
 async def test_build_readable_text_exposes_file_workspace_path(tmp_path):
     src = tmp_path / "NapCat" / "temp" / "问卷.pdf"
     src.parent.mkdir(parents=True)

@@ -69,7 +69,7 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 - 心里有长话 → 拆成 3-7 条短消息瀑布式连发，每条只承载一个语义单元
 - 多条消息不要贴脸连发；每条 target 都必须填写 delay，表示本条发出后到下一条发出前的等待秒数；最后一条填 0，单条消息只发一条时 delay=0 合法
 - 第 i 条 delay 按第 i+1 条即将发送的可见内容估算，不按本条内容估算；非最后一条通常不要低于 2 秒
-- 估算规则：中文约 1.5 字/秒，再加 0.5-1.5 秒自然停顿；转折、补充、犹豫或长内容加 2-5 秒；表情包和图片按约 1.5-3 秒
+- 估算规则：中文约 0.6 字/秒，再加 0.5-1.5 秒自然停顿；转折、补充、犹豫或长内容加 2-5 秒；表情包和图片按约 1.5-3 秒
 - 单字单词回应也是合法的整条消息（"嗯"、"好"、"6"、"？"、"算了"）—— 不要硬展开
 
 <good>
@@ -77,7 +77,7 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 ```json
 {"targets": [
   {"target_qq": 123, "content": "早啊", "order": 1, "delay": 4.5},
-  {"target_qq": 123, "content": "今天冷死了", "order": 2, "delay": 3.0},
+  {"target_qq": 123, "content": "今天冷死了", "order": 2, "delay": 4},
   {"target_qq": 123, "content": "多穿点", "order": 3, "delay": 0}
 ]}
 ```
@@ -93,7 +93,7 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 ```json
 {"targets": [
   {"target_qq": 123, "content": "明天三点", "order": 1, "delay": 4.5},
-  {"target_qq": 123, "content": "不是 四点", "order": 2, "delay": 0}
+  {"target_qq": 123, "content": "不是四点", "order": 2, "delay": 0}
 ]}
 ```
 </good>

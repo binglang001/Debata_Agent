@@ -1648,6 +1648,62 @@ async def test_describe_image_accepts_workspace_path(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_describe_image_missing_workspace_path_does_not_call_vision(tmp_path):
+    class FakeVision:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def describe(self, image_url: str, prompt: str = "") -> str:
+            self.calls += 1
+            raise AssertionError("缺失 workspace 图片不应调用视觉 provider")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    cfg = _make_config(vision_enabled=True)
+    reg = build_default_registry(cfg)
+    vision = FakeVision()
+    ctx = ToolContext(vision=vision, workspace_dir=workspace)
+    executor = reg.get_executor(ctx)
+    result = await executor("describe_image", {"image_url": "incoming/missing.jpg"})
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert result["brief"] == "图片引用不可用。"
+    assert "workspace 图片不存在" in result["error"]
+    assert "真实出现的 [图片 url=...]" in result["error"]
+    assert "不要根据 msg_id 猜 incoming/img_*.jpg" in result["error"]
+    assert result["data"]["image_ref"] == "incoming/missing.jpg"
+    assert result["data"]["retry_hint"]
+    assert vision.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_describe_image_relative_path_without_workspace_does_not_call_vision():
+    class FakeVision:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def describe(self, image_url: str, prompt: str = "") -> str:
+            self.calls += 1
+            raise AssertionError("未配置 workspace 时相对图片路径不应调用视觉 provider")
+
+    cfg = _make_config(vision_enabled=True)
+    reg = build_default_registry(cfg)
+    vision = FakeVision()
+    ctx = ToolContext(vision=vision)
+    executor = reg.get_executor(ctx)
+    result = await executor("describe_image", {"image_url": "incoming/a.jpg"})
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "workspace 未配置" in result["error"]
+    assert "真实出现的 [图片 url=...]" in result["error"]
+    assert result["data"]["image_ref"] == "incoming/a.jpg"
+    assert vision.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_describe_image_prefers_workspace_over_remote_url(tmp_path, monkeypatch):
     class FakeVision:
         def __init__(self) -> None:
@@ -1684,6 +1740,45 @@ async def test_describe_image_prefers_workspace_over_remote_url(tmp_path, monkey
 
     assert result["ok"] is True
     assert vision.image_url.startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_describe_image_missing_workspace_marker_fails_before_provider(tmp_path):
+    class FakeVision:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def describe(self, image_url: str, prompt: str = "") -> str:
+            self.calls += 1
+            raise AssertionError("缺失 workspace 标记不应回退透传给视觉 provider")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    cfg = _make_config(vision_enabled=True)
+    reg = build_default_registry(cfg)
+    vision = FakeVision()
+    ctx = ToolContext(vision=vision, workspace_dir=workspace)
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "describe_image",
+        {
+            "image_url": (
+                "[图片 url=https://example.com/a.jpg "
+                "workspace=incoming/missing.jpg]"
+            )
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert "workspace 图片不存在" in result["error"]
+    assert "优先使用 workspace=" in result["error"]
+    assert "改为直接传消息中真实出现的 url= 图片 URL" in result["error"]
+    assert result["data"]["image_ref"] == "incoming/missing.jpg"
+    assert result["data"]["message_url"] == "https://example.com/a.jpg"
+    assert result["data"]["workspace_path"] == "incoming/missing.jpg"
+    assert vision.calls == 0
 
 
 @pytest.mark.asyncio

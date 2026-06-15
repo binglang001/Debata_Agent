@@ -625,6 +625,7 @@ async def test_after_turn_valid_json_updates_state_and_runtime_records():
     assert "latest_monologue 必须是一人称内心状态" in prompt
     assert "稳定偏好、称呼、长期习惯、关系变化" in prompt
     assert "profile 字段包括 user_id、display_name、summary、traits、affinity" in prompt
+    assert "traits 必须是 JSON 字符串数组" in prompt
     assert "私聊可省略 user_id 由系统推断，群聊必须带 user_id" in prompt
     assert "affinity 是 0-100 的绝对亲近度" in prompt
     assert "不是 0-1，也不是 1-10" in prompt
@@ -641,10 +642,18 @@ async def test_after_turn_valid_json_updates_state_and_runtime_records():
     assert "不要随意用低 absolute affinity 覆盖" in prompt
     assert "profile 事实仍不要塞短期情绪、一次性事件或临时状态" in prompt
     assert "social_need 表示社交未满足度" in prompt
-    assert "被关心、亲密互动、有效交流后通常下降" in prompt
-    assert "想继续聊、社交兴奋或亲近感不要挤到 social_need" in prompt
-    assert "每轮最多新增 1 条 todo" in prompt
-    assert "普通情绪、关系画像、观察线索、已发生事件、泛泛改善建议都不要建 todo" in prompt
+    assert "0-5 非常罕见" in prompt
+    assert "10-25 是被回应、被关心、聊天满足后的常见低位" in prompt
+    assert "30-60 是普通稳定区间" in prompt
+    assert "单轮普通亲密互动通常只小幅下降" in prompt
+    assert "想继续聊、害羞、上头、亲近余韵不要挤到 social_need" in prompt
+    assert "effects[] 用于会持续一段时间的临时情绪、身体感、语气倾向、行动倾向或关系余韵" in prompt
+    assert "当本轮互动留下明显短期余韵时，应创建或更新 effect" in prompt
+    assert "不要把短期余韵塞进长期 profile" in prompt
+    assert "cues[] 用于对当前会话或近期互动有用" in prompt
+    assert "不要因为它不是长期记忆就丢掉" in prompt
+    assert "todos[] 用于之后需要执行、检查、提醒或收尾的具体事项" in prompt
+    assert "用户说“你一定要去睡哦”且角色接受时" in prompt
     assert [(item["state"], item["text"]) for item in statuses] == [
         ("thinking", "人格状态更新中"),
         ("idle", "人格状态更新完成"),
@@ -955,6 +964,48 @@ async def test_after_turn_relationship_update_and_plain_interaction_touch(monkey
 
 
 @pytest.mark.asyncio
+async def test_after_turn_accepts_string_traits_for_profiles_and_relationships(monkeypatch):
+    monkeypatch.setattr(persona_agent_mod.time, "time", lambda: 1000.0)
+    db = FakeDB(PersonaState())
+    provider = FakeProvider(
+        [
+            """
+            {
+              "profiles": [
+                {
+                  "user_id": "u_profile",
+                  "display_name": "画像对象",
+                  "summary": "对 AI 和技术话题很敏感",
+                  "traits": "技术好奇、套话倾向、能懂AI"
+                }
+              ],
+              "relationships": [
+                {
+                  "user_id": "u_relationship",
+                  "display_name": "关系对象",
+                  "summary": "互动里呈现出清晰偏好",
+                  "traits": "a,b; c",
+                  "affinity_delta": 3,
+                  "reason": "测试字符串 traits 容错"
+                }
+              ]
+            }
+            """
+        ]
+    )
+    agent = _agent(db, provider=provider)
+
+    await agent.start()
+    await agent.after_turn("private:u1", [{"user_id": "u1"}], "用户聊到技术和 AI")
+
+    assert db.profiles["u_profile"].traits == ["技术好奇", "套话倾向", "能懂AI"]
+    assert db.profiles["u_relationship"].traits == ["a", "b", "c"]
+    assert db.logs[-1]["event"] == "after_turn"
+    assert db.logs[-1]["fallback"] is False
+    await agent.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_after_turn_accepts_level_words_for_intensity_and_priority():
     db = FakeDB(PersonaState())
     provider = FakeProvider(
@@ -1020,7 +1071,7 @@ async def test_after_turn_accepts_iso_expires_at_for_cue():
 
 
 @pytest.mark.asyncio
-async def test_after_turn_filters_empty_duplicate_and_extra_new_todos():
+async def test_after_turn_filters_empty_duplicate_and_keeps_specific_new_todos():
     db = FakeDB(PersonaState())
     db.todos = [
         Todo(
@@ -1082,11 +1133,12 @@ async def test_after_turn_filters_empty_duplicate_and_extra_new_todos():
     await agent.after_turn("private:u1", [{"user_id": "u1"}], "用户说明早需要叫醒")
 
     todos_by_title = {todo.title: todo for todo in db.todos}
-    assert set(todos_by_title) == {"确认复诊时间", "提醒喝水", "明早叫醒用户"}
+    assert set(todos_by_title) == {"确认复诊时间", "提醒喝水", "明早叫醒用户", "晚上提醒吃饭"}
     assert todos_by_title["确认复诊时间"].id == "todo_existing"
     assert todos_by_title["确认复诊时间"].priority == 6
     assert todos_by_title["提醒喝水"].id == "todo_water"
     assert todos_by_title["明早叫醒用户"].scope == "private:u1"
+    assert todos_by_title["晚上提醒吃饭"].scope == "private:u1"
     await agent.shutdown()
 
 
@@ -2077,7 +2129,13 @@ async def test_periodic_tick_calls_llm_and_records_operation(monkeypatch):
     assert len(provider.calls) == 1
     prompt = provider.calls[0]["messages"][1]["content"]
     assert "social_need 表示社交未满足度" in prompt
+    assert "0-5 非常罕见" in prompt
+    assert "10-25 是被回应、被关心、聊天满足后的常见低位" in prompt
     assert "effects、profiles、relationships、todos、cues 必须是 JSON 数组" in prompt
+    assert "effects[] 用于会持续一段时间的临时情绪、身体感、语气倾向、行动倾向或关系余韵" in prompt
+    assert "cues[] 用于对当前会话或近期互动有用" in prompt
+    assert "todos[] 用于之后需要执行、检查、提醒或收尾的具体事项" in prompt
+    assert "traits 必须是 JSON 字符串数组" in prompt
     assert usage_calls[0][1]["operation"] == "persona_periodic"
     assert db.logs[-1]["event"] == "periodic_tick"
     assert db.logs[-1]["fallback"] is False
@@ -2464,6 +2522,8 @@ async def test_eat_finish_uses_recovery_eval_before_fallback(monkeypatch):
     assert db.eat_updates[0][1]["recovery_estimate"]["satiety"] == 86.0
     prompt = provider.calls[0]["messages"][1]["content"]
     assert "social_need 表示社交未满足度" in prompt
+    assert "30-60 是普通稳定区间" in prompt
+    assert "避免连续把 social_need 压到 0" in prompt
     await agent.shutdown()
 
 

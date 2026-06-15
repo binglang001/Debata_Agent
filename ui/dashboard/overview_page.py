@@ -261,6 +261,14 @@ class OverviewPage(QWidget):
         self._timer.start()
         self.refresh()
 
+    def on_shown(self) -> None:
+        if not self._timer.isActive():
+            self._timer.start()
+        self.refresh()
+
+    def on_hidden(self) -> None:
+        self._timer.stop()
+
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._apply_responsive_layout(event.size().width())

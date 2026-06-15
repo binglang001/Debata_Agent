@@ -176,6 +176,15 @@ class SettingsPage(
         self._provider_status_timer.timeout.connect(self._refresh_provider_status_labels)
         self._provider_status_timer.start()
 
+    def on_shown(self) -> None:
+        if not self._provider_status_timer.isActive():
+            self._provider_status_timer.start()
+        self.refresh()
+
+    def on_hidden(self) -> None:
+        self._provider_status_timer.stop()
+        self._settings_content_sync_timer.stop()
+
     def _add_settings_page(self, key: str, title: str, content: QWidget) -> None:
         item = QListWidgetItem(title)
         item.setData(Qt.ItemDataRole.UserRole, key)

@@ -993,8 +993,9 @@ class DescribeImageArgs(_ToolArgs):
         ...,
         min_length=1,
         description=(
-            "图片 URL 或 workspace 中的图片路径。从用户消息的 [图片 url=...]、"
+            "图片 URL 或 workspace 中已存在的图片路径。从用户消息的 [图片 url=...]、"
             "[图片 workspace=...] 标记中获取；收到图片时先用此工具理解内容。"
+            "不要根据 msg_id 猜 incoming/img_*.jpg；只能使用消息里实际出现的 workspace 路径或 URL。"
         ),
     )
     prompt: str | None = Field(

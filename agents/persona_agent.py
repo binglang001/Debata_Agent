@@ -45,6 +45,32 @@ _TODO_OPEN_STATUS_VALUES = {
     "in-progress",
 }
 
+_SOCIAL_NEED_GUIDANCE = (
+    "social_need 表示社交未满足度，不是亲密度、兴奋度或想继续聊天的程度："
+    "高=缺社交、孤独、需要陪伴；低=当前社交被满足。"
+    "数值锚点：0-5 非常罕见，只在刚完成高质量陪伴、当前确实不需要继续互动、"
+    "且没有悬而未决的社交期待时使用；10-25 是被回应、被关心、聊天满足后的常见低位；"
+    "30-60 是普通稳定区间；70+ 表示孤独、被忽视或长时间缺少互动。"
+    "单轮普通亲密互动通常只小幅下降，避免连续把 social_need 压到 0；"
+    "想继续聊、害羞、上头、亲近余韵不要挤到 social_need，应使用 effects/relationship 表达。\n"
+)
+
+_SHORT_TERM_UPDATE_GUIDANCE = (
+    "effects[] 用于会持续一段时间的临时情绪、身体感、语气倾向、行动倾向或关系余韵；"
+    "当本轮互动留下明显短期余韵时，应创建或更新 effect，而不是只写进 latest_monologue。"
+    "例如被反复关心后的柔软/害羞、晚安后的温暖余韵、被误解后的防备、"
+    "想暂时收尾休息的倾向。已有同类短期影响时优先用真实 id update 或 close；"
+    "不要把短期余韵塞进长期 profile。\n"
+    "cues[] 用于对当前会话或近期互动有用、但不适合进长期画像、也不构成可执行待办的短期线索；"
+    "当对方正在引导、某个话题还没完全收束、近期需要接续某个聊天意图时，应创建或更新 cue，"
+    "不要因为它不是长期记忆就丢掉。\n"
+    "todos[] 用于之后需要执行、检查、提醒或收尾的具体事项；"
+    "当用户明确要求角色之后做某事，且角色答应、接受、或当前生理状态确实需要时，应创建 todo。"
+    "例如用户说“你一定要去睡哦”且角色接受时，可建“准备睡觉/尽快入睡”类 todo。"
+    "todo 必须有可执行标题、scope、priority、触发或过期信息；避免“关注/记得/继续观察/留意一下”"
+    "这类泛泛标题。\n"
+)
+
 
 class _EffectUpdate(BaseModel):
     id: str | None = None
@@ -126,6 +152,28 @@ class _CueUpdate(BaseModel):
         return _normalize_operation(value)
 
 
+def _normalize_traits_field(value: object) -> object:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        for separator in ("、", "，", ",", "；", ";", "\n", "\r"):
+            text = text.replace(separator, ",")
+        return [part.strip() for part in text.split(",") if part.strip()]
+    if isinstance(value, list):
+        traits: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                traits.append(text)
+        return traits
+    return value
+
+
 class _ProfileUpdate(BaseModel):
     user_id: str | None = None
     display_name: str = ""
@@ -136,6 +184,11 @@ class _ProfileUpdate(BaseModel):
     interaction_count: int | None = None
     last_interaction_at: float | None = None
 
+    @field_validator("traits", mode="before")
+    @classmethod
+    def normalize_traits(cls, value: object) -> object:
+        return _normalize_traits_field(value)
+
 
 class _RelationshipUpdate(BaseModel):
     user_id: str | None = None
@@ -145,6 +198,11 @@ class _RelationshipUpdate(BaseModel):
     summary: str = ""
     traits: list[str] = Field(default_factory=list)
     reason: str = ""
+
+    @field_validator("traits", mode="before")
+    @classmethod
+    def normalize_traits(cls, value: object) -> object:
+        return _normalize_traits_field(value)
 
 
 class _TurnUpdate(BaseModel):
@@ -803,9 +861,7 @@ class PersonaAgent:
             "只返回 JSON 对象，不要解释。可用字段："
             "energy、satiety、mood、social_need、latest_monologue、reason。\n"
             "energy、satiety、mood、social_need 都是 0-100 的目标值；"
-            "social_need 表示社交未满足度：高=缺社交、孤独、需要陪伴；"
-            "被关心、亲密互动、有效交流后通常下降，长时间无人互动或被忽视后上升。"
-            "想继续聊或亲近感不要写进 social_need，可写 reason 或交给关系画像。\n"
+            f"{_SOCIAL_NEED_GUIDANCE}"
             "只在你能根据时长、动作和当前状态判断时填写。"
             "不确定的字段省略，系统会保留公式兜底结果。\n"
             "latest_monologue 写醒来或吃完后的短句内心状态；不要编造外部事件。\n"
@@ -831,13 +887,16 @@ class PersonaAgent:
             "只返回 JSON 对象，不要解释。可用字段同 after_turn："
             "mood、mood_delta、social_need、social_need_delta、latest_monologue、effects、profiles、relationships、todos、cues。\n"
             "effects、profiles、relationships、todos、cues 必须是 JSON 数组；没有内容用 []，不要用 {}、null 或空字符串。\n"
-            "social_need 表示社交未满足度：高=缺社交、孤独、需要陪伴；"
-            "被关心、亲密互动、有效交流后通常下降，长时间无人互动或被忽视后上升。"
-            "想继续聊、社交兴奋或亲近感不要挤到 social_need，可用 relationship/effects 表达。\n"
+            "profiles[].traits 和 relationships[].traits 必须是 JSON 字符串数组；没有内容用 []，不要用逗号分隔字符串。\n"
+            f"{_SOCIAL_NEED_GUIDANCE}"
             "如果没有明确变化，返回空对象 {}。\n"
             "latest_monologue 只写此刻内心或身体状态；不要写成刚收到用户消息。\n"
-            "todos 只保留真正需要后续行动的事项；普通观察、泛泛提醒、已过期或已完成事项不要新增。\n"
-            "priority 必须是 0-10 整数；时间必须是 unix timestamp 数字。\n"
+            f"{_SHORT_TERM_UPDATE_GUIDANCE}"
+            "effects[] 需要 name/effect_type/intensity/prompt_hint/source_detail/"
+            "duration_minutes 或 expires_at；intensity 必须是 0-100 数字，不要写 low/medium/high。\n"
+            "todos[] 需要 title，可选 reason/priority/scope/expires_at；已有 todo 可用 id 加 status/completed/done/cancelled 标记完成或取消。"
+            "cues[] 需要 summary，可选 cue_type/conversation_id/expires_at。"
+            "priority 必须是 0-10 整数；时间必须是 unix timestamp 数字；已有项操作必须带上下文里出现过的真实 id。\n"
             f"{retry_text}\n\n"
             f"<now>{now}</now>\n"
             f"<当前状态>\n{json.dumps(asdict(self._state), ensure_ascii=False)}\n</当前状态>\n"
@@ -905,18 +964,17 @@ class PersonaAgent:
             "可用字段：mood、mood_delta、social_need、social_need_delta、"
             "latest_monologue、effects、profile/profiles、relationship/relationships、todos、cues。\n"
             "effects、profiles、relationships、todos、cues 必须是 JSON 数组；没有内容用 []，不要用 {}、null 或空字符串。\n"
+            "profiles[].traits 和 relationships[].traits 必须是 JSON 字符串数组；没有内容用 []，不要用逗号分隔字符串。\n"
             "兼容字段 profile、relationship、effect、todo、cue 只用于单条更新；复数字段始终返回数组。\n"
             "mood、social_need、affinity 都是 0-100 分；delta 是在当前值上的增减。\n"
-            "social_need 表示社交未满足度：高=缺社交、孤独、需要陪伴；"
-            "被关心、亲密互动、有效交流后通常下降，长时间无人互动或被忽视后上升。"
-            "想继续聊、社交兴奋或亲近感不要挤到 social_need，可用 affinity/relationship/effects 表达。\n"
+            f"{_SOCIAL_NEED_GUIDANCE}"
             "归因规则：助手、assistant、当前回复、角色刚说的话，都是当前人格自己的发言；"
             "只有用户消息或明确外部事件才算别人输入。\n"
             "latest_monologue 必须是一人称内心状态，只写我此刻的感受、念头或身体状态；"
             "不得把助手刚说的话改写成用户、对方或外部人物的经历。\n"
+            f"{_SHORT_TERM_UPDATE_GUIDANCE}"
             "effects[] 需要 name/effect_type/intensity/prompt_hint/source_detail/"
             "duration_minutes 或 expires_at；intensity 必须是 0-100 数字，不要写 low/medium/high。\n"
-            "看到已有短期影响、线索、待办时，优先用真实 id 做 update 或 close；确有必要才 create 新项。"
             "已有项操作必须带上下文里出现过的真实 id，不能编造 id；unknown id 不会创建新项。\n"
             "operation 可用 create/update/close/delete/cancel/complete/noop；"
             "close/delete/cancel/complete 表示关闭或移除已有项，noop 表示不改。\n"
@@ -930,11 +988,6 @@ class PersonaAgent:
             "relationship/affinity_delta 是本轮增减分，普通一轮互动优先使用 affinity_delta，优先用 affinity_delta；普通一轮互动通常 -5 到 +5；强烈事件可更大，但要写 reason。"
             "绝对 affinity 只用于首次建档或明确校准；若已有关系只是本轮变好/变坏，不要随意用低 absolute affinity 覆盖。"
             "这类关系更新不要求同时写长期画像事实；私聊可省略 user_id 由系统推断。\n"
-            "todos[] 只用于明确未来动作、生理必要动作、用户明确要求、或确实需要唤醒/提醒的事项；"
-            "普通情绪、关系画像、观察线索、已发生事件、泛泛改善建议都不要建 todo。\n"
-            "每轮最多新增 1 条 todo，除非用户同一轮明确提出多个具体事项；多余事项忽略。\n"
-            "todo 必须有可执行标题、scope、priority、触发/过期信息（schema 支持时用 expires_at）；"
-            "不要写“关注/记得/继续观察/留意一下”这类泛泛标题。\n"
             "todos[] 需要 title，可选 reason/priority/scope/expires_at；已有 todo 可用 id 加 status/completed/done/cancelled 标记完成或取消；priority 必须是 0-10 整数，不要写 low/medium/high。\n"
             "cues[] 需要 summary，可选 cue_type/conversation_id/expires_at。\n"
             f"{retry_text}\n\n"
@@ -1958,7 +2011,6 @@ class PersonaAgent:
         key_by_id = {todo.id: _todo_dedupe_key(todo.scope, todo.title) for todo in self._todos}
         existing_keys = set(key_by_id.values())
         seen_new_keys: set[tuple[str, str]] = set()
-        accepted_new_count = 0
         for todo in todos:
             if todo.id and todo.id in existing_ids:
                 if _todo_update_status(todo) is not None:
@@ -1989,14 +2041,11 @@ class PersonaAgent:
                 continue
             if not todo.title.strip():
                 continue
-            if accepted_new_count >= 1:
-                continue
             key = _todo_dedupe_key(todo.scope, todo.title)
             if key in existing_keys or key in seen_new_keys:
                 continue
             filtered.append(todo)
             seen_new_keys.add(key)
-            accepted_new_count += 1
         return filtered
 
     def _upsert_cue_cache(self, cue: Cue) -> None:

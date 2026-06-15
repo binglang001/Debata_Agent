@@ -62,6 +62,7 @@ class DashboardWindow(QMainWindow):
         self._theme_choice = self._configured_theme()
         self._current_theme = resolve_theme_name(self._theme_choice)
         self._applied_theme: str | None = None
+        self._current_page_key: str | None = None
 
         # 整窗用 WindowFrame 包一层：QSS 里 QFrame#WindowFrame 设了 border-radius
         root = QFrame()
@@ -143,6 +144,9 @@ class DashboardWindow(QMainWindow):
         self._pages["settings"].theme_changed.connect(self._on_theme_changed)
         self._pages["settings"].restart_runtime_requested.connect(self.restart_requested.emit)
         self._pages["personas"].restart_requested.connect(self.restart_requested.emit)
+
+        for key, page in self._pages.items():
+            self._notify_page_hidden(key, page)
 
         # 默认显示 overview
         self._switch_to("overview")
@@ -264,21 +268,41 @@ class DashboardWindow(QMainWindow):
         page = self._pages.get(key)
         if page is None:
             return
+        previous_page = self._pages.get(self._current_page_key or "")
+        if previous_page is not None and previous_page is not page:
+            self._notify_page_hidden(self._current_page_key or "", previous_page)
+            self._clear_page_animation(previous_page)
         self._stack.setCurrentWidget(page)
         self._animate_current_page(page)
         self._sync_content_width()
         self._scroll.verticalScrollBar().setValue(0)  # 切页回顶
-        if hasattr(page, "refresh"):
-            try:
-                page.refresh()
-            except Exception:
-                logger.warning(f"页面 {key} 刷新失败", exc_info=True)
+        self._current_page_key = key
+        self._notify_page_shown(key, page)
         # 更新导航高亮
         for k, btn in self._nav_buttons.items():
             active = "true" if k == key else "false"
             btn.setProperty("active", active)
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+
+    def _notify_page_shown(self, key: str, page: QWidget) -> None:
+        shown = getattr(page, "on_shown", None)
+        try:
+            if callable(shown):
+                shown()
+            elif hasattr(page, "refresh"):
+                page.refresh()
+        except Exception:
+            logger.warning(f"页面 {key} 显示刷新失败", exc_info=True)
+
+    def _notify_page_hidden(self, key: str, page: QWidget) -> None:
+        hidden = getattr(page, "on_hidden", None)
+        if not callable(hidden):
+            return
+        try:
+            hidden()
+        except Exception:
+            logger.warning(f"页面 {key} 隐藏处理失败", exc_info=True)
 
     def _refresh_topbar(self) -> None:
         rt = self._runtime
@@ -397,18 +421,66 @@ class DashboardWindow(QMainWindow):
             from PySide6.QtCore import QEasingCurve, QPropertyAnimation
             from PySide6.QtWidgets import QGraphicsOpacityEffect
 
+            self._clear_page_animation(page)
             effect = QGraphicsOpacityEffect(page)
             page.setGraphicsEffect(effect)
-            anim = QPropertyAnimation(effect, b"opacity", page)
+            anim = QPropertyAnimation(effect, b"opacity")
             anim.setDuration(120)
             anim.setStartValue(0.0)
             anim.setEndValue(1.0)
             anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            page._page_fade_effect = effect  # type: ignore[attr-defined]
             page._page_fade_animation = anim  # type: ignore[attr-defined]
-            anim.finished.connect(lambda: page.setGraphicsEffect(None))
-            anim.start()
+
+            def finish_animation() -> None:
+                if getattr(page, "_page_fade_animation", None) is anim:
+                    page._page_fade_animation = None  # type: ignore[attr-defined]
+                if getattr(page, "_page_fade_effect", None) is effect:
+                    page._page_fade_effect = None  # type: ignore[attr-defined]
+                try:
+                    if page.graphicsEffect() is effect:
+                        page.setGraphicsEffect(None)
+                except RuntimeError:
+                    pass
+                try:
+                    effect.deleteLater()
+                except RuntimeError:
+                    pass
+                try:
+                    anim.deleteLater()
+                except RuntimeError:
+                    pass
+
+            anim.finished.connect(finish_animation)
+            anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
         except Exception:
             pass
+
+    def _clear_page_animation(self, page: QWidget) -> None:
+        anim = getattr(page, "_page_fade_animation", None)
+        if anim is not None:
+            page._page_fade_animation = None  # type: ignore[attr-defined]
+            try:
+                anim.finished.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                anim.stop()
+            except RuntimeError:
+                pass
+
+        effect = getattr(page, "_page_fade_effect", None)
+        if effect is not None:
+            page._page_fade_effect = None  # type: ignore[attr-defined]
+            try:
+                if page.graphicsEffect() is effect:
+                    page.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+            try:
+                effect.deleteLater()
+            except RuntimeError:
+                pass
 
     def notify_runtime_restart_finished(self, ok: bool, message: str = "") -> None:
         settings = getattr(self, "_pages", {}).get("settings")

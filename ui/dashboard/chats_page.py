@@ -279,6 +279,17 @@ class ChatsPage(QWidget):
         self._sync_chat_timeline_subscription()
         self.refresh()
 
+    def on_shown(self) -> None:
+        self._sync_chat_timeline_subscription()
+        if not self._timer.isActive():
+            self._timer.start()
+        self.refresh()
+
+    def on_hidden(self) -> None:
+        self._timer.stop()
+        self._refresh_debounce_timer.stop()
+        self._search_debounce_timer.stop()
+
     def refresh(self) -> None:
         self._sync_chat_timeline_subscription()
         rt = self._runtime

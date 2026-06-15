@@ -217,7 +217,23 @@ class MediaPipelineMixin:
             try:
                 source = await resolver(seg.file_id)
                 if source:
-                    return source
+                    import re
+                    from urllib.parse import unquote, urlparse
+
+                    source = str(source).strip()
+                    if re.match(r"^[A-Za-z]:[\\/]", source) and Path(source).is_file():
+                        return source
+                    parsed = urlparse(source)
+                    if parsed.scheme in ("http", "https"):
+                        return source
+                    if parsed.scheme == "file":
+                        file_path = unquote(parsed.path)
+                        if file_path.startswith("/") and len(file_path) > 3 and file_path[2] == ":":
+                            file_path = file_path[1:]
+                        if Path(file_path).is_file():
+                            return source
+                    elif not parsed.scheme and Path(source).is_file():
+                        return source
             except (AttributeError, NotImplementedError):
                 pass
             except Exception as e:  # noqa: BLE001
