@@ -28,6 +28,7 @@ from .context_builder import (
     build_messages,
     build_task_context,
 )
+from .persona_agent import PersonaAgent
 from .persona_gen_agent import PersonaBrief, PersonaGenAgent
 from .persona_loader import (
     Persona,
@@ -38,6 +39,8 @@ from .persona_loader import (
 )
 from .proactive_agent import ProactiveRouterAgent
 from .runner import DEFAULT_NO_FEEDBACK_TOOLS, SEND_TOOL_NAMES, AgentRunner
+from .social_agent import SocialAgent
+from .subconscious_agent import SubconsciousAgent
 from .summary_agent import SummaryAgent
 
 __all__ = [
@@ -67,7 +70,10 @@ __all__ = [
     # agents
     "AgentRunner",
     "ChatAgent",
+    "PersonaAgent",
     "ProactiveRouterAgent",
+    "SocialAgent",
+    "SubconsciousAgent",
     "SummaryAgent",
     "PersonaGenAgent",
     "PersonaBrief",

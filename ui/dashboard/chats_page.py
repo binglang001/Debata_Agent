@@ -1126,7 +1126,7 @@ def _conversation_info_from_id(conversation_id: str) -> dict[str, str]:
 def _system_conversation_label(target_id: str) -> str:
     labels = {
         "global": "系统记录 · 全局",
-        "proactive": "系统记录 · 主动思考",
+        "proactive": "系统记录 · 社交决策",
         "wakeup": "系统记录 · 定时唤醒",
         "agent_task": "系统记录 · 后台任务",
         "request": "系统记录 · 请求处理",

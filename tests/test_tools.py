@@ -18,6 +18,7 @@ from providers.base import ProviderError
 from tools import (
     DEFAULT_NO_FEEDBACK_TOOLS,
     FEATURE_TOOL_FEATURES,
+    FULL_SCHEMA_TOOLS,
     MEMORY_FILE_TOOLS,
     STUB_SCHEMA_TOOLS,
     ToolContext,
@@ -33,10 +34,15 @@ from tools.feature_tools import send_voice_message
 from tools.message_builder import MessageBuildError, resolve_emoji_path
 from tools.result_shrink import tool_budget
 from tools.schemas import (
+    EatArgs,
+    GetRecentChatMessagesArgs,
+    SaveMemoryArgs,
     SendGroupArgs,
     SendPrivateArgs,
     SendVoiceMessageArgs,
+    SleepArgs,
     ToolSearchArgs,
+    UpdateMemoryArgs,
 )
 
 
@@ -58,6 +64,14 @@ def test_tool_budget_falls_back_to_global_default_for_unknown_tool():
     assert budget.inline == 800
     assert budget.artifact_threshold == 800
     assert budget.hard_cap == 3000
+
+
+def test_tool_context_empty_constructs_with_persona_fields():
+    ctx = ToolContext()
+
+    assert ctx.persona_agent is None
+    assert ctx.subconscious_agent is None
+    assert ctx.persona_db is None
 
 
 def test_tool_budget_keeps_legacy_override_when_no_new_budget_exists():
@@ -282,9 +296,63 @@ def test_send_private_schema_derivation():
     assert "responding_to_message_ids" in props
     assert "reply_to_message_id" in props
     assert "回答被引用的消息或复核后继续旧内容" in props["responding_to_message_ids"]["description"]
-    assert "只在需要锚定原消息时填" in props["reply_to_message_id"]["description"]
+    assert "私聊/群聊都适用" in props["reply_to_message_id"]["description"]
+    assert "延迟回复" in props["reply_to_message_id"]["description"]
+    assert "吃饭睡觉后接旧话" in props["reply_to_message_id"]["description"]
     assert "没有可靠 msg_id 不要编造" in props["reply_to_message_id"]["description"]
     assert "reply_to_message_id" not in fn["parameters"]["required"]
+
+
+def test_eat_args_schema_and_validation():
+    args = EatArgs.model_validate(
+        {"meal_type": "早餐", "duration_minutes": 20, "description": "豆浆和包子"}
+    )
+    assert args.meal_type == "早餐"
+    assert args.duration_minutes == 20
+    assert args.description == "豆浆和包子"
+
+    schema = EatArgs.model_json_schema()
+    props = schema["properties"]
+    assert set(schema["required"]) == {"meal_type", "duration_minutes", "description"}
+    assert props["meal_type"]["minLength"] == 1
+    assert props["duration_minutes"]["minimum"] == 1
+    assert props["duration_minutes"]["maximum"] == 60
+    assert props["description"]["minLength"] == 1
+
+    for duration in (0, 61):
+        with pytest.raises(ValidationError):
+            EatArgs.model_validate(
+                {
+                    "meal_type": "早餐",
+                    "duration_minutes": duration,
+                    "description": "豆浆和包子",
+                }
+            )
+
+    with pytest.raises(ValidationError):
+        EatArgs.model_validate(
+            {"meal_type": "", "duration_minutes": 20, "description": "豆浆和包子"}
+        )
+
+
+def test_sleep_args_schema_and_validation():
+    args = SleepArgs.model_validate({"duration_minutes": 90, "reason": "午休"})
+    assert args.duration_minutes == 90
+    assert args.reason == "午休"
+
+    schema = SleepArgs.model_json_schema()
+    props = schema["properties"]
+    assert set(schema["required"]) == {"duration_minutes", "reason"}
+    assert props["duration_minutes"]["minimum"] == 1
+    assert props["duration_minutes"]["maximum"] == 720
+    assert props["reason"]["minLength"] == 1
+
+    for duration in (0, 721):
+        with pytest.raises(ValidationError):
+            SleepArgs.model_validate({"duration_minutes": duration, "reason": "午休"})
+
+    with pytest.raises(ValidationError):
+        SleepArgs.model_validate({"duration_minutes": 90, "reason": ""})
 
 
 def test_send_targets_require_delay():
@@ -390,9 +458,13 @@ def test_send_group_schema_describes_conditional_reply_reference():
     assert "回复对象不是紧邻上一条" in reply_desc
     assert "多人连续插话" in reply_desc
     assert "回答被引用的消息" in reply_desc
+    assert "私聊/群聊都适用" in reply_desc
+    assert "延迟回复" in reply_desc
+    assert "主动思考接旧话" in reply_desc
     assert "行/OK/可以/知道了/不要" in reply_desc
     assert "普通顺序闲聊不要机械每条都填" in reply_desc
     assert "没有可靠 msg_id 不要编造" in reply_desc
+    assert "自然语言锚定" in reply_desc
     assert "回复对象不是紧邻上一条" in responding_desc
     assert "回答被引用的消息或复核后提交旧内容" in responding_desc
 
@@ -401,8 +473,10 @@ def test_send_group_schema_describes_conditional_reply_reference():
         "reply_to_message_id"
     ]["description"]
     commit_required = commit_schema["function"]["parameters"].get("required", [])
-    assert "群聊复核后提交旧 attempt" in commit_desc
+    assert "私聊/群聊都适用" in commit_desc
     assert "提交旧 attempt 前先复核旧回复是否需要补引用" in commit_desc
+    assert "复核后提交旧 attempt" in commit_desc
+    assert "回复非最新消息" in commit_desc
     assert "回答被引用的消息" in commit_desc
     assert "短确认会看不出回谁" in commit_desc
     assert "普通顺序闲聊不要机械每条都填" in commit_desc
@@ -482,6 +556,7 @@ def test_all_expected_tools_registered():
         "summarize_conversation", "filter_archive_records", "recall_history",
         "start_agent_task",
         "no_action", "schedule_wakeup",
+        "eat", "sleep",
         "tool_search",
         "describe_image", "web_search", "get_weather",
         "send_voice_message",
@@ -532,6 +607,41 @@ def test_delete_memory_schema_prefers_memory_id():
     assert "旧版兼容" in props["keyword"]["description"]
 
 
+def test_memory_scope_schema_requires_semantic_explicit_choice():
+    specs = {s.name: s for s in get_default_specs()}
+    save_schema = specs["save_important_memory"].to_openai_schema()["function"]
+    save_props = save_schema["parameters"]["properties"]
+    save_desc = save_props["scope"]["description"]
+
+    assert "必须显式传 scope" in save_schema["description"]
+    assert "必填：按语义显式选择" in save_desc
+    assert "不会按当前会话自动推断" in save_desc
+    assert "global=跨场景" in save_desc
+    assert "user:QQ号=只适用于该用户本人" in save_desc
+    assert "group:群号=只适用于该群" in save_desc
+    assert "提到某用户不等于 user scope" in save_desc
+    assert "冰狼正在做短中期项目" in save_desc
+    assert "private:QQ" in save_desc
+
+    update_schema = specs["update_important_memory"].to_openai_schema()["function"]
+    update_props = update_schema["parameters"]["properties"]
+    update_scope_desc = update_props["scope"]["description"]
+    assert "修改内容时重新判断适用范围" in update_schema["description"]
+    assert "修改 memory_text 时要重新判断语义范围" in update_scope_desc
+    assert "仍适用原范围可不填" in update_scope_desc
+    assert "不要因为正文提到某用户就自动选 user scope" in update_scope_desc
+
+
+def test_memory_args_scope_guidance_and_recent_chat_private_delay_hint():
+    assert "提到某用户不等于 user scope" in SaveMemoryArgs.model_fields["scope"].description
+    assert "不会按当前会话自动推断" in SaveMemoryArgs.model_fields["scope"].description
+    assert "重新判断语义范围" in UpdateMemoryArgs.model_fields["scope"].description
+    assert (
+        "私聊或群聊延迟接旧话"
+        in GetRecentChatMessagesArgs.model_fields["since_msg_id"].description
+    )
+
+
 # ============================================================
 # build_default_registry: 按配置筛选
 # ============================================================
@@ -543,6 +653,9 @@ def _make_config(
     vision_enabled=False,
     web_search_enabled=False,
     weather_enabled=False,
+    persona_management_enabled=False,
+    energy_mode="disabled",
+    satiety_mode="disabled",
 ):
     """构造最小合法 RootConfig。"""
     from app_config.schema import (
@@ -550,6 +663,7 @@ def _make_config(
         AgentsConfig,
         FeaturesConfig,
         LongTermMemoryConfig,
+        PersonaManagementConfig,
         ProviderConfig,
         RootConfig,
         VisionFeatureConfig,
@@ -578,6 +692,13 @@ def _make_config(
                 host="devapi.qweather.com",
             ),
             long_term_memory=LongTermMemoryConfig(mode=memory_mode),
+        ),
+        persona_management=PersonaManagementConfig(
+            enabled=persona_management_enabled,
+            physiology={
+                "energy": {"mode": energy_mode},
+                "satiety": {"mode": satiety_mode},
+            },
         ),
     )
 
@@ -624,6 +745,155 @@ def test_registry_messaging_always_enabled():
     assert "send_private_messages" in reg
     assert "send_group_message" in reg
     assert "recall_message" in reg
+
+
+def test_registry_persona_tools_disabled_by_default():
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+
+    assert "eat" not in reg
+    assert "sleep" not in reg
+
+
+def test_registry_persona_energy_tool_includes_only_sleep():
+    cfg = _make_config(persona_management_enabled=True, energy_mode="tool")
+    reg = build_default_registry(cfg)
+
+    assert "sleep" in reg
+    assert "eat" not in reg
+
+
+def test_registry_persona_satiety_tool_includes_only_eat():
+    cfg = _make_config(persona_management_enabled=True, satiety_mode="tool")
+    reg = build_default_registry(cfg)
+
+    assert "eat" in reg
+    assert "sleep" not in reg
+
+
+def test_registry_persona_dual_tool_includes_eat_and_sleep():
+    cfg = _make_config(
+        persona_management_enabled=True,
+        energy_mode="tool",
+        satiety_mode="tool",
+    )
+    reg = build_default_registry(cfg)
+
+    assert "eat" in reg
+    assert "sleep" in reg
+    assert {"eat", "sleep"}.issubset(FULL_SCHEMA_TOOLS)
+
+
+@pytest.mark.asyncio
+async def test_persona_tools_without_persona_agent_return_unavailable():
+    cfg = _make_config(
+        persona_management_enabled=True,
+        energy_mode="tool",
+        satiety_mode="tool",
+    )
+    reg = build_default_registry(cfg)
+    executor = reg.get_executor(ToolContext())
+
+    eat_result = await executor(
+        "eat",
+        {
+            "meal_type": "早餐",
+            "duration_minutes": 20,
+            "description": "豆浆和包子",
+        },
+    )
+    sleep_result = await executor(
+        "sleep",
+        {"duration_minutes": 90, "reason": "午休"},
+    )
+
+    _assert_tool_result_envelope(eat_result, "eat")
+    _assert_tool_result_envelope(sleep_result, "sleep")
+    assert eat_result["ok"] is False
+    assert eat_result["status"] == "unavailable"
+    assert sleep_result["ok"] is False
+    assert sleep_result["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_persona_tools_call_persona_agent_and_sleep_reason_compatibility():
+    class FakePersonaAgent:
+        def __init__(self) -> None:
+            self.eat_calls: list[tuple[str, int, str]] = []
+            self.sleep_calls: list[tuple[int, str]] = []
+
+        async def on_eat_start(
+            self,
+            meal_type: str,
+            duration_minutes: int,
+            description: str,
+        ) -> dict:
+            self.eat_calls.append((meal_type, duration_minutes, description))
+            return {"status": "started", "record_id": "eat-1"}
+
+        async def on_sleep_start(
+            self,
+            duration_minutes: int,
+            *,
+            reason: str,
+        ) -> dict:
+            self.sleep_calls.append((duration_minutes, reason))
+            return {"status": "started", "record_id": "sleep-1"}
+
+    class DurationOnlySleepPersonaAgent:
+        def __init__(self) -> None:
+            self.sleep_calls: list[int] = []
+
+        async def on_sleep_start(self, duration_minutes: int) -> dict:
+            self.sleep_calls.append(duration_minutes)
+            return {"status": "started", "record_id": "sleep-legacy"}
+
+    cfg = _make_config(
+        persona_management_enabled=True,
+        energy_mode="tool",
+        satiety_mode="tool",
+    )
+    reg = build_default_registry(cfg)
+    agent = FakePersonaAgent()
+    executor = reg.get_executor(ToolContext(persona_agent=agent))
+
+    eat_result = await executor(
+        "eat",
+        {
+            "meal_type": "早餐",
+            "duration_minutes": 20,
+            "description": "豆浆和包子",
+        },
+    )
+    sleep_result = await executor(
+        "sleep",
+        {"duration_minutes": 90, "reason": "午休"},
+    )
+
+    assert agent.eat_calls == [("早餐", 20, "豆浆和包子")]
+    assert agent.sleep_calls == [(90, "午休")]
+    assert eat_result["ok"] is True
+    assert eat_result["status"] == "started"
+    assert eat_result["result"]["record_id"] == "eat-1"
+    assert sleep_result["ok"] is True
+    assert sleep_result["status"] == "started"
+    assert sleep_result["reason"] == "午休"
+    assert sleep_result["result"]["record_id"] == "sleep-1"
+
+    duration_only_agent = DurationOnlySleepPersonaAgent()
+    duration_only_executor = reg.get_executor(
+        ToolContext(persona_agent=duration_only_agent)
+    )
+    duration_only_result = await duration_only_executor(
+        "sleep",
+        {"duration_minutes": 30, "reason": "小睡"},
+    )
+
+    assert duration_only_agent.sleep_calls == [30]
+    assert duration_only_result["ok"] is True
+    assert duration_only_result["status"] == "started"
+    assert duration_only_result["reason"] == "小睡"
+    assert duration_only_result["result"]["record_id"] == "sleep-legacy"
 
 
 def test_registry_upload_file_is_stub_schema():
@@ -865,7 +1135,31 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             ],
         }
 
+    class FakePersonaAgent:
+        def __init__(self) -> None:
+            self.eat_calls: list[tuple[str, int, str]] = []
+            self.sleep_calls: list[tuple[int, str]] = []
+
+        async def on_eat_start(
+            self,
+            meal_type: str,
+            duration_minutes: int,
+            description: str,
+        ) -> dict:
+            self.eat_calls.append((meal_type, duration_minutes, description))
+            return {"status": "started", "record_id": "eat-runtime"}
+
+        async def on_sleep_start(
+            self,
+            duration_minutes: int,
+            *,
+            reason: str,
+        ) -> dict:
+            self.sleep_calls.append((duration_minutes, reason))
+            return {"status": "started", "record_id": "sleep-runtime"}
+
     adapter = FullFakeAdapter()
+    persona_agent = FakePersonaAgent()
     ctx = ToolContext(
         adapter=adapter,
         important=important,
@@ -880,6 +1174,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         workspace_dir=workspace,
         send_actions_cb=fake_send_actions,
         agent_task_cb=fake_agent_task,
+        persona_agent=persona_agent,
         extras={
             "chat_timeline": timeline,
             "default_reply_target": {"target_type": "private", "target_id": 123},
@@ -915,7 +1210,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
             "prompt": "年轻女性，自然口语",
             "ignore_review_interrupts": True,
         },
-        "save_important_memory": {"memory_text": "用户喜欢红茶"},
+        "save_important_memory": {"memory_text": "用户喜欢红茶", "scope": "user:123"},
         "update_important_memory": {
             "memory_id": "mem-existing",
             "memory_text": "用户喜欢红茶和乌龙茶",
@@ -997,6 +1292,12 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         "list_files": {"path": ".", "pattern": "*.txt", "limit": 20},
         "delete_file": {"path": "delete-me.txt"},
         "run_python": {"code": "print('ok')", "timeout_seconds": 5},
+        "eat": {
+            "meal_type": "早餐",
+            "duration_minutes": 20,
+            "description": "豆浆和包子",
+        },
+        "sleep": {"duration_minutes": 90, "reason": "午休"},
         "tool_search": {"tool_name": "upload_file", "intent": "测试工具详情查询"},
     }
     assert set(calls) == {spec.name for spec in get_default_specs()}
@@ -1031,6 +1332,10 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert results["get_recent_chat_messages"]["data"]["last_msg_id"] == "m1"
     assert results["get_msg"]["content"] == "单条消息内容"
     assert results["get_msg"]["data"]["conversation_id"] == "group:456"
+    assert persona_agent.eat_calls == [("早餐", 20, "豆浆和包子")]
+    assert persona_agent.sleep_calls == [(90, "午休")]
+    assert results["eat"]["result"]["record_id"] == "eat-runtime"
+    assert results["sleep"]["result"]["record_id"] == "sleep-runtime"
 
     assert results["read_file"]["data"]["range"] == "continuous_page"
     assert "old line" in results["read_file"]["content"]
@@ -2274,6 +2579,50 @@ async def test_get_forward_msg_writes_nested_artifact_and_preserves_image_url(tm
 
 
 @pytest.mark.asyncio
+async def test_get_forward_msg_reads_onebot_message_field(tmp_path):
+    class FakeAdapter:
+        async def get_forward_msg(self, forward_id: str):
+            if forward_id == "outer":
+                return [
+                    {
+                        "sender": {"nickname": "Alice", "user_id": "1001"},
+                        "message_id": "m1",
+                        "message": [
+                            {"type": "text", "data": {"text": "外层文字"}},
+                            {"type": "forward", "data": {"id": "inner"}},
+                        ],
+                    }
+                ]
+            return [
+                {
+                    "sender": {"nickname": "Bob", "user_id": "1002"},
+                    "message_id": "m2",
+                    "message": [{"type": "text", "data": {"text": "内层文字"}}],
+                }
+            ]
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    executor = reg.get_executor(
+        ToolContext(adapter=FakeAdapter(), workspace_dir=workspace)
+    )
+
+    result = await executor("get_forward_msg", {"forward_id": "outer"})
+
+    assert result["ok"] is True
+    assert result["data"]["nested_forward_count"] == 1
+    assert result["preview"][0]["segments"][0]["text"] == "外层文字"
+    path = workspace / result["artifact"]["path"]
+    tree = json.loads(path.read_text(encoding="utf-8"))
+    outer_segments = tree["messages"][0]["segments"]
+    assert outer_segments[0]["text"] == "外层文字"
+    assert outer_segments[1]["forward_id"] == "inner"
+    assert outer_segments[1]["node"]["messages"][0]["segments"][0]["text"] == "内层文字"
+
+
+@pytest.mark.asyncio
 async def test_get_forward_msg_keeps_parent_when_nested_forward_expired(tmp_path):
     class FakeAdapter:
         async def get_forward_msg(self, forward_id: str):
@@ -3132,8 +3481,21 @@ async def test_save_memory_with_manager(tmp_path):
     reg = build_default_registry(cfg)
     ctx = ToolContext(important=im, conversation_id="private:123")
     executor = reg.get_executor(ctx)
-    result = await executor(
+    missing_scope = await executor(
         "save_important_memory", {"memory_text": "记住张三是朋友"}
+    )
+    assert missing_scope["ok"] is False
+    assert missing_scope["status"] == "missing_scope"
+    assert missing_scope["retryable"] is True
+    assert "显式填写 scope" in missing_scope["brief"]
+    assert "提到某用户不等于 user scope" in missing_scope["next"]
+    assert "global" in missing_scope["data"]["allowed_scopes"]
+    assert "冰狼正在做短中期项目" in missing_scope["data"]["examples"][1]
+    assert im.items() == []
+
+    result = await executor(
+        "save_important_memory",
+        {"memory_text": "记住张三是朋友", "scope": "user:123"},
     )
     assert result["ok"] is True
     assert result["saved"] is True
@@ -3145,7 +3507,8 @@ async def test_save_memory_with_manager(tmp_path):
     assert im.items()[0]["scope"] == "user:123"
 
     duplicate = await executor(
-        "save_important_memory", {"memory_text": "记住张三是朋友"}
+        "save_important_memory",
+        {"memory_text": "记住张三是朋友", "scope": "user:123"},
     )
     assert duplicate["ok"] is True
     assert duplicate["status"] == "exact_duplicate"
@@ -3174,6 +3537,30 @@ async def test_save_memory_explicit_scope_and_pinned(tmp_path):
     assert result["pinned"] is True
     assert im.items()[0]["scope"] == "global"
     assert im.items()[0]["pinned"] is True
+
+
+@pytest.mark.asyncio
+async def test_save_memory_rejects_private_scope_without_saving(tmp_path):
+    from memory import ImportantMemoryManager
+
+    im = ImportantMemoryManager(tmp_path / "imp.json")
+    await im.load()
+
+    cfg = _make_config()
+    reg = build_default_registry(cfg)
+    ctx = ToolContext(important=im, conversation_id="private:123")
+    executor = reg.get_executor(ctx)
+    result = await executor(
+        "save_important_memory",
+        {"memory_text": "张三喜欢红茶", "scope": "private:123"},
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "invalid_scope"
+    assert result["retryable"] is True
+    assert "不能写 private:QQ" in result["brief"]
+    assert result["data"]["raw_scope"] == "private:123"
+    assert im.items() == []
 
 
 @pytest.mark.asyncio

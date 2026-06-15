@@ -61,6 +61,7 @@ from .settings.behavior import SettingsBehaviorMixin
 from .settings.features import SettingsFeaturesMixin
 from .settings.model import SettingsModelMixin
 from .settings.persona_appearance import SettingsPersonaAppearanceMixin
+from .settings.persona_physiology import SettingsPersonaPhysiologyMixin
 from .settings.software import SettingsSoftwareMixin
 from .settings.state import SettingsStateMixin
 from .settings.token_budget import SettingsTokenBudgetMixin
@@ -79,6 +80,7 @@ class SettingsPage(
     SettingsFeaturesMixin,
     SettingsModelMixin,
     SettingsPersonaAppearanceMixin,
+    SettingsPersonaPhysiologyMixin,
     SettingsSoftwareMixin,
     SettingsStateMixin,
     SettingsTokenBudgetMixin,
@@ -136,6 +138,11 @@ class SettingsPage(
 
         self._add_settings_page("models", "模型", self._build_model_section())
         self._add_settings_page("features", "功能", self._build_features_section())
+        self._add_settings_page(
+            "persona_physiology",
+            "人格与生理",
+            self._build_persona_physiology_section(),
+        )
 
         self._adapter_container = QVBoxLayout()
         self._adapter_container.setContentsMargins(0, 0, 0, 0)
@@ -274,6 +281,7 @@ class SettingsPage(
                 self._ws_chk.setChecked(f.web_search.enabled)
             if hasattr(self, "_emb_summary_lbl"):
                 self._emb_summary_lbl.setText(self._embedding_summary())
+            self._refresh_persona_physiology_controls()
             self._refresh_provider_status_labels()
             # 主题单选按钮同步
             if hasattr(self, "_theme_group"):

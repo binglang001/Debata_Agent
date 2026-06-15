@@ -23,12 +23,14 @@ main.py 调用此类即可。
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import signal
 import time
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -65,7 +67,16 @@ class Runtime:
         self.chat_agent: Any = None
         self.proactive_agent: Any = None
         self.summary_agent: Any = None
+        self.persona_db: Any = None
+        self.persona_agent: Any = None
+        self.social_agent: Any = None
+        self.subconscious_agent: Any = None
+        self.age_profile: Any = None
+        self.decay_engine: Any = None
+        self.sleep_consolidation: Any = None
         self.tool_registry: Any = None
+        self.eat_tool: Any = None
+        self.sleep_tool: Any = None
         self.wakeup_scheduler: Any = None
         self.pending_requests: Any = None
         self.rate_limiter: Any = None
@@ -189,7 +200,24 @@ class Runtime:
             mem_dir / "history.jsonl",
             event_store=self.event_store,
         )
-        self.important = ImportantMemoryManager(mem_dir / "important.json")
+        important_path = mem_dir / "important.json"
+        if self._persona_management_enabled():
+            from mind.db import PersonaDB
+            from mind.important_store import SqliteImportantStore
+
+            self.persona_db = PersonaDB(mem_dir / "persona.db")
+            await self.persona_db.load()
+            sqlite_important_store = SqliteImportantStore(self.persona_db)
+            await self._migrate_legacy_important_memory(
+                important_path,
+                sqlite_important_store,
+            )
+            self.important = ImportantMemoryManager(
+                important_path,
+                store=sqlite_important_store,
+            )
+        else:
+            self.important = ImportantMemoryManager(important_path)
         self.archive = ArchiveStore(mem_dir / "archive.sqlite3")
         self.rolling_summary = RollingSummaryStore(mem_dir / "rolling_summary.json")
         await self.history.load()
@@ -260,6 +288,9 @@ class Runtime:
                 usage_recorder=self._record_model_usage,
                 status_callback=self._update_model_activity,
             )
+
+        if self._persona_management_enabled():
+            await self._setup_persona_management_agents(chat_cfg)
 
         logger.debug("Runtime 阶段完成：Agent 构造 %.2fs", time.monotonic() - stage_t0)
 
@@ -337,6 +368,8 @@ class Runtime:
         from tools import build_default_registry
 
         self.tool_registry = build_default_registry(self.config)
+        self.eat_tool = "eat" in self.tool_registry
+        self.sleep_tool = "sleep" in self.tool_registry
         logger.debug("Runtime 阶段完成：工具注册 %.2fs", time.monotonic() - stage_t0)
 
         # 启动摘要：一行涵盖人格/记忆/provider/adapter/tools
@@ -379,33 +412,47 @@ class Runtime:
         from .message_pipeline import MessagePipeline
 
         chat_context_length = self._model_context_length(chat_cfg.provider, chat_cfg.model)
-        self.pipeline = MessagePipeline(
-            adapter=self.adapter,
-            chat_agent=self.chat_agent,
-            persona=self.persona,
-            history=self.history,
-            important=self.important,
-            archive=self.archive,
-            rolling_summary=self.rolling_summary,
-            tool_registry=self.tool_registry,
-            wakeup_scheduler=self.wakeup_scheduler,
-            pending_requests=self.pending_requests,
-            behavior_cfg=self.config.behavior,
-            features_cfg=self.config.features,
-            whitelist=adapter_cfg.whitelist,
-            emoji_dir=self.paths.EMOJI_DIR,
-            workspace_dir=self.paths.WORKSPACE_DIR,
-            rate_limiter=self.rate_limiter,
-            summary_agent=self.summary_agent,
-            model_context_length=chat_context_length,
-            vision=self.vision,
-            web_search=self.web_search,
-            weather=self.weather,
-            asr=self.asr,
-            tts=self.tts,
-            rag_memory=self.rag_memory,
-            event_store=self.event_store,
+        pipeline_kwargs = {
+            "adapter": self.adapter,
+            "chat_agent": self.chat_agent,
+            "persona": self.persona,
+            "history": self.history,
+            "important": self.important,
+            "archive": self.archive,
+            "rolling_summary": self.rolling_summary,
+            "tool_registry": self.tool_registry,
+            "wakeup_scheduler": self.wakeup_scheduler,
+            "pending_requests": self.pending_requests,
+            "behavior_cfg": self.config.behavior,
+            "features_cfg": self.config.features,
+            "whitelist": adapter_cfg.whitelist,
+            "emoji_dir": self.paths.EMOJI_DIR,
+            "workspace_dir": self.paths.WORKSPACE_DIR,
+            "rate_limiter": self.rate_limiter,
+            "summary_agent": self.summary_agent,
+            "model_context_length": chat_context_length,
+            "vision": self.vision,
+            "web_search": self.web_search,
+            "weather": self.weather,
+            "asr": self.asr,
+            "tts": self.tts,
+            "rag_memory": self.rag_memory,
+            "event_store": self.event_store,
+        }
+        persona_pipeline_kwargs = {
+            "persona_agent": self.persona_agent,
+            "subconscious_agent": self.subconscious_agent,
+            "persona_db": self.persona_db,
+            "eat_tool": self.eat_tool,
+            "sleep_tool": self.sleep_tool,
+        }
+        pipeline_kwargs.update(
+            self._accepted_kwargs(MessagePipeline, persona_pipeline_kwargs)
         )
+        self.pipeline = MessagePipeline(**pipeline_kwargs)
+        for name, value in persona_pipeline_kwargs.items():
+            if not hasattr(self.pipeline, name):
+                setattr(self.pipeline, name, value)
         # 回填 wakeup 双向依赖
         self.wakeup_scheduler._on_fire = self.pipeline.run_wakeup_turn
 
@@ -436,6 +483,7 @@ class Runtime:
             pipeline=self.pipeline,
             proactive_agent=self.proactive_agent,
             behavior_cfg=self.config.behavior,
+            social_agent=self.social_agent,
         )
 
         # ----- 15. 启动 adapter + proactive loop -----
@@ -535,6 +583,12 @@ class Runtime:
             await _close("wakeup_scheduler", self.wakeup_scheduler.cancel_all)
         if self.pipeline is not None:
             await _close("pipeline", self.pipeline.shutdown)
+        if self.subconscious_agent is not None:
+            await _close("subconscious_agent", self.subconscious_agent.stop)
+        if self.persona_agent is not None:
+            await _close("persona_agent", self.persona_agent.shutdown)
+        if self.persona_db is not None:
+            await _close("persona_db", self.persona_db.close)
         if self.event_store is not None:
             await _close("event_journal", self.event_store.shutdown)
         if self.rag_memory is not None:
@@ -556,6 +610,202 @@ class Runtime:
     # ============================================================
     # 辅助
     # ============================================================
+
+    def _persona_management_enabled(self) -> bool:
+        pm_cfg = getattr(self.config, "persona_management", None)
+        return bool(getattr(pm_cfg, "enabled", False))
+
+    async def _migrate_legacy_important_memory(
+        self,
+        legacy_path: Path,
+        sqlite_store: Any,
+    ) -> None:
+        """人格管理启用时把旧 JSON 重要记忆保守迁移到 persona.db。"""
+        if self.persona_db is None or not legacy_path.exists():
+            return
+        try:
+            if await self.persona_db.important_count() > 0:
+                return
+            from memory import ImportantMemoryManager
+
+            legacy = ImportantMemoryManager(legacy_path)
+            await legacy.load()
+            items = legacy.items()
+            if not items:
+                return
+            await sqlite_store.write(items)
+            logger.info("已迁移旧重要记忆到 persona.db：%s 条", len(items))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "旧重要记忆迁移到 persona.db 失败，继续使用空 SQLite 存储：%s",
+                e,
+            )
+
+    async def _setup_persona_management_agents(self, chat_cfg: Any) -> None:
+        if self.persona_db is None:
+            raise RuntimeError("persona_management.enabled=True 但 persona_db 未初始化")
+
+        from agents import PersonaAgent, SocialAgent, SubconsciousAgent
+        from mind import DecayEngine
+        from mind.consolidation import SleepConsolidation
+
+        pm_cfg = self.config.persona_management
+        persona_cfg = self._resolve_persona_management_agent_config(
+            pm_cfg.persona_agent,
+            chat_cfg,
+        )
+        persona_provider = self._provider_for_agent_config(
+            "persona_management.persona_agent",
+            persona_cfg,
+        )
+
+        self.age_profile = self._resolve_persona_age_profile(pm_cfg, self.persona)
+        self.decay_engine = DecayEngine(pm_cfg.physiology, self.age_profile)
+        self.sleep_consolidation = SleepConsolidation(
+            self.persona_db,
+            persona_provider,
+            persona_cfg,
+            self.age_profile,
+            usage_recorder=self._record_model_usage,
+        )
+
+        subconscious_starter = None
+        if pm_cfg.subconscious.enabled:
+            subconscious_cfg = self._resolve_persona_management_agent_config(
+                pm_cfg.subconscious,
+                chat_cfg,
+            )
+            subconscious_provider = self._provider_for_agent_config(
+                "persona_management.subconscious",
+                subconscious_cfg,
+            )
+            self.subconscious_agent = SubconsciousAgent(
+                subconscious_provider,
+                subconscious_cfg,
+                persona_agent=None,
+                status_callback=self._update_model_activity,
+            )
+            subconscious_starter = self.subconscious_agent.start
+
+        self.persona_agent = PersonaAgent(
+            self.persona_db,
+            persona_provider,
+            persona_cfg,
+            pm_cfg,
+            self.age_profile,
+            self.decay_engine,
+            self.sleep_consolidation,
+            self.persona,
+            usage_recorder=self._record_model_usage,
+            status_callback=self._update_model_activity,
+            subconscious_starter=subconscious_starter,
+        )
+        if self.subconscious_agent is not None:
+            self.subconscious_agent.persona_agent = self.persona_agent
+        await self.persona_agent.start()
+
+        if pm_cfg.social_agent.enabled:
+            social_cfg = self._resolve_persona_management_agent_config(
+                pm_cfg.social_agent,
+                chat_cfg,
+            )
+            social_provider = self._provider_for_agent_config(
+                "persona_management.social_agent",
+                social_cfg,
+            )
+            self.social_agent = SocialAgent(
+                social_provider,
+                social_cfg,
+                persona_agent=self.persona_agent,
+                usage_recorder=self._record_model_usage,
+                status_callback=self._update_model_activity,
+            )
+
+    @staticmethod
+    def _resolve_persona_management_agent_config(
+        agent_cfg: Any,
+        chat_cfg: Any,
+    ) -> Any:
+        """解析人格管理后台 Agent 配置，空 provider/model 继承主聊天配置。"""
+        provider = str(getattr(agent_cfg, "provider", "") or "").strip()
+        model = str(getattr(agent_cfg, "model", "") or "").strip()
+        updates = {
+            "provider": provider or chat_cfg.provider,
+            "model": model or chat_cfg.model,
+        }
+
+        model_copy = getattr(agent_cfg, "model_copy", None)
+        if callable(model_copy):
+            return model_copy(update=updates)
+
+        values: dict[str, Any] = {}
+        model_dump = getattr(agent_cfg, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump()
+            if isinstance(dumped, dict):
+                values.update(dumped)
+        elif hasattr(agent_cfg, "__dict__"):
+            values.update(vars(agent_cfg))
+
+        defaults = {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "max_tokens": 16384,
+            "reasoning": None,
+            "first_token_timeout_seconds": 30.0,
+        }
+        for name, default in defaults.items():
+            values.setdefault(name, getattr(agent_cfg, name, default))
+        values.update(updates)
+        return SimpleNamespace(**values)
+
+    def _resolve_persona_age_profile(self, pm_cfg: Any, persona: Any) -> Any:
+        from mind import resolve_age_profile
+
+        age_cfg = getattr(pm_cfg, "age", None)
+        overrides = getattr(age_cfg, "overrides", {}) or {}
+        age = None
+        if isinstance(overrides, dict) and persona.name in overrides:
+            age = overrides[persona.name]
+        else:
+            get_age = getattr(persona, "get_age", None)
+            age = get_age() if callable(get_age) else None
+
+        default_age = getattr(age_cfg, "default_age", None)
+        age_profile = resolve_age_profile(
+            age,
+            getattr(age_cfg, "brackets", []),
+            default_age=default_age if default_age is not None else None,
+        )
+        if age_profile is None:
+            logger.warning(
+                "persona_management 已启用，但人格 %s 未配置年龄；本次不注入年龄系统",
+                persona.name,
+            )
+        return age_profile
+
+    def _provider_for_agent_config(self, label: str, agent_cfg: Any) -> Any:
+        provider_id = str(getattr(agent_cfg, "provider", "") or "")
+        if provider_id not in self.providers:
+            raise RuntimeError(
+                f"{label}.provider={provider_id!r} 不在 providers 中。"
+                f"已实例化: {list(self.providers.keys())}"
+            )
+        return self.providers[provider_id]
+
+    @staticmethod
+    def _accepted_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+        try:
+            signature = inspect.signature(callable_obj)
+        except (TypeError, ValueError):
+            return dict(kwargs)
+        parameters = signature.parameters
+        if any(
+            param.kind is inspect.Parameter.VAR_KEYWORD
+            for param in parameters.values()
+        ):
+            return dict(kwargs)
+        return {name: value for name, value in kwargs.items() if name in parameters}
 
     async def _friend_whitelist_provider(self) -> set[str]:
         """RateLimiter 用：返回当前好友 user_id 集合。"""
@@ -914,7 +1164,7 @@ class Runtime:
 
     def _update_model_activity(self, payload: dict[str, Any]) -> None:
         state = str(payload.get("state") or "idle")
-        text = str(payload.get("text") or "空闲")
+        text = "空闲" if state == "idle" else str(payload.get("text") or "空闲")
         self.model_activity = {
             "state": state,
             "text": text,

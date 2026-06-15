@@ -536,6 +536,362 @@ class PersonaConfig(StrictModel):
 
 
 # ============================================================
+# 人格管理
+# ============================================================
+
+
+class PersonaManagementAgentConfig(StrictModel):
+    """人格管理后台 Agent 的模型参数配置。"""
+
+    provider: str = ""
+    """provider ID。留空则运行时继承 agents.chat.provider。"""
+
+    model: str = ""
+    """模型 ID。留空则运行时继承 agents.chat.model。"""
+
+    temperature: float = Field(default=0.6, ge=0.0, le=2.0)
+    """采样温度。默认与主聊天 Agent 保持一致。"""
+
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0)
+    """nucleus sampling 阈值。通常保持 1.0。"""
+
+    max_tokens: int = Field(default=16384, ge=1)
+    """单次响应最长 token 数。"""
+
+    reasoning: ReasoningConfig | None = None
+    """思考/推理配置。不填则不启用。"""
+
+    first_token_timeout_seconds: float = 30.0
+    """首 token 超时（秒）。流式模式下，首字未到即超时重试。"""
+
+
+class PersonaManagementPersonaAgentConfig(PersonaManagementAgentConfig):
+    """人格档案维护 Agent。"""
+
+    timer_interval_minutes: int = Field(default=30, ge=1)
+    """定时维护人格档案的间隔（分钟）。"""
+
+    min_interval_seconds: int = Field(default=300, ge=0)
+    """两次人格档案维护之间的最小间隔（秒）。"""
+
+
+class PersonaManagementSocialAgentConfig(PersonaManagementAgentConfig):
+    """社交关系维护 Agent。"""
+
+    enabled: bool = True
+    """是否启用社交关系后台维护。"""
+
+    interval_minutes: int = Field(default=30, ge=1)
+    """社交关系后台维护间隔（分钟）。"""
+
+
+class PersonaManagementSubconsciousConfig(PersonaManagementAgentConfig):
+    """潜意识后台处理配置。"""
+
+    enabled: bool = True
+    """是否启用潜意识后台处理。"""
+
+    interval_minutes: int = Field(default=30, ge=1)
+    """潜意识后台处理间隔（分钟）。"""
+
+    merge_window_seconds: float = Field(default=30.0, ge=0.0)
+    """潜意识事件合并窗口（秒）。"""
+
+    max_window_seconds: float = Field(default=300.0, ge=0.0)
+    """潜意识事件最长等待窗口（秒）。"""
+
+    wake_keywords: list[str] = Field(default_factory=list)
+    """触发潜意识唤醒的关键词列表。为空则仅按分数判断。"""
+
+    min_wake_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    """触发潜意识唤醒的最低分数。"""
+
+
+class PersonaManagementCollapseConfig(StrictModel):
+    """精力耗尽后的昏睡兜底配置。"""
+
+    grace_minutes: int = Field(default=60, ge=0)
+    """精力归零后允许维持清醒的宽限时间（分钟）。"""
+
+    sleep_hours: float = Field(default=12.0, ge=0.0)
+    """触发昏睡后的默认睡眠时长。"""
+
+    mood_penalty: float = Field(default=20.0, ge=0.0)
+    """触发昏睡后的心情惩罚。"""
+
+
+class PersonaManagementEnergyConfig(StrictModel):
+    """精力状态配置。"""
+
+    mode: Literal["disabled", "tool"] = "disabled"
+    """disabled = 关闭；tool = 由工具/运行时状态提供。"""
+
+    decay_per_hour: float = Field(default=1.5, ge=0.0)
+    """清醒时每小时精力衰减。"""
+
+    recovery_per_hour_sleep: float = Field(default=8.333, ge=0.0)
+    """睡眠时每小时精力恢复。"""
+
+    recovery_per_hour_eat: float = Field(default=15.0, ge=0.0)
+    """进食时每小时精力恢复。"""
+
+    long_sleep_threshold_minutes: int = Field(default=120, ge=0)
+    """长睡眠判定阈值（分钟）。"""
+
+    max_sleep_minutes: int = Field(default=720, ge=0)
+    """单次睡眠最长时长（分钟）。"""
+
+    collapse: PersonaManagementCollapseConfig = Field(
+        default_factory=PersonaManagementCollapseConfig
+    )
+    """精力耗尽后的昏睡兜底。"""
+
+
+class PersonaManagementSatietyConfig(StrictModel):
+    """饱腹状态配置。"""
+
+    mode: Literal["disabled", "tool"] = "disabled"
+    """disabled = 关闭；tool = 由工具/运行时状态提供。"""
+
+    decay_per_hour: float = Field(default=1.0, ge=0.0)
+    """非进食时每小时饱腹衰减。"""
+
+    recovery_per_minute: float = Field(default=0.5, ge=0.0)
+    """进食时每分钟饱腹恢复。"""
+
+    max_eat_minutes: int = Field(default=60, ge=0)
+    """单次进食最长时长（分钟）。"""
+
+
+class PersonaManagementMoodConfig(StrictModel):
+    """心情状态配置。"""
+
+    decay_per_hour: float = Field(default=0.5, ge=0.0)
+    """心情每小时自然回落量。"""
+
+    social_boost: float = Field(default=3.0, ge=0.0)
+    """良性社交带来的心情增益。"""
+
+
+class PersonaManagementConsolidationConfig(StrictModel):
+    """人格管理记忆整合配置。"""
+
+    daily_fallback_hour: int = Field(default=4, ge=0, le=23)
+    """每日兜底整合小时。"""
+
+
+class PersonaManagementPhysiologyConfig(StrictModel):
+    """生理状态配置。"""
+
+    energy: PersonaManagementEnergyConfig = Field(default_factory=PersonaManagementEnergyConfig)
+    """精力状态。"""
+
+    satiety: PersonaManagementSatietyConfig = Field(default_factory=PersonaManagementSatietyConfig)
+    """饱腹状态。"""
+
+
+class AgeBracketConfig(StrictModel):
+    """年龄分档规则。"""
+
+    name: str
+    """分档名称。"""
+
+    min: int = Field(ge=0)
+    """命中此分档的最小年龄（含）。"""
+
+    max: int | None = Field(default=None, ge=0)
+    """命中此分档的最大年龄（含）。None 表示无上限。"""
+
+    energy_decay_mult: float = Field(default=1.0, ge=0.0)
+    """精力衰减乘数。"""
+
+    energy_recovery_mult: float = Field(default=1.0, ge=0.0)
+    """精力睡眠恢复乘数。"""
+
+    satiety_decay_mult: float = Field(default=1.0, ge=0.0)
+    """饱腹衰减乘数。"""
+
+    mood_volatility_mult: float = Field(default=1.0, ge=0.0)
+    """心情波动乘数。"""
+
+    bedtime_hour: float = Field(default=23.0, ge=0.0, lt=24.0)
+    """建议入睡小时。"""
+
+    wakeup_hour: float = Field(default=7.0, ge=0.0, lt=24.0)
+    """建议醒来小时。"""
+
+    ideal_sleep_hours: float = Field(default=8.0, ge=0.0)
+    """理想睡眠时长。"""
+
+    monologue_style: str = ""
+    """独白风格提示。"""
+
+    emotional_hint: str = ""
+    """情绪提示。"""
+
+    social_hint: str = ""
+    """社交提示。"""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_age_bounds(cls, data: object) -> object:
+        if isinstance(data, dict):
+            data = dict(data)
+            if "min" not in data and "min_age" in data:
+                data["min"] = data.pop("min_age")
+            if "max" not in data and "max_age" in data:
+                data["max"] = data.pop("max_age")
+        return data
+
+
+def default_age_brackets() -> list[AgeBracketConfig]:
+    """人格年龄系统的默认六档分表。"""
+    return [
+        AgeBracketConfig(
+            name="幼年",
+            min=0,
+            max=5,
+            energy_decay_mult=1.25,
+            energy_recovery_mult=1.15,
+            satiety_decay_mult=1.25,
+            mood_volatility_mult=1.4,
+            bedtime_hour=20.0,
+            wakeup_hour=7.0,
+            ideal_sleep_hours=11.0,
+            monologue_style="短句、直觉、依赖照护",
+            emotional_hint="情绪表达直接，容易因需求未满足而波动。",
+            social_hint="更依赖熟悉对象的回应和陪伴。",
+        ),
+        AgeBracketConfig(
+            name="儿童",
+            min=6,
+            max=12,
+            energy_decay_mult=1.15,
+            energy_recovery_mult=1.1,
+            satiety_decay_mult=1.15,
+            mood_volatility_mult=1.25,
+            bedtime_hour=21.0,
+            wakeup_hour=7.0,
+            ideal_sleep_hours=10.0,
+            monologue_style="好奇、具体、带一点跳跃",
+            emotional_hint="对新鲜事物反应强，挫败后恢复也较快。",
+            social_hint="需要明确、温和、及时的互动反馈。",
+        ),
+        AgeBracketConfig(
+            name="少年",
+            min=13,
+            max=17,
+            energy_decay_mult=1.05,
+            energy_recovery_mult=1.05,
+            satiety_decay_mult=1.1,
+            mood_volatility_mult=1.2,
+            bedtime_hour=22.0,
+            wakeup_hour=7.0,
+            ideal_sleep_hours=9.0,
+            monologue_style="自我意识强，表达更敏感",
+            emotional_hint="关系和评价更容易牵动情绪。",
+            social_hint="重视被理解和被尊重。",
+        ),
+        AgeBracketConfig(
+            name="青年",
+            min=18,
+            max=29,
+            energy_decay_mult=1.0,
+            energy_recovery_mult=1.0,
+            satiety_decay_mult=1.0,
+            mood_volatility_mult=1.0,
+            bedtime_hour=23.0,
+            wakeup_hour=7.0,
+            ideal_sleep_hours=8.0,
+            monologue_style="自然、灵活、有探索感",
+            emotional_hint="情绪表达较完整，仍保留即时反应。",
+            social_hint="能在独处和互动之间保持平衡。",
+        ),
+        AgeBracketConfig(
+            name="成年",
+            min=30,
+            max=59,
+            energy_decay_mult=1.05,
+            energy_recovery_mult=0.95,
+            satiety_decay_mult=0.95,
+            mood_volatility_mult=0.85,
+            bedtime_hour=22.5,
+            wakeup_hour=6.5,
+            ideal_sleep_hours=7.5,
+            monologue_style="稳定、克制、重视因果",
+            emotional_hint="情绪波动较缓，更偏向整理和消化。",
+            social_hint="重视可靠、持续、边界清楚的关系。",
+        ),
+        AgeBracketConfig(
+            name="年长",
+            min=60,
+            max=None,
+            energy_decay_mult=1.2,
+            energy_recovery_mult=0.85,
+            satiety_decay_mult=0.9,
+            mood_volatility_mult=0.75,
+            bedtime_hour=21.5,
+            wakeup_hour=5.5,
+            ideal_sleep_hours=7.0,
+            monologue_style="沉稳、回顾、慢节奏",
+            emotional_hint="情绪表达更内敛，但会受长期关系牵动。",
+            social_hint="重视陪伴、记忆延续和稳定回应。",
+        ),
+    ]
+
+
+class PersonaManagementAgeConfig(StrictModel):
+    """人格年龄系统配置。"""
+
+    default_age: int | None = Field(default=None, ge=0)
+    """默认年龄。None 表示未设置年龄，运行时不注入年龄系统。"""
+
+    overrides: dict[str, int] = Field(default_factory=dict)
+    """按对象 ID 覆盖年龄。键由运行时约定，值为年龄。"""
+
+    brackets: list[AgeBracketConfig] = Field(default_factory=default_age_brackets)
+    """年龄分档表。运行时按年龄命中对应分档。"""
+
+
+class PersonaManagementConfig(StrictModel):
+    """人格管理功能总开关和后台配置。"""
+
+    enabled: bool = False
+    """是否启用人格管理后台系统。默认关闭。"""
+
+    persona_agent: PersonaManagementPersonaAgentConfig = Field(
+        default_factory=PersonaManagementPersonaAgentConfig
+    )
+    """人格档案维护 Agent。provider/model 留空时继承 agents.chat。"""
+
+    social_agent: PersonaManagementSocialAgentConfig = Field(
+        default_factory=PersonaManagementSocialAgentConfig
+    )
+    """社交关系维护 Agent。provider/model 留空时继承 agents.chat。"""
+
+    subconscious: PersonaManagementSubconsciousConfig = Field(
+        default_factory=PersonaManagementSubconsciousConfig
+    )
+    """潜意识后台处理配置。provider/model 留空时继承 agents.chat。"""
+
+    physiology: PersonaManagementPhysiologyConfig = Field(
+        default_factory=PersonaManagementPhysiologyConfig
+    )
+    """生理状态配置。"""
+
+    mood: PersonaManagementMoodConfig = Field(default_factory=PersonaManagementMoodConfig)
+    """心情状态配置。"""
+
+    consolidation: PersonaManagementConsolidationConfig = Field(
+        default_factory=PersonaManagementConsolidationConfig
+    )
+    """人格管理记忆整合配置。"""
+
+    age: PersonaManagementAgeConfig = Field(default_factory=PersonaManagementAgeConfig)
+    """人格年龄系统配置。default_age=None 时不启用年龄注入。"""
+
+
+# ============================================================
 # 行为参数
 # ============================================================
 
@@ -843,6 +1199,9 @@ class RootConfig(StrictModel):
     agents: AgentsConfig
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     persona: PersonaConfig = Field(default_factory=PersonaConfig)
+    persona_management: PersonaManagementConfig = Field(
+        default_factory=PersonaManagementConfig
+    )
     behavior: BehaviorConfig = Field(default_factory=BehaviorConfig)
 
     @field_validator("version")
@@ -859,17 +1218,26 @@ class RootConfig(StrictModel):
         """确保所有 provider 引用、密钥 ID 引用都指向已存在的对象。"""
         provider_ids = set(self.providers.keys())
 
+        def ensure_provider_exists(path: str, provider: str) -> None:
+            if provider in provider_ids:
+                return
+            example_id = sorted(provider_ids)[0] if provider_ids else "deepseek_main"
+            raise ValueError(
+                f"{path}.provider = '{provider}' 未在 providers 中定义。\n"
+                f"  已定义的 providers: {sorted(provider_ids)}\n"
+                f"  修法：编辑 config.yaml 把 {path}.provider "
+                f"改成上面已存在的 ID（如 '{example_id}'），"
+                f"或在 providers 段新增 '{provider}' 的配置。"
+            )
+
         # 检查每个 Agent 的 provider 引用
         for name, agent in self._iter_agents():
-            if agent.provider not in provider_ids:
-                example_id = sorted(provider_ids)[0] if provider_ids else "deepseek_main"
-                raise ValueError(
-                    f"agents.{name}.provider = '{agent.provider}' 未在 providers 中定义。\n"
-                    f"  已定义的 providers: {sorted(provider_ids)}\n"
-                    f"  修法：编辑 config.yaml 把 agents.{name}.provider "
-                    f"改成上面已存在的 ID（如 '{example_id}'），"
-                    f"或在 providers 段新增 '{agent.provider}' 的配置。"
-                )
+            ensure_provider_exists(f"agents.{name}", agent.provider)
+
+        # 人格管理后台 Agent 允许空 provider/model，由运行时继承 agents.chat。
+        for name, agent in self._iter_persona_management_agents():
+            if agent.provider:
+                ensure_provider_exists(f"persona_management.{name}", agent.provider)
 
         # 检查 features 中的 provider 引用（如有）
         for _feat_name, feat in [
@@ -892,3 +1260,9 @@ class RootConfig(StrictModel):
             agent = getattr(self.agents, name)
             if agent is not None:
                 yield name, agent
+
+    def _iter_persona_management_agents(self):
+        """遍历人格管理后台 Agent，返回 (name, PersonaManagementAgentConfig)。"""
+        yield "persona_agent", self.persona_management.persona_agent
+        yield "social_agent", self.persona_management.social_agent
+        yield "subconscious", self.persona_management.subconscious

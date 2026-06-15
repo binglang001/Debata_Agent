@@ -206,7 +206,7 @@ class _StatCard(QFrame):
 
 
 class OverviewPage(QWidget):
-    """4 张卡片的总览页。每 5 秒刷新一次。"""
+    """4 张卡片的总览页。每 1 秒刷新一次。"""
 
     _NARROW_WIDTH = 760
 
@@ -254,9 +254,9 @@ class OverviewPage(QWidget):
 
         self._apply_responsive_layout(self.width())
 
-        # 5 秒刷新
+        # 1 秒刷新
         self._timer = QTimer(self)
-        self._timer.setInterval(5000)
+        self._timer.setInterval(1000)
         self._timer.timeout.connect(self.refresh)
         self._timer.start()
         self.refresh()
@@ -394,7 +394,8 @@ class OverviewPage(QWidget):
             face = QLabel(_activity_face(state))
             face.setProperty("role", "title-2")
             self._activity_card.add_widget(face)
-            self._activity_card.add_line("状态", str(activity.get("text") or "空闲"))
+            status_text = "空闲" if state == "idle" else str(activity.get("text") or "空闲")
+            self._activity_card.add_line("状态", status_text)
             model = str(activity.get("model") or "")
             if model:
                 self._activity_card.add_line("模型", model)
