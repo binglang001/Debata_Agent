@@ -286,8 +286,8 @@ class SleepConsolidation:
             await _maybe_await(self.db.save_state(state))
             return
         try:
-            setattr(state, "latest_monologue", text)
-            setattr(state, "last_monologue_at", timestamp)
+            state.latest_monologue = text
+            state.last_monologue_at = timestamp
         except Exception:
             logger.debug("更新明日独白状态对象失败", exc_info=True)
             return

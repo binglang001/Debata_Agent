@@ -28,6 +28,8 @@ class FakeDB:
         self.sleep_updates: list[tuple[str, dict]] = []
         self.eat_records: list[dict] = []
         self.eat_updates: list[tuple[str, dict]] = []
+        self.update_audits: list[dict] = []
+        self.important: list[dict | str] = []
         self.expired_effect_calls = 0
         self.expired_cue_calls = 0
         self.missed_todo_calls = 0
@@ -56,6 +58,12 @@ class FakeDB:
         self.effects.append(effect)
         return effect.id
 
+    async def remove_effects(self, ids) -> int:
+        effect_ids = {str(item) for item in (ids if isinstance(ids, list | tuple | set) else [ids])}
+        before = len(self.effects)
+        self.effects = [effect for effect in self.effects if effect.id not in effect_ids]
+        return before - len(self.effects)
+
     async def expire_effects(self, now: float) -> int:
         before = len(self.effects)
         self.effects = [effect for effect in self.effects if effect.expires_at > now]
@@ -73,7 +81,7 @@ class FakeDB:
         if isinstance(todo, dict) and (
             todo.get("completed")
             or str(todo.get("status") or "").lower()
-            in {"completed", "complete", "done", "finished", "closed", "cancelled", "canceled", "missed"}
+            in {"completed", "complete", "done", "finished", "closed", "cancelled", "canceled", "deleted", "missed"}
         ):
             self.closed_todos[str(todo_id)] = dict(todo)
             return str(todo_id)
@@ -115,6 +123,12 @@ class FakeDB:
         self.cues.append(cue)
         return cue.id
 
+    async def remove_cues(self, ids) -> int:
+        cue_ids = {str(item) for item in (ids if isinstance(ids, list | tuple | set) else [ids])}
+        before = len(self.cues)
+        self.cues = [cue for cue in self.cues if cue.id not in cue_ids]
+        return before - len(self.cues)
+
     async def expire_cues(self, now: float) -> int:
         before = len(self.cues)
         self.cues = [cue for cue in self.cues if cue.expires_at > now]
@@ -141,6 +155,26 @@ class FakeDB:
 
     async def recent_trajectories(self, limit: int = 20) -> list[dict]:
         return self.trajectories[-limit:]
+
+    async def append_update_audit(self, entry: dict) -> int:
+        self.update_audits.append(entry)
+        return len(self.update_audits)
+
+    async def recent_update_audits(
+        self,
+        limit: int = 20,
+        conversation_id: str | None = None,
+        user_id: str | None = None,
+    ) -> list[dict]:
+        records = list(reversed(self.update_audits))
+        if conversation_id is not None:
+            records = [item for item in records if item.get("conversation_id") == conversation_id]
+        if user_id is not None:
+            records = [item for item in records if item.get("user_id") == user_id]
+        return records[:limit]
+
+    async def read_important(self, default=None):
+        return list(self.important) if self.important else default
 
     async def add_sleep_record(self, record: dict) -> str:
         self.sleep_records.append(record)
@@ -526,7 +560,6 @@ async def test_after_turn_valid_json_updates_state_and_runtime_records():
               "social_need": 22,
               "latest_monologue": "今天记得主动问候。",
               "effect": {
-                "id": "effect_1",
                 "name": "安心",
                 "effect_type": "mood",
                 "intensity": 2.5,
@@ -542,14 +575,12 @@ async def test_after_turn_valid_json_updates_state_and_runtime_records():
                 "interaction_count": 3
               },
               "todo": {
-                "id": "todo_1",
                 "title": "稍后确认状态",
                 "reason": "对方刚提到疲惫",
                 "priority": 2,
                 "scope": "private:u1"
               },
               "cue": {
-                "id": "cue_1",
                 "summary": "对方可能需要休息提醒",
                 "expires_at": 9999999999
               }
@@ -572,6 +603,23 @@ async def test_after_turn_valid_json_updates_state_and_runtime_records():
     assert db.cues[0].conversation_id == "private:u1"
     assert db.monologues[0]["text"] == "今天记得主动问候。"
     assert db.logs[-1]["event"] == "after_turn"
+    audit = db.update_audits[-1]
+    assert audit["trigger"] == "after_turn"
+    assert audit["conversation_id"] == "private:u1"
+    assert audit["inferred_user_id"] == "u1"
+    assert audit["raw_update"]["mood"] == 81
+    assert audit["state_before"]["mood"] == 65.0
+    assert audit["state_after"]["mood"] == 81
+    assert audit["profile_before"] is None
+    assert audit["profile_after"]["user_id"] == "u1"
+    assert audit["applied_changes"]["state"]
+    assert audit["applied_changes"]["profiles"]
+    assert audit["applied_changes"]["effects"][0]["operation"] == "create"
+    assert audit["applied_changes"]["effects"][0]["id"].startswith("effect_")
+    assert audit["applied_changes"]["todos"][0]["operation"] == "create"
+    assert audit["applied_changes"]["todos"][0]["id"].startswith("todo_")
+    assert audit["applied_changes"]["cues"][0]["operation"] == "create"
+    assert audit["applied_changes"]["cues"][0]["id"].startswith("cue_")
     prompt = provider.calls[0]["messages"][1]["content"]
     assert "助手、assistant、当前回复、角色刚说的话，都是当前人格自己的发言" in prompt
     assert "latest_monologue 必须是一人称内心状态" in prompt
@@ -605,6 +653,255 @@ async def test_after_turn_valid_json_updates_state_and_runtime_records():
     assert "语气更安心" in context
     assert "稍后确认状态" in context
     assert "对方可能需要休息提醒" in context
+    await agent.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_after_turn_prompt_uses_persona_context_view_ids_audits_and_delta_guidance(monkeypatch):
+    monkeypatch.setattr(persona_agent_mod.time, "time", lambda: 1000.0)
+    db = FakeDB(PersonaState(mood=64, social_need=41))
+    db.profiles["u1"] = UserProfile(
+        user_id="u1",
+        display_name="小林",
+        affinity=82.0,
+        summary="长期偏好短句反馈",
+        traits=["会直接夸奖"],
+        interaction_count=8,
+        last_interaction_at=900.0,
+    )
+    db.effects = [
+        Effect(
+            id="effect_real_1",
+            name="被认可",
+            effect_type="mood",
+            intensity=20,
+            prompt_hint="回应时更放松",
+            source_detail="用户刚夸奖",
+            created_at=900.0,
+            expires_at=9999999999,
+        )
+    ]
+    db.cues = [
+        Cue(
+            id="cue_real_1",
+            cue_type="conversation",
+            summary="可以延续夸奖话题",
+            conversation_id="private:u1",
+            created_at=910.0,
+            expires_at=9999999999,
+        )
+    ]
+    db.todos = [
+        Todo(
+            id="todo_real_1",
+            title="稍后确认项目进展",
+            reason="用户提到项目",
+            priority=5,
+            scope="private:u1",
+            created_at=920.0,
+            expires_at=9999999999,
+        )
+    ]
+    db.update_audits.append(
+        {
+            "id": "audit_recent_1",
+            "conversation_id": "private:u1",
+            "user_id": "u1",
+            "field": "affinity",
+            "old_value": 80,
+            "new_value": 82,
+            "summary": "上轮因稳定互动小幅上调",
+        }
+    )
+    db.important = [
+        {"id": "mem_user_1", "scope": "user:u1", "content": "用户偏好自然短句。"},
+    ]
+    provider = FakeProvider(["{}"])
+    agent = _agent(db, provider=provider)
+
+    await agent.start()
+    await agent.after_turn(
+        "private:u1",
+        [{"user_id": "u1", "nickname": "小林"}],
+        "用户夸奖角色说你今天很厉害。",
+    )
+
+    prompt = provider.calls[0]["messages"][1]["content"]
+    assert "<事件>" in prompt
+    assert "<聊天现场>" in prompt
+    assert "<当前对象画像>" in prompt
+    assert "用户夸奖角色说你今天很厉害" in prompt
+    assert "好感: 82" in prompt
+    assert "effect_real_1" in prompt
+    assert "cue_real_1" in prompt
+    assert "todo_real_1" in prompt
+    assert "audit_recent_1" in prompt
+    assert "最近画像变动" in prompt
+    assert "mem_user_1 用户偏好自然短句" in prompt
+    assert "普通一轮互动优先使用 affinity_delta" in prompt
+    assert "绝对 affinity 只用于首次建档或明确校准" in prompt
+    assert "不要随意用低 absolute affinity 覆盖" in prompt
+    assert "已有项操作必须带上下文里出现过的真实 id" in prompt
+    await agent.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_after_turn_episode_context_is_append_only_within_active_episode(monkeypatch):
+    ticks = iter([1000.0, 1000.0, 1010.0, 1010.0])
+    monkeypatch.setattr(persona_agent_mod.time, "time", lambda: next(ticks, 1010.0))
+    db = FakeDB(PersonaState())
+    provider = FakeProvider(["{}", "{}"])
+    agent = _agent(db, provider=provider)
+
+    await agent.start()
+    await agent.after_turn("private:u1", [{"user_id": "u1"}], "第一轮摘要")
+    await agent.after_turn("private:u1", [{"user_id": "u1"}], "第二轮摘要")
+
+    first_prompt = provider.calls[0]["messages"][1]["content"]
+    second_prompt = provider.calls[1]["messages"][1]["content"]
+    assert "第一轮摘要" in first_prompt
+    assert "第二轮摘要" not in first_prompt
+    assert "第一轮摘要" in second_prompt
+    assert "第二轮摘要" in second_prompt
+    assert "片段数: 2" in second_prompt
+    await agent.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_after_turn_operations_update_close_and_drop_unknown_ids(monkeypatch):
+    monkeypatch.setattr(persona_agent_mod.time, "time", lambda: 1000.0)
+    db = FakeDB(PersonaState())
+    db.effects = [
+        Effect("effect_update", "旧影响", "mood", 10, "旧提示", "旧来源", 100.0, 9999999999),
+        Effect("effect_close", "待关闭", "mood", 5, "关闭提示", "旧来源", 100.0, 9999999999),
+        Effect("effect_keep", "保留", "mood", 5, "保留提示", "旧来源", 100.0, 9999999999),
+    ]
+    db.cues = [
+        Cue("cue_update", "conversation", "旧线索", "private:u1", 100.0, 9999999999),
+        Cue("cue_close", "conversation", "待关闭线索", "private:u1", 100.0, 9999999999),
+        Cue("cue_keep", "conversation", "保留线索", "private:u1", 100.0, 9999999999),
+    ]
+    db.todos = [
+        Todo("todo_update", "旧待办", "旧原因", 3, "private:u1", 100.0, 9999999999),
+        Todo("todo_close", "待关闭待办", "旧原因", 4, "private:u1", 100.0, 9999999999),
+        Todo("todo_keep", "保留待办", "旧原因", 2, "private:u1", 100.0, 9999999999),
+    ]
+    provider = FakeProvider(
+        [
+            """
+            {
+              "effects": [
+                {"id": "effect_update", "operation": "update", "prompt_hint": "新提示"},
+                {"id": "effect_close", "operation": "close"},
+                {"id": "effect_missing", "operation": "delete"}
+              ],
+              "cues": [
+                {"id": "cue_update", "operation": "update", "summary": "新线索"},
+                {"id": "cue_close", "operation": "delete"},
+                {"id": "cue_missing", "operation": "update", "summary": "不要新建"}
+              ],
+              "todos": [
+                {"id": "todo_update", "operation": "update", "title": "新待办"},
+                {"id": "todo_close", "operation": "complete"},
+                {"id": "todo_missing", "operation": "cancel", "title": "不要新建"}
+              ]
+            }
+            """
+        ]
+    )
+    agent = _agent(db, provider=provider)
+
+    await agent.start()
+    await agent.after_turn("private:u1", [{"user_id": "u1"}], "关闭和更新已有项目")
+
+    effects = {effect.id: effect for effect in db.effects}
+    assert set(effects) == {"effect_update", "effect_keep"}
+    assert effects["effect_update"].name == "旧影响"
+    assert effects["effect_update"].prompt_hint == "新提示"
+    cues = {cue.id: cue for cue in db.cues}
+    assert set(cues) == {"cue_update", "cue_keep"}
+    assert cues["cue_update"].summary == "新线索"
+    todos = {todo.id: todo for todo in db.todos}
+    assert set(todos) == {"todo_update", "todo_keep"}
+    assert todos["todo_update"].title == "新待办"
+    assert set(db.closed_todos) == {"todo_close"}
+    assert db.closed_todos["todo_close"]["status"] == "completed"
+    assert "todo_missing" not in db.closed_todos
+
+    audit = db.update_audits[-1]["applied_changes"]
+    assert any(item["operation"] == "dropped_unknown_id" and item["id"] == "effect_missing" for item in audit["effects"])
+    assert any(item["operation"] == "dropped_unknown_id" and item["id"] == "cue_missing" for item in audit["cues"])
+    assert any(item["operation"] == "dropped_unknown_id" and item["id"] == "todo_missing" for item in audit["todos"])
+    assert any(item["operation"] == "close" and item["id"] == "effect_close" for item in audit["effects"])
+    assert any(item["operation"] == "delete" and item["id"] == "cue_close" for item in audit["cues"])
+    assert any(item["operation"] == "completed" and item["id"] == "todo_close" for item in audit["todos"])
+    await agent.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_after_turn_drops_unknown_ids_without_operation_for_state_items(monkeypatch):
+    monkeypatch.setattr(persona_agent_mod.time, "time", lambda: 1000.0)
+    db = FakeDB(PersonaState())
+    provider = FakeProvider(
+        [
+            """
+            {
+              "effects": [
+                {
+                  "id": "effect_unknown_no_operation",
+                  "name": "不应新建",
+                  "effect_type": "mood",
+                  "intensity": 20,
+                  "prompt_hint": "不要写入",
+                  "source_detail": "模型幻觉 id"
+                }
+              ],
+              "cues": [
+                {
+                  "id": "cue_unknown_no_operation",
+                  "summary": "不要写入"
+                }
+              ],
+              "todos": [
+                {
+                  "id": "todo_unknown_no_operation",
+                  "title": "不要写入",
+                  "reason": "模型幻觉 id"
+                }
+              ]
+            }
+            """
+        ]
+    )
+    agent = _agent(db, provider=provider)
+
+    await agent.start()
+    await agent.after_turn("private:u1", [{"user_id": "u1"}], "模型返回了未知 id")
+
+    assert db.effects == []
+    assert db.cues == []
+    assert db.todos == []
+    assert db.closed_todos == {}
+
+    audit = db.update_audits[-1]["applied_changes"]
+    assert any(
+        item["operation"] == "dropped_unknown_id"
+        and item["id"] == "effect_unknown_no_operation"
+        and item["requested_operation"] is None
+        for item in audit["effects"]
+    )
+    assert any(
+        item["operation"] == "dropped_unknown_id"
+        and item["id"] == "cue_unknown_no_operation"
+        and item["requested_operation"] is None
+        for item in audit["cues"]
+    )
+    assert any(
+        item["operation"] == "dropped_unknown_id"
+        and item["id"] == "todo_unknown_no_operation"
+        and item["requested_operation"] is None
+        for item in audit["todos"]
+    )
     await agent.shutdown()
 
 
@@ -665,7 +962,6 @@ async def test_after_turn_accepts_level_words_for_intensity_and_priority():
             """
             {
               "effect": {
-                "id": "effect_level",
                 "name": "被理解",
                 "effect_type": "buff",
                 "intensity": "medium",
@@ -674,7 +970,6 @@ async def test_after_turn_accepts_level_words_for_intensity_and_priority():
                 "expires_at": 9999999999
               },
               "todo": {
-                "id": "todo_level",
                 "title": "稍后补一句关心",
                 "priority": "medium"
               }
@@ -703,7 +998,6 @@ async def test_after_turn_accepts_iso_expires_at_for_cue():
             {
               "mood_delta": 1,
               "cue": {
-                "id": "cue_iso",
                 "summary": "三天后可能有安排",
                 "expires_at": "2026-06-16T00:00:00Z"
               }
@@ -718,7 +1012,7 @@ async def test_after_turn_accepts_iso_expires_at_for_cue():
 
     assert len(provider.calls) == 1
     assert db.logs[-1]["fallback"] is False
-    assert db.cues[0].id == "cue_iso"
+    assert db.cues[0].id.startswith("cue_")
     assert db.cues[0].summary == "三天后可能有安排"
     assert isinstance(db.cues[0].expires_at, float)
     assert db.cues[0].expires_at == pytest.approx(1781568000.0)
@@ -1783,6 +2077,7 @@ async def test_periodic_tick_calls_llm_and_records_operation(monkeypatch):
     assert len(provider.calls) == 1
     prompt = provider.calls[0]["messages"][1]["content"]
     assert "social_need 表示社交未满足度" in prompt
+    assert "effects、profiles、relationships、todos、cues 必须是 JSON 数组" in prompt
     assert usage_calls[0][1]["operation"] == "persona_periodic"
     assert db.logs[-1]["event"] == "periodic_tick"
     assert db.logs[-1]["fallback"] is False
@@ -1790,6 +2085,95 @@ async def test_periodic_tick_calls_llm_and_records_operation(monkeypatch):
         (item["state"], item["text"]) for item in statuses
     ]
     assert statuses[-1]["state"] == "idle"
+    await agent.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_periodic_tick_accepts_empty_object_profiles_and_relationships(monkeypatch):
+    monkeypatch.setattr(persona_agent_mod.time, "time", lambda: 2000.0)
+    db = FakeDB(PersonaState(mood=60, social_need=50))
+    provider = FakeProvider(
+        [
+            """
+            {
+              "mood_delta": 1,
+              "profiles": {},
+              "relationships": {}
+            }
+            """
+        ]
+    )
+    agent = _agent(db, provider=provider)
+
+    await agent.start()
+    await agent.periodic_tick()
+
+    snapshot = agent.get_state_snapshot()
+    assert snapshot.mood == 61
+    assert db.profiles == {}
+    assert len(provider.calls) == 1
+    assert db.logs[-1]["event"] == "periodic_tick"
+    assert db.logs[-1]["fallback"] is False
+    await agent.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_periodic_tick_accepts_single_objects_for_plural_update_fields(monkeypatch):
+    monkeypatch.setattr(persona_agent_mod.time, "time", lambda: 2000.0)
+    db = FakeDB(PersonaState(mood=60, social_need=50))
+    provider = FakeProvider(
+        [
+            """
+            {
+              "effects": {
+                "name": "后台稳定",
+                "effect_type": "mood",
+                "intensity": 15,
+                "prompt_hint": "状态更平稳",
+                "source_detail": "periodic",
+                "expires_at": 9999999999
+              },
+              "profiles": {
+                "user_id": "u_periodic_profile",
+                "display_name": "周期画像",
+                "summary": "后台整理出的稳定信息",
+                "affinity": 55
+              },
+              "relationships": {
+                "user_id": "u_periodic_relationship",
+                "display_name": "周期关系",
+                "summary": "后台关系印象",
+                "affinity_delta": 2,
+                "reason": "periodic"
+              },
+              "todos": {
+                "title": "后台确认状态",
+                "reason": "周期维护",
+                "priority": 3,
+                "scope": "persona"
+              },
+              "cues": {
+                "summary": "后台维护线索",
+                "cue_type": "conversation",
+                "expires_at": 9999999999
+              }
+            }
+            """
+        ]
+    )
+    agent = _agent(db, provider=provider)
+
+    await agent.start()
+    await agent.periodic_tick()
+
+    assert len(provider.calls) == 1
+    assert db.logs[-1]["event"] == "periodic_tick"
+    assert db.logs[-1]["fallback"] is False
+    assert db.effects[0].name == "后台稳定"
+    assert db.todos[0].title == "后台确认状态"
+    assert db.cues[0].summary == "后台维护线索"
+    assert db.profiles["u_periodic_profile"].summary == "后台整理出的稳定信息"
+    assert db.profiles["u_periodic_relationship"].summary == "后台关系印象"
     await agent.shutdown()
 
 

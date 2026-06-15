@@ -16,7 +16,7 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _MISSING = object()
 
 _STATE_TYPES = ("PersonaState",)
@@ -97,6 +97,25 @@ class PersonaDB:
         data = _record_to_dict(entry)
         async with self._lock:
             return await asyncio.to_thread(self._append_state_log_sync, data)
+
+    async def append_update_audit(self, entry: Any) -> int:
+        data = _record_to_dict(entry)
+        async with self._lock:
+            return await asyncio.to_thread(self._append_update_audit_sync, data)
+
+    async def recent_update_audits(
+        self,
+        limit: int = 20,
+        conversation_id: str | None = None,
+        user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._recent_update_audits_sync,
+                limit,
+                conversation_id,
+                user_id,
+            )
 
     async def add_effect(self, effect: Any) -> str:
         data = _record_to_dict(effect)
@@ -401,6 +420,18 @@ class PersonaDB:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS persona_update_audits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                audit_json TEXT NOT NULL,
+                "trigger" TEXT,
+                conversation_id TEXT,
+                user_id TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS effects (
                 effect_id TEXT PRIMARY KEY,
                 effect_json TEXT NOT NULL,
@@ -516,6 +547,8 @@ class PersonaDB:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cues_expires ON cues(expires_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_monologues_recent ON inner_monologues(id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trajectories_recent ON daily_trajectories(id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_update_audits_conversation ON persona_update_audits(conversation_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_update_audits_user ON persona_update_audits(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sleep_started ON sleep_records(started_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_eat_record_id ON eat_records(record_id)")
         conn.execute(
@@ -560,6 +593,58 @@ class PersonaDB:
             )
             conn.commit()
             return int(cur.lastrowid)
+
+    def _append_update_audit_sync(self, data: dict[str, Any]) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO persona_update_audits (
+                    audit_json, "trigger", conversation_id, user_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    _json_dumps(data),
+                    _optional_text(data, ("trigger",)),
+                    _optional_text(data, ("conversation_id",)),
+                    _optional_text(data, ("user_id",)),
+                    _now_text(),
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def _recent_update_audits_sync(
+        self,
+        limit: int,
+        conversation_id: str | None,
+        user_id: str | None,
+    ) -> list[dict[str, Any]]:
+        limit = _clamp_int(limit, default=20, minimum=1, maximum=500)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if conversation_id is not None and (text := str(conversation_id).strip()):
+            clauses.append("conversation_id = ?")
+            params.append(text)
+        if user_id is not None and (text := str(user_id).strip()):
+            clauses.append("user_id = ?")
+            params.append(text)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT audit_json
+                FROM persona_update_audits
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [
+            record for row in rows
+            if isinstance(record := _json_loads(row["audit_json"], default={}), dict)
+        ]
 
     def _upsert_effect_sync(self, effect_id: str, data: dict[str, Any]) -> None:
         now = _now_text()

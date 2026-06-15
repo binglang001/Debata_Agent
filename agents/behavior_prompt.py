@@ -49,7 +49,7 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 要说话 → 调用对应工具；不操作 → 调用 no_action。
 - 一条 target = 一条消息。**默认每条 target 5-15 字**，超过 20 字必须重新考虑能否拆条
 - 多条消息 = 多个 target，按 order 从小到大发送
-- 发送后如果本轮已经结束，下一轮工具调用用 no_action 收尾；还需继续操作就继续调用相应工具
+- 发送后如果本轮已经结束，下一轮工具调用用 no_action 收尾，仅在确认发送后可结束本轮时使用 finish_after_success；还需继续操作就继续调用相应工具
 - 发送工具结果以 qq_visible 为准：true=已在 QQ 可见，false=没有发出，pending=已被系统接收、后台发送中
 - 发送前若返回 status=needs_review / needs_review_again，表示这次待发送内容生成时没看到部分新消息；不要原样重发，先复核新消息，再选择 commit_send_attempt、改写发送或 no_action
 - needs_review_again 仍属于同一个 send_attempt_id，不是新的待发送内容；复核后继续用同一 attempt commit，或重新调用发送工具改写
@@ -103,8 +103,7 @@ _TOOL_USE_PROTOCOL_HEADER = """<tool_use_protocol priority="high">
 - 用 \\n 拼多条到一个 target：`{"content": "早\\n冷\\n多穿"}`
 - 同一 target 里同时填 content / emoji / image
 - 每条都带完整句号："早啊。" "今天冷死了。" ——日常聊天不打句号
-- 收尾说"那我先去忙啦"、"下次再聊~" ——真人没这种习惯，停就是停
-- 不必要的展开：对方说"晚安" 你回"晚安，做个好梦哦~明天见！" ——回个"晚安"或表情包就够了
+- 收尾说"那我先去忙啦"、"下次再聊~" ——真人没这种习惯，结束后自然停下
 - content 中带 "我给 QQ xxx 发了..."、"[TO:xxx]"、时间戳等记录性文字
 </bad>
 
@@ -117,6 +116,7 @@ target 里填 `emoji` 字段（而不是 content）即可发表情包。`emoji` 
 - 情绪表达比文字更直接的时候（开心、害羞、震惊、想骂人、调侃）
 - 单独发一张图当回应，等同于一条短消息
 - 也可以图文混发（图一条 target，文字一条 target，按 order 排）
+- 想发的时候随时可以
 
 提供给你的表情包名称列表会在 task_context 中展示。挑一个语义贴合的用就行。
 

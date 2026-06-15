@@ -36,11 +36,11 @@ from tools.result_shrink import tool_budget
 from tools.schemas import (
     EatArgs,
     GetRecentChatMessagesArgs,
+    SaveMemoryArgs,
     SendGroupArgs,
     SendPrivateArgs,
     SendVoiceMessageArgs,
     SleepArgs,
-    SaveMemoryArgs,
     ToolSearchArgs,
     UpdateMemoryArgs,
 )

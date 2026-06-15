@@ -19,6 +19,7 @@ from mind import Cue, DecayEngine, Effect, PersonaState, Todo, UserProfile, clam
 from providers.base import ProviderError, ReasoningConfig
 
 from .base import StatusCallback, UsageRecorder
+from .persona_context_view import PersonaContextView
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ _TODO_CLOSED_STATUS_VALUES = {
     "closed",
     "cancelled",
     "canceled",
+    "deleted",
     "missed",
 }
 _TODO_OPEN_STATUS_VALUES = {
@@ -46,6 +48,7 @@ _TODO_OPEN_STATUS_VALUES = {
 
 class _EffectUpdate(BaseModel):
     id: str | None = None
+    operation: str | None = None
     name: str = ""
     effect_type: str = "mood"
     intensity: float = 0.0
@@ -60,6 +63,11 @@ class _EffectUpdate(BaseModel):
     def normalize_intensity(cls, value: object) -> object:
         return _coerce_level_value(value, default=value, low=25.0, medium=50.0, high=75.0)
 
+    @field_validator("operation", mode="before")
+    @classmethod
+    def normalize_operation(cls, value: object) -> str | None:
+        return _normalize_operation(value)
+
     @field_validator("created_at", "expires_at", mode="before")
     @classmethod
     def normalize_timestamps(cls, value: object) -> object:
@@ -68,6 +76,7 @@ class _EffectUpdate(BaseModel):
 
 class _TodoUpdate(BaseModel):
     id: str | None = None
+    operation: str | None = None
     title: str = ""
     reason: str = ""
     priority: int = 1
@@ -86,6 +95,11 @@ class _TodoUpdate(BaseModel):
     def normalize_priority(cls, value: object) -> object:
         return _coerce_level_value(value, default=value, low=2, medium=5, high=8)
 
+    @field_validator("operation", mode="before")
+    @classmethod
+    def normalize_operation(cls, value: object) -> str | None:
+        return _normalize_operation(value)
+
     @field_validator("created_at", "expires_at", mode="before")
     @classmethod
     def normalize_timestamps(cls, value: object) -> object:
@@ -94,8 +108,9 @@ class _TodoUpdate(BaseModel):
 
 class _CueUpdate(BaseModel):
     id: str | None = None
+    operation: str | None = None
     cue_type: str = "conversation"
-    summary: str
+    summary: str = ""
     conversation_id: str | None = None
     created_at: float | None = None
     expires_at: float | None = None
@@ -104,6 +119,11 @@ class _CueUpdate(BaseModel):
     @classmethod
     def normalize_timestamps(cls, value: object) -> object:
         return _coerce_model_timestamp(value)
+
+    @field_validator("operation", mode="before")
+    @classmethod
+    def normalize_operation(cls, value: object) -> str | None:
+        return _normalize_operation(value)
 
 
 class _ProfileUpdate(BaseModel):
@@ -160,6 +180,9 @@ class _TurnUpdate(BaseModel):
             value = normalized.pop(plural, None)
             if value is not None and "relationships" not in normalized:
                 normalized["relationships"] = value
+        for field_name in ("effects", "profiles", "relationships", "todos", "cues"):
+            if field_name in normalized:
+                normalized[field_name] = _normalize_update_list_field(normalized[field_name])
         return normalized
 
 
@@ -223,6 +246,7 @@ class PersonaAgent:
         self._todos: list[Todo] = []
         self._cues: list[Cue] = []
         self._profiles: dict[str, UserProfile] = {}
+        self._context_view = PersonaContextView()
         self._state_lock = asyncio.Lock()
         self._timer_task: asyncio.Task[None] | None = None
         self._active_sleep_record_id: str | None = None
@@ -421,6 +445,7 @@ class PersonaAgent:
                     "system:periodic",
                     [],
                     touch_profile=False,
+                    trigger="periodic_tick",
                 )
                 if (
                     finished_action is None
@@ -630,14 +655,15 @@ class PersonaAgent:
         for attempt in range(2):
             try:
                 self._emit_status("thinking", "人格状态更新中")
+                messages = await self._build_turn_messages(
+                    conversation_id,
+                    participants,
+                    chat_summary,
+                    eat_event,
+                    retry=attempt > 0,
+                )
                 result = await self.provider.chat_completion(
-                    self._build_turn_messages(
-                        conversation_id,
-                        participants,
-                        chat_summary,
-                        eat_event,
-                        retry=attempt > 0,
-                    ),
+                    messages,
                     model=self.cfg.model,
                     tools=None,
                     temperature=self.cfg.temperature,
@@ -804,6 +830,7 @@ class PersonaAgent:
             "这不是用户新消息，不要编造新的外部事件；只处理自然状态变化、过期线索、必要待办和简短内心独白。\n"
             "只返回 JSON 对象，不要解释。可用字段同 after_turn："
             "mood、mood_delta、social_need、social_need_delta、latest_monologue、effects、profiles、relationships、todos、cues。\n"
+            "effects、profiles、relationships、todos、cues 必须是 JSON 数组；没有内容用 []，不要用 {}、null 或空字符串。\n"
             "social_need 表示社交未满足度：高=缺社交、孤独、需要陪伴；"
             "被关心、亲密互动、有效交流后通常下降，长时间无人互动或被忽视后上升。"
             "想继续聊、社交兴奋或亲近感不要挤到 social_need，可用 relationship/effects 表达。\n"
@@ -826,7 +853,7 @@ class PersonaAgent:
             {"role": "user", "content": prompt},
         ]
 
-    def _build_turn_messages(
+    async def _build_turn_messages(
         self,
         conversation_id: str,
         participants: Any,
@@ -835,13 +862,51 @@ class PersonaAgent:
         *,
         retry: bool,
     ) -> list[dict[str, Any]]:
+        now = time.time()
+        inferred_user_id = _infer_user_id(conversation_id, participants)
+        profile = self._profiles.get(inferred_user_id or "") if inferred_user_id else None
+        recent_audits = await self._recent_update_audits_for_context(
+            conversation_id,
+            inferred_user_id,
+        )
+        long_term_memory_text = await self._long_term_memory_text_for_context(
+            conversation_id,
+            inferred_user_id,
+        )
+        context_text = self._context_view.build_text(
+            {
+                "event": {
+                    "trigger_type": "after_turn",
+                    "conversation_id": conversation_id,
+                    "turn_new": chat_summary or "",
+                    "summary": chat_summary or "",
+                    "participants": participants,
+                    "eat_event": eat_event,
+                },
+                "state": asdict(self._state),
+                "profile": profile,
+                "profile_audits": recent_audits,
+                "effects": [asdict(effect) for effect in self._effects],
+                "cues": [asdict(cue) for cue in self._cues],
+                "todos": [asdict(todo) for todo in self._todos],
+                "long_term_memory_text": long_term_memory_text,
+            },
+            long_term_memory_text=long_term_memory_text,
+            now=now,
+            append_episode=not retry,
+        )
+        audit_section = _format_recent_audits_section(recent_audits)
+        if audit_section:
+            context_text = f"{context_text}\n\n{audit_section}"
         retry_text = "上一次输出无法解析，请只返回一个 JSON 对象。" if retry else ""
         prompt = (
-            "请根据一轮对话摘要，更新角色的人格运行状态。\n"
+            "请根据上下文对角色人格运行状态做增量维护。\n"
             "只返回 JSON 对象，不要解释。\n"
             "可用字段：mood、mood_delta、social_need、social_need_delta、"
             "latest_monologue、effects、profile/profiles、relationship/relationships、todos、cues。\n"
-            "mood 和 social_need 是 0-100 分；delta 是在当前值上的增减。\n"
+            "effects、profiles、relationships、todos、cues 必须是 JSON 数组；没有内容用 []，不要用 {}、null 或空字符串。\n"
+            "兼容字段 profile、relationship、effect、todo、cue 只用于单条更新；复数字段始终返回数组。\n"
+            "mood、social_need、affinity 都是 0-100 分；delta 是在当前值上的增减。\n"
             "social_need 表示社交未满足度：高=缺社交、孤独、需要陪伴；"
             "被关心、亲密互动、有效交流后通常下降，长时间无人互动或被忽视后上升。"
             "想继续聊、社交兴奋或亲近感不要挤到 social_need，可用 affinity/relationship/effects 表达。\n"
@@ -851,6 +916,10 @@ class PersonaAgent:
             "不得把助手刚说的话改写成用户、对方或外部人物的经历。\n"
             "effects[] 需要 name/effect_type/intensity/prompt_hint/source_detail/"
             "duration_minutes 或 expires_at；intensity 必须是 0-100 数字，不要写 low/medium/high。\n"
+            "看到已有短期影响、线索、待办时，优先用真实 id 做 update 或 close；确有必要才 create 新项。"
+            "已有项操作必须带上下文里出现过的真实 id，不能编造 id；unknown id 不会创建新项。\n"
+            "operation 可用 create/update/close/delete/cancel/complete/noop；"
+            "close/delete/cancel/complete 表示关闭或移除已有项，noop 表示不改。\n"
             "当用户透露稳定偏好、称呼、长期习惯、关系变化、新印象或可复用的相处信息时，使用 profile/profiles 实时更新用户画像；"
             "profile 字段包括 user_id、display_name、summary、traits、affinity。私聊可省略 user_id 由系统推断，群聊必须带 user_id；"
             "affinity 是 0-100 的绝对亲近度，不是 0-1，也不是 1-10；"
@@ -858,8 +927,8 @@ class PersonaAgent:
             "profile 事实仍不要塞短期情绪、一次性事件或临时状态。\n"
             "当一轮互动让关系变好/变坏、有新印象、亲近度变化时，使用 relationship/relationships；"
             "relationship 可含 user_id、display_name、summary、traits、affinity 或 affinity_delta、reason。"
-            "relationship/affinity_delta 是本轮增减分，普通一轮互动通常 -5 到 +5；强烈事件可更大，但要写 reason。"
-            "若已有关系只是本轮变好/变坏，优先用 affinity_delta，不要随意用低 absolute affinity 覆盖。"
+            "relationship/affinity_delta 是本轮增减分，普通一轮互动优先使用 affinity_delta，优先用 affinity_delta；普通一轮互动通常 -5 到 +5；强烈事件可更大，但要写 reason。"
+            "绝对 affinity 只用于首次建档或明确校准；若已有关系只是本轮变好/变坏，不要随意用低 absolute affinity 覆盖。"
             "这类关系更新不要求同时写长期画像事实；私聊可省略 user_id 由系统推断。\n"
             "todos[] 只用于明确未来动作、生理必要动作、用户明确要求、或确实需要唤醒/提醒的事项；"
             "普通情绪、关系画像、观察线索、已发生事件、泛泛改善建议都不要建 todo。\n"
@@ -869,11 +938,7 @@ class PersonaAgent:
             "todos[] 需要 title，可选 reason/priority/scope/expires_at；已有 todo 可用 id 加 status/completed/done/cancelled 标记完成或取消；priority 必须是 0-10 整数，不要写 low/medium/high。\n"
             "cues[] 需要 summary，可选 cue_type/conversation_id/expires_at。\n"
             f"{retry_text}\n\n"
-            f"<当前状态>\n{json.dumps(asdict(self._state), ensure_ascii=False)}\n</当前状态>\n"
-            f"<conversation_id>{conversation_id}</conversation_id>\n"
-            f"<participants>{json.dumps(participants, ensure_ascii=False, default=str)}</participants>\n"
-            f"<eat_event>{json.dumps(eat_event, ensure_ascii=False, default=str)}</eat_event>\n"
-            f"<对话摘要>\n{chat_summary or ''}\n</对话摘要>"
+            f"{context_text}"
         )
         return [
             {
@@ -890,20 +955,76 @@ class PersonaAgent:
         participants: Any,
         *,
         touch_profile: bool = True,
+        trigger: str = "after_turn",
     ) -> None:
         now = time.time()
         state = self._state
+        inferred_user_id = _infer_user_id(conversation_id, participants)
+        state_before = asdict(state)
+        profile_before = _profile_snapshot(
+            self._profiles.get(inferred_user_id or "") if inferred_user_id else None
+        )
+        applied_changes: dict[str, list[dict[str, Any]]] = {
+            "state": [],
+            "profiles": [],
+            "effects": [],
+            "todos": [],
+            "cues": [],
+        }
+
         if update.mood is not None:
+            before = state.mood
             state.mood = clamp_percent(update.mood)
+            _append_field_change(
+                applied_changes["state"],
+                "mood",
+                before,
+                state.mood,
+                source="absolute",
+            )
         if update.mood_delta is not None:
+            before = state.mood
             state.mood = clamp_percent(state.mood + update.mood_delta)
+            _append_field_change(
+                applied_changes["state"],
+                "mood",
+                before,
+                state.mood,
+                source="delta",
+                delta=update.mood_delta,
+            )
         if update.social_need is not None:
+            before = state.social_need
             state.social_need = clamp_percent(update.social_need)
+            _append_field_change(
+                applied_changes["state"],
+                "social_need",
+                before,
+                state.social_need,
+                source="absolute",
+            )
         if update.social_need_delta is not None:
+            before = state.social_need
             state.social_need = clamp_percent(state.social_need + update.social_need_delta)
+            _append_field_change(
+                applied_changes["state"],
+                "social_need",
+                before,
+                state.social_need,
+                source="delta",
+                delta=update.social_need_delta,
+            )
         if update.latest_monologue:
+            before = state.latest_monologue
             state.latest_monologue = update.latest_monologue.strip()
             state.last_monologue_at = now
+            _append_field_change(
+                applied_changes["state"],
+                "latest_monologue",
+                before,
+                state.latest_monologue,
+                source="text",
+            )
             await _maybe_await_call(
                 self.db,
                 "add_monologue",
@@ -911,14 +1032,72 @@ class PersonaAgent:
             )
 
         for effect_update in update.effects:
-            effect = _effect_from_update(effect_update, now)
+            operation = effect_update.operation
+            existing = self._find_effect(effect_update.id)
+            if operation == "noop":
+                applied_changes["effects"].append(
+                    {"operation": "noop", "id": effect_update.id or ""}
+                )
+                continue
+            if _operation_requires_existing(operation) and not effect_update.id:
+                applied_changes["effects"].append(
+                    {
+                        "operation": "dropped_missing_id",
+                        "requested_operation": operation,
+                    }
+                )
+                continue
+            if effect_update.id and existing is None:
+                applied_changes["effects"].append(
+                    {
+                        "operation": "dropped_unknown_id",
+                        "requested_operation": operation,
+                        "id": effect_update.id,
+                    }
+                )
+                continue
+            if existing is not None and operation in _CLOSE_OPERATIONS:
+                self._remove_effect_cache(existing.id)
+                await _maybe_await_call(self.db, "remove_effects", [existing.id], default=0)
+                applied_changes["effects"].append(
+                    {
+                        "operation": operation,
+                        "id": existing.id,
+                        "before": asdict(existing),
+                        "after": None,
+                    }
+                )
+                continue
+            effect = _effect_from_update(effect_update, now, existing)
             self._upsert_effect_cache(effect)
             await _maybe_await_call(self.db, "add_effect", effect)
+            applied_changes["effects"].append(
+                {
+                    "operation": "update" if existing is not None else "create",
+                    "id": effect.id,
+                    "before": asdict(existing) if existing is not None else None,
+                    "after": asdict(effect),
+                }
+            )
 
-        inferred_user_id = _infer_user_id(conversation_id, participants)
         if touch_profile and inferred_user_id:
+            before = _profile_snapshot(self._profiles.get(inferred_user_id))
             await self._touch_profile_locked(inferred_user_id, now, participants)
+            after = _profile_snapshot(self._profiles.get(inferred_user_id))
+            if before != after:
+                applied_changes["profiles"].append(
+                    {
+                        "operation": "touch",
+                        "user_id": inferred_user_id,
+                        "before": before,
+                        "after": after,
+                    }
+                )
         for relationship_update in update.relationships:
+            requested_user_id = (relationship_update.user_id or inferred_user_id or "").strip()
+            before = _profile_snapshot(
+                self._profiles.get(requested_user_id) if requested_user_id else None
+            )
             profile = self._profile_from_relationship_update(
                 relationship_update,
                 inferred_user_id,
@@ -933,10 +1112,30 @@ class PersonaAgent:
                         "conversation_id": conversation_id,
                     }
                 )
+                applied_changes["profiles"].append(
+                    {
+                        "operation": "drop",
+                        "source": "relationship",
+                        "reason": "missing_user_id",
+                    }
+                )
                 continue
             self._profiles[profile.user_id] = profile
             await _maybe_await_call(self.db, "upsert_profile", profile)
+            applied_changes["profiles"].append(
+                {
+                    "operation": "update",
+                    "source": "relationship",
+                    "user_id": profile.user_id,
+                    "before": before,
+                    "after": asdict(profile),
+                }
+            )
         for profile_update in update.profiles:
+            requested_user_id = (profile_update.user_id or inferred_user_id or "").strip()
+            before = _profile_snapshot(
+                self._profiles.get(requested_user_id) if requested_user_id else None
+            )
             profile = self._profile_from_update(profile_update, inferred_user_id, now)
             if profile is None:
                 await self._append_state_log_locked(
@@ -947,30 +1146,163 @@ class PersonaAgent:
                         "conversation_id": conversation_id,
                     }
                 )
+                applied_changes["profiles"].append(
+                    {
+                        "operation": "drop",
+                        "source": "profile",
+                        "reason": "missing_user_id",
+                    }
+                )
                 continue
             self._profiles[profile.user_id] = profile
             await _maybe_await_call(self.db, "upsert_profile", profile)
+            applied_changes["profiles"].append(
+                {
+                    "operation": "update",
+                    "source": "profile",
+                    "user_id": profile.user_id,
+                    "before": before,
+                    "after": asdict(profile),
+                }
+            )
 
         for todo_update in self._filter_todo_updates(update.todos):
             existing = self._find_todo(todo_update.id)
+            operation = todo_update.operation
+            if operation == "noop":
+                applied_changes["todos"].append(
+                    {"operation": "noop", "id": todo_update.id or ""}
+                )
+                continue
+            if _todo_update_requires_existing(todo_update) and not todo_update.id:
+                applied_changes["todos"].append(
+                    {
+                        "operation": "dropped_missing_id",
+                        "requested_operation": operation or _todo_update_status(todo_update),
+                    }
+                )
+                continue
+            if todo_update.id and existing is None:
+                applied_changes["todos"].append(
+                    {
+                        "operation": "dropped_unknown_id",
+                        "requested_operation": operation or _todo_update_status(todo_update),
+                        "id": todo_update.id,
+                    }
+                )
+                continue
             record = _todo_record_from_update(todo_update, now, existing)
             if _todo_record_is_closed(record):
                 self._remove_todo_cache(record["id"])
                 await _maybe_await_call(self.db, "upsert_todo", record)
+                applied_changes["todos"].append(
+                    {
+                        "operation": record.get("status") or operation or "close",
+                        "id": record["id"],
+                        "before": asdict(existing) if existing is not None else None,
+                        "after": dict(record),
+                    }
+                )
                 continue
             todo = _coerce_todo(record)
             if todo is None:
+                applied_changes["todos"].append(
+                    {
+                        "operation": "drop",
+                        "id": record.get("id", ""),
+                        "reason": "invalid_record",
+                    }
+                )
                 continue
             self._upsert_todo_cache(todo)
             await _maybe_await_call(self.db, "upsert_todo", record)
+            applied_changes["todos"].append(
+                {
+                    "operation": "update" if existing is not None else "create",
+                    "id": todo.id,
+                    "before": asdict(existing) if existing is not None else None,
+                    "after": asdict(todo),
+                }
+            )
 
         for cue_update in update.cues:
-            cue = _cue_from_update(cue_update, conversation_id, now)
+            operation = cue_update.operation
+            existing = self._find_cue(cue_update.id)
+            if operation == "noop":
+                applied_changes["cues"].append({"operation": "noop", "id": cue_update.id or ""})
+                continue
+            if _operation_requires_existing(operation) and not cue_update.id:
+                applied_changes["cues"].append(
+                    {
+                        "operation": "dropped_missing_id",
+                        "requested_operation": operation,
+                    }
+                )
+                continue
+            if cue_update.id and existing is None:
+                applied_changes["cues"].append(
+                    {
+                        "operation": "dropped_unknown_id",
+                        "requested_operation": operation,
+                        "id": cue_update.id,
+                    }
+                )
+                continue
+            if existing is not None and operation in _CLOSE_OPERATIONS:
+                self._remove_cue_cache(existing.id)
+                await _maybe_await_call(self.db, "remove_cues", [existing.id], default=0)
+                applied_changes["cues"].append(
+                    {
+                        "operation": operation,
+                        "id": existing.id,
+                        "before": asdict(existing),
+                        "after": None,
+                    }
+                )
+                continue
+            if existing is None and not cue_update.summary.strip():
+                applied_changes["cues"].append(
+                    {
+                        "operation": "drop",
+                        "id": cue_update.id or "",
+                        "reason": "empty_summary",
+                    }
+                )
+                continue
+            cue = _cue_from_update(cue_update, conversation_id, now, existing)
             self._upsert_cue_cache(cue)
             await _maybe_await_call(self.db, "upsert_cue", cue)
+            applied_changes["cues"].append(
+                {
+                    "operation": "update" if existing is not None else "create",
+                    "id": cue.id,
+                    "before": asdict(existing) if existing is not None else None,
+                    "after": asdict(cue),
+                }
+            )
 
         state.mood = clamp_percent(state.mood)
         state.social_need = clamp_percent(state.social_need)
+        profile_after = _profile_snapshot(
+            self._profiles.get(inferred_user_id or "") if inferred_user_id else None
+        )
+        await self._append_update_audit_locked(
+            {
+                "trigger": trigger,
+                "event": trigger,
+                "conversation_id": conversation_id,
+                "user_id": inferred_user_id,
+                "inferred_user_id": inferred_user_id,
+                "created_at": now,
+                "raw_update": update.model_dump(exclude_none=True),
+                "applied_changes": applied_changes,
+                "state_before": state_before,
+                "state_after": asdict(state),
+                "profile_before": profile_before,
+                "profile_after": profile_after,
+                "summary": _audit_summary(applied_changes),
+            }
+        )
 
     async def _expire_runtime_records_locked(self, now: float) -> None:
         await _maybe_await_call(self.db, "expire_effects", now)
@@ -1565,6 +1897,17 @@ class PersonaAgent:
         self._effects = [item for item in self._effects if item.id != effect.id]
         self._effects.append(effect)
 
+    def _remove_effect_cache(self, effect_id: str) -> None:
+        self._effects = [item for item in self._effects if item.id != effect_id]
+
+    def _find_effect(self, effect_id: str | None) -> Effect | None:
+        if not effect_id:
+            return None
+        for effect in self._effects:
+            if effect.id == effect_id:
+                return effect
+        return None
+
     def _upsert_todo_cache(self, todo: Todo) -> None:
         self._todos = [item for item in self._todos if item.id != todo.id]
         self._todos.append(todo)
@@ -1635,7 +1978,13 @@ class PersonaAgent:
                 existing_keys.add(key)
                 key_by_id[todo.id] = key
                 continue
+            if todo.id:
+                filtered.append(todo)
+                continue
             status = _todo_update_status(todo)
+            if _todo_update_requires_existing(todo):
+                filtered.append(todo)
+                continue
             if status in _TODO_CLOSED_STATUS_VALUES:
                 continue
             if not todo.title.strip():
@@ -1653,6 +2002,85 @@ class PersonaAgent:
     def _upsert_cue_cache(self, cue: Cue) -> None:
         self._cues = [item for item in self._cues if item.id != cue.id]
         self._cues.append(cue)
+
+    def _remove_cue_cache(self, cue_id: str) -> None:
+        self._cues = [item for item in self._cues if item.id != cue_id]
+
+    def _find_cue(self, cue_id: str | None) -> Cue | None:
+        if not cue_id:
+            return None
+        for cue in self._cues:
+            if cue.id == cue_id:
+                return cue
+        return None
+
+    async def _recent_update_audits_for_context(
+        self,
+        conversation_id: str,
+        user_id: str | None,
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        try:
+            conversation_audits = await _maybe_await_call(
+                self.db,
+                "recent_update_audits",
+                5,
+                conversation_id,
+                None,
+                default=[],
+            )
+            merged.extend(
+                record for record in _iter_records(conversation_audits) if isinstance(record, dict)
+            )
+            if user_id:
+                user_audits = await _maybe_await_call(
+                    self.db,
+                    "recent_update_audits",
+                    5,
+                    None,
+                    user_id,
+                    default=[],
+                )
+                merged.extend(
+                    record for record in _iter_records(user_audits) if isinstance(record, dict)
+                )
+        except Exception:
+            logger.warning("读取人格更新审计失败", exc_info=True)
+            return []
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for record in merged:
+            key = str(
+                record.get("id")
+                or record.get("audit_id")
+                or record.get("created_at")
+                or json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(record)
+            if len(deduped) >= 5:
+                break
+        return deduped
+
+    async def _long_term_memory_text_for_context(
+        self,
+        conversation_id: str,
+        user_id: str | None,
+    ) -> str:
+        try:
+            memories = await _maybe_await_call(self.db, "read_important", [], default=[])
+        except Exception:
+            logger.warning("读取重要记忆失败", exc_info=True)
+            return ""
+        return _format_relevant_long_term_memory(memories, conversation_id, user_id)
+
+    async def _append_update_audit_locked(self, entry: dict[str, Any]) -> None:
+        try:
+            await _maybe_await_call(self.db, "append_update_audit", entry)
+        except Exception:
+            logger.warning("写入人格更新审计失败", exc_info=True)
 
     def _refresh_energy_critical_since(self, now: float) -> None:
         if self._energy_mode() != "tool":
@@ -1780,6 +2208,18 @@ def _append_singular(data: dict[str, Any], singular: str, plural: str) -> None:
     data[plural] = value if isinstance(value, list) else [value]
 
 
+def _normalize_update_list_field(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict) and not value:
+        return []
+    return [value]
+
+
 def _iter_records(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -1821,6 +2261,99 @@ def _record_date_key(record: Any) -> str:
         if parsed:
             return parsed
     return ""
+
+
+def _profile_snapshot(profile: UserProfile | None) -> dict[str, Any] | None:
+    return asdict(profile) if profile is not None else None
+
+
+def _append_field_change(
+    changes: list[dict[str, Any]],
+    field_name: str,
+    before: Any,
+    after: Any,
+    **metadata: Any,
+) -> None:
+    if before == after:
+        return
+    changes.append(
+        {
+            "field": field_name,
+            "before": before,
+            "after": after,
+            **{key: value for key, value in metadata.items() if value is not None},
+        }
+    )
+
+
+def _audit_summary(applied_changes: dict[str, list[dict[str, Any]]]) -> str:
+    parts = [
+        f"{key}:{len(value)}"
+        for key, value in applied_changes.items()
+        if value
+    ]
+    return "；".join(parts) if parts else "no changes"
+
+
+def _format_relevant_long_term_memory(
+    memories: Any,
+    conversation_id: str,
+    user_id: str | None,
+) -> str:
+    lines: list[str] = []
+    scopes = {"global", conversation_id}
+    if user_id:
+        scopes.add(f"user:{user_id}")
+    for item in _iter_records(memories):
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                lines.append(f"- {text}")
+            continue
+        if not isinstance(item, dict):
+            continue
+        scope = str(item.get("scope") or "global").strip()
+        if scope and scope not in scopes:
+            continue
+        content = str(
+            item.get("content")
+            or item.get("memory_text")
+            or item.get("text")
+            or item.get("summary")
+            or ""
+        ).strip()
+        if not content:
+            continue
+        memory_id = str(item.get("id") or item.get("memory_id") or "").strip()
+        prefix = f"{memory_id} " if memory_id else ""
+        lines.append(f"- {prefix}{content}")
+        if len(lines) >= 5:
+            break
+    return "\n".join(lines)
+
+
+def _format_recent_audits_section(audits: list[dict[str, Any]]) -> str:
+    lines = []
+    for audit in audits[:5]:
+        audit_id = str(audit.get("id") or audit.get("audit_id") or "").strip()
+        user_id = str(audit.get("user_id") or audit.get("inferred_user_id") or "").strip()
+        conversation_id = str(audit.get("conversation_id") or "").strip()
+        summary = str(audit.get("summary") or audit.get("reason") or audit.get("trigger") or "").strip()
+        parts = []
+        if audit_id:
+            parts.append(f"ID: {audit_id}")
+        if user_id:
+            parts.append(f"用户ID: {user_id}")
+        if conversation_id:
+            parts.append(f"会话ID: {conversation_id}")
+        if summary:
+            parts.append(f"摘要: {summary}")
+        if not parts:
+            parts.append(json.dumps(audit, ensure_ascii=False, sort_keys=True, default=str))
+        lines.append("- " + "；".join(parts))
+    if not lines:
+        return ""
+    return "\n".join(["<最近审计>", *lines, "</最近审计>"])
 
 
 def _date_key_from_value(value: Any) -> str:
@@ -2049,6 +2582,9 @@ _ACTION_TODO_SCOPE_BY_TYPE = {
     "sleep": {"", "persona", "sleep", "sleeping", "rest", "energy", "physiological", "short_term"},
     "eat": {"", "persona", "eat", "eating", "meal", "food", "satiety", "drink", "water", "physiological", "short_term"},
 }
+
+_CLOSE_OPERATIONS = {"close", "delete", "cancel", "complete"}
+_UPDATE_OPERATIONS = {"update", "patch"}
 _ACTION_TODO_INCLUDE_BY_TYPE = {
     "sleep": ("睡", "睡觉", "睡眠", "休息", "休眠", "补觉", "躺下", "小睡"),
     "eat": ("吃饭", "吃点", "吃东西", "进食", "用餐", "喝水", "喝点", "喝饮料", "吃早餐", "吃午饭", "吃晚饭", "觅食", "填饱肚子"),
@@ -2170,6 +2706,63 @@ def _coerce_model_timestamp(value: object) -> float | None:
         return None
 
 
+def _normalize_operation(value: object) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not text:
+        return None
+    mapping = {
+        "created": "create",
+        "insert": "create",
+        "new": "create",
+        "add": "create",
+        "upsert": "create",
+        "modify": "update",
+        "modified": "update",
+        "patch": "update",
+        "edit": "update",
+        "edited": "update",
+        "close": "close",
+        "closed": "close",
+        "remove": "delete",
+        "removed": "delete",
+        "delete": "delete",
+        "deleted": "delete",
+        "drop": "delete",
+        "dropped": "delete",
+        "cancel": "cancel",
+        "cancelled": "cancel",
+        "canceled": "cancel",
+        "complete": "complete",
+        "completed": "complete",
+        "done": "complete",
+        "finish": "complete",
+        "finished": "complete",
+        "noop": "noop",
+        "no_op": "noop",
+        "none": "noop",
+        "ignore": "noop",
+        "skip": "noop",
+    }
+    normalized = mapping.get(text, text)
+    if normalized == "cancelled":
+        return "cancel"
+    return normalized
+
+
+def _operation_requires_existing(operation: str | None) -> bool:
+    return operation in _CLOSE_OPERATIONS or operation in _UPDATE_OPERATIONS
+
+
+def _todo_update_requires_existing(update: _TodoUpdate) -> bool:
+    operation = update.operation
+    if operation in _CLOSE_OPERATIONS or operation in _UPDATE_OPERATIONS:
+        return True
+    status = _todo_update_status(update)
+    return status in _TODO_CLOSED_STATUS_VALUES
+
+
 def _todo_is_expired(todo: Todo, now: float) -> bool:
     if todo.expires_at is None:
         return False
@@ -2219,6 +2812,18 @@ def _todo_patch_text(update: _TodoUpdate, field_name: str, default: str) -> str:
     return default
 
 
+def _effect_patch_text(update: _EffectUpdate, field_name: str, default: str) -> str:
+    if field_name in update.model_fields_set:
+        return str(getattr(update, field_name) or "")
+    return default
+
+
+def _cue_patch_text(update: _CueUpdate, field_name: str, default: str) -> str:
+    if field_name in update.model_fields_set:
+        return str(getattr(update, field_name) or "")
+    return default
+
+
 def _coerce_state(value: Any) -> PersonaState:
     if isinstance(value, PersonaState):
         return replace(value)
@@ -2227,19 +2832,51 @@ def _coerce_state(value: Any) -> PersonaState:
     return PersonaState()
 
 
-def _effect_from_update(update: _EffectUpdate, now: float) -> Effect:
-    created_at = update.created_at or now
-    expires_at = update.expires_at
+def _effect_from_update(
+    update: _EffectUpdate,
+    now: float,
+    existing: Effect | None = None,
+) -> Effect:
+    fields_set = update.model_fields_set
+    created_at = (
+        update.created_at
+        if "created_at" in fields_set and update.created_at is not None
+        else existing.created_at if existing is not None else now
+    )
+    if "expires_at" in fields_set and update.expires_at is not None:
+        expires_at = update.expires_at
+    elif "duration_minutes" in fields_set and update.duration_minutes is not None:
+        expires_at = created_at + update.duration_minutes * 60.0
+    elif existing is not None:
+        expires_at = existing.expires_at
+    else:
+        expires_at = None
     if expires_at is None:
         duration = update.duration_minutes if update.duration_minutes is not None else 60.0
         expires_at = created_at + duration * 60.0
     return Effect(
-        id=update.id or f"effect_{uuid4().hex}",
-        name=update.name or update.effect_type,
-        effect_type=update.effect_type,
-        intensity=update.intensity,
-        prompt_hint=update.prompt_hint,
-        source_detail=update.source_detail,
+        id=update.id or (existing.id if existing is not None else f"effect_{uuid4().hex}"),
+        name=_effect_patch_text(update, "name", existing.name if existing is not None else update.effect_type),
+        effect_type=_effect_patch_text(
+            update,
+            "effect_type",
+            existing.effect_type if existing is not None else "mood",
+        ),
+        intensity=(
+            update.intensity
+            if "intensity" in fields_set or existing is None
+            else existing.intensity
+        ),
+        prompt_hint=_effect_patch_text(
+            update,
+            "prompt_hint",
+            existing.prompt_hint if existing is not None else "",
+        ),
+        source_detail=_effect_patch_text(
+            update,
+            "source_detail",
+            existing.source_detail if existing is not None else "",
+        ),
         created_at=created_at,
         expires_at=expires_at,
     )
@@ -2286,6 +2923,12 @@ def _todo_record_from_update(
 
 def _todo_update_status(update: _TodoUpdate) -> str | None:
     fields_set = update.model_fields_set
+    if update.operation in {"close", "complete"}:
+        return "completed"
+    if update.operation == "delete":
+        return "deleted"
+    if update.operation == "cancel":
+        return "cancelled"
     if "status" in fields_set and update.status is not None:
         return _normalize_todo_status(update.status)
     for field_name in ("completed", "done", "finished"):
@@ -2326,14 +2969,42 @@ def _truthy_todo_state(value: Any) -> bool:
     return bool(value)
 
 
-def _cue_from_update(update: _CueUpdate, conversation_id: str, now: float) -> Cue:
+def _cue_from_update(
+    update: _CueUpdate,
+    conversation_id: str,
+    now: float,
+    existing: Cue | None = None,
+) -> Cue:
+    fields_set = update.model_fields_set
+    created_at = (
+        update.created_at
+        if "created_at" in fields_set and update.created_at is not None
+        else existing.created_at if existing is not None else now
+    )
+    expires_at = (
+        update.expires_at
+        if "expires_at" in fields_set and update.expires_at is not None
+        else existing.expires_at if existing is not None else now + 24 * 3600.0
+    )
     return Cue(
-        id=update.id or f"cue_{uuid4().hex}",
-        cue_type=update.cue_type,
-        summary=update.summary,
-        conversation_id=update.conversation_id or conversation_id,
-        created_at=update.created_at or now,
-        expires_at=update.expires_at or now + 24 * 3600.0,
+        id=update.id or (existing.id if existing is not None else f"cue_{uuid4().hex}"),
+        cue_type=_cue_patch_text(
+            update,
+            "cue_type",
+            existing.cue_type if existing is not None else "conversation",
+        ),
+        summary=_cue_patch_text(
+            update,
+            "summary",
+            existing.summary if existing is not None else "",
+        ),
+        conversation_id=(
+            update.conversation_id
+            if "conversation_id" in fields_set and update.conversation_id
+            else existing.conversation_id if existing is not None else conversation_id
+        ),
+        created_at=created_at,
+        expires_at=expires_at,
     )
 
 

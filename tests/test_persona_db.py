@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 
 from mind import Cue, Effect, PersonaState, Todo, UserProfile
-from mind.db import PersonaDB
+from mind.db import SCHEMA_VERSION, PersonaDB
 
 
 @pytest.mark.asyncio
@@ -18,6 +18,7 @@ async def test_persona_db_state_default_roundtrip_and_schema(tmp_path):
     expected_tables = {
         "persona_state",
         "persona_state_log",
+        "persona_update_audits",
         "effects",
         "todos",
         "cues",
@@ -37,7 +38,23 @@ async def test_persona_db_state_default_roundtrip_and_schema(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
+        audit_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(persona_update_audits)").fetchall()
+        }
+        schema_version = conn.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()[0]
     assert expected_tables <= tables
+    assert {
+        "id",
+        "audit_json",
+        "trigger",
+        "conversation_id",
+        "user_id",
+        "created_at",
+    } <= audit_columns
+    assert schema_version == SCHEMA_VERSION
 
     default_state = await db.get_state()
     assert isinstance(default_state, PersonaState)
@@ -61,6 +78,96 @@ async def test_persona_db_state_default_roundtrip_and_schema(tmp_path):
 
     log_id = await db.append_state_log({"mood": "calm", "reason": "test"})
     assert log_id == 1
+
+
+@pytest.mark.asyncio
+async def test_persona_db_update_audits_append_limit_and_filters(tmp_path):
+    db = PersonaDB(tmp_path / "persona.sqlite")
+    await db.load()
+
+    first_id = await db.append_update_audit(
+        {
+            "trigger": "message",
+            "conversation_id": "private:u1",
+            "user_id": "u1",
+            "update": {"mood": 10},
+            "applied": {"mood": 10},
+        }
+    )
+    second_id = await db.append_update_audit(
+        {
+            "trigger": "message",
+            "conversation_id": "private:u2",
+            "user_id": "u2",
+            "update": {"mood": 20},
+            "applied": {"mood": 20},
+        }
+    )
+    third_id = await db.append_update_audit(
+        {
+            "trigger": "tick",
+            "conversation_id": "private:u1",
+            "user_id": "u1",
+            "update": {"energy": 30},
+            "applied": {"energy": 30},
+        }
+    )
+
+    assert (first_id, second_id, third_id) == (1, 2, 3)
+    assert await db.recent_update_audits(limit=2) == [
+        {
+            "trigger": "tick",
+            "conversation_id": "private:u1",
+            "user_id": "u1",
+            "update": {"energy": 30},
+            "applied": {"energy": 30},
+        },
+        {
+            "trigger": "message",
+            "conversation_id": "private:u2",
+            "user_id": "u2",
+            "update": {"mood": 20},
+            "applied": {"mood": 20},
+        },
+    ]
+    assert await db.recent_update_audits(conversation_id="private:u1") == [
+        {
+            "trigger": "tick",
+            "conversation_id": "private:u1",
+            "user_id": "u1",
+            "update": {"energy": 30},
+            "applied": {"energy": 30},
+        },
+        {
+            "trigger": "message",
+            "conversation_id": "private:u1",
+            "user_id": "u1",
+            "update": {"mood": 10},
+            "applied": {"mood": 10},
+        },
+    ]
+    assert await db.recent_update_audits(user_id="u2") == [
+        {
+            "trigger": "message",
+            "conversation_id": "private:u2",
+            "user_id": "u2",
+            "update": {"mood": 20},
+            "applied": {"mood": 20},
+        }
+    ]
+    assert await db.recent_update_audits(
+        conversation_id="private:u1",
+        user_id="u1",
+        limit=1,
+    ) == [
+        {
+            "trigger": "tick",
+            "conversation_id": "private:u1",
+            "user_id": "u1",
+            "update": {"energy": 30},
+            "applied": {"energy": 30},
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -517,3 +624,110 @@ async def test_persona_db_migrates_legacy_eat_records_without_record_id(tmp_path
         ).fetchone()
 
     assert row == ("120.0", "finished")
+
+
+@pytest.mark.asyncio
+async def test_persona_db_migrates_legacy_schema_with_audits_additively(tmp_path):
+    db_path = tmp_path / "persona.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE persona_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE effects (
+                effect_id TEXT PRIMARY KEY,
+                effect_json TEXT NOT NULL,
+                expires_at TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE user_profiles (
+                user_id TEXT PRIMARY KEY,
+                profile_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO schema_version (id, version, updated_at) VALUES (1, 1, ?)",
+            ("2026-06-13 10:00:00",),
+        )
+        conn.execute(
+            "INSERT INTO persona_state (id, state_json, updated_at) VALUES (1, ?, ?)",
+            ('{"mood": 66.0, "energy": 55.0}', "2026-06-13 10:00:00"),
+        )
+        conn.execute(
+            """
+            INSERT INTO effects (
+                effect_id, effect_json, expires_at, active, created_at, updated_at
+            )
+            VALUES (?, ?, ?, 1, ?, ?)
+            """,
+            (
+                "effect_legacy",
+                '{"id": "effect_legacy", "name": "legacy", "expires_at": 4102444800.0}',
+                "4102444800.0",
+                "2026-06-13 10:00:00",
+                "2026-06-13 10:00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO user_profiles (user_id, profile_json, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (
+                "u1",
+                '{"user_id": "u1", "display_name": "旧用户", "affinity": 0.5}',
+                "2026-06-13 10:00:00",
+                "2026-06-13 10:00:00",
+            ),
+        )
+
+    db = PersonaDB(db_path)
+    await db.load()
+
+    with sqlite3.connect(db_path) as conn:
+        audit_table = conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'persona_update_audits'
+            """
+        ).fetchone()
+        schema_version = conn.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()[0]
+
+    assert audit_table == ("persona_update_audits",)
+    assert schema_version == SCHEMA_VERSION
+
+    state = await db.get_state()
+    assert state.mood == 66.0
+    assert state.energy == 55.0
+    assert [effect.id for effect in await db.get_active_effects(now=1.0)] == [
+        "effect_legacy"
+    ]
+    assert await db.get_profile("u1") == UserProfile(
+        user_id="u1",
+        display_name="旧用户",
+        affinity=0.5,
+    )

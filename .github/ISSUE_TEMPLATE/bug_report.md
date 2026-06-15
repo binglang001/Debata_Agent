@@ -24,5 +24,5 @@ assignees: []
 
 - OS: [Windows / Linux / macOS / 版本]
 - Python 版本: [3.11 / 3.12 / ...]
-- Debata 版本: [v0.8.5-alpha / main / develop / commit hash]
+- Debata 版本: [v0.9.0 / main / develop / commit hash]
 - 使用的 LLM 平台: [DeepSeek / OpenAI / Anthropic / ...]
