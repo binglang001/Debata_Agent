@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import time
 from typing import Any
 
 import pytest
@@ -93,6 +94,43 @@ def _make_root_config() -> RootConfig:
         ),
     )
 
+
+class RecordingPersonaAgent:
+    def __init__(
+        self,
+        context: str = "",
+        *,
+        current_action: str = "awake",
+        action_until: float | None = None,
+    ) -> None:
+        self.context = context
+        self.current_action = current_action
+        self.action_until = action_until
+        self.context_calls: list[str | None] = []
+        self.after_turn_calls: list[dict[str, Any]] = []
+
+    def get_context_for_chat(self, conversation_id: str | None) -> str:
+        self.context_calls.append(conversation_id)
+        return self.context
+
+    def is_resting(self) -> bool:
+        if self.current_action not in {"eating", "sleeping", "collapsing"}:
+            return False
+        return self.action_until is None or self.action_until > time.time()
+
+    async def after_turn(
+        self,
+        conversation_id: str,
+        participants: Any,
+        chat_summary: str,
+    ) -> None:
+        self.after_turn_calls.append(
+            {
+                "conversation_id": conversation_id,
+                "participants": participants,
+                "chat_summary": chat_summary,
+            }
+        )
 
 # ============================================================
 # ScriptedProvider —— 每次 chat_completion 弹出一个预设结果
@@ -392,5 +430,4 @@ async def _wait_until(predicate, max_wait: float = 1.0) -> None:
         await asyncio.sleep(step)
         elapsed += step
     raise AssertionError("等待条件超时")
-
 
