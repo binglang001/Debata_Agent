@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import logging
 import time
 from collections import deque
@@ -20,12 +19,24 @@ from typing import TYPE_CHECKING, Any
 from adapters.types import Target
 from utils import get_time
 
+from . import send_receipts as _send_receipts
 from .state import PendingMessageItem
 
 if TYPE_CHECKING:
     from .message_pipeline import MessagePipeline
 
 logger = logging.getLogger("core.message_pipeline")
+
+_action_content_fingerprint = _send_receipts._action_content_fingerprint
+_drop_none = _send_receipts._drop_none
+_list_count = _send_receipts._list_count
+_optional_text = _send_receipts._optional_text
+_safe_int = _send_receipts._safe_int
+_send_action_counts = _send_receipts._send_action_counts
+_send_message_payload = _send_receipts._send_message_payload
+_send_receipt_counts = _send_receipts._send_receipt_counts
+_send_receipt_event_status = _send_receipts._send_receipt_event_status
+_single_conversation_id = _send_receipts._single_conversation_id
 
 
 def _text_mentions_self_or_role(text: str, self_id: str, role_name: str) -> bool:
@@ -1555,110 +1566,3 @@ class _AsyncSendManager:
             "msg_id": ref.message_id,
             "qq_visible": True,
         }
-
-
-def _send_message_payload(
-    send_id: str,
-    action: dict[str, Any],
-    *,
-    status: str,
-) -> dict[str, Any]:
-    content_length, content_hash = _action_content_fingerprint(action)
-    target_scope = _optional_text(action.get("target_scope"))
-    target_id = _optional_text(action.get("target_id"))
-    payload = {
-        "source": "send_manager",
-        "send_id": send_id,
-        "status": status,
-        "order": _safe_int(action.get("order"), default=0),
-        "target_scope": target_scope,
-        "target_id": target_id,
-        "target_conversation_id": (
-            f"{target_scope}:{target_id}" if target_scope and target_id else None
-        ),
-        "kind": _optional_text(action.get("kind")) or "text",
-        "content_hash": content_hash,
-        "content_length": content_length,
-    }
-    return _drop_none(payload)
-
-
-def _action_content_fingerprint(action: dict[str, Any]) -> tuple[int, str]:
-    text = str(action.get("label") or action.get("content") or "")
-    return len(text), hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _send_action_counts(
-    actions: list[dict[str, Any]],
-    conversation_ids: list[str],
-) -> dict[str, int]:
-    return {
-        "messages": len(actions),
-        "conversations": len(conversation_ids),
-        "text": sum(1 for action in actions if action.get("kind", "text") == "text"),
-        "voice": sum(1 for action in actions if action.get("kind") == "voice"),
-        "image": sum(1 for action in actions if action.get("kind") in {"image", "emoji"}),
-    }
-
-
-def _send_receipt_counts(receipt: dict[str, Any]) -> dict[str, int]:
-    return {
-        "sent": _list_count(receipt.get("sent")),
-        "unsent": _list_count(receipt.get("unsent")),
-        "new_messages": _list_count(receipt.get("new_messages")),
-        "recalled_messages": _list_count(receipt.get("recalled_messages")),
-        "errors": _list_count(receipt.get("errors")),
-        "accepted_messages": _list_count(receipt.get("accepted_messages")),
-        "attempted_messages": _list_count(receipt.get("attempted_messages")),
-        "forced_unseen_messages": _list_count(receipt.get("forced_unseen_messages")),
-        "unseen_messages": _list_count(receipt.get("unseen_messages")),
-        "priority_interrupts": _list_count(receipt.get("priority_interrupts")),
-    }
-
-
-def _send_receipt_event_status(
-    receipt: dict[str, Any],
-    counts: dict[str, int],
-) -> str:
-    status = _optional_text(receipt.get("status"))
-    if status:
-        return status
-    if receipt.get("interrupted"):
-        return "interrupted"
-    if counts["errors"] and counts["sent"]:
-        return "partial"
-    if counts["errors"]:
-        return "failed"
-    if counts["unsent"] and counts["sent"]:
-        return "partial"
-    if counts["unsent"]:
-        return "unsent"
-    if counts["sent"]:
-        return "succeeded"
-    return "empty"
-
-
-def _single_conversation_id(conversation_ids: list[str]) -> str | None:
-    return conversation_ids[0] if len(conversation_ids) == 1 else None
-
-
-def _list_count(value: Any) -> int:
-    return len(value) if isinstance(value, list) else 0
-
-
-def _safe_int(value: Any, *, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _optional_text(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _drop_none(payload: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in payload.items() if value is not None}
