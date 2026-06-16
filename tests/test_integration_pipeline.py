@@ -28,30 +28,13 @@ from typing import Any
 
 import pytest
 
-from adapters.base import IAdapter
 from adapters.types import (
-    IncomingMessage,
     IncomingNotice,
-    MediaSegment,
-    MediaType,
     NoticeType,
     Target,
-    UserInfo,
 )
-from agents import ChatAgent, Persona
 from agents.base import AgentRunResult
 from app_config.schema import (
-    AgentConfig,
-    AgentsConfig,
-    BehaviorConfig,
-    FeaturesConfig,
-    LongTermMemoryConfig,
-    NapCatAdapterConfig,
-    PersonaConfig,
-    ProviderConfig,
-    RateLimitConfig,
-    RootConfig,
-    SummarizeConfig,
     TypingConfig,
 )
 from core.message_pipeline import (
@@ -61,72 +44,34 @@ from core.message_pipeline import (
 )
 from core.proactive_loop import ProactiveLoop
 from core.recall_handler import RecallHandler
-from core.state import PendingMessageItem, PendingRequestStore, RateLimiter
-from core.wakeup import WakeupScheduler
+from core.state import PendingMessageItem, RateLimiter
 from memory import (
     ArchiveStore,
     EventStore,
     HistoryManager,
-    ImportantMemoryManager,
-    RollingSummaryStore,
 )
-from providers.base import CompletionResult, IProvider, ToolCall, Usage
+from providers.base import CompletionResult, ToolCall
+from tests.integration_pipeline.helpers import (
+    _ai_no_action,
+    _ai_send_group,
+    _ai_send_private,
+    _ai_tool_search,
+    _approve_stub_tools,
+    _drain_pipeline,
+    _make_root_config,
+    _msg,
+    _wait_until,
+)
+from tests.integration_pipeline.helpers import (
+    build_pipeline as _build_pipeline_fixture,
+)
 from tools import ToolContext, build_default_registry
+
+build_pipeline = _build_pipeline_fixture
 
 # ============================================================
 # 配置/Persona 工厂
 # ============================================================
-
-
-def _make_persona() -> Persona:
-    return Persona(
-        name="test_persona",
-        prompt="<identity>你是测试用 AI</identity>",
-        vars={"name": "测试机器人", "admins": []},
-    )
-
-
-def _make_agent_cfg() -> AgentConfig:
-    return AgentConfig(
-        provider="fake",
-        model="fake-1",
-        temperature=0.6,
-        max_tokens=1024,
-        max_loops=3,
-        refocus_interval=0,
-        first_token_timeout_seconds=5.0,
-    )
-
-
-def _make_root_config() -> RootConfig:
-    """最小可用 RootConfig：刚好够 build_default_registry 与 pipeline 跑通。"""
-    return RootConfig(
-        providers={
-            "fake": ProviderConfig(
-                preset=None,
-                protocol="openai_compat",
-                base_url="https://example.com",
-                api_key_id=None,
-            ),
-        },
-        adapters={"napcat": NapCatAdapterConfig()},
-        agents=AgentsConfig(chat=_make_agent_cfg()),
-        features=FeaturesConfig(
-            long_term_memory=LongTermMemoryConfig(mode="file"),
-        ),
-        persona=PersonaConfig(active="test_persona"),
-        behavior=BehaviorConfig(
-            merge_window_seconds=0.05,
-            recall_merge_window_seconds=0.05,
-            proactive_think_interval_seconds=600.0,
-            default_history_fetch_count=10000,
-            typing=TypingConfig(
-                chars_per_second=999.0,
-            ),
-            rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
-            summarize=SummarizeConfig(),
-        ),
-    )
 
 
 # ============================================================
@@ -134,127 +79,9 @@ def _make_root_config() -> RootConfig:
 # ============================================================
 
 
-class ScriptedProvider(IProvider):
-    def __init__(self, script: list[CompletionResult]) -> None:
-        super().__init__(name="scripted")
-        self._script: list[CompletionResult] = list(script)
-        self.calls: list[dict[str, Any]] = []
-
-    async def chat_completion(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        model: str,
-        tools: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
-    ) -> CompletionResult:
-        self.calls.append({"messages": copy.deepcopy(messages), "model": model, "tools": tools})
-        if not self._script:
-            # 默认无脚本时返回 no_action 收尾（防止死循环）
-            tc = ToolCall(id="auto", name="no_action", arguments="{}")
-            return CompletionResult(tool_calls=[tc], finish_reason="tool_calls", usage=Usage())
-        return self._script.pop(0)
-
-    async def aclose(self) -> None:
-        pass
-
-
 # ============================================================
 # FakeAdapter —— 实现 IAdapter，所有发送拦截到 self.sent
 # ============================================================
-
-
-class FakeAdapter(IAdapter):
-    def __init__(self, name: str = "fake") -> None:
-        super().__init__(name)
-        self.sent: list[tuple[Target, str]] = []
-        self.image_sent: list[tuple[Target, dict[str, Any]]] = []
-        self.voice_sent: list[tuple[Target, Any]] = []
-        self.uploaded: list[tuple[Target, Any, str | None]] = []
-        self.recalled: list[str] = []
-        self.voice_text = ""
-        self.voice_fetch_calls: list[str] = []
-        self._connected = True
-        self._next_msg_id = 1000
-
-    async def start(self) -> None: ...
-    async def stop(self) -> None: ...
-
-    @property
-    def is_connected(self) -> bool:
-        return self._connected
-
-    async def send_text(self, target: Target, content: str) -> str:
-        mid = str(self._next_msg_id)
-        self._next_msg_id += 1
-        self.sent.append((target, content))
-        return mid
-
-    async def send_voice(self, target: Target, audio_path) -> str:
-        mid = str(self._next_msg_id)
-        self._next_msg_id += 1
-        self.voice_sent.append((target, audio_path))
-        return mid
-
-    async def send_image(self, target, *, image_path=None, image_url=None, image_b64=None):
-        mid = str(self._next_msg_id)
-        self._next_msg_id += 1
-        self.image_sent.append(
-            (
-                target,
-                {
-                    "image_path": image_path,
-                    "image_url": image_url,
-                    "image_b64": image_b64,
-                },
-            )
-        )
-        return mid
-
-    async def recall(self, message_id: str) -> bool:
-        self.recalled.append(message_id)
-        return True
-
-    async def list_friends(self):
-        return []
-
-    async def list_groups(self):
-        return []
-
-    async def list_group_members(self, group_id: str):
-        return []
-
-    async def get_user_info(self, user_id: str) -> UserInfo:
-        return UserInfo(user_id=user_id, nickname="unknown")
-
-    async def handle_friend_request(self, flag, approve, remark=""): ...
-    async def handle_group_request(self, flag, sub_type, approve, reason=""): ...
-
-    async def call_api(self, action: str, **params: Any) -> dict:
-        return {}
-
-    async def fetch_voice_text(self, message_id: str) -> str:
-        self.voice_fetch_calls.append(message_id)
-        return self.voice_text
-
-    async def upload_file(self, target, file_path, *, display_name=None):
-        self.uploaded.append((target, file_path, display_name))
-
-
-class FailingQQSentEventStore:
-    def __init__(self) -> None:
-        self.appended_events: list[dict[str, Any]] = []
-
-    async def append_event(self, **event: Any) -> int:
-        self.appended_events.append(event)
-        if event.get("event_type") == "qq_message_sent":
-            raise RuntimeError("append log failed")
-        return len(self.appended_events)
-
-
-class ProjectionFailingEventStore(EventStore):
-    def _project_events_sync(self, events: list[Any]) -> None:
-        raise RuntimeError("projection failed")
 
 
 # ============================================================
@@ -262,136 +89,9 @@ class ProjectionFailingEventStore(EventStore):
 # ============================================================
 
 
-@pytest.fixture
-def build_pipeline(tmp_path):
-    """返回 async 工厂。调用 build(script) 得到 (pipeline, provider, adapter, history, important)。"""
-
-    async def _build(
-        script: list[CompletionResult],
-        *,
-        emoji_dir=None,
-        workspace_dir=None,
-        rate_limiter=None,
-        event_store=None,
-        persona_agent=None,
-        subconscious_agent=None,
-        persona_db=None,
-        eat_tool=False,
-        sleep_tool=False,
-    ):
-        cfg = _make_root_config()
-        provider = ScriptedProvider(script)
-        chat_agent = ChatAgent(provider, cfg.agents.chat)
-        persona = _make_persona()
-        history = HistoryManager(tmp_path / "history.jsonl")
-        important = ImportantMemoryManager(tmp_path / "important.json")
-        archive = ArchiveStore(tmp_path / "archive.sqlite3")
-        rolling_summary = RollingSummaryStore(tmp_path / "rolling_summary.json")
-        await history.load()
-        await important.load()
-        await archive.load()
-        await rolling_summary.load()
-        registry = build_default_registry(cfg)
-        adapter = FakeAdapter("fake")
-        scheduler = WakeupScheduler(
-            on_fire=lambda r, target=None, mode="wakeup", message_text=None: asyncio.sleep(0)
-        )
-
-        pipeline = MessagePipeline(
-            adapter=adapter,
-            chat_agent=chat_agent,
-            persona=persona,
-            history=history,
-            important=important,
-            archive=archive,
-            rolling_summary=rolling_summary,
-            tool_registry=registry,
-            wakeup_scheduler=scheduler,
-            pending_requests=PendingRequestStore(),
-            behavior_cfg=cfg.behavior,
-            features_cfg=cfg.features,
-            emoji_dir=emoji_dir,
-            workspace_dir=workspace_dir,
-            rate_limiter=rate_limiter,
-            summary_agent=None,
-            event_store=event_store,
-            persona_agent=persona_agent,
-            subconscious_agent=subconscious_agent,
-            persona_db=persona_db,
-            eat_tool=eat_tool,
-            sleep_tool=sleep_tool,
-        )
-        scheduler._on_fire = pipeline.run_wakeup_turn  # 双向依赖回填
-        return pipeline, provider, adapter, history, important
-
-    return _build
-
-
 # ============================================================
 # Helpers
 # ============================================================
-
-
-def _msg(
-    *,
-    user_id: str = "123",
-    group_id: str | None = None,
-    text: str = "你好",
-    message_id: str = "m1",
-    reply_to: str | None = None,
-) -> IncomingMessage:
-    scope = "group" if group_id else "private"
-    return IncomingMessage(
-        adapter="fake",
-        timestamp=1.0,
-        self_id="999",
-        message_id=message_id,
-        scope=scope,
-        user_id=user_id,
-        nickname="用户",
-        group_id=group_id,
-        text=text,
-        raw_message=text,
-        reply_to=reply_to,
-    )
-
-
-def _ai_send_private(target_qq: str = "123", content: str = "嗨") -> CompletionResult:
-    args = {
-        "targets": [{"target_qq": target_qq, "content": content, "order": 1, "delay": 0}],
-    }
-    tc = ToolCall(id="tc-1", name="send_private_messages", arguments=json.dumps(args))
-    return CompletionResult(tool_calls=[tc], finish_reason="tool_calls")
-
-
-def _ai_send_group(group_id: str = "5555", content: str = "群好") -> CompletionResult:
-    args = {
-        "group_id": int(group_id),
-        "targets": [{"content": content, "order": 1, "delay": 0}],
-    }
-    tc = ToolCall(id="tc-g", name="send_group_message", arguments=json.dumps(args))
-    return CompletionResult(tool_calls=[tc], finish_reason="tool_calls")
-
-
-def _ai_no_action(reason: str = "无需回复") -> CompletionResult:
-    _ = reason
-    tc = ToolCall(id="tc-na", name="no_action", arguments="{}")
-    return CompletionResult(tool_calls=[tc], finish_reason="tool_calls")
-
-
-def _ai_tool_search(tool_name: str) -> CompletionResult:
-    tc = ToolCall(
-        id=f"tc-search-{tool_name}",
-        name="tool_search",
-        arguments=json.dumps({"tool_name": tool_name}),
-    )
-    return CompletionResult(tool_calls=[tc], finish_reason="tool_calls")
-
-
-def _approve_stub_tools(ctx: ToolContext, *names: str) -> None:
-    approved = ctx.extras.setdefault("tool_search_approved_tools", set())
-    assert isinstance(approved, set)
-    approved.update(names)
 
 
 def test_text_mentions_self_or_role_uses_deterministic_tokens():
@@ -399,45 +99,6 @@ def test_text_mentions_self_or_role_uses_deterministic_tokens():
     assert _text_mentions_self_or_role("[CQ:at,qq=999] 在吗", "999", "测试机器人") is True
     assert _text_mentions_self_or_role("@测试机器人 在吗", "999", "测试机器人") is True
     assert _text_mentions_self_or_role("普通插话", "999", "测试机器人") is False
-
-
-async def _drain_pipeline(pipeline: MessagePipeline, max_wait: float = 1.0) -> None:
-    """等待 batch + agent + send 全部完成。"""
-    elapsed = 0.0
-    step = 0.05
-    while elapsed < max_wait:
-        await asyncio.sleep(step)
-        elapsed += step
-        batch_task = pipeline._batch_task
-        requeue = pipeline._requeue_task
-        rag_tasks = getattr(pipeline, "_rag_memory_tasks", set())
-        send_states = getattr(getattr(pipeline, "_send_manager", None), "_states", {})
-        send_workers_done = all(
-            state.worker is None or state.worker.done()
-            for state in send_states.values()
-        )
-        receipt_tasks = getattr(pipeline, "_send_receipt_tasks", {})
-        receipt_tasks_done = all(task.done() for task in receipt_tasks.values())
-        if (
-            (batch_task is None or batch_task.done())
-            and (requeue is None or requeue.done())
-            and all(t.done() for t in rag_tasks)
-            and send_workers_done
-            and receipt_tasks_done
-        ):
-            return
-    raise AssertionError(f"pipeline 在 {max_wait}s 内未完成")
-
-
-async def _wait_until(predicate, max_wait: float = 1.0) -> None:
-    elapsed = 0.0
-    step = 0.02
-    while elapsed < max_wait:
-        if predicate():
-            return
-        await asyncio.sleep(step)
-        elapsed += step
-    raise AssertionError("等待条件超时")
 
 
 class RecordingPersonaAgent:
@@ -4718,327 +4379,3 @@ async def test_rag_mode_inbound_keyword_text_does_not_auto_save_important_memory
     assert not any("长期活动" in item.get("content", "") for item in important.items())
 
 
-@pytest.mark.asyncio
-async def test_wakeup_mode_no_action_does_not_send_fallback(build_pipeline):
-    pipeline, _, adapter, _, _ = await build_pipeline([_ai_no_action()])
-
-    await pipeline.run_wakeup_turn(
-        "内部继续任务：检查后台状态",
-        {"target_type": "private", "target_id": 123},
-    )
-
-    assert adapter.sent == []
-
-
-@pytest.mark.asyncio
-async def test_send_message_mode_sends_without_model_or_interrupt(
-    build_pipeline,
-):
-    pipeline, provider, adapter, _, _ = await build_pipeline([])
-    await pipeline.batch.append(
-        PendingMessageItem(
-            message_id="pending-1",
-            user_id="u1",
-            nickname="用户",
-            location="私聊",
-            text="打断用的新消息",
-            raw_event=_msg(text="打断用的新消息"),
-        )
-    )
-
-    await pipeline.run_wakeup_turn(
-        "[定时发送消息]\n消息内容：到点了\n发送目标：private:123",
-        {"target_type": "private", "target_id": 123},
-        mode="send_message",
-        message_text="到点了",
-    )
-
-    assert provider.calls == []
-    assert adapter.sent[-1][1] == "到点了"
-
-
-@pytest.mark.asyncio
-async def test_send_message_mode_raises_when_qq_sent_append_log_fails(
-    build_pipeline,
-):
-    event_store = FailingQQSentEventStore()
-    pipeline, provider, adapter, history, _ = await build_pipeline(
-        [],
-        event_store=event_store,
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match="QQ 消息已发送，但 qq_message_sent 事件持久化失败.*append log failed",
-    ):
-        await pipeline.run_wakeup_turn(
-            "[定时发送消息]\n消息内容：审计失败\n发送目标：private:123",
-            {"target_type": "private", "target_id": 123},
-            mode="send_message",
-            message_text="审计失败",
-        )
-
-    assert provider.calls == []
-    assert adapter.sent[-1][0].scope == "private"
-    assert adapter.sent[-1][0].target_id == "123"
-    assert adapter.sent[-1][1] == "审计失败"
-    assert [event["event_type"] for event in event_store.appended_events] == [
-        "qq_message_sent"
-    ]
-    records = await history.records()
-    assert not any(
-        "msg_id=1000" in str(record.get("content") or "") for record in records
-    )
-
-
-@pytest.mark.asyncio
-async def test_send_message_mode_ignores_sqlite_projection_failure(
-    build_pipeline,
-    tmp_path,
-):
-    event_store = ProjectionFailingEventStore(
-        tmp_path / "projection-fails.sqlite3",
-        projection_retry_delay=0.001,
-    )
-    pipeline, provider, adapter, _, _ = await build_pipeline(
-        [],
-        event_store=event_store,
-    )
-
-    try:
-        await pipeline.run_wakeup_turn(
-            "[定时发送消息]\n消息内容：投影失败仍发送\n发送目标：private:123",
-            {"target_type": "private", "target_id": 123},
-            mode="send_message",
-            message_text="投影失败仍发送",
-        )
-
-        stats = await event_store.stats()
-        assert provider.calls == []
-        assert adapter.sent[-1][1] == "投影失败仍发送"
-        assert stats["last_appended_event_id"] == 1
-        assert stats["last_projected_event_id"] == 0
-    finally:
-        await event_store.shutdown(timeout=0.01)
-
-
-@pytest.mark.asyncio
-async def test_wakeup_action_uses_normal_window_with_reminder_as_current_task(build_pipeline):
-    pipeline, provider, adapter, history, _ = await build_pipeline(
-        [_ai_send_private(target_qq="123", content="到点了")]
-    )
-    await history.add_user_message("旧消息：请执行已完成的无关任务")
-
-    await pipeline.run_wakeup_turn(
-        "内部继续任务：检查后台状态",
-        {"target_type": "private", "target_id": 123},
-    )
-
-    messages = provider.calls[0]["messages"]
-    joined = "\n".join(str(m.get("content", "")) for m in messages)
-    assert "旧消息：请执行已完成的无关任务" in joined
-    assert "检查后台状态" in joined
-    assert "只处理这一条提醒" in joined
-    assert messages[-1]["role"] == "user"
-    assert adapter.sent[-1][1] == "到点了"
-
-
-@pytest.mark.asyncio
-async def test_execute_collected_sends_voice_action(build_pipeline, tmp_path):
-    pipeline, _, adapter, _, _ = await build_pipeline([])
-    audio = tmp_path / "voice.wav"
-    audio.write_bytes(b"RIFF")
-
-    await pipeline._execute_collected(
-        [
-            {
-                "kind": "voice",
-                "action": "private",
-                "target": "123",
-                "label": "[语音] 测试",
-                "delay": 0.0,
-                "audio_path": str(audio),
-            }
-        ],
-    )
-
-    assert adapter.voice_sent
-    target, sent_path = adapter.voice_sent[-1]
-    assert target.scope == "private"
-    assert target.target_id == "123"
-    assert sent_path == audio
-
-
-@pytest.mark.asyncio
-async def test_plain_text_after_send_is_rejected_until_no_action(build_pipeline):
-    pipeline, provider, adapter, history, _ = await build_pipeline(
-        [
-            _ai_send_private(target_qq="123", content="先说一句"),
-            CompletionResult(content="这句纯文本不应该触发纠正", finish_reason="stop"),
-            _ai_no_action(),
-        ]
-    )
-
-    await pipeline.enqueue(_msg(text="测试发送后纯文本"))
-    await _drain_pipeline(pipeline)
-
-    assert [content for _, content in adapter.sent] == ["先说一句"]
-    records = await history.records()
-    assert any(
-        "错误：未调用工具" in (r.get("content") or "") for r in records
-    )
-    assert len(provider.calls) == 3
-
-
-@pytest.mark.asyncio
-async def test_voice_message_prefers_injected_asr(build_pipeline, tmp_path, monkeypatch):
-    """语音消息应优先调用 Runtime 注入的 ASR，而不是适配器自带转写。"""
-
-    class FakeASR:
-        def __init__(self) -> None:
-            self.calls: list[Any] = []
-
-        async def transcribe(self, audio_path):
-            self.calls.append(audio_path)
-            return "ASR 识别文本"
-
-    pipeline, _, adapter, _, _ = await build_pipeline([])
-    asr = FakeASR()
-    pipeline.asr = asr
-    pipeline.workspace_dir = tmp_path
-
-    async def fake_save_media(url: str, suggested_name: str) -> str:
-        incoming = tmp_path / "incoming"
-        incoming.mkdir(parents=True, exist_ok=True)
-        (incoming / suggested_name).write_bytes(b"voice")
-        return f"incoming/{suggested_name}"
-
-    monkeypatch.setattr(pipeline, "_save_media_to_workspace", fake_save_media)
-    event = _msg(text="[语音]", message_id="voice-1")
-    event.media.append(
-        MediaSegment(type=MediaType.VOICE, url="https://example.com/voice.amr")
-    )
-
-    text = await pipeline._build_readable_text(event)
-
-    assert "ASR 识别文本" in text
-    assert "workspace=incoming/voice_voice-1.amr" in text
-    assert asr.calls == [tmp_path / "incoming" / "voice_voice-1.amr"]
-    assert adapter.voice_fetch_calls == []
-
-
-@pytest.mark.asyncio
-async def test_voice_message_falls_back_to_adapter_when_asr_fails(
-    build_pipeline, tmp_path, monkeypatch
-):
-    """ASR 失败时应记录失败并回退到 adapter.fetch_voice_text。"""
-
-    class BrokenASR:
-        async def transcribe(self, audio_path):
-            raise RuntimeError("boom")
-
-    pipeline, _, adapter, _, _ = await build_pipeline([])
-    pipeline.asr = BrokenASR()
-    pipeline.workspace_dir = tmp_path
-    adapter.voice_text = "适配器转写文本"
-
-    async def fake_save_media(url: str, suggested_name: str) -> str:
-        incoming = tmp_path / "incoming"
-        incoming.mkdir(parents=True, exist_ok=True)
-        (incoming / suggested_name).write_bytes(b"voice")
-        return f"incoming/{suggested_name}"
-
-    monkeypatch.setattr(pipeline, "_save_media_to_workspace", fake_save_media)
-    event = _msg(text="[语音]", message_id="voice-2")
-    event.media.append(
-        MediaSegment(type=MediaType.VOICE, url="https://example.com/voice.amr")
-    )
-
-    text = await pipeline._build_readable_text(event)
-
-    assert "适配器转写文本" in text
-    assert adapter.voice_fetch_calls == ["voice-2"]
-
-
-@pytest.mark.asyncio
-async def test_multi_turn_tool_loop(build_pipeline):
-    """非 no_action 工具默认把结果回填给模型，不再因 no_feedback 隐式结束。"""
-    # 工具参数字段名是 memory_text 不是 content（被集成测试抓出来的）
-    save_args = {"memory_text": "用户喜欢咖啡", "scope": "user:12345"}
-    save_tc = ToolCall(id="tc-s", name="save_important_memory", arguments=json.dumps(save_args))
-    pipeline, provider, adapter, _, important = await build_pipeline(
-        [CompletionResult(tool_calls=[save_tc], finish_reason="tool_calls")]
-    )
-
-    await pipeline.enqueue(_msg(text="我喜欢咖啡"))
-    await _drain_pipeline(pipeline)
-
-    items = important.items()
-    assert any("咖啡" in (i.get("content") or "") for i in items)
-
-
-@pytest.mark.asyncio
-async def test_max_loops_reached_no_crash(build_pipeline):
-    """AgentRunner 对无工具纯文本只做纠正重试，不把文本兜底发送。"""
-    # 脚本：连续返回纯文本（无工具调用）—— runner 应在一次纠正重试后 give up
-    plain = CompletionResult(content="（纯文本）", finish_reason="stop")
-    pipeline, provider, adapter, history, _ = await build_pipeline([plain, plain, plain])
-
-    await pipeline.enqueue(_msg(text="测试无工具重试"))
-    await _drain_pipeline(pipeline, max_wait=2.0)
-
-    # 不应发出消息（runner 拒绝接受纯文本输出）
-    assert adapter.sent == []
-    # provider 被调用 2 次：首次纯文本 + 一次纠正重试。
-    assert len(provider.calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_tool_loop_finalization_does_not_send_plain_text_to_qq(build_pipeline):
-    """工具循环无工具收尾只能写内部记录，不能绕过发送工具发 QQ。"""
-    save_args = {"memory_text": "循环中的中间结果"}
-    save_tc_1 = ToolCall(id="tc-save-1", name="save_important_memory", arguments=json.dumps(save_args))
-    save_tc_2 = ToolCall(id="tc-save-2", name="save_important_memory", arguments=json.dumps(save_args))
-    pipeline, provider, adapter, history, _ = await build_pipeline(
-        [
-            CompletionResult(tool_calls=[save_tc_1], finish_reason="tool_calls"),
-            CompletionResult(tool_calls=[save_tc_2], finish_reason="tool_calls"),
-            CompletionResult(content="内部最终说明，不应发送到 QQ。", finish_reason="stop"),
-        ]
-    )
-    pipeline.chat_agent.cfg.tool_loop_reminder_interval = 1
-    pipeline.chat_agent.cfg.tool_loop_final_warning_count = 1
-    pipeline.chat_agent.cfg.tool_loop_final_grace_loops = 1
-
-    await pipeline.enqueue(_msg(text="测试工具循环最终收尾"))
-    await _drain_pipeline(pipeline, max_wait=2.0)
-
-    assert adapter.sent == []
-    assert provider.calls[-1]["tools"] is None
-    records = await history.records()
-    assert any(
-        record.get("role") == "assistant"
-        and "内部最终说明" in str(record.get("content") or "")
-        for record in records
-    )
-
-
-@pytest.mark.asyncio
-async def test_unknown_scope_fails_gracefully(build_pipeline):
-    """B17 防御：如果 collected 里的 scope 既不是 'private' 也不是 'group'，
-    _do_send 应该写 system_note 而不是崩。
-
-    这里手动塞一条非法 action 进 ctx.collected 进行验证。"""
-    pipeline, _, adapter, history, _ = await build_pipeline([])
-
-    # 直接调 _do_send 触发分支
-    result = await pipeline._do_send(
-        {"action": "weird_scope", "target": "1", "content": "hi", "label": "x", "delay": 0}
-    )
-    assert result is None
-    assert adapter.sent == []
-
-    records = await history.records()
-    assert any(
-        "未知 scope" in (r.get("content") or "") for r in records if r.get("role") == "system"
-    ), f"应有 system_note 警告未知 scope；实际 records={records}"
