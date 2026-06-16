@@ -13,37 +13,128 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import ValidationError
 
 from mind import Cue, DecayEngine, Effect, PersonaState, Todo, UserProfile, clamp_percent
 from providers.base import ProviderError, ReasoningConfig
 
 from .base import StatusCallback, UsageRecorder
+from .persona.update_helpers import (
+    _CLOSE_OPERATIONS as _CLOSE_OPERATIONS,
+)
+from .persona.update_helpers import (
+    _TODO_CLOSED_STATUS_VALUES as _TODO_CLOSED_STATUS_VALUES,
+)
+from .persona.update_helpers import (
+    _TODO_OPEN_STATUS_VALUES as _TODO_OPEN_STATUS_VALUES,
+)
+from .persona.update_helpers import (
+    _UPDATE_OPERATIONS as _UPDATE_OPERATIONS,
+)
+from .persona.update_helpers import (
+    _coerce_level_value as _coerce_level_value,
+)
+from .persona.update_helpers import (
+    _coerce_model_timestamp as _coerce_model_timestamp,
+)
+from .persona.update_helpers import (
+    _cue_from_update as _cue_from_update,
+)
+from .persona.update_helpers import (
+    _cue_patch_text as _cue_patch_text,
+)
+from .persona.update_helpers import (
+    _effect_from_update as _effect_from_update,
+)
+from .persona.update_helpers import (
+    _effect_patch_text as _effect_patch_text,
+)
+from .persona.update_helpers import (
+    _int_sort_value as _int_sort_value,
+)
+from .persona.update_helpers import (
+    _normalize_operation as _normalize_operation,
+)
+from .persona.update_helpers import (
+    _normalize_todo_status as _normalize_todo_status,
+)
+from .persona.update_helpers import (
+    _operation_requires_existing as _operation_requires_existing,
+)
+from .persona.update_helpers import (
+    _optional_float as _optional_float,
+)
+from .persona.update_helpers import (
+    _time_sort_value as _time_sort_value,
+)
+from .persona.update_helpers import (
+    _todo_dedupe_key as _todo_dedupe_key,
+)
+from .persona.update_helpers import (
+    _todo_from_update as _todo_from_update,
+)
+from .persona.update_helpers import (
+    _todo_is_expired as _todo_is_expired,
+)
+from .persona.update_helpers import (
+    _todo_patch_text as _todo_patch_text,
+)
+from .persona.update_helpers import (
+    _todo_record_from_update as _todo_record_from_update,
+)
+from .persona.update_helpers import (
+    _todo_record_is_closed as _todo_record_is_closed,
+)
+from .persona.update_helpers import (
+    _todo_sort_key as _todo_sort_key,
+)
+from .persona.update_helpers import (
+    _todo_update_requires_existing as _todo_update_requires_existing,
+)
+from .persona.update_helpers import (
+    _todo_update_status as _todo_update_status,
+)
+from .persona.update_helpers import (
+    _truthy_todo_state as _truthy_todo_state,
+)
+from .persona.update_models import (
+    _append_singular as _append_singular,
+)
+from .persona.update_models import (
+    _CueUpdate as _CueUpdate,
+)
+from .persona.update_models import (
+    _EffectUpdate as _EffectUpdate,
+)
+from .persona.update_models import (
+    _normalize_traits_field as _normalize_traits_field,
+)
+from .persona.update_models import (
+    _normalize_update_list_field as _normalize_update_list_field,
+)
+from .persona.update_models import (
+    _ProfileUpdate as _ProfileUpdate,
+)
+from .persona.update_models import (
+    _RecoveryEstimate as _RecoveryEstimate,
+)
+from .persona.update_models import (
+    _RecoveryResult as _RecoveryResult,
+)
+from .persona.update_models import (
+    _RelationshipUpdate as _RelationshipUpdate,
+)
+from .persona.update_models import (
+    _TodoUpdate as _TodoUpdate,
+)
+from .persona.update_models import (
+    _TurnUpdate as _TurnUpdate,
+)
 from .persona_context_view import PersonaContextView
 
 logger = logging.getLogger(__name__)
 
 _RESTING_ACTIONS = {"sleeping", "eating", "collapsing"}
-_TODO_CLOSED_STATUS_VALUES = {
-    "completed",
-    "complete",
-    "done",
-    "finished",
-    "closed",
-    "cancelled",
-    "canceled",
-    "deleted",
-    "missed",
-}
-_TODO_OPEN_STATUS_VALUES = {
-    "open",
-    "pending",
-    "active",
-    "todo",
-    "new",
-    "in_progress",
-    "in-progress",
-}
 
 _SOCIAL_NEED_GUIDANCE = (
     "social_need 表示社交未满足度，不是亲密度、兴奋度或想继续聊天的程度："
@@ -70,203 +161,6 @@ _SHORT_TERM_UPDATE_GUIDANCE = (
     "todo 必须有可执行标题、scope、priority、触发或过期信息；避免“关注/记得/继续观察/留意一下”"
     "这类泛泛标题。\n"
 )
-
-
-class _EffectUpdate(BaseModel):
-    id: str | None = None
-    operation: str | None = None
-    name: str = ""
-    effect_type: str = "mood"
-    intensity: float = 0.0
-    prompt_hint: str = ""
-    source_detail: str = ""
-    duration_minutes: float | None = Field(default=None, ge=0.0)
-    created_at: float | None = None
-    expires_at: float | None = None
-
-    @field_validator("intensity", mode="before")
-    @classmethod
-    def normalize_intensity(cls, value: object) -> object:
-        return _coerce_level_value(value, default=value, low=25.0, medium=50.0, high=75.0)
-
-    @field_validator("operation", mode="before")
-    @classmethod
-    def normalize_operation(cls, value: object) -> str | None:
-        return _normalize_operation(value)
-
-    @field_validator("created_at", "expires_at", mode="before")
-    @classmethod
-    def normalize_timestamps(cls, value: object) -> object:
-        return _coerce_model_timestamp(value)
-
-
-class _TodoUpdate(BaseModel):
-    id: str | None = None
-    operation: str | None = None
-    title: str = ""
-    reason: str = ""
-    priority: int = 1
-    scope: str = "persona"
-    created_at: float | None = None
-    expires_at: float | None = None
-    status: str | None = None
-    completed: Any = None
-    done: Any = None
-    finished: Any = None
-    cancelled: Any = None
-    canceled: Any = None
-
-    @field_validator("priority", mode="before")
-    @classmethod
-    def normalize_priority(cls, value: object) -> object:
-        return _coerce_level_value(value, default=value, low=2, medium=5, high=8)
-
-    @field_validator("operation", mode="before")
-    @classmethod
-    def normalize_operation(cls, value: object) -> str | None:
-        return _normalize_operation(value)
-
-    @field_validator("created_at", "expires_at", mode="before")
-    @classmethod
-    def normalize_timestamps(cls, value: object) -> object:
-        return _coerce_model_timestamp(value)
-
-
-class _CueUpdate(BaseModel):
-    id: str | None = None
-    operation: str | None = None
-    cue_type: str = "conversation"
-    summary: str = ""
-    conversation_id: str | None = None
-    created_at: float | None = None
-    expires_at: float | None = None
-
-    @field_validator("created_at", "expires_at", mode="before")
-    @classmethod
-    def normalize_timestamps(cls, value: object) -> object:
-        return _coerce_model_timestamp(value)
-
-    @field_validator("operation", mode="before")
-    @classmethod
-    def normalize_operation(cls, value: object) -> str | None:
-        return _normalize_operation(value)
-
-
-def _normalize_traits_field(value: object) -> object:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return []
-        for separator in ("、", "，", ",", "；", ";", "\n", "\r"):
-            text = text.replace(separator, ",")
-        return [part.strip() for part in text.split(",") if part.strip()]
-    if isinstance(value, list):
-        traits: list[str] = []
-        for item in value:
-            if item is None:
-                continue
-            text = str(item).strip()
-            if text:
-                traits.append(text)
-        return traits
-    return value
-
-
-class _ProfileUpdate(BaseModel):
-    user_id: str | None = None
-    display_name: str = ""
-    affinity: float | None = None
-    affinity_delta: float | None = None
-    summary: str = ""
-    traits: list[str] = Field(default_factory=list)
-    interaction_count: int | None = None
-    last_interaction_at: float | None = None
-
-    @field_validator("traits", mode="before")
-    @classmethod
-    def normalize_traits(cls, value: object) -> object:
-        return _normalize_traits_field(value)
-
-
-class _RelationshipUpdate(BaseModel):
-    user_id: str | None = None
-    display_name: str = ""
-    affinity: float | None = None
-    affinity_delta: float | None = None
-    summary: str = ""
-    traits: list[str] = Field(default_factory=list)
-    reason: str = ""
-
-    @field_validator("traits", mode="before")
-    @classmethod
-    def normalize_traits(cls, value: object) -> object:
-        return _normalize_traits_field(value)
-
-
-class _TurnUpdate(BaseModel):
-    mood: float | None = None
-    mood_delta: float | None = None
-    social_need: float | None = None
-    social_need_delta: float | None = None
-    latest_monologue: str = ""
-    effects: list[_EffectUpdate] = Field(default_factory=list)
-    profiles: list[_ProfileUpdate] = Field(default_factory=list)
-    relationships: list[_RelationshipUpdate] = Field(default_factory=list)
-    todos: list[_TodoUpdate] = Field(default_factory=list)
-    cues: list[_CueUpdate] = Field(default_factory=list)
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_singular_fields(cls, data: object) -> object:
-        if not isinstance(data, dict):
-            return data
-        normalized = dict(data)
-        _append_singular(normalized, "effect", "effects")
-        _append_singular(normalized, "todo", "todos")
-        _append_singular(normalized, "cue", "cues")
-
-        profile = normalized.pop("profile", None)
-        if profile is not None and "profiles" not in normalized:
-            normalized["profiles"] = profile if isinstance(profile, list) else [profile]
-        for singular in ("relationship", "relationship_update", "affinity_update"):
-            value = normalized.pop(singular, None)
-            if value is not None and "relationships" not in normalized:
-                normalized["relationships"] = value if isinstance(value, list) else [value]
-        for plural in ("relationship_updates", "affinity_updates"):
-            value = normalized.pop(plural, None)
-            if value is not None and "relationships" not in normalized:
-                normalized["relationships"] = value
-        for field_name in ("effects", "profiles", "relationships", "todos", "cues"):
-            if field_name in normalized:
-                normalized[field_name] = _normalize_update_list_field(normalized[field_name])
-        return normalized
-
-
-class _RecoveryEstimate(BaseModel):
-    energy: float | None = None
-    satiety: float | None = None
-    mood: float | None = None
-    social_need: float | None = None
-    latest_monologue: str = ""
-    reason: str = ""
-
-    @field_validator("energy", "satiety", "mood", "social_need", mode="before")
-    @classmethod
-    def normalize_percent(cls, value: object) -> object:
-        if value is None or isinstance(value, bool):
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-
-class _RecoveryResult(BaseModel):
-    estimate: _RecoveryEstimate = Field(default_factory=_RecoveryEstimate)
-    source: str = "fallback_formula"
-    error: str = ""
 
 
 class PersonaAgent:
@@ -2250,25 +2144,6 @@ class PersonaAgent:
             logger.debug("更新人格管理状态失败", exc_info=True)
 
 
-def _append_singular(data: dict[str, Any], singular: str, plural: str) -> None:
-    value = data.pop(singular, None)
-    if value is None or plural in data:
-        return
-    data[plural] = value if isinstance(value, list) else [value]
-
-
-def _normalize_update_list_field(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    if isinstance(value, tuple):
-        return list(value)
-    if isinstance(value, dict) and not value:
-        return []
-    return [value]
-
-
 def _iter_records(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -2569,71 +2444,11 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _coerce_level_value(
-    value: object,
-    *,
-    default: object,
-    low: float | int,
-    medium: float | int,
-    high: float | int,
-) -> object:
-    if not isinstance(value, str):
-        return value
-    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
-    if not normalized:
-        return default
-    mapping = {
-        "low": low,
-        "minor": low,
-        "weak": low,
-        "small": low,
-        "light": low,
-        "轻": low,
-        "低": low,
-        "弱": low,
-        "轻微": low,
-        "medium": medium,
-        "mid": medium,
-        "moderate": medium,
-        "normal": medium,
-        "average": medium,
-        "中": medium,
-        "中等": medium,
-        "一般": medium,
-        "适中": medium,
-        "普通": medium,
-        "high": high,
-        "major": high,
-        "strong": high,
-        "large": high,
-        "important": high,
-        "高": high,
-        "强": high,
-        "强烈": high,
-        "重要": high,
-        "urgent": high,
-        "critical": high,
-        "very_high": high,
-        "极高": high,
-        "紧急": high,
-    }
-    return mapping.get(normalized, default)
-
-
-def _todo_dedupe_key(scope: str, title: str) -> tuple[str, str]:
-    normalized_scope = " ".join(str(scope or "persona").strip().lower().split()) or "persona"
-    normalized_title = " ".join(str(title or "").strip().lower().split())
-    normalized_title = normalized_title.rstrip("。.!！?？；;，,")
-    return normalized_scope, normalized_title
-
-
 _ACTION_TODO_SCOPE_BY_TYPE = {
     "sleep": {"", "persona", "sleep", "sleeping", "rest", "energy", "physiological", "short_term"},
     "eat": {"", "persona", "eat", "eating", "meal", "food", "satiety", "drink", "water", "physiological", "short_term"},
 }
 
-_CLOSE_OPERATIONS = {"close", "delete", "cancel", "complete"}
-_UPDATE_OPERATIONS = {"update", "patch"}
 _ACTION_TODO_INCLUDE_BY_TYPE = {
     "sleep": ("睡", "睡觉", "睡眠", "休息", "休眠", "补觉", "躺下", "小睡"),
     "eat": ("吃饭", "吃点", "吃东西", "进食", "用餐", "喝水", "喝点", "喝饮料", "吃早餐", "吃午饭", "吃晚饭", "觅食", "填饱肚子"),
@@ -2733,328 +2548,12 @@ def _format_action_context(state: PersonaState, now: float) -> str:
     return "；".join(parts)
 
 
-def _coerce_model_timestamp(value: object) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, int | float):
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        pass
-    iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
-    try:
-        return datetime.fromisoformat(iso_text).timestamp()
-    except ValueError:
-        return None
-
-
-def _normalize_operation(value: object) -> str | None:
-    if value is None or isinstance(value, bool):
-        return None
-    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if not text:
-        return None
-    mapping = {
-        "created": "create",
-        "insert": "create",
-        "new": "create",
-        "add": "create",
-        "upsert": "create",
-        "modify": "update",
-        "modified": "update",
-        "patch": "update",
-        "edit": "update",
-        "edited": "update",
-        "close": "close",
-        "closed": "close",
-        "remove": "delete",
-        "removed": "delete",
-        "delete": "delete",
-        "deleted": "delete",
-        "drop": "delete",
-        "dropped": "delete",
-        "cancel": "cancel",
-        "cancelled": "cancel",
-        "canceled": "cancel",
-        "complete": "complete",
-        "completed": "complete",
-        "done": "complete",
-        "finish": "complete",
-        "finished": "complete",
-        "noop": "noop",
-        "no_op": "noop",
-        "none": "noop",
-        "ignore": "noop",
-        "skip": "noop",
-    }
-    normalized = mapping.get(text, text)
-    if normalized == "cancelled":
-        return "cancel"
-    return normalized
-
-
-def _operation_requires_existing(operation: str | None) -> bool:
-    return operation in _CLOSE_OPERATIONS or operation in _UPDATE_OPERATIONS
-
-
-def _todo_update_requires_existing(update: _TodoUpdate) -> bool:
-    operation = update.operation
-    if operation in _CLOSE_OPERATIONS or operation in _UPDATE_OPERATIONS:
-        return True
-    status = _todo_update_status(update)
-    return status in _TODO_CLOSED_STATUS_VALUES
-
-
-def _todo_is_expired(todo: Todo, now: float) -> bool:
-    if todo.expires_at is None:
-        return False
-    try:
-        return float(todo.expires_at) <= now
-    except (TypeError, ValueError):
-        return False
-
-
-def _todo_sort_key(todo: Todo) -> tuple[Any, ...]:
-    return (
-        -_int_sort_value(todo.priority),
-        _time_sort_value(todo.expires_at),
-        _time_sort_value(todo.created_at),
-        str(todo.id or ""),
-    )
-
-
-def _int_sort_value(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _time_sort_value(value: Any) -> tuple[int, float | str]:
-    parsed = _optional_float(value)
-    if parsed is not None:
-        return (0, parsed)
-    if value is None:
-        return (1, "")
-    return (1, str(value).strip())
-
-
-def _optional_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _todo_patch_text(update: _TodoUpdate, field_name: str, default: str) -> str:
-    if field_name in update.model_fields_set:
-        return str(getattr(update, field_name) or "")
-    return default
-
-
-def _effect_patch_text(update: _EffectUpdate, field_name: str, default: str) -> str:
-    if field_name in update.model_fields_set:
-        return str(getattr(update, field_name) or "")
-    return default
-
-
-def _cue_patch_text(update: _CueUpdate, field_name: str, default: str) -> str:
-    if field_name in update.model_fields_set:
-        return str(getattr(update, field_name) or "")
-    return default
-
-
 def _coerce_state(value: Any) -> PersonaState:
     if isinstance(value, PersonaState):
         return replace(value)
     if isinstance(value, dict):
         return PersonaState(**_filter_dataclass_fields(PersonaState, value))
     return PersonaState()
-
-
-def _effect_from_update(
-    update: _EffectUpdate,
-    now: float,
-    existing: Effect | None = None,
-) -> Effect:
-    fields_set = update.model_fields_set
-    created_at = (
-        update.created_at
-        if "created_at" in fields_set and update.created_at is not None
-        else existing.created_at if existing is not None else now
-    )
-    if "expires_at" in fields_set and update.expires_at is not None:
-        expires_at = update.expires_at
-    elif "duration_minutes" in fields_set and update.duration_minutes is not None:
-        expires_at = created_at + update.duration_minutes * 60.0
-    elif existing is not None:
-        expires_at = existing.expires_at
-    else:
-        expires_at = None
-    if expires_at is None:
-        duration = update.duration_minutes if update.duration_minutes is not None else 60.0
-        expires_at = created_at + duration * 60.0
-    return Effect(
-        id=update.id or (existing.id if existing is not None else f"effect_{uuid4().hex}"),
-        name=_effect_patch_text(update, "name", existing.name if existing is not None else update.effect_type),
-        effect_type=_effect_patch_text(
-            update,
-            "effect_type",
-            existing.effect_type if existing is not None else "mood",
-        ),
-        intensity=(
-            update.intensity
-            if "intensity" in fields_set or existing is None
-            else existing.intensity
-        ),
-        prompt_hint=_effect_patch_text(
-            update,
-            "prompt_hint",
-            existing.prompt_hint if existing is not None else "",
-        ),
-        source_detail=_effect_patch_text(
-            update,
-            "source_detail",
-            existing.source_detail if existing is not None else "",
-        ),
-        created_at=created_at,
-        expires_at=expires_at,
-    )
-
-
-def _todo_from_update(update: _TodoUpdate, now: float) -> Todo:
-    return Todo(
-        id=update.id or f"todo_{uuid4().hex}",
-        title=update.title,
-        reason=update.reason,
-        priority=update.priority,
-        scope=update.scope,
-        created_at=update.created_at or now,
-        expires_at=update.expires_at,
-    )
-
-
-def _todo_record_from_update(
-    update: _TodoUpdate,
-    now: float,
-    existing: Todo | None,
-) -> dict[str, Any]:
-    status = _todo_update_status(update)
-    fields_set = update.model_fields_set
-    if existing is not None:
-        record = asdict(existing)
-        for field_name in ("title", "reason", "priority", "scope", "created_at", "expires_at"):
-            if field_name in fields_set:
-                record[field_name] = getattr(update, field_name)
-    elif status is None or status in _TODO_OPEN_STATUS_VALUES:
-        record = asdict(_todo_from_update(update, now))
-    else:
-        record = {"id": update.id or f"todo_{uuid4().hex}"}
-        for field_name in ("title", "reason", "priority", "scope", "created_at", "expires_at"):
-            if field_name in fields_set:
-                record[field_name] = getattr(update, field_name)
-
-    record["id"] = str(update.id or record.get("id") or f"todo_{uuid4().hex}")
-    if status is not None:
-        record["status"] = status
-        record["completed"] = status in _TODO_CLOSED_STATUS_VALUES
-    return record
-
-
-def _todo_update_status(update: _TodoUpdate) -> str | None:
-    fields_set = update.model_fields_set
-    if update.operation in {"close", "complete"}:
-        return "completed"
-    if update.operation == "delete":
-        return "deleted"
-    if update.operation == "cancel":
-        return "cancelled"
-    if "status" in fields_set and update.status is not None:
-        return _normalize_todo_status(update.status)
-    for field_name in ("completed", "done", "finished"):
-        if field_name in fields_set:
-            return "completed" if _truthy_todo_state(getattr(update, field_name)) else "open"
-    for field_name in ("cancelled", "canceled"):
-        if field_name in fields_set:
-            return "cancelled" if _truthy_todo_state(getattr(update, field_name)) else "open"
-    return None
-
-
-def _todo_record_is_closed(record: dict[str, Any]) -> bool:
-    status = _normalize_todo_status(record.get("status"))
-    if status in _TODO_CLOSED_STATUS_VALUES:
-        return True
-    for field_name in ("completed", "done", "finished", "cancelled", "canceled"):
-        if field_name in record and _truthy_todo_state(record.get(field_name)):
-            return True
-    return False
-
-
-def _normalize_todo_status(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    if text == "canceled":
-        return "cancelled"
-    if text in {"complete", "finished", "closed"}:
-        return "completed"
-    return text
-
-
-def _truthy_todo_state(value: Any) -> bool:
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in _TODO_CLOSED_STATUS_VALUES or text in {"1", "true", "yes", "y"}:
-            return True
-        if text in _TODO_OPEN_STATUS_VALUES or text in {"0", "false", "no", "n", ""}:
-            return False
-    return bool(value)
-
-
-def _cue_from_update(
-    update: _CueUpdate,
-    conversation_id: str,
-    now: float,
-    existing: Cue | None = None,
-) -> Cue:
-    fields_set = update.model_fields_set
-    created_at = (
-        update.created_at
-        if "created_at" in fields_set and update.created_at is not None
-        else existing.created_at if existing is not None else now
-    )
-    expires_at = (
-        update.expires_at
-        if "expires_at" in fields_set and update.expires_at is not None
-        else existing.expires_at if existing is not None else now + 24 * 3600.0
-    )
-    return Cue(
-        id=update.id or (existing.id if existing is not None else f"cue_{uuid4().hex}"),
-        cue_type=_cue_patch_text(
-            update,
-            "cue_type",
-            existing.cue_type if existing is not None else "conversation",
-        ),
-        summary=_cue_patch_text(
-            update,
-            "summary",
-            existing.summary if existing is not None else "",
-        ),
-        conversation_id=(
-            update.conversation_id
-            if "conversation_id" in fields_set and update.conversation_id
-            else existing.conversation_id if existing is not None else conversation_id
-        ),
-        created_at=created_at,
-        expires_at=expires_at,
-    )
 
 
 def _coerce_effect(value: Any) -> Effect | None:
