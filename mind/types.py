@@ -72,7 +72,7 @@ class UserProfile:
 
     user_id: str
     display_name: str = ""
-    affinity: float = 0.0
+    affinity: float = 60.0
     summary: str = ""
     traits: list[str] = field(default_factory=list)
     interaction_count: int = 0

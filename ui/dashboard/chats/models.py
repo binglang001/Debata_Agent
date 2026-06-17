@@ -52,5 +52,5 @@ class ConversationDisplayCache:
     records_signature: tuple[int, str]
     persona_name: str
     normalized_items: list[DisplayItem]
-    filter_signature: tuple[str, bool, bool, bool, bool] | None = None
+    filter_signature: tuple[str, bool, bool, bool, bool, bool] | None = None
     filtered_items: list[DisplayItem] = field(default_factory=list)

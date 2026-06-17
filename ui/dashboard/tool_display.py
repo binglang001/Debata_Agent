@@ -73,8 +73,14 @@ def _format_tool_call_uncached(tool_call: dict[str, Any]) -> ToolDisplay:
         return ToolDisplay(name, "读取最近聊天记录", f"读取最近聊天记录：{target}，{limit} 条", f"工具调用：读取最近聊天记录。范围：{target}。数量：{limit} 条。")
     if name == "recall_history":
         target = _value_text(args.get("conversation_id") or "全部会话")
-        keyword = _value_text(args.get("keyword") or "-")
-        return ToolDisplay(name, "检索历史记录", f"检索历史记录：{target}，关键词={keyword}", f"工具调用：检索历史记录。范围：{target}。关键词：{keyword}。")
+        keyword = _value_text(args.get("keyword") or args.get("query") or "-")
+        limit = _value_text(args.get("limit") or "")
+        summary = f"检索历史记录：{target}，关键词：{keyword}"
+        detail = f"工具调用：检索历史记录。范围：{target}。关键词：{keyword}。"
+        if limit:
+            summary += f"，数量上限：{limit}"
+            detail += f"数量上限：{limit}。"
+        return ToolDisplay(name, "检索历史记录", summary, detail)
     if name in {"read_file", "write_file", "edit_file", "list_files"}:
         return _format_file_tool_call(name, args)
     if name == "run_python":
@@ -111,6 +117,14 @@ def _format_tool_result_uncached(
     if name == "commit_send_attempt" or _looks_like_commit_send_attempt_result(payload):
         return _format_commit_send_attempt_result(name, payload, content)
     if isinstance(payload, dict):
+        if name in {"read_file", "write_file", "edit_file", "list_files"}:
+            return _format_file_tool_result(name, payload)
+        if name == "run_python":
+            return _format_run_python_result(name, payload)
+        if name in {"get_recent_chat_messages", "recall_history"}:
+            return _format_history_tool_result(name, payload)
+        if name == "upload_file":
+            return _format_upload_file_result(name, payload)
         return _format_generic_tool_result(name, payload)
     text = _first_nonempty_line(content) or "(空结果)"
     detail = f"工具返回：文本结果：{_short_text(text, limit=260)}。"
@@ -285,7 +299,7 @@ def _format_file_tool_call(name: str, args: dict[str, Any]) -> ToolDisplay:
         "list_files": ("列出文件", "列出文件"),
     }
     title, action = labels.get(name, ("文件工具", name))
-    path = _value_text(args.get("path") or ".")
+    path = _value_text(args.get("path") or args.get("file_path") or ".")
     pattern = _value_text(args.get("pattern") or "*")
     if name == "list_files":
         summary = f"{action}：{path} / {pattern}"
@@ -293,6 +307,17 @@ def _format_file_tool_call(name: str, args: dict[str, Any]) -> ToolDisplay:
     else:
         summary = f"{action}：{path}"
         detail = f"工具调用：{action}。路径：{path}。"
+    if name == "write_file" and "content" in args:
+        detail += f"内容：{_summarize_value(args.get('content'))}。"
+    if name == "edit_file":
+        if "old" in args:
+            detail += f"原内容：{_summarize_value(args.get('old'))}。"
+        if "new" in args:
+            detail += f"新内容：{_summarize_value(args.get('new'))}。"
+    if name == "read_file" and args.get("max_lines") is not None:
+        detail += f"最大行数：{_value_text(args.get('max_lines'))}。"
+    if name == "list_files" and args.get("limit") is not None:
+        detail += f"数量上限：{_value_text(args.get('limit'))}。"
     return ToolDisplay(name, title, summary, detail)
 
 
@@ -388,12 +413,112 @@ def _format_commit_send_attempt_result(
     )
 
 
+def _format_file_tool_result(name: str, payload: dict[str, Any]) -> ToolDisplay:
+    labels = {
+        "read_file": ("读取文件结果", "读取文件"),
+        "write_file": ("写入文件结果", "写入文件"),
+        "edit_file": ("编辑文件结果", "编辑文件"),
+        "list_files": ("列出文件结果", "列出文件"),
+    }
+    title, action = labels.get(name, ("文件工具返回", "文件工具"))
+    parts = _result_state_parts(payload)
+    path = _payload_nested_value(payload, "path", "file_path")
+    if path is not None:
+        parts.append(f"路径：{_summarize_value(path)}")
+    if name == "list_files":
+        entries = _payload_nested_value(payload, "entries", "items", "files")
+        count = _payload_nested_value(payload, "count")
+        if isinstance(entries, list):
+            parts.append(f"条目：共 {len(entries)} 项")
+        elif count is not None:
+            parts.append(f"条目：共 {_summarize_value(count)} 项")
+    content = _payload_nested_value(payload, "content", "text", "stdout")
+    if content is not None:
+        parts.append(f"内容：{_summarize_value(content)}")
+    extra = _summarize_mapping(
+        {
+            key: value
+            for key, value in payload.items()
+            if key not in {"ok", "status", "path", "file_path", "content", "text", "stdout", "entries", "items", "files", "count", "data"}
+        },
+        limit=3,
+    )
+    parts.extend(extra)
+    summary = f"{action}：" + "；".join(parts) if parts else f"{action}完成"
+    return ToolDisplay(name, title, summary, f"工具返回：{summary}。")
+
+
+def _format_run_python_result(name: str, payload: dict[str, Any]) -> ToolDisplay:
+    parts = _result_state_parts(payload)
+    returncode = _payload_nested_value(payload, "returncode", "exit_code")
+    if returncode is not None:
+        parts.append(f"退出码：{_summarize_value(returncode)}")
+    stdout = _payload_nested_value(payload, "stdout", "output", "content")
+    if stdout is not None:
+        parts.append(f"标准输出：{_summarize_value(stdout)}")
+    stderr = _payload_nested_value(payload, "stderr", "error")
+    if stderr:
+        parts.append(f"错误输出：{_summarize_value(stderr)}")
+    summary = "运行 Python：" + "；".join(parts) if parts else "运行 Python 完成"
+    return ToolDisplay(name, "运行 Python 结果", summary, f"工具返回：{summary}。")
+
+
+def _format_history_tool_result(name: str, payload: dict[str, Any]) -> ToolDisplay:
+    action = "读取最近聊天记录" if name == "get_recent_chat_messages" else "检索历史记录"
+    parts = _result_state_parts(payload)
+    count = _payload_nested_value(payload, "count")
+    if count is not None:
+        parts.append(f"数量：{_summarize_value(count)}")
+    content = _payload_nested_value(payload, "content", "text")
+    if content is not None:
+        parts.append(f"内容：{_summarize_value(content)}")
+    records = _payload_nested_value(payload, "records", "items", "messages")
+    if isinstance(records, list):
+        parts.append(f"记录：共 {len(records)} 项")
+    summary = f"{action}：" + "；".join(parts) if parts else f"{action}完成"
+    return ToolDisplay(name, f"{action}结果", summary, f"工具返回：{summary}。")
+
+
+def _format_upload_file_result(name: str, payload: dict[str, Any]) -> ToolDisplay:
+    parts = _result_state_parts(payload)
+    for key in ("target_type", "target_scope", "target_id", "group_id", "user_id", "file_path", "path"):
+        if key in payload:
+            parts.append(_summarize_key_value(key, _summarize_field_value(key, payload.get(key))))
+    summary = "上传文件：" + "；".join(parts) if parts else "上传文件完成"
+    return ToolDisplay(name, "上传文件结果", summary, f"工具返回：{summary}。")
+
+
+def _result_state_parts(payload: dict[str, Any]) -> list[str]:
+    parts: list[str] = []
+    if "ok" in payload:
+        parts.append("成功" if payload.get("ok") is True else "失败")
+    if payload.get("status") is not None:
+        parts.append(f"状态：{_status_label(_value_text(payload.get('status'))) or _value_text(payload.get('status'))}")
+    if payload.get("error") is not None:
+        parts.append(f"错误：{_summarize_value(payload.get('error'))}")
+    if payload.get("error_type") is not None:
+        parts.append(f"错误类型：{_summarize_value(payload.get('error_type'))}")
+    if payload.get("brief") is not None:
+        parts.append(f"摘要：{_summarize_value(payload.get('brief'))}")
+    return parts
+
+
+def _payload_nested_value(payload: dict[str, Any], *keys: str) -> Any:
+    for source in (payload, payload.get("data") if isinstance(payload.get("data"), dict) else {}):
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            if key in source and source.get(key) is not None:
+                return source.get(key)
+    return None
+
+
 def _format_generic_tool_result(name: str, payload: dict[str, Any]) -> ToolDisplay:
     parts = []
     handled_keys = {"status", "ok"}
     status = payload.get("status")
     if status is not None:
-        parts.append(f"状态 {_value_text(status)}")
+        parts.append(f"状态 {_status_label(_value_text(status)) or _value_text(status)}")
     elif "ok" in payload:
         parts.append("成功" if payload.get("ok") else "失败")
     delivery = _value_text(payload.get("delivery") or "")
@@ -416,10 +541,10 @@ def _format_generic_tool_result(name: str, payload: dict[str, Any]) -> ToolDispl
     return ToolDisplay(name, "工具返回", summary, "工具返回：" + summary + "。")
 
 
-def _summarize_mapping(values: dict[str, Any], *, limit: int = 5) -> list[str]:
+def _summarize_mapping(values: dict[str, Any], *, limit: int = 8) -> list[str]:
     parts = []
     for key, value in values.items():
-        parts.append(_summarize_key_value(str(key), _summarize_value(value)))
+        parts.append(_summarize_key_value(str(key), _summarize_field_value(str(key), value)))
         if len(parts) >= limit:
             break
     extra = len(values) - len(parts)
@@ -429,24 +554,121 @@ def _summarize_mapping(values: dict[str, Any], *, limit: int = 5) -> list[str]:
 
 
 def _summarize_key_value(key: str, value_summary: str) -> str:
+    label = _field_label(key)
     if value_summary.startswith(("列表", "对象")):
-        return f"{key} 为{value_summary}"
-    return f"{key} 为 {value_summary}"
+        return f"{label}为{value_summary}"
+    return f"{label}为 {value_summary}"
+
+
+def _summarize_field_value(key: str, value: Any) -> str:
+    if key == "ok" and isinstance(value, bool):
+        return "成功" if value else "失败"
+    if key in {"status", "delivery"}:
+        text = _value_text(value)
+        return _status_label(text) or text
+    if key == "qq_visible":
+        if value == "pending":
+            return "待确认"
+        if value is True:
+            return "已可见"
+        if value is False:
+            return "不可见"
+    if key in {"result_hash", "content_hash"} and value:
+        return f"已记录（{_short_text(_value_text(value), limit=16)}）"
+    return _summarize_value(value)
 
 
 def _summarize_value(value: Any) -> str:
     if isinstance(value, bool):
-        return "true" if value else "false"
+        return "是" if value else "否"
     if value is None:
-        return "null"
+        return "无"
     if isinstance(value, list):
         sample = _list_sample(value)
         suffix = f"，样例：{sample}" if sample else ""
-        return f"列表 {len(value)} 项{suffix}"
+        return f"列表，共 {len(value)} 项{suffix}"
     if isinstance(value, dict):
-        keys = "、".join(str(key) for key in list(value)[:4])
+        keys = "、".join(_field_label(str(key)) for key in list(value)[:4])
         return f"对象，包含 {keys}" if keys else "对象"
     return _short_text(_value_text(value), limit=96)
+
+
+_FIELD_LABELS = {
+    "tool_name": "工具",
+    "name": "名称",
+    "tool": "工具",
+    "status": "状态",
+    "ok": "结果",
+    "error": "错误",
+    "error_type": "错误类型",
+    "brief": "摘要",
+    "content": "内容",
+    "text": "文本",
+    "message": "消息",
+    "path": "路径",
+    "file_path": "文件路径",
+    "target_id": "目标 ID",
+    "target_scope": "目标范围",
+    "target_type": "目标类型",
+    "target_qq": "目标 QQ",
+    "group_id": "群号",
+    "user_id": "用户 ID",
+    "conversation_id": "会话",
+    "target_conversation_id": "目标会话",
+    "msg_id": "消息 ID",
+    "message_id": "消息 ID",
+    "reply_to_message_id": "引用消息 ID",
+    "order": "顺序",
+    "count": "数量",
+    "limit": "数量上限",
+    "query": "查询词",
+    "keyword": "关键词",
+    "reason": "原因",
+    "result_format": "结果格式",
+    "stop_after_tool": "工具后停止",
+    "turn_completion": "回合完成",
+    "args": "参数",
+    "arguments": "参数",
+    "raw_arguments": "参数",
+    "tool_args": "参数",
+    "input": "输入",
+    "parameters": "参数",
+    "result": "结果",
+    "tool_result": "工具结果",
+    "output": "输出",
+    "data": "数据",
+    "items": "条目",
+    "payload": "载荷",
+    "delivery": "投递状态",
+    "qq_visible": "QQ 可见性",
+    "send_id": "发送 ID",
+    "send_attempt_id": "发送尝试 ID",
+    "attempt_id": "尝试 ID",
+    "reviewed_until_seq": "已复核到编号",
+    "ignore_review_interrupts": "忽略复核打断",
+    "delivery_interrupt_policy": "投递打断策略",
+    "loop": "循环轮次",
+    "step": "步骤",
+    "args_keys": "参数字段",
+    "args_length": "参数长度",
+    "args_preview": "参数预览",
+    "result_keys": "结果字段",
+    "result_length": "结果长度",
+    "result_hash": "结果摘要",
+    "result_preview": "结果预览",
+    "content_length": "内容长度",
+    "content_hash": "内容摘要",
+    "pattern": "匹配模式",
+    "max_lines": "最大行数",
+    "timeout_seconds": "超时秒数",
+    "code": "代码",
+    "old": "原内容",
+    "new": "新内容",
+}
+
+
+def _field_label(key: str) -> str:
+    return _FIELD_LABELS.get(key, key.replace("_", " "))
 
 
 def _format_interrupts(value: Any, *, action: str, noun: str) -> str:
@@ -561,10 +783,19 @@ def _status_label(status: str) -> str:
         "accepted": "已接受",
         "queued": "排队中",
         "pending": "等待确认",
+        "started": "已开始",
+        "running": "运行中",
         "stale": "已过期",
         "failed": "失败",
+        "failure": "失败",
+        "success": "成功",
+        "succeeded": "成功",
+        "complete": "完成",
+        "completed": "完成",
         "needs_review": "等待复核",
         "needs_review_again": "等待再次复核",
+        "already_committed": "已提交",
+        "artifact": "已生成附件",
         "done": "完成",
     }
     return labels.get(status, status)

@@ -11,6 +11,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
+from ..tool_display import format_tool_call, format_tool_result
 from .display_items import _parse_float_value, _record_timestamp_sort_value
 from .grouping import _LEGACY_HEADER_RE, _conversation_info, _record_role
 from .models import DisplaySeverity
@@ -134,12 +135,7 @@ def _runtime_tool_call_for_record(rec: dict[str, Any], *, base_id: str) -> dict[
         "type": "function",
         "function": {
             "name": _runtime_event_tool_name(payload),
-            "arguments": json.dumps(
-                _runtime_tool_call_arguments(payload),
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            ),
+            "arguments": _runtime_tool_call_arguments_text(payload),
         },
     }
 
@@ -390,12 +386,7 @@ def _runtime_event_to_record(event: dict[str, Any]) -> dict[str, Any] | None:
             "type": "function",
             "function": {
                 "name": tool_name,
-                "arguments": json.dumps(
-                    _runtime_tool_call_arguments(payload),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                ),
+                "arguments": _runtime_tool_call_arguments_text(payload),
             },
         }
         return {
@@ -412,12 +403,7 @@ def _runtime_event_to_record(event: dict[str, Any]) -> dict[str, Any] | None:
             **base,
             "role": "tool",
             "tool_call_id": tool_call_id,
-            "content": json.dumps(
-                _runtime_tool_result_payload(payload, event),
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            ),
+            "content": _runtime_tool_result_content(payload, event),
         }
 
     return {
@@ -469,6 +455,13 @@ def _runtime_event_tool_name(payload: dict[str, Any]) -> str:
 
 
 def _runtime_tool_call_arguments(payload: dict[str, Any]) -> dict[str, Any]:
+    full_args = _runtime_payload_first_value(
+        payload,
+        ("args", "raw_arguments", "arguments", "tool_args", "input", "parameters"),
+    )
+    if full_args is not _MISSING_RUNTIME_VALUE:
+        parsed = _runtime_maybe_parse_json(full_args)
+        return parsed if isinstance(parsed, dict) else {"value": parsed}
     return _runtime_payload_subset(
         payload,
         (
@@ -484,10 +477,31 @@ def _runtime_tool_call_arguments(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _runtime_tool_call_arguments_text(payload: dict[str, Any]) -> str:
+    full_args = _runtime_payload_first_value(
+        payload,
+        ("args", "raw_arguments", "arguments", "tool_args", "input", "parameters"),
+    )
+    if isinstance(full_args, str) and full_args.strip():
+        return full_args
+    return json.dumps(
+        _runtime_tool_call_arguments(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+
 def _runtime_tool_result_payload(
     payload: dict[str, Any],
     event: dict[str, Any],
-) -> dict[str, Any]:
+) -> Any:
+    full_result = _runtime_payload_first_value(
+        payload,
+        ("result", "tool_result", "output", "content", "message", "data"),
+    )
+    if full_result is not _MISSING_RUNTIME_VALUE:
+        return full_result
     result = _runtime_payload_subset(
         payload,
         (
@@ -511,6 +525,49 @@ def _runtime_tool_result_payload(
         if tool_call_id:
             result["tool_call_id"] = tool_call_id
     return result or {"event_type": "tool_result_received"}
+
+
+_MISSING_RUNTIME_VALUE = object()
+
+
+def _runtime_payload_first_value(payload: dict[str, Any], keys: Iterable[str]) -> Any:
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if value is not None:
+            return value
+    return _MISSING_RUNTIME_VALUE
+
+
+def _runtime_payload_display_text(value: Any) -> str:
+    if value is _MISSING_RUNTIME_VALUE or value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, default=str)
+
+
+def _runtime_maybe_parse_json(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return value
+
+
+def _runtime_tool_result_content(payload: dict[str, Any], event: dict[str, Any]) -> str:
+    value = _runtime_tool_result_payload(payload, event)
+    tool_name = _runtime_event_tool_name(payload)
+    return format_tool_result(
+        _runtime_payload_json_text(value),
+        tool_name="" if tool_name == "未知工具" else tool_name,
+        tool_call_id=_runtime_event_tool_call_id(event, payload, fallback=""),
+    ).detail
 
 
 def _runtime_payload_subset(payload: dict[str, Any], keys: Iterable[str]) -> dict[str, Any]:
@@ -568,9 +625,42 @@ def _runtime_event_detail(
     if tool_call_id:
         parts.append(f"tool_call_id={tool_call_id}")
     parts.extend(_runtime_event_summary_parts(payload, include_preview=True))
+    parts.extend(_runtime_event_content_parts(event_type, payload, event))
     if not payload:
         parts.append("payload 为空")
     return "；".join(_unique_text_parts(parts))
+
+
+def _runtime_event_content_parts(
+    event_type: str,
+    payload: dict[str, Any],
+    event: dict[str, Any],
+) -> list[str]:
+    if event_type == "tool_call_started":
+        text = _runtime_tool_call_display_detail(payload, event)
+        return [f"参数：{text}"] if text else []
+    if event_type == "tool_result_received":
+        text = _runtime_tool_result_content(payload, event)
+        return [f"结果：{text}"] if text else []
+    if event_type == "system_note_recorded":
+        text = _runtime_payload_display_text(_runtime_system_note_content(payload))
+        return [f"内容：\n{text}"] if text else []
+    value = _runtime_payload_first_value(
+        payload,
+        ("content", "message", "text", "detail", "result", "data"),
+    )
+    text = _runtime_payload_display_text(value)
+    return [f"内容：\n{text}"] if text else []
+
+
+def _runtime_system_note_content(payload: dict[str, Any]) -> Any:
+    value = _runtime_payload_first_value(payload, ("content", "message", "text"))
+    if value is not _MISSING_RUNTIME_VALUE:
+        return value
+    record = payload.get("record")
+    if isinstance(record, dict):
+        return _runtime_payload_first_value(record, ("content", "message", "text"))
+    return _MISSING_RUNTIME_VALUE
 
 
 def _runtime_event_summary_parts(
@@ -582,10 +672,10 @@ def _runtime_event_summary_parts(
     for key, label in (
         ("tool_name", "工具"),
         ("status", "状态"),
-        ("send_id", "send_id"),
-        ("send_attempt_id", "send_attempt_id"),
-        ("attempt_id", "attempt_id"),
-        ("msg_id", "msg_id"),
+        ("send_id", "发送 ID"),
+        ("send_attempt_id", "发送尝试 ID"),
+        ("attempt_id", "尝试 ID"),
+        ("msg_id", "消息 ID"),
         ("delivery", "投递"),
         ("source_tool", "来源工具"),
         ("kind", "类型"),
@@ -601,8 +691,8 @@ def _runtime_event_summary_parts(
     for key, label in (
         ("count", "数量"),
         ("order", "顺序"),
-        ("loop", "loop"),
-        ("step", "step"),
+        ("loop", "循环轮次"),
+        ("step", "步骤"),
         ("args_length", "参数长度"),
         ("result_length", "结果长度"),
         ("content_length", "内容长度"),
@@ -634,7 +724,7 @@ def _runtime_event_summary_parts(
             parts.append(f"{label} [{shown}]")
     for key, label in (
         ("content_hash", "内容hash"),
-        ("result_hash", "结果hash"),
+        ("result_hash", "结果摘要"),
     ):
         value = _optional_record_text(payload.get(key))
         if value:
@@ -649,6 +739,27 @@ def _runtime_event_summary_parts(
             if value:
                 parts.append(f"{label}：{_compact_inline_tokens(value)}")
     return parts
+
+
+def _runtime_tool_call_display_detail(payload: dict[str, Any], event: dict[str, Any]) -> str:
+    tool_name = _runtime_event_tool_name(payload)
+    tool_call = {
+        "id": _runtime_event_tool_call_id(event, payload, fallback=""),
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "arguments": _runtime_tool_call_arguments_text(payload),
+        },
+    }
+    return format_tool_call(tool_call).detail
+
+
+def _runtime_payload_json_text(value: Any) -> str:
+    if value is _MISSING_RUNTIME_VALUE:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def _unique_text_parts(parts: Iterable[str]) -> list[str]:
@@ -825,6 +936,7 @@ def _merge_chat_page_records(
             for record in _history_runtime_event_records(
                 history_records,
                 skip_runtime_identities=event_runtime_identities,
+                visible_real_identities=visible_real_ids,
             )
         ],
     ]
@@ -982,19 +1094,32 @@ def _history_runtime_event_records(
     records: list[dict],
     *,
     skip_runtime_identities: set[tuple[str, ...]] | None = None,
+    visible_real_identities: set[tuple[str, str, str]] | None = None,
 ) -> list[dict]:
     skip_runtime_identities = skip_runtime_identities or set()
+    visible_real_identities = visible_real_identities or set()
     result: list[dict] = []
     for record in records:
-        if _history_runtime_record_has_duplicate(record, skip_runtime_identities):
+        record = _history_runtime_record_without_duplicate_parts(
+            record,
+            skip_runtime_identities,
+        )
+        if record is None:
             continue
         role = _record_role(record)
         content = str(record.get("content") or "")
         if role in {"system", "tool"} or _runtime_event_summary(content) is not None:
             result.append(record)
             continue
-        if role == "assistant" and not _record_is_qq_visible_outbound(record):
-            if content.strip() or record.get("tool_calls") or record.get("reasoning_content"):
+        if role == "assistant":
+            if _record_is_qq_visible_outbound(record):
+                if _real_record_identity(record) in visible_real_identities:
+                    record = _history_assistant_record_without_duplicate_visible_content(record)
+                    if not _history_assistant_record_has_displayable_parts(record):
+                        continue
+                elif record.get("_history_duplicate_tool_calls_stripped") is not True:
+                    continue
+            if _history_assistant_record_has_displayable_parts(record):
                 result.append(record)
     return result
 
@@ -1011,21 +1136,100 @@ def _event_store_runtime_duplicate_identities(records: list[dict]) -> set[tuple[
     return result
 
 
-def _history_runtime_record_has_duplicate(
+def _history_runtime_record_without_duplicate_parts(
     record: dict[str, Any],
     skip_runtime_identities: set[tuple[str, ...]],
-) -> bool:
+) -> dict[str, Any] | None:
     if not skip_runtime_identities:
-        return False
+        return record
     role = _record_role(record)
     if role == "assistant" and record.get("tool_calls"):
-        call_ids = [
-            str(tool_call.get("id") or "").strip()
-            for tool_call in record.get("tool_calls") or []
-            if isinstance(tool_call, dict) and str(tool_call.get("id") or "").strip()
-        ]
-        return bool(call_ids) and all(("tool_call", call_id) in skip_runtime_identities for call_id in call_ids)
-    return bool(_runtime_record_duplicate_identities(record) & skip_runtime_identities)
+        stripped = _history_assistant_record_without_duplicate_tool_calls(
+            record,
+            skip_runtime_identities,
+        )
+        return stripped if _history_assistant_record_has_displayable_parts(stripped) else None
+    if _runtime_record_duplicate_identities(record) & skip_runtime_identities:
+        return None
+    return record
+
+
+def _history_assistant_record_without_duplicate_tool_calls(
+    record: dict[str, Any],
+    skip_runtime_identities: set[tuple[str, ...]],
+) -> dict[str, Any]:
+    kept_tool_calls = []
+    removed_duplicate = False
+    for tool_call in record.get("tool_calls") or []:
+        if not isinstance(tool_call, dict):
+            kept_tool_calls.append(tool_call)
+            continue
+        tool_call_id = str(tool_call.get("id") or "").strip()
+        if tool_call_id and ("tool_call", tool_call_id) in skip_runtime_identities:
+            removed_duplicate = True
+            continue
+        kept_tool_calls.append(tool_call)
+    if not removed_duplicate:
+        return record
+    stripped = dict(record)
+    if kept_tool_calls:
+        stripped["tool_calls"] = kept_tool_calls
+    else:
+        stripped.pop("tool_calls", None)
+    stripped["_history_duplicate_tool_calls_stripped"] = True
+    reasoning = _history_assistant_reasoning_text(stripped)
+    if reasoning and not str(stripped.get("reasoning_content") or "").strip():
+        stripped["reasoning_content"] = reasoning
+    return stripped
+
+
+def _history_assistant_record_has_displayable_parts(record: dict[str, Any]) -> bool:
+    return bool(
+        str(record.get("content") or "").strip()
+        or record.get("tool_calls")
+        or _history_assistant_reasoning_text(record)
+    )
+
+
+def _history_assistant_record_without_duplicate_visible_content(record: dict[str, Any]) -> dict[str, Any]:
+    stripped = dict(record)
+    if str(stripped.get("content") or "").strip():
+        stripped["content"] = ""
+    reasoning = _history_assistant_reasoning_text(stripped)
+    if reasoning and not str(stripped.get("reasoning_content") or "").strip():
+        stripped["reasoning_content"] = reasoning
+    return stripped
+
+
+def _history_assistant_reasoning_text(record: dict[str, Any]) -> str:
+    reasoning_content = str(record.get("reasoning_content") or "").strip()
+    if reasoning_content:
+        return reasoning_content
+    blocks = record.get("reasoning_blocks")
+    if not isinstance(blocks, list):
+        return ""
+    parts: list[str] = []
+    for block in blocks:
+        text = _history_reasoning_block_text(block)
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _history_reasoning_block_text(block: Any) -> str:
+    if isinstance(block, str):
+        return block.strip()
+    if not isinstance(block, dict):
+        return ""
+    for key in ("text", "content", "reasoning", "summary"):
+        value = block.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if value is not None and not isinstance(value, str):
+            text = _runtime_payload_display_text(value).strip()
+            if text:
+                return text
+    return ""
 
 
 def _runtime_record_duplicate_identities(record: dict[str, Any]) -> set[tuple[str, ...]]:
@@ -1056,6 +1260,10 @@ def _system_note_duplicate_identity(record: dict[str, Any]) -> tuple[str, ...] |
     payload = record.get("metadata", {}).get("event_payload") if isinstance(record.get("metadata"), dict) else {}
     conversation_id = _record_conversation_id_for_display(record)
     if isinstance(payload, dict):
+        if record.get("_source") == "event_store":
+            content = _runtime_system_note_content(payload)
+            if content is _MISSING_RUNTIME_VALUE:
+                return None
         content_hash = _optional_record_text(payload.get("content_hash"))
         content_length = _optional_record_text(payload.get("content_length"))
         payload_conversation_id = _optional_record_text(payload.get("conversation_id"))

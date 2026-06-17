@@ -359,6 +359,58 @@ def test_adapter_from_config_server_loopback_binds_all_interfaces():
     assert conn.path == "/"
 
 
+@pytest.mark.asyncio
+async def test_reverse_ws_connection_connect_disables_environment_proxy(monkeypatch):
+    captured_calls: list[dict[str, Any]] = []
+    conn = ReverseWSConnection(
+        "ws://127.0.0.1:3001",
+        access_token="secret-token",
+        ping_interval=1.5,
+        ping_timeout=2.5,
+        initial_connect_timeout=0,
+        reconnect_interval=0,
+        max_reconnect_attempts=1,
+        reconnect_jitter=0,
+    )
+
+    class FakeWebSocket:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            return None
+
+    class FakeConnect:
+        def __init__(self, *args, **kwargs) -> None:
+            captured_calls.append({"args": args, "kwargs": kwargs})
+
+        async def __aenter__(self):
+            conn._stop_event.set()
+            return FakeWebSocket()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_connect(*args, **kwargs):
+        return FakeConnect(*args, **kwargs)
+
+    monkeypatch.setattr("adapters.napcat.connection.websockets.connect", fake_connect)
+
+    await conn._run_forever()
+
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["args"] == ("ws://127.0.0.1:3001",)
+    kwargs = captured_calls[0]["kwargs"]
+    assert kwargs["proxy"] is None
+    assert kwargs["additional_headers"] == {"Authorization": "Bearer secret-token"}
+    assert kwargs["ping_interval"] == 1.5
+    assert kwargs["ping_timeout"] == 2.5
+    assert kwargs["max_size"] == 2**24
+
+
 # ============================================================
 # NapCatAdapter 测试
 # ============================================================

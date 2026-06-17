@@ -75,6 +75,7 @@ def test_chats_display_cache_reuses_normalized_and_filtered_items(
         show_chat,
         show_system,
         show_tools,
+        show_reasoning=True,
         media_only=False,
     ):
         nonlocal filter_calls
@@ -85,6 +86,7 @@ def test_chats_display_cache_reuses_normalized_and_filtered_items(
             show_chat=show_chat,
             show_system=show_system,
             show_tools=show_tools,
+            show_reasoning=show_reasoning,
             media_only=media_only,
         )
 
@@ -256,6 +258,48 @@ def test_chats_normalizes_records_to_display_items():
     assert items[2].tool_results[0].kind == "tool_result"
     assert "QQ 可见性待确认" in items[2].tool_results[0].summary
     assert "outbound_message" not in [item.kind for item in items]
+
+
+def test_chats_build_display_items_filters_reasoning_independently_from_system():
+    records = [
+        {
+            "role": "assistant",
+            "content": "助手正文",
+            "reasoning_content": "独立思考内容",
+            "direction": "outbound",
+            "qq_visible": True,
+            "conversation_id": "group:1",
+        },
+        {
+            "role": "system",
+            "content": "系统消息内容",
+            "conversation_id": "group:1",
+        },
+    ]
+
+    without_system = _build_display_items(
+        records,
+        persona_name="玖",
+        search_text="",
+        show_chat=True,
+        show_system=False,
+        show_tools=True,
+        show_reasoning=True,
+    )
+    without_reasoning = _build_display_items(
+        records,
+        persona_name="玖",
+        search_text="",
+        show_chat=True,
+        show_system=True,
+        show_tools=True,
+        show_reasoning=False,
+    )
+
+    assert [item.kind for item in without_system] == ["reasoning", "outbound_message"]
+    assert [item.text for item in without_system] == ["独立思考内容", "助手正文"]
+    assert [item.kind for item in without_reasoning] == ["outbound_message", "system_event"]
+    assert "独立思考内容" not in [item.text for item in without_reasoning]
 
 
 def test_chats_build_display_items_keeps_tool_parent_when_result_matches():
@@ -568,7 +612,7 @@ def test_chats_tool_result_summary_shows_pending_state():
         persona_name="玖",
     )
 
-    assert "状态 accepted" in items[0].summary
+    assert "状态 已接受" in items[0].summary
     assert "正在投递" in items[0].summary
     assert "QQ 可见性待确认" in items[0].summary
     assert "工具返回" in html

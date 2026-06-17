@@ -73,7 +73,7 @@ class HistoryManager:
             task.add_done_callback(self._notify_tasks.discard)
 
     async def _append_records_and_mirror(self, records: list[dict]) -> None:
-        """先写完整 JSONL，再把轻量索引镜像到事件库。"""
+        """先写完整 JSONL，再把完整记录镜像到事件库。"""
         if not records:
             return
         history_start = await self._store.length()
@@ -114,7 +114,7 @@ class HistoryManager:
             logger.warning(f"history EventStore 截断镜像失败: {e}", exc_info=True)
 
     async def _record_system_note_event(self, record: dict) -> None:
-        """记录 system note 专用轻量事件，失败不影响 JSONL 历史。"""
+        """记录 system note 专用事件，失败不影响 JSONL 历史。"""
         if self._event_store is None:
             return
         try:
@@ -131,6 +131,8 @@ class HistoryManager:
                     "history_index": history_index,
                     "history_offset": history_index,
                     "conversation_id": conversation_id,
+                    "content": content,
+                    "record": record,
                     "content_hash": content_hash,
                     "content_length": content_length,
                     "record_keys": [str(key) for key in record.keys()],
@@ -353,6 +355,7 @@ def _history_record_event_payload(
         "conversation_id": conversation_id,
         "tool_call_id": _optional_text(record.get("tool_call_id")),
         "tool_call_ids": _tool_call_ids(record),
+        "record": record,
         "content_hash": content_hash,
         "content_length": content_length,
         "record_keys": [str(key) for key in record.keys()],

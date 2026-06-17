@@ -129,7 +129,7 @@ def test_dataclass_defaults_match_contract():
     assert asdict(profile) == {
         "user_id": "u1",
         "display_name": "",
-        "affinity": 0.0,
+        "affinity": 60.0,
         "summary": "",
         "traits": [],
         "interaction_count": 0,

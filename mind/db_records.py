@@ -120,7 +120,7 @@ def _prepare_dataclass_data(cls: type, data: dict[str, Any]) -> dict[str, Any]:
         prepared = {
             "user_id": _text_from(prepared, ("user_id", "profile_id", "id"), default=""),
             "display_name": _text_from(prepared, ("display_name", "nickname", "name"), default=""),
-            "affinity": _float_from(prepared, ("affinity",), default=0.0),
+            "affinity": _float_from(prepared, ("affinity",), default=60.0),
             "summary": _text_from(prepared, ("summary", "description"), default=""),
             "traits": _text_list_from(prepared, ("traits", "facts")),
             "interaction_count": _int_from(prepared, ("interaction_count",), default=0),

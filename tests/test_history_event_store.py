@@ -37,7 +37,7 @@ def _content_hash(content: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_history_event_store_success_writes_full_jsonl_and_light_mirror(
+async def test_history_event_store_success_writes_full_jsonl_and_full_mirror(
     tmp_path,
 ):
     history_path = tmp_path / "history.jsonl"
@@ -82,8 +82,8 @@ async def test_history_event_store_success_writes_full_jsonl_and_light_mirror(
     assert [event["event_id"] if event else None for event in events] == [2, None, 1]
     first_payload = events[2]["payload"]
     second_payload = events[0]["payload"]
-    assert "record" not in first_payload
-    assert "record" not in second_payload
+    assert first_payload["record"] == records[0]
+    assert second_payload["record"] == records[1]
     assert first_payload["history_index"] == 0
     assert first_payload["content_length"] == len("你好")
     assert first_payload["content_hash"] == _content_hash("你好")
@@ -244,7 +244,11 @@ async def test_history_truncate_rewrites_full_jsonl_and_mirrors_truncation(
         _content_hash("b"),
         _content_hash("c"),
     ]
-    assert all("record" not in event["payload"] for event in events[:3])
+    assert [event["payload"]["record"] for event in events[:3]] == [
+        {"role": "user", "content": "a", "conversation_id": "private:1"},
+        {"role": "assistant", "content": "b", "conversation_id": "private:1"},
+        {"role": "user", "content": "c", "conversation_id": "private:1"},
+    ]
     assert events[-1]["payload"] == {"cut_point": 2, "remaining_count": 1}
 
 
@@ -269,7 +273,7 @@ async def test_history_on_append_receives_full_records_when_event_store_enabled(
 
 
 @pytest.mark.asyncio
-async def test_history_add_system_note_writes_full_jsonl_and_light_events(tmp_path):
+async def test_history_add_system_note_writes_full_jsonl_and_full_events(tmp_path):
     history_path = tmp_path / "history.jsonl"
     event_store = EventStore(tmp_path / "events.sqlite3")
     history = HistoryManager(history_path, event_store=event_store)
@@ -288,13 +292,14 @@ async def test_history_add_system_note_writes_full_jsonl_and_light_events(tmp_pa
         "history_record_appended",
         "system_note_recorded",
     ]
-    assert "record" not in events[0]["payload"]
-    assert "content" not in events[0]["payload"]
+    assert events[0]["payload"]["record"] == expected[0]
+    assert events[0]["payload"]["record"]["content"] == content
     assert events[0]["payload"]["content_length"] == len(content)
     note_payload = events[1]["payload"]
     assert note_payload["role"] == "system"
     assert note_payload["history_index"] == 0
     assert note_payload["conversation_id"] == "private:123"
+    assert note_payload["content"] == content
+    assert note_payload["record"] == expected[0]
     assert note_payload["content_length"] == len(content)
-    assert "content" not in note_payload
     assert "preview" not in note_payload

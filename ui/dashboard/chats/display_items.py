@@ -322,6 +322,7 @@ def _filter_display_items(
     show_chat: bool,
     show_system: bool,
     show_tools: bool,
+    show_reasoning: bool = True,
     media_only: bool = False,
 ) -> list[DisplayItem]:
     query = search_text.strip().casefold()
@@ -334,6 +335,7 @@ def _filter_display_items(
             show_chat=show_chat,
             show_system=show_system,
             show_tools=show_tools,
+            show_reasoning=show_reasoning,
             media_only=media_only,
         )
     ]
@@ -346,7 +348,8 @@ def _display_item_matches_filters(
     show_chat: bool,
     show_system: bool,
     show_tools: bool,
-    media_only: bool,
+    show_reasoning: bool = True,
+    media_only: bool = False,
 ) -> bool:
     categories = _display_item_categories(item)
     if not show_chat and "chat" in categories:
@@ -355,6 +358,8 @@ def _display_item_matches_filters(
         categories.discard("system")
     if not show_tools and "tool" in categories:
         categories.discard("tool")
+    if not show_reasoning and "reasoning" in categories:
+        categories.discard("reasoning")
     if not categories:
         return False
     if media_only and not _display_item_has_media_or_file(item):
@@ -374,6 +379,8 @@ def _display_item_categories(item: DisplayItem) -> set[str]:
         return {"chat"}
     if item.kind in {"tool_call", "tool_result"}:
         return {"tool"}
+    if item.kind == "reasoning":
+        return {"reasoning"}
     return {"system"}
 
 

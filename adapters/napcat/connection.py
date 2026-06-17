@@ -240,6 +240,7 @@ class ReverseWSConnection(NapCatConnection):
                     ping_interval=self.ping_interval,
                     ping_timeout=self.ping_timeout,
                     max_size=2**24,  # 16 MB，支持大消息（如长群历史）
+                    proxy=None,
                 ) as ws:
                     self._ws = ws
                     self._connected_event.set()

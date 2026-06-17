@@ -27,8 +27,10 @@ from ui.dashboard.chats_page import (
 from ui.theme import palette_for_theme
 
 from tests.test_dashboard_p2 import (
+    _FakeEventStore,
     _StaticRecordStore,
     _dashboard_runtime,
+    _runtime_event,
     _timeline_record,
 )
 
@@ -689,6 +691,93 @@ async def test_chats_real_messages_sort_by_timeline_qq_time_not_tool_order(qapp,
     assert html.index(">试了<") < html.index("Debata · 发送私聊消息")
 
 
+@pytest.mark.asyncio
+async def test_chats_renders_history_reasoning_after_event_store_tool_dedupe(qapp, tmp_paths):
+    rt = _dashboard_runtime(tmp_paths)
+    rt.event_store = _FakeEventStore(
+        [
+            _runtime_event(
+                1,
+                "tool_call_started",
+                payload={
+                    "tool_name": "write_file",
+                    "tool_call_id": "tc-render",
+                    "args": {"path": "event-render.md"},
+                },
+                tool_call_id="tc-render",
+            ),
+            _runtime_event(
+                2,
+                "tool_result_received",
+                payload={
+                    "tool_name": "write_file",
+                    "tool_call_id": "tc-render",
+                    "result": {"ok": True, "content": "EventStore 渲染工具返回"},
+                },
+                tool_call_id="tc-render",
+            ),
+        ]
+    )
+    rt.history = _StaticRecordStore(
+        [
+            {
+                "id": "turn-render",
+                "role": "assistant",
+                "content": "助手最终正文",
+                "reasoning_content": "history 渲染思考",
+                "conversation_id": "private:10001",
+                "direction": "outbound",
+                "qq_visible": True,
+                "tool_calls": [
+                    {
+                        "id": "tc-render",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": '{"path":"history-render.md"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "tc-render",
+                "conversation_id": "private:10001",
+                "content": '{"ok":true,"content":"history 渲染工具返回"}',
+            },
+        ]
+    )
+    page = ChatsPage(rt)
+    page._expand_reasoning_cb.setChecked(True)
+    page._expand_tool_call_cb.setChecked(True)
+    page._expand_tool_result_cb.setChecked(True)
+
+    try:
+        records = await _load_chat_page_records(rt)
+        conv = next(item for item in _group_records_by_conversation(records) if item["key"] == "private:10001")
+        html = page._render_conversation(conv)
+
+        assert "history 渲染思考" in html
+        assert "助手最终正文" in html
+        assert "event-render.md" in html
+        assert "EventStore 渲染工具返回" in html
+        assert "路径：event-render.md" in html
+        assert "内容：EventStore 渲染工具返回" in html
+        assert "成功" in html
+        assert "history-render.md" not in html
+        assert "history 渲染工具返回" not in html
+        assert html.count("Debata · 工具调用：write_file") == 1
+        assert html.count("class='chat-record chat-event chat-event-tool'") == 2
+        assert html.find("Debata · 思考过程") < html.find("助手最终正文")
+        assert "&quot;tool_name&quot;" not in html
+        assert "&quot;content&quot;:" not in html
+        assert "result_hash" not in html
+    finally:
+        page._timer.stop()
+        page._refresh_debounce_timer.stop()
+        page._search_debounce_timer.stop()
+        page.deleteLater()
+
+
 def test_chats_bubble_style_separates_light_and_dark_from_card_background():
     light = _chat_html_style("light")
     dark = _chat_html_style("dark")
@@ -815,6 +904,7 @@ def test_chats_default_expand_controls_are_separate_from_type_filters(qapp, tmp_
     assert "聊天" in labels
     assert "系统" in labels
     assert "工具" in labels
+    assert "思考" in labels
     assert "展开思考" in labels
     assert "展开系统" in labels
     assert "展开工具调用" in labels
@@ -827,8 +917,10 @@ def test_chats_default_expand_controls_are_separate_from_type_filters(qapp, tmp_
             {
                 "id": "turn-1",
                 "role": "assistant",
-                "content": "",
+                "content": "助手回答",
                 "reasoning_content": "内部推理 raw-only",
+                "direction": "outbound",
+                "qq_visible": True,
                 "tool_calls": [
                     {
                         "id": "call-1",
@@ -867,3 +959,16 @@ def test_chats_default_expand_controls_are_separate_from_type_filters(qapp, tmp_
     assert "提交被打断的消息" not in hidden_tools
     assert "工具状态：已接受" not in hidden_tools
     assert "内部推理 raw-only" in hidden_tools
+
+    page._show_reasoning_cb.setChecked(False)
+    hidden_reasoning = page._render_conversation(conv)
+    assert "内部推理 raw-only" not in hidden_reasoning
+    assert "助手回答" in hidden_reasoning
+
+    page._show_system_cb.setChecked(False)
+    page._show_tools_cb.setChecked(False)
+    page._show_reasoning_cb.setChecked(True)
+    page._expand_reasoning_cb.setChecked(False)
+    chat_and_reasoning = page._render_conversation(conv)
+    assert chat_and_reasoning.find("Debata · 思考过程") < chat_and_reasoning.find("助手回答")
+    assert "内部推理 raw-only" not in chat_and_reasoning

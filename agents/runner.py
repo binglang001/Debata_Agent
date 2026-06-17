@@ -813,6 +813,8 @@ def _build_tool_started_event(
     payload = {
         "tool_call_id": tc.id,
         "tool_name": tc.name,
+        "args": args,
+        "raw_arguments": tc.arguments,
         **_tool_args_summary(args=args, raw_arguments=tc.arguments),
     }
     _add_loop_step(payload, loop=loop, step=step)
@@ -836,9 +838,13 @@ def _build_tool_result_event(
     payload = {
         "tool_call_id": tc.id,
         "tool_name": tc.name,
+        "raw_arguments": tc.arguments,
+        "result": result,
         **_tool_args_summary(args=args, raw_arguments=tc.arguments),
         **_tool_result_summary(result, error_type=error_type),
     }
+    if args is not None:
+        payload["args"] = args
     _add_loop_step(payload, loop=loop, step=step)
     return {
         "event_type": "tool_result_received",

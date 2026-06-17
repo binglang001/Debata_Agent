@@ -86,19 +86,22 @@ async def test_after_turn_valid_json_updates_state_and_runtime_records():
     assert "profile 字段包括 user_id、display_name、summary、traits、affinity" in prompt
     assert "traits 必须是 JSON 字符串数组" in prompt
     assert "私聊可省略 user_id 由系统推断，群聊必须带 user_id" in prompt
-    assert "affinity 是 0-100 的绝对亲近度" in prompt
+    assert "affinity 是 0-100 的目标绝对亲近度" in prompt
     assert "不是 0-1，也不是 1-10" in prompt
+    assert "AI 可以在有把握时填写以覆盖当前值" in prompt
     assert "0=陌生/排斥" in prompt
     assert "30=疏离" in prompt
     assert "50=普通熟人" in prompt
     assert "70=信任友好" in prompt
     assert "85=亲近在意" in prompt
     assert "95=核心亲密关系" in prompt
+    assert "首次建档若关系正常，应以 60/100 作为中性友好基线" in prompt
+    assert "不要从 0 起步" in prompt
     assert "relationship/affinity_delta 是本轮增减分" in prompt
     assert "普通一轮互动通常 -5 到 +5" in prompt
     assert "强烈事件可更大，但要写 reason" in prompt
-    assert "优先用 affinity_delta" in prompt
-    assert "不要随意用低 absolute affinity 覆盖" in prompt
+    assert "普通一轮互动可优先使用 affinity_delta，但不是唯一选项" in prompt
+    assert "已有关系写低绝对 affinity 意味着明确关系降温" in prompt
     assert "profile 事实仍不要塞短期情绪、一次性事件或临时状态" in prompt
     assert "social_need 表示社交未满足度" in prompt
     assert "0-5 非常罕见" in prompt
@@ -206,9 +209,9 @@ async def test_after_turn_prompt_uses_persona_context_view_ids_audits_and_delta_
     assert "audit_recent_1" in prompt
     assert "最近画像变动" in prompt
     assert "mem_user_1 用户偏好自然短句" in prompt
-    assert "普通一轮互动优先使用 affinity_delta" in prompt
-    assert "绝对 affinity 只用于首次建档或明确校准" in prompt
-    assert "不要随意用低 absolute affinity 覆盖" in prompt
+    assert "普通一轮互动可优先使用 affinity_delta，但不是唯一选项" in prompt
+    assert "AI 可以在有把握时填写以覆盖当前值" in prompt
+    assert "已有关系写低绝对 affinity 意味着明确关系降温" in prompt
     assert "已有项操作必须带上下文里出现过的真实 id" in prompt
     await agent.shutdown()
 

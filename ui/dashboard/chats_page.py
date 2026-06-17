@@ -252,9 +252,6 @@ from .chats.records import (
     _history_runtime_event_records as _history_runtime_event_records,
 )
 from .chats.records import (
-    _history_runtime_record_has_duplicate as _history_runtime_record_has_duplicate,
-)
-from .chats.records import (
     _light_archive_result_to_record as _light_archive_result_to_record,
 )
 from .chats.records import (
@@ -575,6 +572,11 @@ class ChatsPage(QWidget):
         self._show_tools_cb.setChecked(True)
         self._show_tools_cb.stateChanged.connect(self._on_filter_changed)
         filters.addWidget(self._show_tools_cb)
+
+        self._show_reasoning_cb = QCheckBox("思考")
+        self._show_reasoning_cb.setChecked(True)
+        self._show_reasoning_cb.stateChanged.connect(self._on_filter_changed)
+        filters.addWidget(self._show_reasoning_cb)
 
         self._media_only_cb = QCheckBox("只看图片/文件")
         self._media_only_cb.setChecked(False)
@@ -954,12 +956,13 @@ class ChatsPage(QWidget):
         else:
             bar.setValue(min(value, bar.maximum()))
 
-    def _display_filter_signature(self) -> tuple[str, bool, bool, bool, bool]:
+    def _display_filter_signature(self) -> tuple[str, bool, bool, bool, bool, bool]:
         return (
             self._search_text,
             self._show_chat_cb.isChecked(),
             self._show_system_cb.isChecked(),
             self._show_tools_cb.isChecked(),
+            self._show_reasoning_cb.isChecked(),
             self._media_only_cb.isChecked(),
         )
 
@@ -1000,6 +1003,7 @@ class ChatsPage(QWidget):
                 show_chat=self._show_chat_cb.isChecked(),
                 show_system=self._show_system_cb.isChecked(),
                 show_tools=self._show_tools_cb.isChecked(),
+                show_reasoning=self._show_reasoning_cb.isChecked(),
                 media_only=self._media_only_cb.isChecked(),
             )
             cache.filter_signature = filter_signature
@@ -1735,6 +1739,7 @@ def _build_display_items(
     show_chat: bool,
     show_system: bool,
     show_tools: bool,
+    show_reasoning: bool = True,
     media_only: bool = False,
 ) -> list[DisplayItem]:
     return _filter_display_items(
@@ -1743,6 +1748,7 @@ def _build_display_items(
         show_chat=show_chat,
         show_system=show_system,
         show_tools=show_tools,
+        show_reasoning=show_reasoning,
         media_only=media_only,
     )
 
@@ -2131,6 +2137,7 @@ def _render_record_html(
     show_chat: bool = True,
     show_system: bool = True,
     show_tools: bool = True,
+    show_reasoning: bool = True,
 ) -> str:
     bubbles = _render_record_bubbles(
         rec,
@@ -2138,6 +2145,7 @@ def _render_record_html(
         show_chat=show_chat,
         show_system=show_system,
         show_tools=show_tools,
+        show_reasoning=show_reasoning,
     )
     return "".join(bubbles)
 
@@ -2149,6 +2157,7 @@ def _render_record_bubbles(
     show_chat: bool = True,
     show_system: bool = True,
     show_tools: bool = True,
+    show_reasoning: bool = True,
     attached_tool_results: dict[str, list[dict]] | None = None,
 ) -> list[str]:
     items = normalize_history_record(rec, persona_name=persona_name)
@@ -2168,6 +2177,7 @@ def _render_record_bubbles(
         show_chat=show_chat,
         show_system=show_system,
         show_tools=show_tools,
+        show_reasoning=show_reasoning,
     )
     return [_render_display_item(item) for item in visible]
 
