@@ -37,6 +37,7 @@ class LegacyMemoryImportResult:
     rolling_summary: LegacyImportDomainResult
     usage: LegacyImportDomainResult
     events: LegacyImportDomainResult = LegacyImportDomainResult()
+    archive: LegacyImportDomainResult = LegacyImportDomainResult()
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +58,41 @@ class _LegacyEventRow:
     payload_json: str
     payload_hash: str
     schema_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyArchiveMessageRow:
+    rowid: int
+    archive_id: str
+    timestamp: Any
+    timestamp_unix: Any
+    date_key: Any
+    month_key: Any
+    conversation_id: Any
+    conversation_type: Any
+    target_id: Any
+    sender_id: Any
+    sender_name: Any
+    sender_role: Any
+    direction: Any
+    message_kind: Any
+    content: Any
+    content_search: Any
+    original_msg_id: Any
+    reply_to_msg_id: Any
+    metadata_json: Any
+    record_json: Any
+    created_at: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyArchiveMediaRow:
+    id: int
+    archive_id: str
+    media_type: Any
+    workspace_path: Any
+    original_name: Any
+    metadata_json: Any
 
 
 def import_legacy_memory_files(
@@ -119,6 +155,7 @@ async def _import_legacy_memory_files_async(
         )
         usage_result = _import_usage(target_db, source_path, normalized_usage_persona)
         events_result = _import_events(target_db, source_path, normalized_persona)
+        archive_result = _import_archive(target_db, source_path, normalized_persona)
     finally:
         if should_close_db:
             target_db.close()
@@ -130,6 +167,7 @@ async def _import_legacy_memory_files_async(
         rolling_summary=rolling_result,
         usage=usage_result,
         events=events_result,
+        archive=archive_result,
     )
 
 
@@ -254,6 +292,407 @@ def _import_events(
     return LegacyImportDomainResult(
         imported=imported,
         skipped=sqlite_skipped + append_skipped + duplicate_or_conflict_skipped,
+    )
+
+
+def _import_archive(
+    db: DianaDB,
+    source_dir: Path,
+    persona_id: str,
+) -> LegacyImportDomainResult:
+    path = source_dir / "archive.sqlite3"
+    if not path.exists():
+        return LegacyImportDomainResult()
+
+    message_rows, message_skipped, messages_exists = _read_legacy_archive_message_rows(path)
+    if not messages_exists:
+        return LegacyImportDomainResult(skipped=message_skipped)
+
+    media_rows, media_skipped, _ = _read_legacy_archive_media_rows(path)
+    imported, duplicate_or_conflict_skipped = _insert_archive_rows(
+        db,
+        persona_id,
+        message_rows,
+        media_rows,
+    )
+    return LegacyImportDomainResult(
+        imported=imported,
+        skipped=message_skipped + media_skipped + duplicate_or_conflict_skipped,
+    )
+
+
+def _read_legacy_archive_message_rows(
+    path: Path,
+) -> tuple[list[_LegacyArchiveMessageRow], int, bool]:
+    try:
+        with closing(sqlite3.connect(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            if not _legacy_sqlite_table_exists(conn, "archive_messages"):
+                logger.warning("旧 archive.sqlite3 缺少 archive_messages 表，跳过归档导入: %s", path)
+                return [], 0, False
+
+            columns = _legacy_sqlite_table_columns(conn, "archive_messages")
+            missing_columns = sorted(
+                set(_LEGACY_ARCHIVE_MESSAGE_REQUIRED_COLUMNS) - columns
+            )
+            if missing_columns:
+                skipped = _legacy_sqlite_row_count(conn, "archive_messages")
+                logger.warning(
+                    "旧 archive.sqlite3 archive_messages 缺少必要列，跳过归档导入: "
+                    "%s missing=%s",
+                    path,
+                    ",".join(missing_columns),
+                )
+                return [], skipped, False
+
+            select_columns = [
+                column
+                for column in _LEGACY_ARCHIVE_MESSAGE_COLUMNS
+                if column in columns
+            ]
+            source_rows = conn.execute(
+                f"""
+                SELECT {_sql_identifier_list(select_columns)}
+                FROM archive_messages
+                ORDER BY rowid ASC
+                """
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning("读取旧 archive.sqlite3 失败，跳过归档导入: %s error=%s", path, exc)
+        return [], 0, False
+
+    rows: list[_LegacyArchiveMessageRow] = []
+    skipped = 0
+    for index, source_row in enumerate(source_rows, start=1):
+        archive_row = _legacy_archive_message_row_from_mapping(
+            source_row,
+            f"{path}:archive_messages row {index}",
+        )
+        if archive_row is None:
+            skipped += 1
+            continue
+        rows.append(archive_row)
+    return rows, skipped, True
+
+
+def _read_legacy_archive_media_rows(
+    path: Path,
+) -> tuple[list[_LegacyArchiveMediaRow], int, bool]:
+    try:
+        with closing(sqlite3.connect(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            if not _legacy_sqlite_table_exists(conn, "archive_message_media"):
+                logger.warning(
+                    "旧 archive.sqlite3 缺少 archive_message_media 表，跳过归档媒体导入: %s",
+                    path,
+                )
+                return [], 0, False
+
+            columns = _legacy_sqlite_table_columns(conn, "archive_message_media")
+            missing_columns = sorted(set(_LEGACY_ARCHIVE_MEDIA_COLUMNS) - columns)
+            if missing_columns:
+                skipped = _legacy_sqlite_row_count(conn, "archive_message_media")
+                logger.warning(
+                    "旧 archive.sqlite3 archive_message_media 缺少必要列，跳过归档媒体: "
+                    "%s missing=%s",
+                    path,
+                    ",".join(missing_columns),
+                )
+                return [], skipped, True
+
+            source_rows = conn.execute(
+                f"""
+                SELECT {_sql_identifier_list(_LEGACY_ARCHIVE_MEDIA_COLUMNS)}
+                FROM archive_message_media
+                ORDER BY id ASC
+                """
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning(
+            "读取旧 archive.sqlite3 媒体表失败，跳过归档媒体导入: %s error=%s",
+            path,
+            exc,
+        )
+        return [], 0, False
+
+    rows: list[_LegacyArchiveMediaRow] = []
+    skipped = 0
+    for index, source_row in enumerate(source_rows, start=1):
+        media_row = _legacy_archive_media_row_from_mapping(
+            source_row,
+            f"{path}:archive_message_media row {index}",
+        )
+        if media_row is None:
+            skipped += 1
+            continue
+        rows.append(media_row)
+    return rows, skipped, True
+
+
+def _legacy_archive_message_row_from_mapping(
+    record: sqlite3.Row,
+    location: str,
+) -> _LegacyArchiveMessageRow | None:
+    rowid = _positive_int(_mapping_value(record, "rowid"))
+    archive_id = _required_archive_id(_mapping_value(record, "archive_id"))
+    if rowid is None or archive_id is None:
+        logger.warning("跳过缺少关键字段的旧归档消息行: %s", location)
+        return None
+
+    return _LegacyArchiveMessageRow(
+        rowid=rowid,
+        archive_id=archive_id,
+        timestamp=_mapping_value(record, "timestamp"),
+        timestamp_unix=_mapping_value(record, "timestamp_unix"),
+        date_key=_mapping_value(record, "date_key"),
+        month_key=_mapping_value(record, "month_key"),
+        conversation_id=_mapping_value(record, "conversation_id"),
+        conversation_type=_mapping_value(record, "conversation_type"),
+        target_id=_mapping_value(record, "target_id"),
+        sender_id=_mapping_value(record, "sender_id"),
+        sender_name=_mapping_value(record, "sender_name"),
+        sender_role=_mapping_value(record, "sender_role"),
+        direction=_mapping_value(record, "direction"),
+        message_kind=_mapping_value(record, "message_kind"),
+        content=_mapping_value(record, "content"),
+        content_search=_mapping_value(record, "content_search"),
+        original_msg_id=_mapping_value(record, "original_msg_id"),
+        reply_to_msg_id=_mapping_value(record, "reply_to_msg_id"),
+        metadata_json=_mapping_value(record, "metadata_json"),
+        record_json=_mapping_value(record, "record_json"),
+        created_at=_mapping_value(record, "created_at"),
+    )
+
+
+def _legacy_archive_media_row_from_mapping(
+    record: sqlite3.Row,
+    location: str,
+) -> _LegacyArchiveMediaRow | None:
+    media_id = _positive_int(_mapping_value(record, "id"))
+    archive_id = _required_archive_id(_mapping_value(record, "archive_id"))
+    if media_id is None or archive_id is None:
+        logger.warning("跳过缺少关键字段的旧归档媒体行: %s", location)
+        return None
+
+    return _LegacyArchiveMediaRow(
+        id=media_id,
+        archive_id=archive_id,
+        media_type=_mapping_value(record, "media_type"),
+        workspace_path=_mapping_value(record, "workspace_path"),
+        original_name=_mapping_value(record, "original_name"),
+        metadata_json=_mapping_value(record, "metadata_json"),
+    )
+
+
+def _insert_archive_rows(
+    db: DianaDB,
+    persona_id: str,
+    message_rows: Sequence[_LegacyArchiveMessageRow],
+    media_rows: Sequence[_LegacyArchiveMediaRow],
+) -> tuple[int, int]:
+    imported = 0
+    skipped = 0
+    with closing(_connect_for_import(db)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            messages_by_rowid = _existing_archive_messages_by_rowid(conn, persona_id)
+            messages_by_archive_id = _existing_archive_messages_by_archive_id(
+                conn,
+                persona_id,
+            )
+            blocked_archive_ids: set[str] = set()
+            for row in message_rows:
+                existing_by_rowid = messages_by_rowid.get(row.rowid)
+                existing_by_archive_id = messages_by_archive_id.get(row.archive_id)
+                if (
+                    existing_by_rowid is not None
+                    and existing_by_archive_id is not None
+                    and _archive_message_identity(existing_by_rowid)
+                    != _archive_message_identity(existing_by_archive_id)
+                ):
+                    skipped += 1
+                    blocked_archive_ids.add(row.archive_id)
+                    logger.warning(
+                        "跳过冲突的旧归档消息 rowid=%s archive_id=%s persona_id=%s",
+                        row.rowid,
+                        row.archive_id,
+                        persona_id,
+                    )
+                    continue
+
+                existing = existing_by_rowid or existing_by_archive_id
+                if existing is not None:
+                    skipped += 1
+                    if not _legacy_archive_messages_equivalent(existing, row):
+                        blocked_archive_ids.add(row.archive_id)
+                        logger.warning(
+                            "跳过冲突的旧归档消息 rowid=%s archive_id=%s persona_id=%s",
+                            row.rowid,
+                            row.archive_id,
+                            persona_id,
+                        )
+                    continue
+
+                _insert_archive_message_row(conn, persona_id, row)
+                messages_by_rowid[row.rowid] = row
+                messages_by_archive_id[row.archive_id] = row
+                imported += 1
+
+            archive_ids = set(messages_by_archive_id)
+            media_by_id = _existing_archive_media_by_id(conn, persona_id)
+            for row in media_rows:
+                if row.archive_id in blocked_archive_ids:
+                    skipped += 1
+                    logger.warning(
+                        "跳过关联冲突归档消息的旧归档媒体 id=%s archive_id=%s persona_id=%s",
+                        row.id,
+                        row.archive_id,
+                        persona_id,
+                    )
+                    continue
+                if row.archive_id not in archive_ids:
+                    skipped += 1
+                    logger.warning(
+                        "跳过孤儿旧归档媒体 id=%s archive_id=%s persona_id=%s",
+                        row.id,
+                        row.archive_id,
+                        persona_id,
+                    )
+                    continue
+
+                existing = media_by_id.get(row.id)
+                if existing is not None:
+                    skipped += 1
+                    if not _legacy_archive_media_equivalent(existing, row):
+                        logger.warning(
+                            "跳过冲突的旧归档媒体 id=%s archive_id=%s persona_id=%s",
+                            row.id,
+                            row.archive_id,
+                            persona_id,
+                        )
+                    continue
+
+                _insert_archive_media_row(conn, persona_id, row)
+                media_by_id[row.id] = row
+                imported += 1
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+    return imported, skipped
+
+
+def _existing_archive_messages_by_rowid(
+    conn: sqlite3.Connection,
+    persona_id: str,
+) -> dict[int, sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM archive_messages
+        WHERE persona_id = ?
+        """,
+        (persona_id,),
+    ).fetchall()
+    return {int(row["rowid"]): row for row in rows}
+
+
+def _existing_archive_messages_by_archive_id(
+    conn: sqlite3.Connection,
+    persona_id: str,
+) -> dict[str, sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM archive_messages
+        WHERE persona_id = ?
+        """,
+        (persona_id,),
+    ).fetchall()
+    return {str(row["archive_id"]): row for row in rows}
+
+
+def _existing_archive_media_by_id(
+    conn: sqlite3.Connection,
+    persona_id: str,
+) -> dict[int, sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM archive_message_media
+        WHERE persona_id = ?
+        """,
+        (persona_id,),
+    ).fetchall()
+    return {int(row["id"]): row for row in rows}
+
+
+def _insert_archive_message_row(
+    conn: sqlite3.Connection,
+    persona_id: str,
+    row: _LegacyArchiveMessageRow,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO archive_messages (
+            persona_id, rowid, archive_id, timestamp, timestamp_unix,
+            date_key, month_key, conversation_id, conversation_type,
+            target_id, sender_id, sender_name, sender_role, direction,
+            message_kind, content, content_search, original_msg_id,
+            reply_to_msg_id, metadata_json, record_json, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            persona_id,
+            row.rowid,
+            row.archive_id,
+            row.timestamp,
+            row.timestamp_unix,
+            row.date_key,
+            row.month_key,
+            row.conversation_id,
+            row.conversation_type,
+            row.target_id,
+            row.sender_id,
+            row.sender_name,
+            row.sender_role,
+            row.direction,
+            row.message_kind,
+            row.content,
+            row.content_search,
+            row.original_msg_id,
+            row.reply_to_msg_id,
+            row.metadata_json,
+            row.record_json,
+            row.created_at,
+        ),
+    )
+
+
+def _insert_archive_media_row(
+    conn: sqlite3.Connection,
+    persona_id: str,
+    row: _LegacyArchiveMediaRow,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO archive_message_media (
+            persona_id, id, archive_id, media_type, workspace_path,
+            original_name, metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            persona_id,
+            row.id,
+            row.archive_id,
+            row.media_type,
+            row.workspace_path,
+            row.original_name,
+            row.metadata_json,
+        ),
     )
 
 
@@ -560,6 +999,69 @@ _LEGACY_EVENT_EQUIVALENCE_COLUMNS = (
 )
 
 
+_LEGACY_ARCHIVE_MESSAGE_COLUMNS = (
+    "rowid",
+    "archive_id",
+    "timestamp",
+    "timestamp_unix",
+    "date_key",
+    "month_key",
+    "conversation_id",
+    "conversation_type",
+    "target_id",
+    "sender_id",
+    "sender_name",
+    "sender_role",
+    "direction",
+    "message_kind",
+    "content",
+    "content_search",
+    "original_msg_id",
+    "reply_to_msg_id",
+    "metadata_json",
+    "record_json",
+    "created_at",
+)
+_LEGACY_ARCHIVE_MESSAGE_REQUIRED_COLUMNS = tuple(
+    column for column in _LEGACY_ARCHIVE_MESSAGE_COLUMNS if column != "record_json"
+)
+_LEGACY_ARCHIVE_MEDIA_COLUMNS = (
+    "id",
+    "archive_id",
+    "media_type",
+    "workspace_path",
+    "original_name",
+    "metadata_json",
+)
+
+
+def _legacy_archive_messages_equivalent(
+    existing: sqlite3.Row | _LegacyArchiveMessageRow,
+    incoming: _LegacyArchiveMessageRow,
+) -> bool:
+    return all(
+        _archive_message_value(existing, column) == getattr(incoming, column)
+        for column in _LEGACY_ARCHIVE_MESSAGE_COLUMNS
+    )
+
+
+def _legacy_archive_media_equivalent(
+    existing: sqlite3.Row | _LegacyArchiveMediaRow,
+    incoming: _LegacyArchiveMediaRow,
+) -> bool:
+    return all(
+        _archive_media_value(existing, column) == getattr(incoming, column)
+        for column in _LEGACY_ARCHIVE_MEDIA_COLUMNS
+    )
+
+
+def _archive_message_identity(row: sqlite3.Row | _LegacyArchiveMessageRow) -> tuple[int, str]:
+    return (
+        int(_archive_message_value(row, "rowid")),
+        str(_archive_message_value(row, "archive_id")),
+    )
+
+
 def _insert_usage_records(
     db: DianaDB,
     records: Sequence[dict[str, Any]],
@@ -714,6 +1216,41 @@ def _connect_for_import(db: DianaDB) -> sqlite3.Connection:
     return conn
 
 
+def _legacy_sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        """,
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _legacy_sqlite_table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        str(row["name"])
+        for row in conn.execute(f"PRAGMA table_info({_quote_sql_identifier(table)})").fetchall()
+    }
+
+
+def _legacy_sqlite_row_count(conn: sqlite3.Connection, table: str) -> int:
+    return int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM {_quote_sql_identifier(table)}"
+        ).fetchone()[0]
+    )
+
+
+def _sql_identifier_list(columns: Sequence[str]) -> str:
+    return ", ".join(_quote_sql_identifier(column) for column in columns)
+
+
+def _quote_sql_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 def _mapping_value(record: sqlite3.Row | dict[str, Any], key: str) -> Any:
     if isinstance(record, dict):
         return record.get(key)
@@ -722,6 +1259,24 @@ def _mapping_value(record: sqlite3.Row | dict[str, Any], key: str) -> Any:
 
 def _event_value(record: sqlite3.Row | _LegacyEventRow, key: str) -> Any:
     if isinstance(record, _LegacyEventRow):
+        return getattr(record, key)
+    return record[key]
+
+
+def _archive_message_value(
+    record: sqlite3.Row | _LegacyArchiveMessageRow,
+    key: str,
+) -> Any:
+    if isinstance(record, _LegacyArchiveMessageRow):
+        return getattr(record, key)
+    return record[key]
+
+
+def _archive_media_value(
+    record: sqlite3.Row | _LegacyArchiveMediaRow,
+    key: str,
+) -> Any:
+    if isinstance(record, _LegacyArchiveMediaRow):
         return getattr(record, key)
     return record[key]
 
@@ -762,6 +1317,10 @@ def _record_text(value: Any) -> str | None:
 def _required_text(value: Any) -> str | None:
     text = _optional_text(value)
     return text
+
+
+def _required_archive_id(value: Any) -> str | None:
+    return _optional_text(value)
 
 
 def _required_raw_json_text(value: Any) -> str | None:

@@ -12,6 +12,7 @@ from memory.diana_importers import (
     import_legacy_memory_files,
 )
 from memory.diana_stores import (
+    DianaArchiveStore,
     DianaEventStore,
     DianaHistoryStore,
     DianaImportantStore,
@@ -292,6 +293,296 @@ def test_import_legacy_memory_files_keeps_personas_isolated(tmp_path):
     ]
 
 
+def test_import_legacy_archive_preserves_messages_media_and_store_reads(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    first = _legacy_archive_message(
+        3,
+        archive_id="old-3",
+        content="第一条",
+        content_search="第一条 keyword",
+        timestamp_unix=100,
+    )
+    second = _legacy_archive_message(
+        8,
+        archive_id="old-8",
+        content="第二条 [图片 workspace=img/a.jpg name=a.jpg]",
+        content_search="第二条 keyword [图片 workspace=img/a.jpg name=a.jpg]",
+        timestamp_unix=110,
+    )
+    media = _legacy_archive_media(12, archive_id="old-8", workspace_path="img/a.jpg")
+    _write_legacy_archive_sqlite(source_dir / "archive.sqlite3", [first, second], [media])
+
+    result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.archive == LegacyImportDomainResult(imported=3, skipped=0)
+    assert _archive_message_rows(db_path, "yuexi") == [
+        {"persona_id": "yuexi", **first},
+        {"persona_id": "yuexi", **second},
+    ]
+    assert _archive_media_rows(db_path, "yuexi") == [
+        {"persona_id": "yuexi", **media},
+    ]
+
+    store = DianaArchiveStore(db_path, "yuexi")
+    assert [record["archive_id"] for record in asyncio.run(store.records())] == [
+        "old-3",
+        "old-8",
+    ]
+    assert [item["id"] for item in asyncio.run(store.media_records())] == [12]
+    assert [item["archive_id"] for item in asyncio.run(store.media_records("old-8"))] == [
+        "old-8",
+    ]
+    assert [record["content"] for record in asyncio.run(store.search(keyword="keyword"))] == [
+        "第一条",
+        "第二条 [图片 workspace=img/a.jpg name=a.jpg]",
+    ]
+    filtered = asyncio.run(
+        store.filter_records(
+            {
+                "conversation_ids": ["private:1"],
+                "keywords": ["keyword"],
+                "limit": 10,
+                "order": "asc",
+            }
+        )
+    )
+    assert [item["id"] for item in filtered["results"]] == ["old-3", "old-8"]
+    assert [record["archive_id"] for record in asyncio.run(store.get_by_ids(["old-8"]))] == [
+        "old-8",
+    ]
+    assert [
+        record["archive_id"]
+        for record in asyncio.run(store.context_around("old-8", before=1, after=1))
+    ] == ["old-3", "old-8"]
+    assert [record["archive_id"] for record in asyncio.run(store.rag_records())] == [
+        "old-3",
+        "old-8",
+    ]
+
+
+def test_import_legacy_archive_is_idempotent(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    message = _legacy_archive_message(1, archive_id="same-1", content="重复归档")
+    media = _legacy_archive_media(1, archive_id="same-1", workspace_path="same.jpg")
+    _write_legacy_archive_sqlite(source_dir / "archive.sqlite3", [message], [media])
+
+    first = import_legacy_memory_files(db_path, source_dir, "yuexi")
+    second = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert first.archive == LegacyImportDomainResult(imported=2, skipped=0)
+    assert second.archive == LegacyImportDomainResult(imported=0, skipped=2)
+    assert _archive_message_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **message}]
+    assert _archive_media_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **media}]
+
+
+def test_import_legacy_archive_message_conflict_warns_and_keeps_existing(tmp_path, caplog):
+    source_dir = tmp_path / "legacy"
+    conflict_source = tmp_path / "legacy_conflict"
+    db_path = tmp_path / "diana.db"
+    original = _legacy_archive_message(1, archive_id="old-1", content="原始")
+    rowid_conflict = _legacy_archive_message(1, archive_id="other-1", content="冲突 rowid")
+    archive_id_conflict = _legacy_archive_message(2, archive_id="old-1", content="冲突 id")
+    _write_legacy_archive_sqlite(source_dir / "archive.sqlite3", [original], [])
+    _write_legacy_archive_sqlite(
+        conflict_source / "archive.sqlite3",
+        [rowid_conflict, archive_id_conflict],
+        [],
+    )
+
+    first = import_legacy_memory_files(db_path, source_dir, "yuexi")
+    with caplog.at_level("WARNING"):
+        second = import_legacy_memory_files(db_path, conflict_source, "yuexi")
+
+    assert first.archive == LegacyImportDomainResult(imported=1, skipped=0)
+    assert second.archive == LegacyImportDomainResult(imported=0, skipped=2)
+    assert _archive_message_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **original}]
+    assert "跳过冲突的旧归档消息 rowid=1 archive_id=other-1" in caplog.text
+    assert "跳过冲突的旧归档消息 rowid=2 archive_id=old-1" in caplog.text
+
+
+def test_import_legacy_archive_media_orphan_and_conflict_warn(tmp_path, caplog):
+    source_dir = tmp_path / "legacy"
+    conflict_source = tmp_path / "legacy_conflict"
+    db_path = tmp_path / "diana.db"
+    message = _legacy_archive_message(1, archive_id="old-1", content="有媒体")
+    original_media = _legacy_archive_media(1, archive_id="old-1", workspace_path="keep.jpg")
+    orphan_media = _legacy_archive_media(2, archive_id="missing", workspace_path="orphan.jpg")
+    media_conflict = _legacy_archive_media(1, archive_id="old-1", workspace_path="changed.jpg")
+    _write_legacy_archive_sqlite(source_dir / "archive.sqlite3", [message], [original_media])
+    _write_legacy_archive_sqlite(
+        conflict_source / "archive.sqlite3",
+        [message],
+        [orphan_media, media_conflict],
+    )
+
+    first = import_legacy_memory_files(db_path, source_dir, "yuexi")
+    with caplog.at_level("WARNING"):
+        second = import_legacy_memory_files(db_path, conflict_source, "yuexi")
+
+    assert first.archive == LegacyImportDomainResult(imported=2, skipped=0)
+    assert second.archive == LegacyImportDomainResult(imported=0, skipped=3)
+    assert _archive_media_rows(db_path, "yuexi") == [
+        {"persona_id": "yuexi", **original_media},
+    ]
+    assert "跳过孤儿旧归档媒体 id=2 archive_id=missing" in caplog.text
+    assert "跳过冲突的旧归档媒体 id=1 archive_id=old-1" in caplog.text
+
+
+def test_import_legacy_archive_without_record_json_uses_store_fallback(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    message = _legacy_archive_message(4, archive_id="no-record", content="无原始 JSON")
+    _write_legacy_archive_sqlite(
+        source_dir / "archive.sqlite3",
+        [message],
+        [],
+        include_record_json=False,
+    )
+
+    result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.archive == LegacyImportDomainResult(imported=1, skipped=0)
+    row = _archive_message_rows(db_path, "yuexi")[0]
+    assert row["record_json"] is None
+    loaded = asyncio.run(DianaArchiveStore(db_path, "yuexi").records())
+    assert loaded == [
+        {
+            "role": "user",
+            "content": "无原始 JSON",
+            "conversation_id": "private:1",
+            "metadata": {"source": "legacy-test"},
+            "archive_id": "no-record",
+        }
+    ]
+
+
+def test_import_legacy_archive_missing_required_message_column_skips_media(
+    tmp_path,
+    caplog,
+):
+    source_dir = tmp_path / "legacy"
+    broken_source = tmp_path / "broken"
+    db_path = tmp_path / "diana.db"
+    existing_message = _legacy_archive_message(1, archive_id="shared", content="已有归档")
+    existing_media = _legacy_archive_media(
+        1,
+        archive_id="shared",
+        workspace_path="existing.jpg",
+    )
+    broken_message = _legacy_archive_message(2, archive_id="shared", content="坏库归档")
+    broken_media = _legacy_archive_media(
+        2,
+        archive_id="shared",
+        workspace_path="wrongly-attached.jpg",
+    )
+    _write_legacy_archive_sqlite(
+        source_dir / "archive.sqlite3",
+        [existing_message],
+        [existing_media],
+    )
+    _write_legacy_archive_sqlite_missing_message_column(
+        broken_source / "archive.sqlite3",
+        [broken_message],
+        [broken_media],
+    )
+
+    first = import_legacy_memory_files(db_path, source_dir, "yuexi")
+    with caplog.at_level("WARNING"):
+        second = import_legacy_memory_files(db_path, broken_source, "yuexi")
+
+    assert first.archive == LegacyImportDomainResult(imported=2, skipped=0)
+    assert second.archive == LegacyImportDomainResult(imported=0, skipped=1)
+    assert _archive_message_rows(db_path, "yuexi") == [
+        {"persona_id": "yuexi", **existing_message},
+    ]
+    assert _archive_media_rows(db_path, "yuexi") == [
+        {"persona_id": "yuexi", **existing_media},
+    ]
+    assert "archive_messages 缺少必要列，跳过归档导入" in caplog.text
+    assert "missing=content" in caplog.text
+
+
+def test_import_legacy_archive_skips_bad_rows_without_aborting(tmp_path, caplog):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    valid = _legacy_archive_message(1, archive_id="valid", content="有效行")
+    bad_message = _legacy_archive_message(2, archive_id=" ", content="缺 archive_id")
+    bad_media = _legacy_archive_media(1, archive_id=" ", workspace_path="bad.jpg")
+    _write_legacy_archive_sqlite(
+        source_dir / "archive.sqlite3",
+        [valid, bad_message],
+        [bad_media],
+    )
+
+    with caplog.at_level("WARNING"):
+        result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.archive == LegacyImportDomainResult(imported=1, skipped=2)
+    assert _archive_message_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **valid}]
+    assert _archive_media_rows(db_path, "yuexi") == []
+    assert "跳过缺少关键字段的旧归档消息行" in caplog.text
+    assert "跳过缺少关键字段的旧归档媒体行" in caplog.text
+
+
+def test_import_legacy_archive_missing_file_and_tables_do_not_crash(tmp_path, caplog):
+    source_dir = tmp_path / "missing"
+    source_dir.mkdir()
+    db_path = tmp_path / "diana.db"
+
+    missing_result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert missing_result.archive == LegacyImportDomainResult(imported=0, skipped=0)
+
+    no_messages_dir = tmp_path / "no_messages"
+    sqlite_path = no_messages_dir / "archive.sqlite3"
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE unrelated(id INTEGER PRIMARY KEY)")
+
+    with caplog.at_level("WARNING"):
+        no_messages_result = import_legacy_memory_files(db_path, no_messages_dir, "yuexi")
+
+    assert no_messages_result.archive == LegacyImportDomainResult(imported=0, skipped=0)
+    assert "旧 archive.sqlite3 缺少 archive_messages 表" in caplog.text
+
+    no_media_dir = tmp_path / "no_media"
+    message = _legacy_archive_message(1, archive_id="message-only", content="只有消息")
+    _write_legacy_archive_sqlite(
+        no_media_dir / "archive.sqlite3",
+        [message],
+        [],
+        include_media_table=False,
+    )
+
+    with caplog.at_level("WARNING"):
+        no_media_result = import_legacy_memory_files(db_path, no_media_dir, "yuexi")
+
+    assert no_media_result.archive == LegacyImportDomainResult(imported=1, skipped=0)
+    assert "旧 archive.sqlite3 缺少 archive_message_media 表" in caplog.text
+
+
+def test_import_legacy_archive_keeps_personas_isolated(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    message = _legacy_archive_message(1, archive_id="shared", content="共享旧归档")
+    media = _legacy_archive_media(1, archive_id="shared", workspace_path="shared.jpg")
+    _write_legacy_archive_sqlite(source_dir / "archive.sqlite3", [message], [media])
+
+    first = import_legacy_memory_files(db_path, source_dir, "yuexi")
+    second = import_legacy_memory_files(db_path, source_dir, "jiu")
+
+    assert first.archive == LegacyImportDomainResult(imported=2, skipped=0)
+    assert second.archive == LegacyImportDomainResult(imported=2, skipped=0)
+    assert _archive_message_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **message}]
+    assert _archive_message_rows(db_path, "jiu") == [{"persona_id": "jiu", **message}]
+    assert _archive_media_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **media}]
+    assert _archive_media_rows(db_path, "jiu") == [{"persona_id": "jiu", **media}]
+    assert asyncio.run(DianaArchiveStore(db_path, "yuexi").records())[0]["archive_id"] == "shared"
+    assert asyncio.run(DianaArchiveStore(db_path, "jiu").records())[0]["archive_id"] == "shared"
+
+
 def test_import_legacy_events_sqlite_preserves_fields_and_store_reads(tmp_path):
     source_dir = tmp_path / "legacy"
     db_path = tmp_path / "diana.db"
@@ -556,6 +847,165 @@ def _write_legacy_event_sqlite(path: Path, rows: list[dict]) -> None:
         )
 
 
+def _write_legacy_archive_sqlite(
+    path: Path,
+    messages: list[dict],
+    media: list[dict],
+    *,
+    include_record_json: bool = True,
+    include_media_table: bool = True,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        record_json_column = "record_json TEXT," if include_record_json else ""
+        conn.execute(
+            f"""
+            CREATE TABLE archive_messages (
+                rowid INTEGER PRIMARY KEY,
+                archive_id TEXT UNIQUE NOT NULL,
+                timestamp TEXT,
+                timestamp_unix INTEGER,
+                date_key TEXT,
+                month_key TEXT,
+                conversation_id TEXT,
+                conversation_type TEXT,
+                target_id TEXT,
+                sender_id TEXT,
+                sender_name TEXT,
+                sender_role TEXT,
+                direction TEXT,
+                message_kind TEXT,
+                content TEXT,
+                content_search TEXT,
+                original_msg_id TEXT,
+                reply_to_msg_id TEXT,
+                metadata_json TEXT,
+                {record_json_column}
+                created_at TEXT
+            )
+            """
+        )
+        if include_record_json:
+            conn.executemany(
+                """
+                INSERT INTO archive_messages (
+                    rowid, archive_id, timestamp, timestamp_unix, date_key,
+                    month_key, conversation_id, conversation_type, target_id,
+                    sender_id, sender_name, sender_role, direction, message_kind,
+                    content, content_search, original_msg_id, reply_to_msg_id,
+                    metadata_json, record_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [_legacy_archive_message_sql_values(row) for row in messages],
+            )
+        else:
+            conn.executemany(
+                """
+                INSERT INTO archive_messages (
+                    rowid, archive_id, timestamp, timestamp_unix, date_key,
+                    month_key, conversation_id, conversation_type, target_id,
+                    sender_id, sender_name, sender_role, direction, message_kind,
+                    content, content_search, original_msg_id, reply_to_msg_id,
+                    metadata_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [_legacy_archive_message_sql_values_without_record_json(row) for row in messages],
+            )
+        if include_media_table:
+            conn.execute(
+                """
+                CREATE TABLE archive_message_media (
+                    id INTEGER PRIMARY KEY,
+                    archive_id TEXT NOT NULL,
+                    media_type TEXT,
+                    workspace_path TEXT,
+                    original_name TEXT,
+                    metadata_json TEXT
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO archive_message_media (
+                    id, archive_id, media_type, workspace_path, original_name, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [_legacy_archive_media_sql_values(row) for row in media],
+            )
+
+
+def _write_legacy_archive_sqlite_missing_message_column(
+    path: Path,
+    messages: list[dict],
+    media: list[dict],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE archive_messages (
+                rowid INTEGER PRIMARY KEY,
+                archive_id TEXT UNIQUE NOT NULL,
+                timestamp TEXT,
+                timestamp_unix INTEGER,
+                date_key TEXT,
+                month_key TEXT,
+                conversation_id TEXT,
+                conversation_type TEXT,
+                target_id TEXT,
+                sender_id TEXT,
+                sender_name TEXT,
+                sender_role TEXT,
+                direction TEXT,
+                message_kind TEXT,
+                content_search TEXT,
+                original_msg_id TEXT,
+                reply_to_msg_id TEXT,
+                metadata_json TEXT,
+                record_json TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO archive_messages (
+                rowid, archive_id, timestamp, timestamp_unix, date_key,
+                month_key, conversation_id, conversation_type, target_id,
+                sender_id, sender_name, sender_role, direction, message_kind,
+                content_search, original_msg_id, reply_to_msg_id, metadata_json,
+                record_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [_legacy_archive_message_sql_values_without_content(row) for row in messages],
+        )
+        conn.execute(
+            """
+            CREATE TABLE archive_message_media (
+                id INTEGER PRIMARY KEY,
+                archive_id TEXT NOT NULL,
+                media_type TEXT,
+                workspace_path TEXT,
+                original_name TEXT,
+                metadata_json TEXT
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO archive_message_media (
+                id, archive_id, media_type, workspace_path, original_name, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [_legacy_archive_media_sql_values(row) for row in media],
+        )
+
+
 def _legacy_event(
     event_id: int,
     *,
@@ -612,6 +1062,120 @@ def _legacy_event_sql_values(row: dict) -> tuple:
         row["payload_json"],
         row["payload_hash"],
         row["schema_version"],
+    )
+
+
+def _legacy_archive_message(
+    rowid: int,
+    *,
+    archive_id: str | None = None,
+    content: str = "旧归档",
+    content_search: str | None = None,
+    timestamp: str = "2026-06-18 12:00:00",
+    timestamp_unix: int = 1_782_000_000,
+    conversation_id: str = "private:1",
+    metadata: dict | None = None,
+    record: dict | None = None,
+) -> dict:
+    metadata_data = {"source": "legacy-test"} if metadata is None else metadata
+    record_data = (
+        {
+            "role": "user",
+            "content": content,
+            "conversation_id": conversation_id,
+            "metadata": metadata_data,
+        }
+        if record is None
+        else record
+    )
+    return {
+        "rowid": rowid,
+        "archive_id": archive_id or f"old-{rowid}",
+        "timestamp": timestamp,
+        "timestamp_unix": timestamp_unix,
+        "date_key": "2026-06-18",
+        "month_key": "2026-06",
+        "conversation_id": conversation_id,
+        "conversation_type": "private",
+        "target_id": "1",
+        "sender_id": "user-1",
+        "sender_name": "Alice",
+        "sender_role": "user",
+        "direction": "inbound",
+        "message_kind": "text",
+        "content": content,
+        "content_search": content if content_search is None else content_search,
+        "original_msg_id": f"msg-{rowid}",
+        "reply_to_msg_id": None,
+        "metadata_json": orjson.dumps(metadata_data).decode("utf-8"),
+        "record_json": orjson.dumps(record_data).decode("utf-8"),
+        "created_at": "2026-06-18 12:00:01",
+    }
+
+
+def _legacy_archive_media(
+    media_id: int,
+    *,
+    archive_id: str,
+    media_type: str = "image",
+    workspace_path: str = "image.jpg",
+    original_name: str = "image.jpg",
+    metadata: dict | None = None,
+) -> dict:
+    return {
+        "id": media_id,
+        "archive_id": archive_id,
+        "media_type": media_type,
+        "workspace_path": workspace_path,
+        "original_name": original_name,
+        "metadata_json": orjson.dumps(metadata or {"source": "legacy-test"}).decode("utf-8"),
+    }
+
+
+def _legacy_archive_message_sql_values(row: dict) -> tuple:
+    return (
+        row["rowid"],
+        row["archive_id"],
+        row["timestamp"],
+        row["timestamp_unix"],
+        row["date_key"],
+        row["month_key"],
+        row["conversation_id"],
+        row["conversation_type"],
+        row["target_id"],
+        row["sender_id"],
+        row["sender_name"],
+        row["sender_role"],
+        row["direction"],
+        row["message_kind"],
+        row["content"],
+        row["content_search"],
+        row["original_msg_id"],
+        row["reply_to_msg_id"],
+        row["metadata_json"],
+        row["record_json"],
+        row["created_at"],
+    )
+
+
+def _legacy_archive_message_sql_values_without_record_json(row: dict) -> tuple:
+    values = _legacy_archive_message_sql_values(row)
+    return (*values[:19], values[20])
+
+
+def _legacy_archive_message_sql_values_without_content(row: dict) -> tuple:
+    values = _legacy_archive_message_sql_values(row)
+    return (*values[:14], *values[15:])
+
+
+def _legacy_archive_media_sql_values(row: dict) -> tuple:
+    return (
+        row["id"],
+        row["archive_id"],
+        row["media_type"],
+        row["workspace_path"],
+        row["original_name"],
+        row["metadata_json"],
     )
 
 
@@ -694,6 +1258,36 @@ def _event_rows(db_path: Path, persona_id: str) -> list[dict]:
             FROM event_log
             WHERE persona_id = ?
             ORDER BY event_id ASC
+            """,
+            (persona_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _archive_message_rows(db_path: Path, persona_id: str) -> list[dict]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM archive_messages
+            WHERE persona_id = ?
+            ORDER BY rowid ASC
+            """,
+            (persona_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _archive_media_rows(db_path: Path, persona_id: str) -> list[dict]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM archive_message_media
+            WHERE persona_id = ?
+            ORDER BY id ASC
             """,
             (persona_id,),
         ).fetchall()
