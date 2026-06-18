@@ -10,6 +10,11 @@
     get_config            —— 获取已加载的全局单例
 """
 
+from .config_migration import (
+    CURRENT_CONFIG_VERSION,
+    ConfigMigrationReport,
+    migrate_config,
+)
 from .data_migration import DataMigrationError, ensure_data_root_initialized
 from .loader import (
     ConfigError,
@@ -63,6 +68,10 @@ __all__ = [
     "get_application_version",
     "create_default_registry",
     "VersionRegistry",
+    # config migration
+    "CURRENT_CONFIG_VERSION",
+    "ConfigMigrationReport",
+    "migrate_config",
     # schema
     "RootConfig",
     "AppMeta",

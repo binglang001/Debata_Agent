@@ -624,10 +624,12 @@ def test_save_creates_backup(tmp_paths, fake_keyring):
     save_config(tmp_paths, cfg, backup=False)
     assert tmp_paths.CONFIG_FILE.exists()
 
-    # 第二次保存应生成 .bak
+    # 第二次保存应生成版本化备份。
     save_config(tmp_paths, cfg, backup=True)
-    backup_path = tmp_paths.CONFIG_FILE.with_suffix(".yaml.bak")
-    assert backup_path.exists()
+    backup_dir = tmp_paths.DATA_DIR / "config_backups"
+    backups = list(backup_dir.glob("config-*-v2.yaml"))
+    assert len(backups) == 1
+    assert not tmp_paths.CONFIG_FILE.with_suffix(".yaml.bak").exists()
 
 
 def test_optional_agents_default_none(tmp_paths, fake_keyring):
