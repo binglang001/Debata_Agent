@@ -257,6 +257,49 @@
 
 约束：`PRIMARY KEY(persona_id, name)`。
 
+#### DianaEventStore 接口
+
+`memory.diana_stores.DianaEventStore(db, persona_id)` 是 `event_log` / `event_projection_state` 的轻量事件仓储，面向 `EventJournal` 的当前调用面实现。构造参数：
+
+- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `persona_id`：人格 ID；去除首尾空白后不能为空。事件 ID、幂等键、读取查询都按 persona 隔离。
+
+异步接口与 `EventJournal` 依赖的 `EventStore` 调用面对齐：
+
+- `start_projection() -> None`：确保 schema 与当前状态可用；不启动后台 worker。
+- `append_event(...) -> int`：追加单条事件，关键字参数形状与旧 `EventStore.append_event()` 一致。
+- `append_events(events) -> list[int]`：追加一批事件，返回与输入顺序对应的 event_id。
+- `wait_projected(event_id=None, timeout=None) -> bool`：`event_id is None` 时刷新当前 persona 最大 event_id 后立即返回已追平；显式 event_id 已存在时立即返回 `True`，未来 event_id 会短间隔轮询当前 persona 最大 event_id，直到到达目标或 timeout 到期。
+- `stats() -> dict[str, Any]`：返回当前 persona 的事件进度和固定投影指标。
+- `shutdown(timeout=5.0) -> bool` / `close(timeout=5.0) -> bool`：标记仓储关闭；无后台 worker 需要回收。
+- `get_event(event_id) -> dict[str, Any] | None`
+- `get_events(event_ids) -> list[dict[str, Any] | None]`
+- `iter_events(limit=100, after_event_id=None, before_event_id=None, order="asc") -> list[dict[str, Any]]`
+- `events_for_conversation(conversation_id, limit=100, before_event_id=None) -> list[dict[str, Any]]`
+- `events_by_type(event_type, limit=100, after_event_id=None, before_event_id=None, order="asc") -> list[dict[str, Any]]`
+
+写入语义：
+
+- 不复制旧 `EventStore` 的外置 append-log、后台投影 worker 和 backpressure 机制。
+- `append_events()` 在单个 SQLite `BEGIN IMMEDIATE` 事务中直接写入 `event_log`，并同步更新 `event_projection_state(persona_id, "last_projected_event_id")` 到当前 persona 最大 event_id。
+- 因没有后台投影 worker，`wait_projected()` 等待的是当前 persona 的事件 ID 到达目标；显式未来 event_id 仍保持旧 `EventStore` 的等待/超时契约。
+- 每个新事件按当前 persona 的 `MAX(event_id) + 1` 分配连续 event_id；不同 persona 的 event_id 序列互不影响。
+- 同批和已有库内的 `idempotency_key` 在同一 persona 内返回已有 event_id，不重复写入；不同 persona 的幂等键空间隔离。
+- 多实例并发时，实例内锁保证同一对象顺序写入；跨实例依赖 SQLite 主键/唯一约束，并在冲突后重查以避免同一 persona 重复 event_id 或重复幂等事件。
+- `payload_json`、`payload_hash`、`schema_version` 使用旧事件归一化逻辑生成并原样写入，不在 diana 仓储层重写 payload。
+
+读取语义：
+
+- 所有读取只返回当前 persona 的事件。
+- 返回 dict 与旧 `_row_to_event()` 一致，包含解析后的 `payload` 以及原始 `payload_json` / `payload_hash`。
+- `limit` clamp、`after_event_id` / `before_event_id` 游标、`order` 校验、会话最近页升序返回、类型分页语义与旧 `EventStore` 保持一致。
+
+状态语义：
+
+- `stats()` 中 `last_appended_event_id` 与 `last_projected_event_id` 均为当前 persona 最大 event_id。
+- `projection_lag=0`、`pending_count=0`、`projection_error_count=0`、`last_projection_error=None`、`last_projection_error_event_id=None`、`projection_running=False`。
+- `closed` 反映 `shutdown()` / `close()` 是否已调用。
+
 ### archive_messages
 
 复制现 `memory/archive_sqlite.py` 的 `archive_messages` 字段，并新增 `persona_id`。

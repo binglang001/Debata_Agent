@@ -7,7 +7,9 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
 import time
+from collections.abc import Mapping
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +21,17 @@ from providers.base import Usage
 from utils.usage_summary import UsageRange, UsageSummary, cutoff_timestamp
 
 from .diana_db import DianaDB
+from .event_store import (
+    _clamp_limit,
+    _clean_optional,
+    _clean_required,
+    _cursor_where,
+    _normalize_event,
+    _normalize_order,
+    _PendingEvent,
+    _positive_int_or_none,
+    _row_to_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -723,6 +736,529 @@ class DianaUsageStatsStore:
         return db.connect()
 
 
+class DianaEventStore:
+    """使用 diana.db 的 event_log 表实现 EventJournal 可用的事件仓储。"""
+
+    _PROJECTION_STATE_NAME = "last_projected_event_id"
+    _schema_lock = threading.Lock()
+    _schema_ready_paths: set[Path] = set()
+
+    def __init__(self, db: DianaDB | str | Path, persona_id: str) -> None:
+        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+        self._schema_path = self._db.path.expanduser().resolve()
+        self.persona_id = str(persona_id).strip()
+        if not self.persona_id:
+            raise ValueError("persona_id must not be empty")
+        self._lock = asyncio.Lock()
+        self._load_lock = asyncio.Lock()
+        self._loaded = False
+        self._closed = False
+        self._last_appended_event_id = 0
+        self._last_projected_event_id = 0
+
+    @property
+    def db(self) -> DianaDB:
+        return self._db
+
+    async def start_projection(self) -> None:
+        """兼容 EventStore 入口：diana.db 写入即投影，无后台 worker。"""
+
+        await self._ensure_loaded()
+
+    async def append_event(
+        self,
+        *,
+        event_type: str,
+        payload: Any,
+        event_uuid: str | None = None,
+        conversation_id: str | None = None,
+        session_id: str | None = None,
+        turn_id: str | int | None = None,
+        source: str | None = None,
+        external_id: str | None = None,
+        tool_call_id: str | None = None,
+        parent_event_id: int | None = None,
+        idempotency_key: str | None = None,
+        timestamp_unix: float | int | None = None,
+        created_at_unix: float | int | None = None,
+        schema_version: int = 1,
+    ) -> int:
+        ids = await self.append_events(
+            [
+                {
+                    "event_type": event_type,
+                    "event_uuid": event_uuid,
+                    "conversation_id": conversation_id,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "source": source,
+                    "external_id": external_id,
+                    "tool_call_id": tool_call_id,
+                    "parent_event_id": parent_event_id,
+                    "idempotency_key": idempotency_key,
+                    "timestamp_unix": timestamp_unix,
+                    "created_at_unix": created_at_unix,
+                    "payload": payload,
+                    "schema_version": schema_version,
+                }
+            ]
+        )
+        return ids[0]
+
+    async def append_events(self, events: list[Mapping[str, Any]]) -> list[int]:
+        if not events:
+            return []
+
+        pending = [_normalize_event(event) for event in events]
+        await self._ensure_loaded()
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("DianaEventStore is closed")
+            ids, max_event_id = await asyncio.to_thread(self._append_events_sync, pending)
+            self._last_appended_event_id = max_event_id
+            self._last_projected_event_id = max_event_id
+            return ids
+
+    async def wait_projected(
+        self,
+        event_id: int | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> bool:
+        """等待当前 persona 至少出现指定 event_id。"""
+
+        await self._ensure_loaded()
+        if event_id is None:
+            await self._refresh_event_ids()
+            return True
+
+        target_event_id = _positive_int_or_none(event_id)
+        if target_event_id is None:
+            return True
+
+        if await self._refresh_event_ids() >= target_event_id:
+            return True
+
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + max(0.0, float(timeout))
+        poll_interval = self._projection_poll_interval(timeout)
+        while True:
+            if deadline is None:
+                await asyncio.sleep(poll_interval)
+            else:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                await asyncio.sleep(min(poll_interval, remaining))
+            if await self._refresh_event_ids() >= target_event_id:
+                return True
+
+    async def stats(self) -> dict[str, Any]:
+        await self._ensure_loaded()
+        max_event_id = await asyncio.to_thread(self._max_event_id_sync)
+        self._last_appended_event_id = max_event_id
+        self._last_projected_event_id = max_event_id
+        return {
+            "last_appended_event_id": max_event_id,
+            "last_projected_event_id": max_event_id,
+            "projection_lag": 0,
+            "pending_count": 0,
+            "projection_error_count": 0,
+            "last_projection_error": None,
+            "last_projection_error_event_id": None,
+            "projection_running": False,
+            "closed": self._closed,
+        }
+
+    async def shutdown(self, timeout: float | None = 5.0) -> bool:
+        del timeout
+        await self._ensure_loaded()
+        async with self._lock:
+            self._closed = True
+        return True
+
+    async def close(self, timeout: float | None = 5.0) -> bool:
+        return await self.shutdown(timeout=timeout)
+
+    async def get_event(self, event_id: int) -> dict[str, Any] | None:
+        event_id = _positive_int_or_none(event_id)
+        if event_id is None:
+            return None
+        await self._ensure_loaded()
+        return await asyncio.to_thread(self._get_event_sync, event_id)
+
+    async def get_events(self, event_ids: list[int]) -> list[dict[str, Any] | None]:
+        normalized_ids = [_positive_int_or_none(event_id) for event_id in event_ids]
+        query_ids = list(dict.fromkeys(event_id for event_id in normalized_ids if event_id))
+        if not query_ids:
+            return [None for _ in normalized_ids]
+        await self._ensure_loaded()
+        events_by_id = await asyncio.to_thread(self._get_events_sync, query_ids)
+        return [
+            events_by_id.get(event_id) if event_id is not None else None
+            for event_id in normalized_ids
+        ]
+
+    async def iter_events(
+        self,
+        limit: int = 100,
+        after_event_id: int | None = None,
+        before_event_id: int | None = None,
+        order: str = "asc",
+    ) -> list[dict[str, Any]]:
+        limit = _clamp_limit(limit)
+        after_event_id = _positive_int_or_none(after_event_id)
+        before_event_id = _positive_int_or_none(before_event_id)
+        order = _normalize_order(order)
+        await self._ensure_loaded()
+        return await asyncio.to_thread(
+            self._iter_events_sync,
+            limit,
+            after_event_id,
+            before_event_id,
+            order,
+        )
+
+    async def events_for_conversation(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        before_event_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        conversation_id = _clean_optional(conversation_id)
+        if conversation_id is None:
+            return []
+        limit = _clamp_limit(limit)
+        before_event_id = _positive_int_or_none(before_event_id)
+        await self._ensure_loaded()
+        return await asyncio.to_thread(
+            self._events_for_conversation_sync,
+            conversation_id,
+            limit,
+            before_event_id,
+        )
+
+    async def events_by_type(
+        self,
+        event_type: str,
+        *,
+        limit: int = 100,
+        after_event_id: int | None = None,
+        before_event_id: int | None = None,
+        order: str = "asc",
+    ) -> list[dict[str, Any]]:
+        event_type = _clean_required(event_type, "event_type")
+        limit = _clamp_limit(limit)
+        after_event_id = _positive_int_or_none(after_event_id)
+        before_event_id = _positive_int_or_none(before_event_id)
+        order = _normalize_order(order)
+        await self._ensure_loaded()
+        return await asyncio.to_thread(
+            self._events_by_type_sync,
+            event_type,
+            limit,
+            after_event_id,
+            before_event_id,
+            order,
+        )
+
+    async def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        async with self._load_lock:
+            if self._loaded:
+                return
+            await asyncio.to_thread(self._ensure_schema_sync)
+            max_event_id = await asyncio.to_thread(self._max_event_id_sync)
+            self._last_appended_event_id = max_event_id
+            self._last_projected_event_id = max_event_id
+            self._loaded = True
+
+    async def _refresh_event_ids(self) -> int:
+        max_event_id = await asyncio.to_thread(self._max_event_id_sync)
+        self._last_appended_event_id = max_event_id
+        self._last_projected_event_id = max_event_id
+        return max_event_id
+
+    @staticmethod
+    def _projection_poll_interval(timeout: float | None) -> float:
+        if timeout is None:
+            return 0.01
+        timeout_seconds = max(0.0, float(timeout))
+        if timeout_seconds <= 0:
+            return 0.001
+        return min(0.01, max(0.001, timeout_seconds / 10))
+
+    def _append_events_sync(self, events: list[_PendingEvent]) -> tuple[list[int], int]:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                next_event_id = self._max_event_id(conn) + 1
+                ids: list[int] = []
+                batch_idempotency: dict[str, int] = {}
+
+                for event in events:
+                    existing_id = self._existing_event_id(
+                        conn,
+                        event,
+                        batch_idempotency,
+                    )
+                    if existing_id is not None:
+                        ids.append(existing_id)
+                        continue
+
+                    while True:
+                        try:
+                            self._insert_event(conn, next_event_id, event)
+                        except sqlite3.IntegrityError:
+                            existing_id = self._idempotency_event_id(
+                                conn,
+                                event.idempotency_key,
+                            )
+                            if existing_id is not None:
+                                ids.append(existing_id)
+                                batch_idempotency[event.idempotency_key or ""] = existing_id
+                                break
+                            latest_event_id = self._max_event_id(conn)
+                            if latest_event_id >= next_event_id:
+                                next_event_id = latest_event_id + 1
+                                continue
+                            raise
+                        ids.append(next_event_id)
+                        if event.idempotency_key is not None:
+                            batch_idempotency[event.idempotency_key] = next_event_id
+                        next_event_id += 1
+                        break
+
+                max_event_id = self._max_event_id(conn)
+                self._set_projection_progress(conn, max_event_id)
+            except Exception:
+                conn.rollback()
+                raise
+            conn.commit()
+        return ids, max_event_id
+
+    def _existing_event_id(
+        self,
+        conn: sqlite3.Connection,
+        event: _PendingEvent,
+        batch_idempotency: dict[str, int],
+    ) -> int | None:
+        key = event.idempotency_key
+        if key is None:
+            return None
+        existing_id = batch_idempotency.get(key)
+        if existing_id is not None:
+            return existing_id
+        existing_id = self._idempotency_event_id(conn, key)
+        if existing_id is not None:
+            batch_idempotency[key] = existing_id
+        return existing_id
+
+    def _idempotency_event_id(
+        self,
+        conn: sqlite3.Connection,
+        idempotency_key: str | None,
+    ) -> int | None:
+        if idempotency_key is None:
+            return None
+        row = conn.execute(
+            """
+            SELECT event_id
+            FROM event_log
+            WHERE persona_id = ? AND idempotency_key = ?
+            """,
+            (self.persona_id, idempotency_key),
+        ).fetchone()
+        return None if row is None else int(row["event_id"])
+
+    def _insert_event(
+        self,
+        conn: sqlite3.Connection,
+        event_id: int,
+        event: _PendingEvent,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO event_log (
+                persona_id, event_id, event_type, event_uuid, conversation_id,
+                session_id, turn_id, source, external_id, tool_call_id,
+                parent_event_id, idempotency_key, timestamp_unix,
+                created_at_unix, payload_json, payload_hash, schema_version
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self.persona_id,
+                event_id,
+                event.event_type,
+                event.event_uuid,
+                event.conversation_id,
+                event.session_id,
+                event.turn_id,
+                event.source,
+                event.external_id,
+                event.tool_call_id,
+                event.parent_event_id,
+                event.idempotency_key,
+                event.timestamp_unix,
+                event.created_at_unix,
+                event.payload_json,
+                event.payload_hash,
+                event.schema_version,
+            ),
+        )
+
+    def _set_projection_progress(
+        self,
+        conn: sqlite3.Connection,
+        event_id: int,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO event_projection_state(persona_id, name, value)
+            VALUES (?, ?, ?)
+            ON CONFLICT(persona_id, name) DO UPDATE SET value = excluded.value
+            """,
+            (self.persona_id, self._PROJECTION_STATE_NAME, str(event_id)),
+        )
+
+    def _get_event_sync(self, event_id: int) -> dict[str, Any] | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM event_log
+                WHERE persona_id = ? AND event_id = ?
+                """,
+                (self.persona_id, event_id),
+            ).fetchone()
+        return _row_to_event(row) if row is not None else None
+
+    def _get_events_sync(self, event_ids: list[int]) -> dict[int, dict[str, Any]]:
+        placeholders = ", ".join("?" for _ in event_ids)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM event_log
+                WHERE persona_id = ? AND event_id IN ({placeholders})
+                """,
+                [self.persona_id, *event_ids],
+            ).fetchall()
+        return {int(row["event_id"]): _row_to_event(row) for row in rows}
+
+    def _iter_events_sync(
+        self,
+        limit: int,
+        after_event_id: int | None,
+        before_event_id: int | None,
+        order: str,
+    ) -> list[dict[str, Any]]:
+        cursor_where, cursor_params = _cursor_where(after_event_id, before_event_id)
+        where = ["persona_id = ?", *cursor_where]
+        params: list[Any] = [self.persona_id, *cursor_params, limit]
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM event_log
+                WHERE {" AND ".join(where)}
+                ORDER BY event_id {order.upper()}
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [_row_to_event(row) for row in rows]
+
+    def _events_for_conversation_sync(
+        self,
+        conversation_id: str,
+        limit: int,
+        before_event_id: int | None,
+    ) -> list[dict[str, Any]]:
+        where = ["persona_id = ?", "conversation_id = ?"]
+        params: list[Any] = [self.persona_id, conversation_id]
+        if before_event_id is not None:
+            where.append("event_id < ?")
+            params.append(before_event_id)
+        params.append(limit)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM event_log
+                WHERE {" AND ".join(where)}
+                ORDER BY event_id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [_row_to_event(row) for row in reversed(rows)]
+
+    def _events_by_type_sync(
+        self,
+        event_type: str,
+        limit: int,
+        after_event_id: int | None,
+        before_event_id: int | None,
+        order: str,
+    ) -> list[dict[str, Any]]:
+        cursor_where, cursor_params = _cursor_where(after_event_id, before_event_id)
+        where = ["persona_id = ?", "event_type = ?", *cursor_where]
+        params: list[Any] = [self.persona_id, event_type, *cursor_params, limit]
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM event_log
+                WHERE {" AND ".join(where)}
+                ORDER BY event_id {order.upper()}
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [_row_to_event(row) for row in rows]
+
+    def _max_event_id_sync(self) -> int:
+        with closing(self._connect()) as conn:
+            return self._max_event_id(conn)
+
+    def _max_event_id(self, conn: sqlite3.Connection) -> int:
+        return int(
+            conn.execute(
+                """
+                SELECT COALESCE(MAX(event_id), 0)
+                FROM event_log
+                WHERE persona_id = ?
+                """,
+                (self.persona_id,),
+            ).fetchone()[0]
+        )
+
+    def _ensure_schema_sync(self) -> None:
+        if self._schema_path in self._schema_ready_paths and self._schema_path.exists():
+            return
+        with self._schema_lock:
+            if self._schema_path in self._schema_ready_paths and self._schema_path.exists():
+                return
+            db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+            try:
+                db.load()
+            finally:
+                db.close()
+            self._schema_ready_paths.add(self._schema_path)
+
+    def _connect(self) -> sqlite3.Connection:
+        self._db.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self._db.path, timeout=self._db.busy_timeout_ms / 1000)
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={int(self._db.busy_timeout_ms)}")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+
 _LEGACY_RAW_IMPORTANT_MEMORY_ID = "__diana_important_raw__"
 _LEGACY_RAW_IMPORTANT_SCOPE = "__legacy_raw__"
 
@@ -869,6 +1405,7 @@ def _default_rolling_summary_data() -> dict[str, Any]:
 
 
 __all__ = [
+    "DianaEventStore",
     "DianaHistoryStore",
     "DianaImportantStore",
     "DianaRollingSummaryStore",
