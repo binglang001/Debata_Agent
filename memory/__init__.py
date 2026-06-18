@@ -28,6 +28,7 @@ from .diana_db import (
     DianaDBVersionError,
     backup_existing_database,
 )
+from .diana_stores import DianaHistoryStore
 from .event_journal import EventJournal
 from .event_store import EventStore
 from .history import HistoryManager
@@ -39,6 +40,7 @@ __all__ = [
     "ArchiveStore",
     "DIANA_DB_SCHEMA_VERSION",
     "DianaDB",
+    "DianaHistoryStore",
     "DianaDBSchemaVersion",
     "DianaDBVersionError",
     "EventJournal",

@@ -1,6 +1,6 @@
 # diana.db v1 契约
 
-本文档定义阶段 2 第一块的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现只负责建库和版本/备份能力，不接 runtime，不导入旧数据，不实现仓储读写逻辑。
+本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records` 的最小读写；不接 runtime，不导入旧数据，不实现 important/summary/usage/runtime 仓储。
 
 ## 文件与版本
 
@@ -96,6 +96,32 @@
 - `idx_history_conversation(persona_id, conversation_id, history_index)`
 - `idx_history_role(persona_id, role)`
 - `idx_history_content_hash(content_hash)`
+
+#### DianaHistoryStore 接口
+
+`memory.diana_stores.DianaHistoryStore(db, persona_id)` 是 `history_records` 的轻量仓储，构造参数：
+
+- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `persona_id`：人格 ID；同一 persona 的历史是一条全局时间线，不按 `conversation_id` 拆分。
+
+异步接口与 `JsonlStore` 对齐：
+
+- `load(force_reload=False) -> list[dict]`：按 `history_index` 升序返回当前 persona 的完整历史；默认使用缓存，`force_reload=True` 强制从数据库读取。
+- `append(record: dict)`：追加单条记录。
+- `append_many(records: list[dict])`：追加多条记录；空列表不写库。
+- `length() -> int`：返回当前 persona 的记录数。
+- `get_slice(start=0, end=None) -> list[dict]`：按当前全局流位置切片，不按会话筛选。
+- `truncate_head(cut_point) -> int`：删除最早的 `cut_point` 条记录，返回剩余长度；剩余记录重新写入为连续 `history_index`。
+- `replace_all(records: list[dict]) -> None`：用传入记录整体替换当前 persona 的历史流，`history_index` 从 0 连续写入。
+- `clear() -> None`：删除当前 persona 的全部历史记录。
+
+写入语义：
+
+- 每条输入记录完整保存到 `record_json`，不得只保存提取字段。
+- 读取时遇到损坏的 `record_json` 或非对象 JSON 会跳过该行并记录 warning；仓储不在读取阶段回写修复数据。
+- 同一 persona 下 `history_index` 按当前全局流连续递增；不同 `conversation_id` 仍共享同一序列。
+- 同步提取 `conversation_id`、`role`、`content_hash`、`content_length`、`timestamp` 供后续查询使用。
+- 所有数据库操作由仓储锁保护，并通过后台线程执行，避免阻塞事件循环。
 
 ### important_memories
 
