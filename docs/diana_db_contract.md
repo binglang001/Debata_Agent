@@ -1,6 +1,6 @@
 # diana.db v1 契约
 
-本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records` 的最小读写；不接 runtime，不导入旧数据，不实现 runtime 仓储。
+本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records`、`DianaPersonaDB` 对 `persona_*` legacy domains 的最小读写；不接 runtime，不导入旧数据，不实现 runtime 仓储。
 
 ## 文件与版本
 
@@ -453,6 +453,29 @@
 ## Persona state 域
 
 Persona state 域使用 `persona_*` 表名前缀复制现 `mind/db_schema.py` 的字段，并补 `persona_id`。原 `important_memories` 表名已被新重要记忆域使用，因此 persona.db 的旧聚合重要记忆表命名为 `persona_important_state_legacy`。
+
+#### DianaPersonaDB 接口
+
+`memory.diana_stores.DianaPersonaDB(db, persona_id)` 是 `diana.db` 中 `persona_*` legacy domains 的轻量仓储，面向 `mind.db.PersonaDB` 当前公开调用面实现。构造参数：
+
+- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `persona_id`：人格 ID；去除首尾空白后不能为空，空值抛出 `ValueError("persona_id must not be empty")`。
+
+接口覆盖旧 `PersonaDB` 的 state、state log、update audit、effect、todo、cue、profile、inner monologue、daily trajectory、persona arc、sleep/eat record 与旧聚合 important memory 读写方法。`load()` 只确保 diana schema 可用，并在 `persona_schema_version_legacy` 为当前 persona 写入旧 persona.db schema version；不接 runtime，不导入旧数据，不修改 diana schema version。
+
+写入语义：
+
+- 所有 `SELECT`、`INSERT`、`UPDATE`、`DELETE` 必须按当前 `persona_id` 隔离；同一 `diana.db` 中不同 persona 的记录、删除、过期处理和最近记录查询互不影响。
+- `persona_state`、`persona_important_state_legacy`、`persona_schema_version_legacy` 是每 persona 单行旧聚合表，主键为 `(persona_id, id=1)`。
+- 旧 `AUTOINCREMENT` 表在 diana schema 中改为 `(persona_id, id)` 复合主键；`persona_state_log`、`persona_update_audits`、`persona_inner_monologues`、`persona_daily_trajectories`、`persona_arc`、`persona_eat_records` 的 id 在 `BEGIN IMMEDIATE` 事务内按当前 persona 的 `MAX(id)+1` 分配。
+- effect、todo、cue、profile、sleep record 使用旧记录 ID 与 `persona_id` 组成复合主键；todo partial update、sleep/eat update、expire/missed 行为与旧 `PersonaDB` 对齐。
+- JSON 保真列保存完整记录，读取时继续复用 `mind.db_records` 的 JSON、时间解析、过期判断、排序、ID 归一化和 mind dataclass 适配 helper。
+
+读取语义：
+
+- state/effect/todo/cue/profile 等返回值通过 `mind.db_records` 适配为 `mind` dataclass；旧 recent raw rows 仍返回 dict。
+- update audit 支持 `limit`、`conversation_id`、`user_id` 筛选，且筛选只在当前 persona 内生效。
+- 旧聚合 important memory 使用 `persona_important_state_legacy.memories_json`，`read_important(default=None)`、`write_important(data)`、`important_count()` 与旧 `PersonaDB` 行为一致。
 
 ### persona_schema_version_legacy
 

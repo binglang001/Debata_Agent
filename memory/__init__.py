@@ -11,6 +11,7 @@
     DianaArchiveStore         —— diana.db archive_messages 轻量归档仓储
     DianaEventStore            —— diana.db event_log 轻量事件仓储
     DianaImportantStore        —— diana.db important_memories 轻量仓储
+    DianaPersonaDB             —— diana.db persona_* legacy domains 仓储
     DianaRollingSummaryStore   —— diana.db rolling_summary 轻量仓储
     DianaUsageStatsStore       —— diana.db usage_records 轻量仓储
     RagMemoryService          —— RAG 模式的会话向量检索服务
@@ -38,6 +39,7 @@ from .diana_stores import (
     DianaEventStore,
     DianaHistoryStore,
     DianaImportantStore,
+    DianaPersonaDB,
     DianaRollingSummaryStore,
     DianaUsageStatsStore,
 )
@@ -56,6 +58,7 @@ __all__ = [
     "DianaEventStore",
     "DianaHistoryStore",
     "DianaImportantStore",
+    "DianaPersonaDB",
     "DianaRollingSummaryStore",
     "DianaUsageStatsStore",
     "DianaDBSchemaVersion",
