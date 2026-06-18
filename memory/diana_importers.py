@@ -36,6 +36,27 @@ class LegacyMemoryImportResult:
     important: LegacyImportDomainResult
     rolling_summary: LegacyImportDomainResult
     usage: LegacyImportDomainResult
+    events: LegacyImportDomainResult = LegacyImportDomainResult()
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyEventRow:
+    event_id: int
+    event_type: str
+    event_uuid: str
+    conversation_id: str | None
+    session_id: str | None
+    turn_id: str | None
+    source: str | None
+    external_id: str | None
+    tool_call_id: str | None
+    parent_event_id: int | None
+    idempotency_key: str | None
+    timestamp_unix: float
+    created_at_unix: float
+    payload_json: str
+    payload_hash: str
+    schema_version: int
 
 
 def import_legacy_memory_files(
@@ -97,6 +118,7 @@ async def _import_legacy_memory_files_async(
             normalized_persona,
         )
         usage_result = _import_usage(target_db, source_path, normalized_usage_persona)
+        events_result = _import_events(target_db, source_path, normalized_persona)
     finally:
         if should_close_db:
             target_db.close()
@@ -107,6 +129,7 @@ async def _import_legacy_memory_files_async(
         important=important_result,
         rolling_summary=rolling_result,
         usage=usage_result,
+        events=events_result,
     )
 
 
@@ -207,6 +230,334 @@ def _import_usage(
         imported=imported,
         skipped=skipped + duplicate_count,
     )
+
+
+def _import_events(
+    db: DianaDB,
+    source_dir: Path,
+    persona_id: str,
+) -> LegacyImportDomainResult:
+    sqlite_rows, sqlite_skipped, sqlite_exists = _read_legacy_event_sqlite_rows(
+        source_dir / "events.sqlite3"
+    )
+    append_rows, append_skipped, append_exists = _read_legacy_event_append_log_rows(
+        source_dir / "events.sqlite3.append.jsonl"
+    )
+    if not sqlite_exists and not append_exists:
+        return LegacyImportDomainResult()
+
+    imported, duplicate_or_conflict_skipped = _insert_event_rows(
+        db,
+        persona_id,
+        [*sqlite_rows, *append_rows],
+    )
+    return LegacyImportDomainResult(
+        imported=imported,
+        skipped=sqlite_skipped + append_skipped + duplicate_or_conflict_skipped,
+    )
+
+
+def _read_legacy_event_sqlite_rows(
+    path: Path,
+) -> tuple[list[_LegacyEventRow], int, bool]:
+    if not path.exists():
+        return [], 0, False
+
+    rows: list[_LegacyEventRow] = []
+    skipped = 0
+    try:
+        with closing(sqlite3.connect(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            source_rows = conn.execute(
+                """
+                SELECT
+                    event_id, event_type, event_uuid, conversation_id, session_id,
+                    turn_id, source, external_id, tool_call_id, parent_event_id,
+                    idempotency_key, timestamp_unix, created_at_unix, payload_json,
+                    payload_hash, schema_version
+                FROM event_log
+                ORDER BY event_id ASC
+                """
+            ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            logger.warning("旧 events.sqlite3 缺少 event_log 表，跳过事件导入: %s", path)
+            return [], 0, False
+        logger.warning("读取旧 events.sqlite3 失败，跳过事件导入: %s error=%s", path, exc)
+        return [], 0, False
+    except sqlite3.Error as exc:
+        logger.warning("读取旧 events.sqlite3 失败，跳过事件导入: %s error=%s", path, exc)
+        return [], 0, False
+
+    for index, source_row in enumerate(source_rows, start=1):
+        event_row = _legacy_event_row_from_mapping(source_row, f"{path}:row {index}")
+        if event_row is None:
+            skipped += 1
+            continue
+        rows.append(event_row)
+    return rows, skipped, True
+
+
+def _read_legacy_event_append_log_rows(
+    path: Path,
+) -> tuple[list[_LegacyEventRow], int, bool]:
+    if not path.exists():
+        return [], 0, False
+
+    rows: list[_LegacyEventRow] = []
+    skipped = 0
+    for line_number, raw_line in enumerate(path.read_bytes().splitlines(), start=1):
+        line = raw_line.strip()
+        location = f"{path}:{line_number}"
+        if not line:
+            skipped += 1
+            logger.warning("跳过空的旧事件 append log 行: %s", location)
+            continue
+        try:
+            data = orjson.loads(line)
+        except orjson.JSONDecodeError as exc:
+            skipped += 1
+            logger.warning("跳过损坏的旧事件 append log 行: %s error=%s", location, exc)
+            continue
+        if not isinstance(data, dict):
+            skipped += 1
+            logger.warning("跳过非对象旧事件 append log 行: %s", location)
+            continue
+        event_row = _legacy_event_row_from_mapping(data, location)
+        if event_row is None:
+            skipped += 1
+            continue
+        rows.append(event_row)
+    return rows, skipped, True
+
+
+def _legacy_event_row_from_mapping(
+    record: sqlite3.Row | dict[str, Any],
+    location: str,
+) -> _LegacyEventRow | None:
+    event_id = _positive_int(_mapping_value(record, "event_id"))
+    event_type = _required_text(_mapping_value(record, "event_type"))
+    event_uuid = _required_text(_mapping_value(record, "event_uuid"))
+    timestamp_unix = _required_float(_mapping_value(record, "timestamp_unix"))
+    created_at_unix = _required_float(_mapping_value(record, "created_at_unix"))
+    payload_json = _required_raw_json_text(_mapping_value(record, "payload_json"))
+    payload_hash = _required_text(_mapping_value(record, "payload_hash"))
+    schema_version = _required_int(_mapping_value(record, "schema_version"))
+    if (
+        event_id is None
+        or event_type is None
+        or event_uuid is None
+        or timestamp_unix is None
+        or created_at_unix is None
+        or payload_json is None
+        or payload_hash is None
+        or schema_version is None
+    ):
+        logger.warning("跳过缺少关键字段的旧事件行: %s", location)
+        return None
+    try:
+        orjson.loads(payload_json)
+    except orjson.JSONDecodeError as exc:
+        logger.warning("跳过 payload_json 损坏的旧事件行: %s error=%s", location, exc)
+        return None
+
+    return _LegacyEventRow(
+        event_id=event_id,
+        event_type=event_type,
+        event_uuid=event_uuid,
+        conversation_id=_optional_text(_mapping_value(record, "conversation_id")),
+        session_id=_optional_text(_mapping_value(record, "session_id")),
+        turn_id=_optional_text(_mapping_value(record, "turn_id")),
+        source=_optional_text(_mapping_value(record, "source")),
+        external_id=_optional_text(_mapping_value(record, "external_id")),
+        tool_call_id=_optional_text(_mapping_value(record, "tool_call_id")),
+        parent_event_id=_optional_int(_mapping_value(record, "parent_event_id")),
+        idempotency_key=_optional_text(_mapping_value(record, "idempotency_key")),
+        timestamp_unix=timestamp_unix,
+        created_at_unix=created_at_unix,
+        payload_json=payload_json,
+        payload_hash=payload_hash,
+        schema_version=schema_version,
+    )
+
+
+def _insert_event_rows(
+    db: DianaDB,
+    persona_id: str,
+    rows: Sequence[_LegacyEventRow],
+) -> tuple[int, int]:
+    imported = 0
+    skipped = 0
+    with closing(_connect_for_import(db)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            events_by_id = _existing_events_by_id(conn, persona_id)
+            ids_by_key = _existing_event_ids_by_idempotency_key(conn, persona_id)
+            for row in rows:
+                existing = events_by_id.get(row.event_id)
+                if existing is not None:
+                    skipped += 1
+                    if not _legacy_events_equivalent(existing, row):
+                        logger.warning(
+                            "跳过冲突的旧事件 event_id=%s persona_id=%s",
+                            row.event_id,
+                            persona_id,
+                        )
+                    continue
+
+                if row.idempotency_key is not None:
+                    idempotency_event_id = ids_by_key.get(row.idempotency_key)
+                    if idempotency_event_id is not None:
+                        skipped += 1
+                        if idempotency_event_id != row.event_id:
+                            logger.warning(
+                                "跳过冲突的旧事件 idempotency_key=%s persona_id=%s "
+                                "existing_event_id=%s incoming_event_id=%s",
+                                row.idempotency_key,
+                                persona_id,
+                                idempotency_event_id,
+                                row.event_id,
+                            )
+                        continue
+
+                _insert_event_row(conn, persona_id, row)
+                events_by_id[row.event_id] = row
+                if row.idempotency_key is not None:
+                    ids_by_key[row.idempotency_key] = row.event_id
+                imported += 1
+
+            _set_event_projection_progress(conn, persona_id, _max_event_id(conn, persona_id))
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+    return imported, skipped
+
+
+def _existing_events_by_id(
+    conn: sqlite3.Connection,
+    persona_id: str,
+) -> dict[int, sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM event_log
+        WHERE persona_id = ?
+        """,
+        (persona_id,),
+    ).fetchall()
+    return {int(row["event_id"]): row for row in rows}
+
+
+def _existing_event_ids_by_idempotency_key(
+    conn: sqlite3.Connection,
+    persona_id: str,
+) -> dict[str, int]:
+    rows = conn.execute(
+        """
+        SELECT event_id, idempotency_key
+        FROM event_log
+        WHERE persona_id = ? AND idempotency_key IS NOT NULL
+        """,
+        (persona_id,),
+    ).fetchall()
+    return {str(row["idempotency_key"]): int(row["event_id"]) for row in rows}
+
+
+def _insert_event_row(
+    conn: sqlite3.Connection,
+    persona_id: str,
+    row: _LegacyEventRow,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO event_log (
+            persona_id, event_id, event_type, event_uuid, conversation_id,
+            session_id, turn_id, source, external_id, tool_call_id,
+            parent_event_id, idempotency_key, timestamp_unix,
+            created_at_unix, payload_json, payload_hash, schema_version
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            persona_id,
+            row.event_id,
+            row.event_type,
+            row.event_uuid,
+            row.conversation_id,
+            row.session_id,
+            row.turn_id,
+            row.source,
+            row.external_id,
+            row.tool_call_id,
+            row.parent_event_id,
+            row.idempotency_key,
+            row.timestamp_unix,
+            row.created_at_unix,
+            row.payload_json,
+            row.payload_hash,
+            row.schema_version,
+        ),
+    )
+
+
+def _set_event_projection_progress(
+    conn: sqlite3.Connection,
+    persona_id: str,
+    event_id: int,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO event_projection_state(persona_id, name, value)
+        VALUES (?, ?, ?)
+        ON CONFLICT(persona_id, name) DO UPDATE SET value = excluded.value
+        """,
+        (persona_id, "last_projected_event_id", str(event_id)),
+    )
+
+
+def _max_event_id(conn: sqlite3.Connection, persona_id: str) -> int:
+    return int(
+        conn.execute(
+            """
+            SELECT COALESCE(MAX(event_id), 0)
+            FROM event_log
+            WHERE persona_id = ?
+            """,
+            (persona_id,),
+        ).fetchone()[0]
+    )
+
+
+def _legacy_events_equivalent(
+    existing: sqlite3.Row | _LegacyEventRow,
+    incoming: _LegacyEventRow,
+) -> bool:
+    return all(
+        _event_value(existing, column) == getattr(incoming, column)
+        for column in _LEGACY_EVENT_EQUIVALENCE_COLUMNS
+    )
+
+
+_LEGACY_EVENT_EQUIVALENCE_COLUMNS = (
+    "event_id",
+    "event_type",
+    "event_uuid",
+    "conversation_id",
+    "session_id",
+    "turn_id",
+    "source",
+    "external_id",
+    "tool_call_id",
+    "parent_event_id",
+    "idempotency_key",
+    "timestamp_unix",
+    "created_at_unix",
+    "payload_json",
+    "payload_hash",
+    "schema_version",
+)
 
 
 def _insert_usage_records(
@@ -363,6 +714,18 @@ def _connect_for_import(db: DianaDB) -> sqlite3.Connection:
     return conn
 
 
+def _mapping_value(record: sqlite3.Row | dict[str, Any], key: str) -> Any:
+    if isinstance(record, dict):
+        return record.get(key)
+    return record[key] if key in record.keys() else None
+
+
+def _event_value(record: sqlite3.Row | _LegacyEventRow, key: str) -> Any:
+    if isinstance(record, _LegacyEventRow):
+        return getattr(record, key)
+    return record[key]
+
+
 def _normalize_persona_id(persona_id: str) -> str:
     text = str(persona_id).strip()
     if not text:
@@ -396,6 +759,24 @@ def _record_text(value: Any) -> str | None:
     return str(value)
 
 
+def _required_text(value: Any) -> str | None:
+    text = _optional_text(value)
+    return text
+
+
+def _required_raw_json_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value if value.strip() else None
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _coerce_int(value: Any) -> int:
     try:
         return int(value or 0)
@@ -403,11 +784,45 @@ def _coerce_int(value: Any) -> int:
         return 0
 
 
+def _required_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _positive_int(value: Any) -> int | None:
+    number = _required_int(value)
+    if number is None or number <= 0:
+        return None
+    return number
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _coerce_float(value: Any) -> float:
     try:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _required_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _coerce_non_negative_int(value: Any) -> int | None:

@@ -12,6 +12,7 @@ from memory.diana_importers import (
     import_legacy_memory_files,
 )
 from memory.diana_stores import (
+    DianaEventStore,
     DianaHistoryStore,
     DianaImportantStore,
     DianaRollingSummaryStore,
@@ -89,6 +90,7 @@ def test_import_legacy_memory_files_full_sample_roundtrip(tmp_path):
     assert result.important == LegacyImportDomainResult(imported=1, skipped=0)
     assert result.rolling_summary == LegacyImportDomainResult(imported=1, skipped=0)
     assert result.usage == LegacyImportDomainResult(imported=2, skipped=0)
+    assert result.events == LegacyImportDomainResult(imported=0, skipped=0)
     assert _load_history(db_path, "yuexi") == history_records
     assert _read_important(db_path, "yuexi") == important_items
     assert _load_rolling_summary(db_path, "yuexi") == {
@@ -241,6 +243,7 @@ def test_import_legacy_memory_files_skips_missing_and_damaged_files(tmp_path, ca
     assert result.important == LegacyImportDomainResult(imported=0, skipped=1)
     assert result.rolling_summary == LegacyImportDomainResult(imported=0, skipped=1)
     assert result.usage == LegacyImportDomainResult(imported=0, skipped=0)
+    assert result.events == LegacyImportDomainResult(imported=0, skipped=0)
     assert _load_history(db_path, "yuexi") == [{"role": "user", "content": "ok"}]
     assert _read_important(db_path, "yuexi") == []
     assert _load_rolling_summary(db_path, "yuexi") == {
@@ -248,6 +251,7 @@ def test_import_legacy_memory_files_skips_missing_and_damaged_files(tmp_path, ca
         "archived_until": None,
         "updated_at": "",
     }
+    assert _projection_state_value(db_path, "yuexi") is None
     assert "跳过空的旧 JSONL 行" in caplog.text
     assert "跳过损坏的旧 JSONL 行" in caplog.text
     assert "跳过损坏的旧 JSON 文件" in caplog.text
@@ -288,6 +292,215 @@ def test_import_legacy_memory_files_keeps_personas_isolated(tmp_path):
     ]
 
 
+def test_import_legacy_events_sqlite_preserves_fields_and_store_reads(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    payload = {"text": "旧事件", "nested": {"a": 1}}
+    event = _legacy_event(
+        7,
+        payload=payload,
+        payload_hash="legacy-hash-7",
+        schema_version=4,
+        idempotency_key="legacy:7",
+    )
+    _write_legacy_event_sqlite(source_dir / "events.sqlite3", [event])
+
+    result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.events == LegacyImportDomainResult(imported=1, skipped=0)
+    row = _event_rows(db_path, "yuexi")[0]
+    for key, value in event.items():
+        assert row[key] == value
+
+    store = DianaEventStore(db_path, "yuexi")
+    loaded = asyncio.run(store.get_event(7))
+    assert loaded is not None
+    assert loaded["payload"] == payload
+    assert loaded["payload_json"] == event["payload_json"]
+    assert loaded["payload_hash"] == "legacy-hash-7"
+    assert loaded["schema_version"] == 4
+    assert [item["event_id"] for item in asyncio.run(store.iter_events(limit=10))] == [7]
+    assert asyncio.run(store.wait_projected(7, timeout=0.01))
+    stats = asyncio.run(store.stats())
+    assert stats["last_appended_event_id"] == 7
+    assert stats["last_projected_event_id"] == 7
+    assert _projection_state_value(db_path, "yuexi") == "7"
+
+
+def test_import_legacy_events_append_log_preserves_event_id_and_projection(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    event = _legacy_event(9, payload={"append": True}, idempotency_key="append:9")
+    _write_jsonl(source_dir / "events.sqlite3.append.jsonl", [event])
+
+    result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.events == LegacyImportDomainResult(imported=1, skipped=0)
+    loaded = asyncio.run(DianaEventStore(db_path, "yuexi").get_event(9))
+    assert loaded is not None
+    assert loaded["event_id"] == 9
+    assert loaded["payload"] == {"append": True}
+    assert _projection_state_value(db_path, "yuexi") == "9"
+
+
+def test_import_legacy_events_union_deduplicates_and_rerun_is_idempotent(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    event = _legacy_event(5, payload={"same": "event"}, idempotency_key="same:5")
+    _write_legacy_event_sqlite(source_dir / "events.sqlite3", [event])
+    _write_jsonl(source_dir / "events.sqlite3.append.jsonl", [event])
+
+    first = import_legacy_memory_files(db_path, source_dir, "yuexi")
+    second = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert first.events == LegacyImportDomainResult(imported=1, skipped=1)
+    assert second.events == LegacyImportDomainResult(imported=0, skipped=2)
+    assert _event_rows(db_path, "yuexi") == [
+        {"persona_id": "yuexi", **event},
+    ]
+
+
+def test_import_legacy_events_same_id_same_hash_different_row_warns(tmp_path, caplog):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    original = _legacy_event(
+        6,
+        event_uuid="uuid-original",
+        payload={"text": "原始"},
+        payload_hash="same-hash",
+        schema_version=1,
+        idempotency_key="msg:6",
+    )
+    conflict = {
+        **original,
+        "event_uuid": "uuid-conflict",
+        "payload_json": orjson.dumps({"text": "变更"}).decode("utf-8"),
+        "schema_version": 2,
+    }
+    _write_legacy_event_sqlite(source_dir / "events.sqlite3", [original])
+    _write_jsonl(source_dir / "events.sqlite3.append.jsonl", [conflict])
+
+    with caplog.at_level("WARNING"):
+        result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.events == LegacyImportDomainResult(imported=1, skipped=1)
+    assert _event_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **original}]
+    loaded = asyncio.run(DianaEventStore(db_path, "yuexi").get_event(6))
+    assert loaded["event_uuid"] == "uuid-original"
+    assert loaded["payload"] == {"text": "原始"}
+    assert loaded["schema_version"] == 1
+    assert "跳过冲突的旧事件 event_id=6" in caplog.text
+
+
+def test_import_legacy_events_conflicts_skip_without_overwrite(tmp_path, caplog):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    original = _legacy_event(
+        1,
+        event_type="message",
+        payload={"text": "原始"},
+        payload_hash="hash-original",
+        idempotency_key="msg:1",
+    )
+    event_id_conflict = _legacy_event(
+        1,
+        event_type="tool",
+        payload={"text": "冲突"},
+        payload_hash="hash-conflict",
+        idempotency_key="msg:conflict",
+    )
+    idempotency_conflict = _legacy_event(
+        2,
+        event_type="message",
+        payload={"text": "重复键"},
+        payload_hash="hash-duplicate-key",
+        idempotency_key="msg:1",
+    )
+    _write_legacy_event_sqlite(source_dir / "events.sqlite3", [original])
+    _write_jsonl(
+        source_dir / "events.sqlite3.append.jsonl",
+        [event_id_conflict, idempotency_conflict],
+    )
+
+    with caplog.at_level("WARNING"):
+        result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.events == LegacyImportDomainResult(imported=1, skipped=2)
+    assert _event_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **original}]
+    assert asyncio.run(DianaEventStore(db_path, "yuexi").get_event(2)) is None
+    assert "跳过冲突的旧事件 event_id=1" in caplog.text
+    assert "跳过冲突的旧事件 idempotency_key=msg:1" in caplog.text
+
+
+def test_import_legacy_events_skips_bad_append_log_lines(tmp_path, caplog):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    append_log_path = source_dir / "events.sqlite3.append.jsonl"
+    append_log_path.parent.mkdir(parents=True, exist_ok=True)
+    valid = _legacy_event(3, payload={"ok": True})
+    bad_payload = _legacy_event(4, payload={"bad": True})
+    bad_payload["payload_json"] = "{broken"
+    append_log_path.write_bytes(
+        b"{broken\n"
+        b"[]\n"
+        b'{"event_id":4}\n'
+        + orjson.dumps(bad_payload)
+        + b"\n"
+        + orjson.dumps(valid)
+        + b"\n"
+    )
+
+    with caplog.at_level("WARNING"):
+        result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.events == LegacyImportDomainResult(imported=1, skipped=4)
+    assert _event_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **valid}]
+    assert "跳过损坏的旧事件 append log 行" in caplog.text
+    assert "跳过非对象旧事件 append log 行" in caplog.text
+    assert "跳过缺少关键字段的旧事件行" in caplog.text
+    assert "跳过 payload_json 损坏的旧事件行" in caplog.text
+
+
+def test_import_legacy_events_sqlite_without_event_log_is_missing_domain(tmp_path, caplog):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    sqlite_path = source_dir / "events.sqlite3"
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE unrelated(id INTEGER PRIMARY KEY)")
+
+    with caplog.at_level("WARNING"):
+        result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.events == LegacyImportDomainResult(imported=0, skipped=0)
+    assert _event_rows(db_path, "yuexi") == []
+    assert _projection_state_value(db_path, "yuexi") is None
+    assert "旧 events.sqlite3 缺少 event_log 表" in caplog.text
+
+
+def test_import_legacy_events_keeps_personas_isolated(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    event = _legacy_event(11, payload={"shared": True}, idempotency_key="shared:11")
+    _write_legacy_event_sqlite(source_dir / "events.sqlite3", [event])
+
+    first = import_legacy_memory_files(db_path, source_dir, "yuexi")
+    second = import_legacy_memory_files(db_path, source_dir, "jiu")
+
+    assert first.events == LegacyImportDomainResult(imported=1, skipped=0)
+    assert second.events == LegacyImportDomainResult(imported=1, skipped=0)
+    assert _event_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **event}]
+    assert _event_rows(db_path, "jiu") == [{"persona_id": "jiu", **event}]
+    assert asyncio.run(DianaEventStore(db_path, "yuexi").get_event(11))["payload"] == {
+        "shared": True,
+    }
+    assert asyncio.run(DianaEventStore(db_path, "jiu").get_event(11))["payload"] == {
+        "shared": True,
+    }
+    assert _projection_state_value(db_path, "yuexi") == "11"
+    assert _projection_state_value(db_path, "jiu") == "11"
+
+
 def test_memory_package_exports_legacy_importer():
     from memory import import_legacy_memory_files as package_importer
 
@@ -302,6 +515,104 @@ def _write_json(path: Path, data: object) -> None:
 def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"".join(orjson.dumps(record) + b"\n" for record in records))
+
+
+def _write_legacy_event_sqlite(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE event_log (
+                event_id INTEGER PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                event_uuid TEXT NOT NULL,
+                conversation_id TEXT,
+                session_id TEXT,
+                turn_id TEXT,
+                source TEXT,
+                external_id TEXT,
+                tool_call_id TEXT,
+                parent_event_id INTEGER,
+                idempotency_key TEXT UNIQUE,
+                timestamp_unix REAL NOT NULL,
+                created_at_unix REAL NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                schema_version INTEGER NOT NULL
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO event_log (
+                event_id, event_type, event_uuid, conversation_id, session_id,
+                turn_id, source, external_id, tool_call_id, parent_event_id,
+                idempotency_key, timestamp_unix, created_at_unix, payload_json,
+                payload_hash, schema_version
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [_legacy_event_sql_values(row) for row in rows],
+        )
+
+
+def _legacy_event(
+    event_id: int,
+    *,
+    event_type: str = "message",
+    event_uuid: str | None = None,
+    payload: dict | None = None,
+    payload_hash: str | None = None,
+    schema_version: int = 2,
+    conversation_id: str | None = "private:1",
+    session_id: str | None = "session-1",
+    turn_id: str | None = None,
+    source: str | None = "runtime",
+    external_id: str | None = None,
+    tool_call_id: str | None = None,
+    parent_event_id: int | None = None,
+    idempotency_key: str | None = None,
+) -> dict:
+    payload_data = {"event_id": event_id} if payload is None else payload
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "event_uuid": event_uuid or f"uuid-{event_id}",
+        "conversation_id": conversation_id,
+        "session_id": session_id,
+        "turn_id": turn_id or str(event_id),
+        "source": source,
+        "external_id": external_id or f"external-{event_id}",
+        "tool_call_id": tool_call_id,
+        "parent_event_id": parent_event_id,
+        "idempotency_key": idempotency_key,
+        "timestamp_unix": float(1000 + event_id),
+        "created_at_unix": float(2000 + event_id),
+        "payload_json": orjson.dumps(payload_data).decode("utf-8"),
+        "payload_hash": payload_hash or f"hash-{event_id}",
+        "schema_version": schema_version,
+    }
+
+
+def _legacy_event_sql_values(row: dict) -> tuple:
+    return (
+        row["event_id"],
+        row["event_type"],
+        row["event_uuid"],
+        row["conversation_id"],
+        row["session_id"],
+        row["turn_id"],
+        row["source"],
+        row["external_id"],
+        row["tool_call_id"],
+        row["parent_event_id"],
+        row["idempotency_key"],
+        row["timestamp_unix"],
+        row["created_at_unix"],
+        row["payload_json"],
+        row["payload_hash"],
+        row["schema_version"],
+    )
 
 
 def _load_history(db_path: Path, persona_id: str) -> list[dict]:
@@ -372,6 +683,34 @@ def _usage_rows(db_path: Path) -> list[dict]:
             """
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _event_rows(db_path: Path, persona_id: str) -> list[dict]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM event_log
+            WHERE persona_id = ?
+            ORDER BY event_id ASC
+            """,
+            (persona_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _projection_state_value(db_path: Path, persona_id: str) -> str | None:
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT value
+            FROM event_projection_state
+            WHERE persona_id = ? AND name = 'last_projected_event_id'
+            """,
+            (persona_id,),
+        ).fetchone()
+    return None if row is None else str(row[0])
 
 
 def _row_count(db_path: Path, table: str, persona_id: str) -> int:
