@@ -25,9 +25,9 @@ class StrictModel(BaseModel):
     作为 `Field.description`，避免在每个字段重复写 `Field(description=...)`。
     GUI 编辑器 / JSON schema 生成器可以直接读到说明。
     """
-    """禁止未知字段，避免拼写错误被静默吞掉。"""
+    """容忍未知字段，避免旧配置或前置阶段字段导致启动失败。"""
 
-    model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
+    model_config = ConfigDict(extra="ignore", use_attribute_docstrings=True)
 
 
 # ============================================================

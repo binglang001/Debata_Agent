@@ -25,13 +25,18 @@ import main_cli as _main_cli
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(level: str = "INFO", *, project_root: Path | None = None) -> None:
+def setup_logging(
+    level: str = "INFO",
+    *,
+    project_root: Path | None = None,
+    logs_dir: Path | None = None,
+) -> None:
     """配置标准 logging。
 
     格式：[YYYY-MM-DD HH:MM:SS] [LEVEL] [module] message
     """
     root = project_root or Path(__file__).resolve().parent
-    logs_dir = root / "data" / "logs"
+    logs_dir = logs_dir or root / "data" / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter(
         "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
@@ -162,7 +167,7 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
-    from app_config import AppPaths, SecretsManager
+    from app_config import AppPaths, SecretsManager, initialize_runtime_data
     from core import Runtime
     from ui.dashboard.main_window import DashboardWindow
     from ui.theme import cached_qss, palette_for_theme
@@ -186,6 +191,7 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
 
     paths = AppPaths(project_root=project_root, config_file=config_file)
     paths.ensure_data_dirs()
+    initialize_runtime_data(paths, project_root=project_root)
 
     state: dict = {
         "rt": None,
@@ -440,12 +446,13 @@ def main() -> None:
     args = parse_args()
     project_root = Path(__file__).resolve().parent
 
-    from app_config import AppPaths
+    from app_config import AppPaths, initialize_runtime_data
 
     config_file = Path(args.config) if args.config else None
     paths = AppPaths(project_root=project_root, config_file=config_file)
     paths.ensure_data_dirs()
-    setup_logging("INFO", project_root=project_root)
+    initialize_runtime_data(paths, project_root=project_root)
+    setup_logging("INFO", project_root=project_root, logs_dir=paths.LOGS_DIR)
     install_uvloop()
 
     if args.napcat:

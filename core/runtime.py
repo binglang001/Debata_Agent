@@ -123,10 +123,11 @@ class Runtime:
 
         # ----- 1. 路径与配置 -----
         stage_t0 = time.monotonic()
-        from app_config import AppPaths, SecretsManager, load_config
+        from app_config import AppPaths, SecretsManager, initialize_runtime_data, load_config
 
         self.paths = AppPaths(project_root=self.project_root, config_file=self._config_file)
         self.paths.ensure_data_dirs()
+        initialize_runtime_data(self.paths, project_root=self.project_root)
         os.environ.setdefault("DEBATA_MODELS_DIR", str(self.paths.MODELS_DIR.resolve()))
         self.secrets = SecretsManager(self.paths)
         self.secrets.initialize()

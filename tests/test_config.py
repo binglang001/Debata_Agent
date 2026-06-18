@@ -489,18 +489,30 @@ def test_agent_provider_must_exist():
         )
 
 
-def test_extra_fields_rejected():
-    """unknown 字段应被拒绝（防止拼写错误）。"""
-    with pytest.raises(ValidationError):
-        RootConfig.model_validate(
-            {
-                "agents": {
-                    "chat": {"provider": "ds", "model": "x"},
+def test_extra_fields_ignored():
+    """未知字段应被容忍，但不能被回写到导出配置。"""
+    cfg = RootConfig.model_validate(
+        {
+            "agents": {
+                "chat": {
+                    "provider": "ds",
+                    "model": "x",
+                    "unknown_chat_field": "ignored",
                 },
-                "providers": {"ds": {"preset": "deepseek"}},
-                "unknown_field": "boom",
-            }
-        )
+            },
+            "providers": {"ds": {"preset": "deepseek"}},
+            "behavior": {
+                "unknown_behavior_field": "ignored",
+            },
+            "unknown_field": "ignored",
+        }
+    )
+
+    dumped = cfg.model_dump()
+
+    assert "unknown_field" not in dumped
+    assert "unknown_behavior_field" not in dumped["behavior"]
+    assert "unknown_chat_field" not in dumped["agents"]["chat"]
 
 
 def test_custom_provider_requires_protocol_and_url():
