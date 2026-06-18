@@ -1,6 +1,6 @@
 # diana.db v1 契约
 
-本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records` 的最小读写；不接 runtime，不导入旧数据，不实现 important/summary/usage/runtime 仓储。
+本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories` 的最小读写；不接 runtime，不导入旧数据，不实现 summary/usage/runtime 仓储。
 
 ## 文件与版本
 
@@ -147,6 +147,29 @@
 - `idx_important_persona_time(persona_id, timestamp)`
 - `idx_important_persona_scope(persona_id, scope)`
 - `idx_important_pinned(persona_id, pinned)`
+
+#### DianaImportantStore 接口
+
+`memory.diana_stores.DianaImportantStore(db, persona_id)` 是 `important_memories` 的轻量仓储，构造参数：
+
+- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `persona_id`：人格 ID；同一 persona 的重要记忆是一份整体 JSON 列表。
+
+异步接口与 `JsonStore` 对齐：
+
+- `read(default=None) -> Any`：按写入顺序读取当前 persona 的重要记忆。没有记录时返回传入的 `default`；如果 `default is None`，与 `JsonStore` 一致返回 `{}`。
+- `write(data: Any) -> None`：整体替换当前 persona 的重要记忆；不同 persona 的记录不受影响。
+
+写入语义：
+
+- 主路径是 `list[dict]`：列表中每个 item 写入 `important_memories` 一行，读取时按写入顺序返回 list。
+- 每个 item 完整保存到 `item_json`，不得只保存提取字段；仓储不会为了生成缺失 ID 而改写原 item。
+- 同步提取 `id` 到 `memory_id`，提取 `timestamp`、`scope`、`pinned`、`content`、`updated_at` 到同名列供后续查询使用。
+- item 缺少 `id` 时，`memory_id` 使用基于 item 规范化 JSON 的稳定 fallback；同一次写入中若出现重复 fallback 或重复 id，会在后续重复项后追加序号，避免破坏唯一约束。
+- `write()` 使用删除再插入实现整体替换，同一 persona 幂等替换，不影响其他 persona。
+- 非 list 数据按 legacy/raw 单行保存：`memory_id = "__diana_important_raw__"`，`scope = "__legacy_raw__"`，`item_json` 保存原始 JSON；读取该行时返回原始非 list 数据。`ImportantMemoryManager` 主路径会以 `read(default=[])` 读取空表，因此新数据应保持 list。
+- 读取时遇到损坏的 `item_json` 会跳过该行并记录 warning；仓储不在读取阶段回写修复数据。
+- 所有数据库写入和读取由仓储锁保护，并通过后台线程执行，避免阻塞事件循环。
 
 ### rolling_summary
 

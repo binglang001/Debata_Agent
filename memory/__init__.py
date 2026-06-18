@@ -8,6 +8,7 @@
     EventJournal              —— 单 worker 顺序写入事件库
     RollingSummaryStore       —— 全局滚动会话摘要
     DianaDB                   —— diana.db 基础 schema / 版本 / 备份入口
+    DianaImportantStore        —— diana.db important_memories 轻量仓储
     RagMemoryService          —— RAG 模式的会话向量检索服务
     JsonStore / JsonlStore    —— 底层存储基类（如有特殊需求可直接用）
 
@@ -28,7 +29,7 @@ from .diana_db import (
     DianaDBVersionError,
     backup_existing_database,
 )
-from .diana_stores import DianaHistoryStore
+from .diana_stores import DianaHistoryStore, DianaImportantStore
 from .event_journal import EventJournal
 from .event_store import EventStore
 from .history import HistoryManager
@@ -41,6 +42,7 @@ __all__ = [
     "DIANA_DB_SCHEMA_VERSION",
     "DianaDB",
     "DianaHistoryStore",
+    "DianaImportantStore",
     "DianaDBSchemaVersion",
     "DianaDBVersionError",
     "EventJournal",

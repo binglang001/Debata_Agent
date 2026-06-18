@@ -8,7 +8,9 @@ import json
 import logging
 import sqlite3
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import orjson
 
@@ -215,8 +217,201 @@ class DianaHistoryStore:
         )
 
 
+class DianaImportantStore:
+    """使用 diana.db 的 important_memories 表实现 JsonStore 等价接口。"""
+
+    def __init__(self, db: DianaDB | str | Path, persona_id: str) -> None:
+        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+        self.persona_id = str(persona_id).strip()
+        if not self.persona_id:
+            raise ValueError("persona_id must not be empty")
+        self._lock = asyncio.Lock()
+
+    @property
+    def db(self) -> DianaDB:
+        return self._db
+
+    async def read(self, default: Any = None) -> Any:
+        async with self._lock:
+            rows = await asyncio.to_thread(self._load_rows_sync)
+        if not rows:
+            return default if default is not None else {}
+
+        items: list[Any] = []
+        for row in rows:
+            try:
+                item = orjson.loads(row["item_json"])
+            except orjson.JSONDecodeError:
+                logger.warning(
+                    "跳过损坏的 diana important memory persona_id=%s rowid=%s",
+                    self.persona_id,
+                    row["id"],
+                )
+                continue
+            if _is_legacy_raw_important_row(row):
+                return item
+            items.append(item)
+        return items
+
+    async def write(self, data: Any) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._replace_sync, data)
+
+    def _load_rows_sync(self) -> list[sqlite3.Row]:
+        with closing(self._connect()) as conn:
+            return conn.execute(
+                """
+                SELECT id, memory_id, scope, item_json FROM important_memories
+                WHERE persona_id = ?
+                ORDER BY id ASC
+                """,
+                (self.persona_id,),
+            ).fetchall()
+
+    def _replace_sync(self, data: Any) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "DELETE FROM important_memories WHERE persona_id = ?",
+                    (self.persona_id,),
+                )
+                self._insert_data(conn, data)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+
+    def _connect(self):
+        db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+        db.load()
+        return db.connect()
+
+    def _insert_data(self, conn: sqlite3.Connection, data: Any) -> None:
+        if not isinstance(data, list):
+            now = _utc_timestamp()
+            conn.execute(
+                """
+                INSERT INTO important_memories (
+                    persona_id, memory_id, timestamp, scope, pinned,
+                    content, item_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.persona_id,
+                    _LEGACY_RAW_IMPORTANT_MEMORY_ID,
+                    None,
+                    _LEGACY_RAW_IMPORTANT_SCOPE,
+                    0,
+                    None,
+                    _json_data(data),
+                    now,
+                ),
+            )
+            return
+
+        rows = []
+        used_memory_ids: set[str] = set()
+        now = _utc_timestamp()
+        for item in data:
+            item_json = _json_data(item)
+            memory_id = _unique_memory_id(
+                _important_memory_id(item),
+                used_memory_ids,
+            )
+            rows.append(
+                (
+                    self.persona_id,
+                    memory_id,
+                    _important_item_text(item, "timestamp"),
+                    _important_item_text(item, "scope"),
+                    _important_pinned_value(item),
+                    _important_item_text(item, "content"),
+                    item_json,
+                    _important_item_text(item, "updated_at") or now,
+                )
+            )
+        if not rows:
+            return
+        conn.executemany(
+            """
+            INSERT INTO important_memories (
+                persona_id, memory_id, timestamp, scope, pinned,
+                content, item_json, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+
+_LEGACY_RAW_IMPORTANT_MEMORY_ID = "__diana_important_raw__"
+_LEGACY_RAW_IMPORTANT_SCOPE = "__legacy_raw__"
+
+
+def _is_legacy_raw_important_row(row: sqlite3.Row) -> bool:
+    return (
+        row["memory_id"] == _LEGACY_RAW_IMPORTANT_MEMORY_ID
+        and row["scope"] == _LEGACY_RAW_IMPORTANT_SCOPE
+    )
+
+
+def _important_memory_id(item: Any) -> str:
+    if isinstance(item, dict):
+        item_id = _optional_text(item.get("id"))
+        if item_id:
+            return item_id
+    digest = hashlib.sha256(_canonical_json_data(item).encode("utf-8")).hexdigest()[:32]
+    return f"fallback:{digest}"
+
+
+def _unique_memory_id(memory_id: str, used_memory_ids: set[str]) -> str:
+    candidate = memory_id
+    suffix = 2
+    while candidate in used_memory_ids:
+        candidate = f"{memory_id}#{suffix}"
+        suffix += 1
+    used_memory_ids.add(candidate)
+    return candidate
+
+
+def _important_item_text(item: Any, key: str) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    return _optional_text(item.get(key))
+
+
+def _important_pinned_value(item: Any) -> int:
+    if not isinstance(item, dict):
+        return 0
+    value = item.get("pinned", False)
+    if isinstance(value, str):
+        return 1 if value.strip().lower() in {"1", "true", "yes", "on"} else 0
+    return 1 if bool(value) else 0
+
+
 def _record_json(record: dict) -> str:
     return orjson.dumps(record).decode("utf-8")
+
+
+def _json_data(data: Any) -> str:
+    return orjson.dumps(data).decode("utf-8")
+
+
+def _canonical_json_data(data: Any) -> str:
+    return json.dumps(
+        data,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _history_record_conversation_id(record: dict) -> str | None:
@@ -283,4 +478,4 @@ def _optional_text(value: object) -> str | None:
     return text or None
 
 
-__all__ = ["DianaHistoryStore"]
+__all__ = ["DianaHistoryStore", "DianaImportantStore"]
