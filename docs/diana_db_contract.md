@@ -1,6 +1,6 @@
 # diana.db v1 契约
 
-本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records`、`DianaPersonaDB` 对 `persona_*` legacy domains 的最小读写；不接 runtime，不导入旧数据，不实现 runtime 仓储。
+本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records`、`DianaPersonaDB` 对 `persona_*` legacy domains 的最小读写；第一批旧文件导入器覆盖 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`；不接 runtime，不实现 runtime 仓储。
 
 ## 文件与版本
 
@@ -57,6 +57,33 @@
 - `persona_arc.event_json`
 - `persona_sleep_records.record_json`
 - `persona_eat_records.record_json`
+
+## 第一批旧文件导入器
+
+`memory.diana_importers.import_legacy_memory_files(db, source_dir, persona_id, *, backup=True, usage_persona_id=None)` 是同步导入入口，用于把旧 `memory/` 与 `logs/` 中第一批文件导入已存在的 `diana.db` stores。参数约定：
+
+- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。入口会主动 `load()` 并确保 schema 可用。
+- `source_dir`：旧 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl` 所在目录。
+- `persona_id`：写入 `history_records`、`important_memories`、`rolling_summary` 的目标 persona。
+- `backup=True`：导入前如果目标 `diana.db` 已存在，调用 `backup_existing_database()`；目标库不存在时不创建备份。
+- `usage_persona_id=None`：默认跟随 `persona_id` 写入 `usage_records.persona_id`。显式传入空字符串表示全局 usage，写库时 `persona_id` 为 `NULL`。
+
+返回值是 `LegacyMemoryImportResult`，包含 `backup_path` 以及 `history`、`important`、`rolling_summary`、`usage` 四个 `LegacyImportDomainResult(imported, skipped)` 统计，供 runtime 后续展示。
+
+导入映射：
+
+- `history.jsonl` -> `DianaHistoryStore.replace_all(...)`。
+- `important.json` -> `DianaImportantStore.write(...)`。
+- `rolling_summary.json` -> 直写 `rolling_summary` 单行；查询列按 store 读取契约抽取，`summary_json` 完整保留旧 JSON 对象。
+- `model_usage.jsonl` -> 直接写入 `usage_records`，保留完整 `record_json`，并抽取 usage 常用列。
+
+幂等与容错：
+
+- 缺失文件视为该域 `imported=0, skipped=0`，不写入该域。
+- `history`、`important`、`rolling_summary` 采用整体替换或 upsert 语义；重复导入不会追加重复记录。
+- `usage` 按同一 `usage_persona_id` 下的 `record_json` 去重；重复导入同一旧记录时计入 skipped，不新增行。
+- JSONL 中空行、损坏行、非对象行会跳过并记录 warning；损坏 JSON 文件会跳过整个域并记录 warning，不让整体导入崩溃。
+- 只有指定 persona 的 `history`、`important`、`rolling_summary` 会被替换；其他 persona 不受影响。`usage` 去重和写入按 `usage_persona_id` 隔离。
 
 ## 表结构
 
@@ -679,5 +706,5 @@ Persona state 域使用 `persona_*` 表名前缀复制现 `mind/db_schema.py` �
 - 未改现有 memory/history/important/event/archive manager。
 - 未改 `mind/db.py` 或 `mind/db_schema.py`。
 - 未实现统一仓储抽象。
-- 未实现旧 `history.jsonl`、`important.json`、`rolling_summary.json`、`events.sqlite3`、`archive.sqlite3`、`model_usage.jsonl`、`persona.db` 的导入器。
+- 未实现旧 `events.sqlite3`、`archive.sqlite3`、`persona.db` 的导入器。
 - 未处理向量库搬迁；向量库按阶段计划保持独立文件。

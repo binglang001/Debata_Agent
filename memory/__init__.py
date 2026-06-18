@@ -14,6 +14,7 @@
     DianaPersonaDB             —— diana.db persona_* legacy domains 仓储
     DianaRollingSummaryStore   —— diana.db rolling_summary 轻量仓储
     DianaUsageStatsStore       —— diana.db usage_records 轻量仓储
+    import_legacy_memory_files —— 旧 memory/logs 文件到 diana.db 的同步导入入口
     RagMemoryService          —— RAG 模式的会话向量检索服务
     JsonStore / JsonlStore    —— 底层存储基类（如有特殊需求可直接用）
 
@@ -33,6 +34,11 @@ from .diana_db import (
     DianaDBSchemaVersion,
     DianaDBVersionError,
     backup_existing_database,
+)
+from .diana_importers import (
+    LegacyImportDomainResult,
+    LegacyMemoryImportResult,
+    import_legacy_memory_files,
 )
 from .diana_stores import (
     DianaArchiveStore,
@@ -69,9 +75,12 @@ __all__ = [
     "ImportantMemoryManager",
     "JsonStore",
     "JsonlStore",
+    "LegacyImportDomainResult",
+    "LegacyMemoryImportResult",
     "RagMemoryService",
     "RollingSummaryStore",
     "SqliteVectorStore",
     "StoreError",
     "backup_existing_database",
+    "import_legacy_memory_files",
 ]
