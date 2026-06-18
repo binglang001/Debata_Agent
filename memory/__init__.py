@@ -8,6 +8,7 @@
     EventJournal              —— 单 worker 顺序写入事件库
     RollingSummaryStore       —— 全局滚动会话摘要
     DianaDB                   —— diana.db 基础 schema / 版本 / 备份入口
+    DianaArchiveStore         —— diana.db archive_messages 轻量归档仓储
     DianaEventStore            —— diana.db event_log 轻量事件仓储
     DianaImportantStore        —— diana.db important_memories 轻量仓储
     DianaRollingSummaryStore   —— diana.db rolling_summary 轻量仓储
@@ -33,6 +34,7 @@ from .diana_db import (
     backup_existing_database,
 )
 from .diana_stores import (
+    DianaArchiveStore,
     DianaEventStore,
     DianaHistoryStore,
     DianaImportantStore,
@@ -50,6 +52,7 @@ __all__ = [
     "ArchiveStore",
     "DIANA_DB_SCHEMA_VERSION",
     "DianaDB",
+    "DianaArchiveStore",
     "DianaEventStore",
     "DianaHistoryStore",
     "DianaImportantStore",

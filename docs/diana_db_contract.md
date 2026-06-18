@@ -360,6 +360,39 @@
 
 - `idx_archive_media_archive(persona_id, archive_id)`
 
+#### DianaArchiveStore 接口
+
+`memory.diana_stores.DianaArchiveStore(db, persona_id)` 是 `archive_messages` / `archive_message_media` 的轻量归档仓储，构造参数：
+
+- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `persona_id`：人格 ID；去除首尾空白后不能为空。归档消息、短 ID、媒体 ID、去重和所有查询都按 persona 隔离。
+
+异步接口与旧 `ArchiveStore` 当前调用面对齐：
+
+- `load(force_reload=False) -> list[dict]`：直接返回 `records()`。
+- `append_many(records: list[dict]) -> None`
+- `records() -> list[dict]`
+- `search(conversation_id=None, keyword=None, time_range=None, limit=20) -> list[dict]`
+- `filter_records(query) -> dict[str, Any]`
+- `get_by_ids(archive_ids: list[str]) -> list[dict]`
+- `context_around(archive_id, before, after) -> list[dict]`
+- `rag_records() -> list[dict]`
+- `media_records(archive_id=None) -> list[dict[str, Any]]`
+
+写入语义：
+
+- `append_many()` 复用旧 archive normalization/filter helper，只归档真实聊天记录，以及 tool `send_result` 中 `qq_visible is True` 的 outbound 发送结果；runtime、system、internal、未证明已外发的 assistant 文本不入库。
+- `record_json` 保存归一化后的完整记录 JSON。同一 persona 内按 `record_json` 去重；不同 persona 的去重空间互不影响。
+- 当前 persona 的 `rowid` 从 `1` 连续递增，`archive_id` 使用旧短 ID 形态 `a1`、`a2` 等；不同 persona 独立分配。
+- 当前 persona 的 `archive_message_media.id` 从 `1` 连续递增，外键写入 `(persona_id, archive_id)`。
+
+读取语义：
+
+- `records()`、`search()`、`filter_records()`、`get_by_ids()`、`context_around()`、`rag_records()`、`media_records()` 都只返回当前 persona 的真实聊天数据或媒体。
+- `filter_records()` 复用旧 `_filter_sql_plan()`，但 diana 查询会在主 SQL 和 fallback SQL 的基底强制加 `persona_id = ?`；Python residual filter 只接收当前 persona 已筛出的行。
+- `context_around()` 只在当前 persona 且同一 `conversation_id` 中取上下文。
+- `rag_records()` 返回真实聊天记录，并用 `content_search` 作为 RAG 文本内容，与旧 SQLite 归档行为一致。
+
 ### usage_records
 
 抽取 `model_usage.jsonl` 的 token 和常用维度列，同时保留完整 JSON。

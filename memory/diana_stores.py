@@ -20,6 +20,30 @@ import orjson
 from providers.base import Usage
 from utils.usage_summary import UsageRange, UsageSummary, cutoff_timestamp
 
+from .archive_sqlite_filters import (
+    _filter_order_sql,
+    _filter_row_sort_key,
+    _filter_sql_plan,
+    _placeholders,
+    _row_matches_filter,
+    _unique_rows_by_rowid,
+)
+from .archive_sqlite_records import (
+    _base36,
+    _clamp_int,
+    _clean_id,
+    _extract_media,
+    _json_dumps,
+    _json_loads,
+    _legacy_search_text,
+    _normalize_record,
+    _now_text,
+    _query_to_dict,
+    _row_is_real_chat,
+    _row_to_light_result,
+    _row_to_record,
+    real_chat_archive_records,
+)
 from .diana_db import DianaDB
 from .event_store import (
     _clamp_limit,
@@ -232,6 +256,467 @@ class DianaHistoryStore:
             """,
             rows,
         )
+
+
+class DianaArchiveStore:
+    """使用 diana.db 的 archive_messages 表实现 ArchiveStore 等价接口。"""
+
+    def __init__(self, db: DianaDB | str | Path, persona_id: str) -> None:
+        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+        self.persona_id = str(persona_id).strip()
+        if not self.persona_id:
+            raise ValueError("persona_id must not be empty")
+        self._lock = asyncio.Lock()
+
+    @property
+    def db(self) -> DianaDB:
+        return self._db
+
+    async def load(self, force_reload: bool = False) -> list[dict]:
+        _ = force_reload
+        return await self.records()
+
+    async def append_many(self, records: list[dict[str, Any]]) -> None:
+        if not records:
+            return
+        payload: list[dict[str, Any]] = []
+        for record in records:
+            if isinstance(record, dict):
+                payload.extend(real_chat_archive_records(record))
+        if not payload:
+            return
+        async with self._lock:
+            await asyncio.to_thread(self._append_many_sync, payload)
+
+    async def records(self) -> list[dict]:
+        async with self._lock:
+            return await asyncio.to_thread(self._records_sync)
+
+    async def search(
+        self,
+        *,
+        conversation_id: str | None = None,
+        keyword: str | None = None,
+        time_range: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._legacy_search_sync,
+                conversation_id,
+                keyword,
+                time_range,
+                limit,
+            )
+
+    async def filter_records(self, query: Any) -> dict[str, Any]:
+        query_dict = _query_to_dict(query)
+        started_at = time.perf_counter()
+        async with self._lock:
+            result = await asyncio.to_thread(self._filter_records_sync, query_dict)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Diana archive filter_records 指标 persona_id=%s limit=%s offset=%s "
+                "returned=%s total=%s elapsed_ms=%.3f",
+                self.persona_id,
+                result.get("limit"),
+                result.get("offset"),
+                result.get("count"),
+                result.get("total"),
+                (time.perf_counter() - started_at) * 1000,
+            )
+        return result
+
+    async def get_by_ids(self, archive_ids: list[str]) -> list[dict]:
+        ids = [_clean_id(value) for value in archive_ids]
+        ids = [value for value in ids if value]
+        if not ids:
+            return []
+        async with self._lock:
+            return await asyncio.to_thread(self._get_by_ids_sync, ids)
+
+    async def context_around(
+        self,
+        archive_id: str,
+        before: int,
+        after: int,
+    ) -> list[dict]:
+        archive_id = _clean_id(archive_id)
+        if not archive_id:
+            return []
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._context_around_sync,
+                archive_id,
+                max(0, before),
+                max(0, after),
+            )
+
+    async def rag_records(self) -> list[dict]:
+        async with self._lock:
+            return await asyncio.to_thread(self._rag_records_sync)
+
+    async def media_records(self, archive_id: str | None = None) -> list[dict[str, Any]]:
+        async with self._lock:
+            return await asyncio.to_thread(self._media_records_sync, archive_id)
+
+    def _connect(self) -> sqlite3.Connection:
+        db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+        db.load()
+        return db.connect()
+
+    def _append_many_sync(self, records: list[dict[str, Any]]) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = _now_text()
+                existing_record_json = self._existing_record_json(conn, records)
+                seen_record_json: set[str] = set()
+                pending: list[tuple[Any, str, str]] = []
+                for record in records:
+                    normalized = _normalize_record(record)
+                    record_json = _json_dumps(normalized.record)
+                    if record_json in existing_record_json or record_json in seen_record_json:
+                        continue
+                    seen_record_json.add(record_json)
+                    pending.append(
+                        (normalized, record_json, _json_dumps(normalized.metadata))
+                    )
+                if not pending:
+                    conn.commit()
+                    return
+
+                next_rowid = int(
+                    conn.execute(
+                        """
+                        SELECT COALESCE(MAX(rowid), 0) + 1
+                        FROM archive_messages
+                        WHERE persona_id = ?
+                        """,
+                        (self.persona_id,),
+                    ).fetchone()[0]
+                )
+                next_media_id = int(
+                    conn.execute(
+                        """
+                        SELECT COALESCE(MAX(id), 0) + 1
+                        FROM archive_message_media
+                        WHERE persona_id = ?
+                        """,
+                        (self.persona_id,),
+                    ).fetchone()[0]
+                )
+                message_rows: list[tuple[Any, ...]] = []
+                media_rows: list[tuple[Any, ...]] = []
+                for offset, (normalized, record_json, metadata_json) in enumerate(pending):
+                    rowid = next_rowid + offset
+                    archive_id = "a" + _base36(rowid)
+                    message_rows.append(
+                        (
+                            self.persona_id,
+                            rowid,
+                            archive_id,
+                            normalized.timestamp,
+                            normalized.timestamp_unix,
+                            normalized.date_key,
+                            normalized.month_key,
+                            normalized.conversation_id,
+                            normalized.conversation_type,
+                            normalized.target_id,
+                            normalized.sender_id,
+                            normalized.sender_name,
+                            normalized.sender_role,
+                            normalized.direction,
+                            normalized.message_kind,
+                            normalized.content,
+                            normalized.content_search,
+                            normalized.original_msg_id,
+                            normalized.reply_to_msg_id,
+                            metadata_json,
+                            record_json,
+                            now,
+                        )
+                    )
+                    for item in _extract_media(normalized.record.get("content")):
+                        media_rows.append(
+                            (
+                                self.persona_id,
+                                next_media_id + len(media_rows),
+                                archive_id,
+                                item["media_type"],
+                                item.get("workspace_path"),
+                                item.get("original_name"),
+                                _json_dumps(item.get("metadata") or {}),
+                            )
+                        )
+                conn.executemany(
+                    """
+                    INSERT INTO archive_messages (
+                        persona_id, rowid, archive_id, timestamp, timestamp_unix,
+                        date_key, month_key, conversation_id, conversation_type,
+                        target_id, sender_id, sender_name, sender_role, direction,
+                        message_kind, content, content_search, original_msg_id,
+                        reply_to_msg_id, metadata_json, record_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    message_rows,
+                )
+                if media_rows:
+                    conn.executemany(
+                        """
+                        INSERT INTO archive_message_media (
+                            persona_id, id, archive_id, media_type, workspace_path,
+                            original_name, metadata_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        media_rows,
+                    )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+
+    def _existing_record_json(
+        self,
+        conn: sqlite3.Connection,
+        records: list[dict[str, Any]],
+    ) -> set[str]:
+        record_json_values = list(
+            dict.fromkeys(_json_dumps(_normalize_record(record).record) for record in records)
+        )
+        existing: set[str] = set()
+        for start in range(0, len(record_json_values), 500):
+            chunk = record_json_values[start:start + 500]
+            if not chunk:
+                continue
+            placeholders = _placeholders(len(chunk))
+            rows = conn.execute(
+                f"""
+                SELECT record_json FROM archive_messages
+                WHERE persona_id = ? AND record_json IN ({placeholders})
+                """,
+                [self.persona_id, *chunk],
+            ).fetchall()
+            existing.update(str(row["record_json"]) for row in rows if row["record_json"])
+        return existing
+
+    def _records_sync(self) -> list[dict]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM archive_messages
+                WHERE persona_id = ?
+                ORDER BY rowid ASC
+                """,
+                (self.persona_id,),
+            ).fetchall()
+        return [_row_to_record(row) for row in rows if _row_is_real_chat(row)]
+
+    def _legacy_search_sync(
+        self,
+        conversation_id: str | None,
+        keyword: str | None,
+        time_range: str | None,
+        limit: int,
+    ) -> list[dict]:
+        keyword = (keyword or "").strip()
+        time_range = (time_range or "").strip()
+        matched: list[dict] = []
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM archive_messages
+                WHERE persona_id = ?
+                ORDER BY rowid ASC
+                """,
+                (self.persona_id,),
+            ).fetchall()
+        for row in rows:
+            if not _row_is_real_chat(row):
+                continue
+            if conversation_id and row["conversation_id"] != conversation_id:
+                continue
+            text = _legacy_search_text(row)
+            if keyword and keyword not in text:
+                continue
+            if time_range and time_range not in text:
+                continue
+            matched.append(_row_to_record(row))
+        return matched[-max(1, limit):]
+
+    def _filter_records_sync(self, query: dict[str, Any]) -> dict[str, Any]:
+        limit = _clamp_int(query.get("limit"), default=50, minimum=1, maximum=500)
+        offset = _clamp_int(query.get("offset"), default=0, minimum=0, maximum=1_000_000)
+        order = str(query.get("order") or "desc").lower()
+        reverse = order != "asc"
+        plan = _filter_sql_plan(query)
+        order_sql = _filter_order_sql(reverse)
+        base_sql = f"""
+            FROM archive_messages
+            WHERE persona_id = ? AND {plan.where_sql}
+            """
+        base_params = [self.persona_id, *plan.params]
+        with closing(self._connect()) as conn:
+            if plan.has_python_residual_filter:
+                rows = conn.execute(
+                    f"SELECT * {base_sql} ORDER BY {order_sql}",
+                    base_params,
+                ).fetchall()
+                if plan.fallback_where_sql is not None:
+                    fallback_base_sql = f"""
+                        FROM archive_messages
+                        WHERE persona_id = ? AND {plan.fallback_where_sql}
+                        """
+                    fallback_rows = conn.execute(
+                        f"SELECT * {fallback_base_sql} ORDER BY {order_sql}",
+                        [self.persona_id, *(plan.fallback_params or [])],
+                    ).fetchall()
+                    rows = _unique_rows_by_rowid([*rows, *fallback_rows])
+                    rows.sort(key=_filter_row_sort_key, reverse=reverse)
+                matched = [
+                    row for row in rows
+                    if _row_is_real_chat(row) and _row_matches_filter(row, query)
+                ]
+                total = len(matched)
+                selected = matched[offset:offset + limit]
+            else:
+                total = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) {base_sql}",
+                        base_params,
+                    ).fetchone()[0]
+                )
+                selected = conn.execute(
+                    f"SELECT * {base_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+                    [*base_params, limit, offset],
+                ).fetchall()
+        return {
+            "ok": True,
+            "count": len(selected),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "order": "desc" if reverse else "asc",
+            "results": [_row_to_light_result(row) for row in selected],
+            "next": "如需完整上下文，把 results[].id 传给 recall_history 的 archive_ids。",
+        }
+
+    def _get_by_ids_sync(self, archive_ids: list[str]) -> list[dict]:
+        placeholders = ",".join("?" for _ in archive_ids)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM archive_messages
+                WHERE persona_id = ? AND archive_id IN ({placeholders})
+                """,
+                [self.persona_id, *archive_ids],
+            ).fetchall()
+        by_id = {
+            row["archive_id"]: _row_to_record(row)
+            for row in rows
+            if _row_is_real_chat(row)
+        }
+        return [by_id[archive_id] for archive_id in archive_ids if archive_id in by_id]
+
+    def _context_around_sync(
+        self,
+        archive_id: str,
+        before: int,
+        after: int,
+    ) -> list[dict]:
+        with closing(self._connect()) as conn:
+            target = conn.execute(
+                """
+                SELECT * FROM archive_messages
+                WHERE persona_id = ? AND archive_id = ?
+                """,
+                (self.persona_id, archive_id),
+            ).fetchone()
+            if target is None or not _row_is_real_chat(target):
+                return []
+            conversation_id = target["conversation_id"]
+            if conversation_id is None:
+                prev_rows = []
+                next_rows = []
+            else:
+                prev_rows = conn.execute(
+                    """
+                    SELECT * FROM archive_messages
+                    WHERE persona_id = ? AND conversation_id = ? AND rowid < ?
+                    ORDER BY rowid DESC
+                    """,
+                    (self.persona_id, conversation_id, target["rowid"]),
+                ).fetchall()
+                next_rows = conn.execute(
+                    """
+                    SELECT * FROM archive_messages
+                    WHERE persona_id = ? AND conversation_id = ? AND rowid > ?
+                    ORDER BY rowid ASC
+                    """,
+                    (self.persona_id, conversation_id, target["rowid"]),
+                ).fetchall()
+        prev_real = [row for row in prev_rows if _row_is_real_chat(row)][:before]
+        next_real = [row for row in next_rows if _row_is_real_chat(row)][:after]
+        rows = list(reversed(prev_real)) + [target] + next_real
+        return [_row_to_record(row) for row in rows]
+
+    def _rag_records_sync(self) -> list[dict]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM archive_messages
+                WHERE persona_id = ?
+                  AND direction IN ('inbound', 'outbound')
+                  AND message_kind IN ('text', 'image', 'file', 'audio', 'forward', 'mixed')
+                ORDER BY rowid ASC
+                """,
+                (self.persona_id,),
+            ).fetchall()
+        records: list[dict] = []
+        for row in rows:
+            if not _row_is_real_chat(row):
+                continue
+            record = _row_to_record(row)
+            record["content"] = str(row["content_search"] or row["content"] or "")
+            records.append(record)
+        return records
+
+    def _media_records_sync(self, archive_id: str | None) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            if archive_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM archive_message_media
+                    WHERE persona_id = ? AND archive_id = ?
+                    ORDER BY id ASC
+                    """,
+                    (self.persona_id, archive_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM archive_message_media
+                    WHERE persona_id = ?
+                    ORDER BY id ASC
+                    """,
+                    (self.persona_id,),
+                ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            result.append(
+                {
+                    "id": row["id"],
+                    "archive_id": row["archive_id"],
+                    "media_type": row["media_type"],
+                    "workspace_path": row["workspace_path"],
+                    "original_name": row["original_name"],
+                    "metadata": _json_loads(row["metadata_json"], default={}),
+                }
+            )
+        return result
 
 
 class DianaImportantStore:
@@ -1405,6 +1890,7 @@ def _default_rolling_summary_data() -> dict[str, Any]:
 
 
 __all__ = [
+    "DianaArchiveStore",
     "DianaEventStore",
     "DianaHistoryStore",
     "DianaImportantStore",
