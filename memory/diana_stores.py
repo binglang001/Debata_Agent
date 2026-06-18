@@ -7,12 +7,16 @@ import hashlib
 import json
 import logging
 import sqlite3
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import orjson
+
+from providers.base import Usage
+from utils.usage_summary import UsageRange, UsageSummary, cutoff_timestamp
 
 from .diana_db import DianaDB
 
@@ -554,6 +558,171 @@ class DianaRollingSummaryStore:
             return None
 
 
+class DianaUsageStatsStore:
+    """使用 diana.db 的 usage_records 表实现 UsageStatsStore 等价接口。"""
+
+    def __init__(
+        self,
+        db: DianaDB | str | Path,
+        persona_id: str | None = None,
+    ) -> None:
+        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+        persona_text = "" if persona_id is None else str(persona_id).strip()
+        self.persona_id = persona_text or None
+        self._lock = asyncio.Lock()
+        self._records: list[dict[str, Any]] | None = None
+
+    @property
+    def db(self) -> DianaDB:
+        return self._db
+
+    async def load(self) -> None:
+        async with self._lock:
+            self._records = await asyncio.to_thread(self._load_sync)
+
+    async def record(
+        self,
+        usage: Usage,
+        *,
+        provider: str = "",
+        model: str = "",
+        agent: str = "",
+        operation: str = "",
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if usage.total_tokens <= 0 and usage.prompt_tokens <= 0 and usage.completion_tokens <= 0:
+            return
+
+        record = {
+            "ts": time.time(),
+            "provider": provider,
+            "model": model,
+            "agent": agent,
+            "operation": operation,
+            "prompt_tokens": int(usage.prompt_tokens),
+            "completion_tokens": int(usage.completion_tokens),
+            "reasoning_tokens": int(usage.reasoning_tokens),
+            "cached_tokens": int(usage.cached_tokens),
+            "cache_creation_tokens": int(usage.cache_creation_tokens),
+            "total_tokens": int(
+                usage.total_tokens
+                or (usage.prompt_tokens + usage.completion_tokens)
+            ),
+        }
+        if extra:
+            record.update(extra)
+
+        async with self._lock:
+            if self._records is None:
+                self._records = await asyncio.to_thread(self._load_sync)
+            await asyncio.to_thread(self._insert_record_sync, record)
+            self._records.append(record)
+
+    def summarize(self, range_name: UsageRange = "today") -> UsageSummary:
+        records = self._records or []
+        cutoff = cutoff_timestamp(range_name)
+        summary = UsageSummary()
+        for record in records:
+            ts = float(record.get("ts") or 0)
+            if cutoff is not None and ts < cutoff:
+                continue
+            summary.request_count += 1
+            summary.prompt_tokens += int(record.get("prompt_tokens") or 0)
+            summary.completion_tokens += int(record.get("completion_tokens") or 0)
+            summary.reasoning_tokens += int(record.get("reasoning_tokens") or 0)
+            summary.cached_tokens += int(record.get("cached_tokens") or 0)
+            summary.cache_creation_tokens += int(record.get("cache_creation_tokens") or 0)
+            summary.total_tokens += int(record.get("total_tokens") or 0)
+        return summary
+
+    @property
+    def count(self) -> int:
+        return len(self._records or [])
+
+    def _load_sync(self) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            if self.persona_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT id, persona_id, record_json
+                    FROM usage_records
+                    ORDER BY id ASC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, persona_id, record_json
+                    FROM usage_records
+                    WHERE persona_id = ?
+                    ORDER BY id ASC
+                    """,
+                    (self.persona_id,),
+                ).fetchall()
+
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                record = orjson.loads(row["record_json"])
+            except orjson.JSONDecodeError:
+                logger.warning(
+                    "跳过损坏的 diana usage record_json persona_id=%s rowid=%s",
+                    row["persona_id"],
+                    row["id"],
+                )
+                continue
+            if not isinstance(record, dict):
+                logger.warning(
+                    "跳过非对象 diana usage record_json persona_id=%s rowid=%s",
+                    row["persona_id"],
+                    row["id"],
+                )
+                continue
+            records.append(record)
+        return records
+
+    def _insert_record_sync(self, record: dict[str, Any]) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO usage_records (
+                        persona_id, ts, provider, model, agent, operation,
+                        prompt_tokens, completion_tokens, reasoning_tokens,
+                        cached_tokens, cache_creation_tokens, total_tokens,
+                        record_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self.persona_id,
+                        float(record.get("ts") or 0),
+                        _record_text(record.get("provider")),
+                        _record_text(record.get("model")),
+                        _record_text(record.get("agent")),
+                        _record_text(record.get("operation")),
+                        int(record.get("prompt_tokens") or 0),
+                        int(record.get("completion_tokens") or 0),
+                        int(record.get("reasoning_tokens") or 0),
+                        int(record.get("cached_tokens") or 0),
+                        int(record.get("cache_creation_tokens") or 0),
+                        int(record.get("total_tokens") or 0),
+                        _record_json(record),
+                    ),
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+
+    def _connect(self):
+        db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+        db.load()
+        return db.connect()
+
+
 _LEGACY_RAW_IMPORTANT_MEMORY_ID = "__diana_important_raw__"
 _LEGACY_RAW_IMPORTANT_SCOPE = "__legacy_raw__"
 
@@ -601,6 +770,12 @@ def _important_pinned_value(item: Any) -> int:
 
 def _record_json(record: dict) -> str:
     return orjson.dumps(record).decode("utf-8")
+
+
+def _record_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
 
 
 def _json_data(data: Any) -> str:
@@ -693,4 +868,9 @@ def _default_rolling_summary_data() -> dict[str, Any]:
     }
 
 
-__all__ = ["DianaHistoryStore", "DianaImportantStore", "DianaRollingSummaryStore"]
+__all__ = [
+    "DianaHistoryStore",
+    "DianaImportantStore",
+    "DianaRollingSummaryStore",
+    "DianaUsageStatsStore",
+]

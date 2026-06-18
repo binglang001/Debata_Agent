@@ -1,6 +1,6 @@
 # diana.db v1 契约
 
-本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary` 的最小读写；不接 runtime，不导入旧数据，不实现 usage/runtime 仓储。
+本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records` 的最小读写；不接 runtime，不导入旧数据，不实现 runtime 仓储。
 
 ## 文件与版本
 
@@ -345,6 +345,34 @@
 - `idx_usage_provider_model(provider, model)`
 - `idx_usage_agent_operation(agent, operation)`
 - `idx_usage_persona_ts(persona_id, ts)`
+
+#### DianaUsageStatsStore 接口
+
+`memory.diana_stores.DianaUsageStatsStore(db, persona_id=None)` 是 `usage_records` 的轻量仓储，构造参数：
+
+- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `persona_id`：可选人格 ID。`None` 或空白字符串表示全局 usage，写库时 `persona_id` 为 `NULL`；非空值去除首尾空白后保存。
+
+接口与 `core.usage_stats.UsageStatsStore` 对齐：
+
+- `load() -> None`：从 `usage_records` 加载记录到内存列表。构造时指定 persona 时只加载该 persona；未指定 persona 时加载全部记录。
+- `record(usage, *, provider="", model="", agent="", operation="", extra=None) -> None`：记录一次模型 usage。
+- `summarize(range_name="today") -> UsageSummary`：基于内存列表聚合 `today`、`7d`、`30d` 或 `all`。
+- `count`：返回当前内存列表长度。
+
+写入语义：
+
+- 当 `usage.total_tokens`、`usage.prompt_tokens`、`usage.completion_tokens` 全部小于等于 0 时，与旧 `UsageStatsStore` 一致直接返回，不写库也不改内存。
+- 每条记录构造完整 record 对象：`ts=time.time()`、`provider`、`model`、`agent`、`operation`、`prompt_tokens`、`completion_tokens`、`reasoning_tokens`、`cached_tokens`、`cache_creation_tokens`、`total_tokens`。`total_tokens` 使用 `usage.total_tokens`，缺省时回退为 `prompt_tokens + completion_tokens`。
+- `extra` 有值时合并到完整 record 对象，`kv_*` 等任意诊断字段必须保留。
+- `record_json` 保存完整 record 对象，不得只保存抽取字段。
+- 同步抽取 `persona_id`、`ts`、`provider`、`model`、`agent`、`operation`、五类 token 与 `total_tokens` 到同名列供后续查询使用。
+
+读取语义：
+
+- `load()` 只从 `record_json` 恢复内存列表；聚合以 `_records` 为准，与旧 JSONL 仓储一致。
+- 读取损坏的 `record_json` 或非对象 JSON 时跳过该行并记录 warning；仓储不在读取阶段回写修复数据。
+- 所有数据库写入和读取由仓储锁保护，并通过后台线程执行，避免阻塞事件循环。
 
 ## Persona state 域
 
