@@ -7,6 +7,7 @@
     EventStore                —— 磁盘 append-only 全量事件库
     EventJournal              —— 单 worker 顺序写入事件库
     RollingSummaryStore       —— 全局滚动会话摘要
+    DianaDB                   —— diana.db 基础 schema / 版本 / 备份入口
     RagMemoryService          —— RAG 模式的会话向量检索服务
     JsonStore / JsonlStore    —— 底层存储基类（如有特殊需求可直接用）
 
@@ -20,6 +21,13 @@ per-persona 实例化：
 
 from .archive import ArchiveStore
 from .conversation_summary import RollingSummaryStore
+from .diana_db import (
+    DIANA_DB_SCHEMA_VERSION,
+    DianaDB,
+    DianaDBSchemaVersion,
+    DianaDBVersionError,
+    backup_existing_database,
+)
 from .event_journal import EventJournal
 from .event_store import EventStore
 from .history import HistoryManager
@@ -29,6 +37,10 @@ from .store import JsonlStore, JsonStore, StoreError
 
 __all__ = [
     "ArchiveStore",
+    "DIANA_DB_SCHEMA_VERSION",
+    "DianaDB",
+    "DianaDBSchemaVersion",
+    "DianaDBVersionError",
     "EventJournal",
     "EventStore",
     "HistoryManager",
@@ -39,4 +51,5 @@ __all__ = [
     "RollingSummaryStore",
     "SqliteVectorStore",
     "StoreError",
+    "backup_existing_database",
 ]
