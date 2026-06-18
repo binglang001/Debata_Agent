@@ -1,6 +1,6 @@
 # diana.db v1 契约
 
-本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories` 的最小读写；不接 runtime，不导入旧数据，不实现 summary/usage/runtime 仓储。
+本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary` 的最小读写；不接 runtime，不导入旧数据，不实现 usage/runtime 仓储。
 
 ## 文件与版本
 
@@ -183,6 +183,32 @@
 | active_start_index | INTEGER |  |
 | summary_json | TEXT | NOT NULL DEFAULT '{}' |
 | updated_at | TEXT | NOT NULL |
+
+#### DianaRollingSummaryStore 接口
+
+`memory.diana_stores.DianaRollingSummaryStore(db, persona_id)` 是 `rolling_summary` 的轻量仓储，构造参数：
+
+- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `persona_id`：人格 ID；同一 persona 只保存一行滚动摘要。
+
+异步接口与旧 `RollingSummaryStore` 对齐：
+
+- `load() -> dict[str, Any]`：读取当前 persona 摘要。没有记录时返回 `summary_text=""`、`archived_until=None`、`updated_at=""`，并刷新内存缓存但不写库。
+- `text() -> str`：返回内存缓存中的摘要文本。
+- `active_start_index() -> int`：先读取 `archived_until.active_start_index`，否则兼容旧顶层 `active_start_index`；非法值返回 `0`。
+- `update(summary_text, *, archived_until=None, updated_at="", active_start_index=None) -> None`：整体替换当前 persona 摘要。
+
+写入语义：
+
+- `summary_text` 列保存去除首尾空白后的摘要文本。
+- `archived_until_json` 保存 `archived_until` 的 JSON 表示；`None` 保存为 JSON `null`，读取时还原为 `None`。
+- `active_start_index` 列保存归一化后的非负整数或 `NULL`。当 `active_start_index` 参数不为 `None` 时，同时写入 `archived_until.active_start_index`；如果原 `archived_until` 不是对象，按旧类语义封装为 `{"legacy_archived_until": old, "active_start_index": n}`。
+- `summary_json` 保存完整新数据对象：`{"summary_text": ..., "archived_until": ..., "updated_at": ...}`，用于未来导出和审计。
+- `updated_at` 列保存调用方传入值，允许空字符串。
+- 读取时先从 `summary_text`、`archived_until_json`、`active_start_index`、`updated_at` 列构造基线数据，再解析 `summary_json`。如果 `summary_json` 是对象，只用其中实际存在的 `summary_text`、`archived_until`、`updated_at` 关键字段覆盖基线数据；合法但缺关键字段的对象（例如 schema 默认 `{}`）不得吞掉列字段。`summary_json` 顶层 `active_start_index` 仅在实际存在时参与旧数据兼容归一化；不存在时继续使用列中的 `active_start_index`。
+- 如果 `summary_json` 损坏或不是对象，记录 warning，并只使用列字段回退构造。
+- 仓储只管理当前 persona 单行，不影响其他 persona。
+- 所有数据库写入和读取由仓储锁保护，并通过后台线程执行，避免阻塞事件循环。
 
 ### event_log
 

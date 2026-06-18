@@ -347,6 +347,213 @@ class DianaImportantStore:
         )
 
 
+class DianaRollingSummaryStore:
+    """使用 diana.db 的 rolling_summary 表实现 RollingSummaryStore 等价接口。"""
+
+    def __init__(self, db: DianaDB | str | Path, persona_id: str) -> None:
+        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+        self.persona_id = str(persona_id).strip()
+        if not self.persona_id:
+            raise ValueError("persona_id must not be empty")
+        self._lock = asyncio.Lock()
+        self._data: dict[str, Any] = _default_rolling_summary_data()
+
+    @property
+    def db(self) -> DianaDB:
+        return self._db
+
+    async def load(self) -> dict[str, Any]:
+        async with self._lock:
+            self._data = await asyncio.to_thread(self._load_sync)
+            return dict(self._data)
+
+    def text(self) -> str:
+        return str(self._data.get("summary_text") or "")
+
+    def active_start_index(self) -> int:
+        """当前活跃窗口在完整 history 中的起点。"""
+
+        archived_until = self._data.get("archived_until")
+        value: Any = None
+        if isinstance(archived_until, dict):
+            value = archived_until.get("active_start_index")
+        if value is None:
+            value = self._data.get("active_start_index")
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    async def update(
+        self,
+        summary_text: str,
+        *,
+        archived_until: Any = None,
+        updated_at: str = "",
+        active_start_index: int | None = None,
+    ) -> None:
+        archived_payload = archived_until
+        if active_start_index is not None:
+            active_start_index = max(0, int(active_start_index))
+            if isinstance(archived_payload, dict):
+                archived_payload = dict(archived_payload)
+            elif archived_payload is None:
+                archived_payload = {}
+            else:
+                archived_payload = {"legacy_archived_until": archived_payload}
+            archived_payload["active_start_index"] = active_start_index
+        new_data = {
+            "summary_text": summary_text.strip(),
+            "archived_until": archived_payload,
+            "updated_at": updated_at,
+        }
+        active_start_column = self._active_start_from_archived_until(archived_payload)
+        async with self._lock:
+            await asyncio.to_thread(self._update_sync, new_data, active_start_column)
+            self._data = new_data
+
+    def _load_sync(self) -> dict[str, Any]:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT summary_text, archived_until_json, active_start_index,
+                       summary_json, updated_at
+                FROM rolling_summary
+                WHERE persona_id = ?
+                """,
+                (self.persona_id,),
+            ).fetchone()
+        if row is None:
+            return _default_rolling_summary_data()
+
+        summary_data = self._fallback_summary_data(row)
+        summary_json = self._load_summary_json(row)
+        if summary_json is not None:
+            summary_data = self._merge_summary_data(summary_data, summary_json)
+        return self._normalize_loaded_data(summary_data)
+
+    def _update_sync(
+        self,
+        new_data: dict[str, Any],
+        active_start_index: int | None,
+    ) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO rolling_summary (
+                        persona_id, summary_text, archived_until_json,
+                        active_start_index, summary_json, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(persona_id) DO UPDATE SET
+                        summary_text = excluded.summary_text,
+                        archived_until_json = excluded.archived_until_json,
+                        active_start_index = excluded.active_start_index,
+                        summary_json = excluded.summary_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        self.persona_id,
+                        new_data["summary_text"],
+                        _json_data(new_data["archived_until"]),
+                        active_start_index,
+                        _json_data(new_data),
+                        new_data["updated_at"],
+                    ),
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+
+    def _connect(self):
+        db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+        db.load()
+        return db.connect()
+
+    def _load_summary_json(self, row: sqlite3.Row) -> dict[str, Any] | None:
+        try:
+            data = orjson.loads(row["summary_json"])
+        except orjson.JSONDecodeError:
+            logger.warning(
+                "回退读取损坏的 diana rolling summary summary_json persona_id=%s",
+                self.persona_id,
+            )
+            return None
+        if not isinstance(data, dict):
+            logger.warning(
+                "回退读取非对象 diana rolling summary summary_json persona_id=%s",
+                self.persona_id,
+            )
+            return None
+        return data
+
+    def _fallback_summary_data(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            archived_until = orjson.loads(row["archived_until_json"])
+        except orjson.JSONDecodeError:
+            logger.warning(
+                "回退读取损坏的 diana rolling summary archived_until_json persona_id=%s",
+                self.persona_id,
+            )
+            archived_until = None
+        return {
+            "summary_text": row["summary_text"],
+            "archived_until": archived_until,
+            "updated_at": row["updated_at"],
+            "active_start_index": row["active_start_index"],
+        }
+
+    @staticmethod
+    def _merge_summary_data(
+        fallback_data: dict[str, Any],
+        summary_json: dict[str, Any],
+    ) -> dict[str, Any]:
+        data = dict(fallback_data)
+        for key in ("summary_text", "archived_until", "updated_at"):
+            if key in summary_json:
+                data[key] = summary_json[key]
+        if "active_start_index" in summary_json:
+            data["active_start_index"] = summary_json["active_start_index"]
+        return data
+
+    @classmethod
+    def _normalize_loaded_data(cls, data: dict[str, Any]) -> dict[str, Any]:
+        archived_until = data.get("archived_until")
+        legacy_active_start = cls._coerce_active_start(data.get("active_start_index"))
+        if legacy_active_start is not None:
+            if isinstance(archived_until, dict):
+                archived_until = dict(archived_until)
+            elif archived_until is None:
+                archived_until = {}
+            else:
+                archived_until = {"legacy_archived_until": archived_until}
+            archived_until.setdefault("active_start_index", legacy_active_start)
+        return {
+            "summary_text": str(data.get("summary_text") or ""),
+            "archived_until": archived_until,
+            "updated_at": str(data.get("updated_at") or ""),
+        }
+
+    @classmethod
+    def _active_start_from_archived_until(cls, archived_until: Any) -> int | None:
+        if not isinstance(archived_until, dict):
+            return None
+        return cls._coerce_active_start(archived_until.get("active_start_index"))
+
+    @staticmethod
+    def _coerce_active_start(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return None
+
+
 _LEGACY_RAW_IMPORTANT_MEMORY_ID = "__diana_important_raw__"
 _LEGACY_RAW_IMPORTANT_SCOPE = "__legacy_raw__"
 
@@ -478,4 +685,12 @@ def _optional_text(value: object) -> str | None:
     return text or None
 
 
-__all__ = ["DianaHistoryStore", "DianaImportantStore"]
+def _default_rolling_summary_data() -> dict[str, Any]:
+    return {
+        "summary_text": "",
+        "archived_until": None,
+        "updated_at": "",
+    }
+
+
+__all__ = ["DianaHistoryStore", "DianaImportantStore", "DianaRollingSummaryStore"]
