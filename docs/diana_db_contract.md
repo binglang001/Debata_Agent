@@ -1,6 +1,6 @@
 # diana.db v1 契约
 
-本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records`、`DianaPersonaDB` 对 `persona_*` legacy domains 的最小读写；旧文件导入器覆盖 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3` 与 `persona.db`；不接 runtime，不实现 runtime 仓储。
+本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records`、`DianaEventStore` 对 `event_log`、`DianaArchiveStore` 对 `archive_messages` / `archive_message_media`、`DianaPersonaDB` 对 `persona_*` legacy domains 的最小读写；旧文件导入器覆盖 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3` 与 `persona.db`；runtime 已接线到每人格 `memory/<persona>/diana.db`，但向量库/RAG 仍保持独立文件，未迁入 `diana.db`。
 
 ## 文件与版本
 
@@ -58,15 +58,27 @@
 - `persona_sleep_records.record_json`
 - `persona_eat_records.record_json`
 
+## Runtime 接线约定
+
+- Runtime 对当前人格使用 `paths.memory_dir_for(persona.name) / "diana.db"`，不使用全局 `DATA_DIR/db/diana.db` 默认路径。
+- `Runtime.start()` 在记忆阶段先调用异步导入入口，把旧人格 memory 目录中的 `history.jsonl`、`important.json`、`rolling_summary.json`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3`、`persona.db` 和日志目录中的 `model_usage.jsonl` 导入当前人格的 `diana.db`。旧文件保留，不删除。
+- Runtime 只在旧源存在且对应 diana 目标域为空时触发旧文件导入；已初始化并已有数据的目标域不会再从旧文件整体覆盖。无实际导入需求时不调用 importer，因此不会在每次启动时生成备份。
+- Runtime 保留现有 Manager/门面调用面：`HistoryManager` 注入 `DianaHistoryStore`，`ImportantMemoryManager` 注入 `DianaImportantStore`，`ArchiveStore` 注入 `DianaArchiveStore`，`EventJournal` 包装 `DianaEventStore`，滚动摘要和 usage 分别直接使用 `DianaRollingSummaryStore` 与 `DianaUsageStatsStore`。
+- persona management 启用时，runtime 使用 `DianaPersonaDB(diana_db, persona_id)`，不再新建 `persona.db`，重要记忆仍通过 `DianaImportantStore` 作为运行时主后端。
+- `UsageStatsStore` 的运行时后端是 `DianaUsageStatsStore(diana_db, persona_id)`；旧 usage 导入源由 runtime 显式传入 `paths.LOGS_DIR / "model_usage.jsonl"`。
+- RAG/vector 相关存储仍由原独立文件负责，不在本阶段迁入，也不由导入器处理。
+
 ## 第一批旧文件导入器
 
-`memory.diana_importers.import_legacy_memory_files(db, source_dir, persona_id, *, backup=True, usage_persona_id=None)` 是同步导入入口，用于把旧 `memory/` 与 `logs/` 中第一批文件导入已存在的 `diana.db` stores。参数约定：
+`memory.diana_importers.import_legacy_memory_files(db, source_dir, persona_id, *, backup=True, usage_persona_id=None, usage_source_path=None, skip_existing_domains=False)` 是同步导入入口，用于把旧 `memory/` 与 `logs/` 中第一批文件导入已存在的 `diana.db` stores。`memory.diana_importers.import_legacy_memory_files_async(...)` 使用同一参数签名，是等价异步入口，供 `Runtime.start()` 等 running event loop 内调用；同步入口在 running event loop 中仍抛错。参数约定：
 
 - `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。入口会主动 `load()` 并确保 schema 可用。
-- `source_dir`：旧 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3`、`persona.db` 所在目录。
+- `source_dir`：旧 `history.jsonl`、`important.json`、`rolling_summary.json`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3`、`persona.db` 所在目录。默认 usage 源仍兼容为 `source_dir / "model_usage.jsonl"`。
 - `persona_id`：写入 `history_records`、`important_memories`、`rolling_summary`、`event_log`、`event_projection_state`、`archive_messages`、`archive_message_media` 与 `persona_*` 目标表的目标 persona。
 - `backup=True`：导入前如果目标 `diana.db` 已存在，调用 `backup_existing_database()`；目标库不存在时不创建备份。
 - `usage_persona_id=None`：默认跟随 `persona_id` 写入 `usage_records.persona_id`。显式传入空字符串表示全局 usage，写库时 `persona_id` 为 `NULL`。
+- `usage_source_path=None`：默认保持旧行为，从 `source_dir / "model_usage.jsonl"` 读取；runtime 应显式传入 `paths.LOGS_DIR / "model_usage.jsonl"`，因为 usage 旧文件位于 logs 目录而非人格 memory 目录。
+- `skip_existing_domains=False`：默认保持旧导入器行为；runtime 传 `True`，对已有数据的 history/important/rolling/usage/events/archive/persona 域跳过导入，避免旧文件覆盖运行期写入的 diana 数据。
 
 返回值是 `LegacyMemoryImportResult`，包含 `backup_path` 以及 `history`、`important`、`rolling_summary`、`usage`、`events`、`archive`、`persona` 七个 `LegacyImportDomainResult(imported, skipped)` 统计，供 runtime 后续展示。`important.imported` 统计最终写入新 `important_memories` 域的 item 数；`important.skipped` 统计损坏/非列表合并源与双源去重丢弃的 item 数。`archive` 统计按归档消息行与归档媒体行合计，`persona` 统计按旧 `persona.db` 导入到 `persona_*` 目标表的行合计。
 
@@ -75,7 +87,7 @@
 - `history.jsonl` -> `DianaHistoryStore.replace_all(...)`。
 - `important.json` 与 `persona.db important_memories.memories_json` -> 双源合并后 `DianaImportantStore.write(...)`。`persona.db` 是权威源，输出顺序为 persona 聚合列表项在前、`important.json` 中未被同 ID 覆盖的项在后；缺少 `id` 的 item 使用基于规范化 JSON 的稳定 fallback ID 做跨源去重，但不改写 item 本身。
 - `rolling_summary.json` -> 直写 `rolling_summary` 单行；查询列按 store 读取契约抽取，`summary_json` 完整保留旧 JSON 对象。
-- `model_usage.jsonl` -> 直接写入 `usage_records`，保留完整 `record_json`，并抽取 usage 常用列。
+- `model_usage.jsonl` -> 直接写入 `usage_records`，保留完整 `record_json`，并抽取 usage 常用列；源文件路径由 `usage_source_path` 决定，未传时兼容 `source_dir / "model_usage.jsonl"`。
 - `events.sqlite3` 与 `events.sqlite3.append.jsonl` -> 直接写入 `event_log`；先导入 SQLite 已投影行，再导入 append log 行；保留旧事件自带 `event_id`、`event_uuid`、`schema_version`、`payload_json`、`payload_hash` 与其他事件列，不调用会重新分配 ID 的事件追加接口。导入完成后写入 `event_projection_state(persona_id, "last_projected_event_id")` 为当前 persona 最大 `event_id`。
 - `archive.sqlite3` -> 直接写入 `archive_messages` 与 `archive_message_media`；先导入消息，再导入媒体；保留旧 `rowid`、`archive_id`、媒体 `id`、`metadata_json`、`record_json` 与所有抽取列，不调用会重新归一化并重新分配 ID 的归档追加接口。早期旧库缺少 `archive_messages.record_json` 时写入 `NULL`，不视为损坏行。
 
@@ -729,8 +741,6 @@ Persona state 域使用 `persona_*` 表名前缀复制现 `mind/db_schema.py` �
 
 ## 当前未实现
 
-- 未接 `core/runtime.py`。
-- 未改现有 memory/history/important/event/archive manager。
 - 未改 `mind/db.py` 或 `mind/db_schema.py`。
 - 未实现统一仓储抽象。
-- 未处理向量库搬迁；向量库按阶段计划保持独立文件。
+- 未处理向量库/RAG 搬迁；向量库按阶段计划保持独立文件。

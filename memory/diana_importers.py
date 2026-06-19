@@ -125,10 +125,14 @@ def import_legacy_memory_files(
     *,
     backup: bool = True,
     usage_persona_id: str | None = None,
+    usage_source_path: str | Path | None = None,
+    skip_existing_domains: bool = False,
 ) -> LegacyMemoryImportResult:
     """同步导入第一批旧 memory/logs 文件到 diana.db。
 
     `usage_persona_id=None` 表示跟随 `persona_id`；传入空字符串表示全局 usage。
+    `usage_source_path=None` 保持旧行为，从 `source_dir / "model_usage.jsonl"` 导入。
+    `skip_existing_domains=True` 时，history/important/rolling 等已有数据的域不会被旧文件覆盖。
     """
 
     try:
@@ -141,9 +145,34 @@ def import_legacy_memory_files(
                 persona_id,
                 backup=backup,
                 usage_persona_id=usage_persona_id,
+                usage_source_path=usage_source_path,
+                skip_existing_domains=skip_existing_domains,
             )
         )
     raise RuntimeError("import_legacy_memory_files cannot run inside a running event loop")
+
+
+async def import_legacy_memory_files_async(
+    db: DianaDB | str | Path,
+    source_dir: str | Path,
+    persona_id: str,
+    *,
+    backup: bool = True,
+    usage_persona_id: str | None = None,
+    usage_source_path: str | Path | None = None,
+    skip_existing_domains: bool = False,
+) -> LegacyMemoryImportResult:
+    """异步导入第一批旧 memory/logs 文件到 diana.db。"""
+
+    return await _import_legacy_memory_files_async(
+        db,
+        source_dir,
+        persona_id,
+        backup=backup,
+        usage_persona_id=usage_persona_id,
+        usage_source_path=usage_source_path,
+        skip_existing_domains=skip_existing_domains,
+    )
 
 
 async def _import_legacy_memory_files_async(
@@ -153,10 +182,17 @@ async def _import_legacy_memory_files_async(
     *,
     backup: bool,
     usage_persona_id: str | None,
+    usage_source_path: str | Path | None,
+    skip_existing_domains: bool,
 ) -> LegacyMemoryImportResult:
     target_db = db if isinstance(db, DianaDB) else DianaDB(db)
     should_close_db = not isinstance(db, DianaDB)
     source_path = Path(source_dir)
+    usage_path = (
+        Path(usage_source_path)
+        if usage_source_path is not None
+        else source_path / "model_usage.jsonl"
+    )
     normalized_persona = _normalize_persona_id(persona_id)
     normalized_usage_persona = _normalize_usage_persona_id(
         normalized_persona,
@@ -172,22 +208,69 @@ async def _import_legacy_memory_files_async(
         persona_important_source = _read_legacy_persona_important_source(
             source_path / "persona.db"
         )
-        history_result = await _import_history(target_db, source_path, normalized_persona)
-        important_result = await _import_important(
+        history_result = LegacyImportDomainResult()
+        if not skip_existing_domains or _domain_row_count(
             target_db,
-            source_path,
+            "history_records",
             normalized_persona,
-            persona_important_source,
-        )
-        rolling_result = await _import_rolling_summary(
+        ) == 0:
+            history_result = await _import_history(target_db, source_path, normalized_persona)
+
+        important_result = LegacyImportDomainResult()
+        if not skip_existing_domains or _domain_row_count(
             target_db,
-            source_path,
+            "important_memories",
             normalized_persona,
-        )
-        usage_result = _import_usage(target_db, source_path, normalized_usage_persona)
-        events_result = _import_events(target_db, source_path, normalized_persona)
-        archive_result = _import_archive(target_db, source_path, normalized_persona)
-        persona_result = _import_persona(target_db, source_path, normalized_persona)
+        ) == 0:
+            important_result = await _import_important(
+                target_db,
+                source_path,
+                normalized_persona,
+                persona_important_source,
+            )
+
+        rolling_result = LegacyImportDomainResult()
+        if not skip_existing_domains or _domain_row_count(
+            target_db,
+            "rolling_summary",
+            normalized_persona,
+        ) == 0:
+            rolling_result = await _import_rolling_summary(
+                target_db,
+                source_path,
+                normalized_persona,
+            )
+
+        usage_result = LegacyImportDomainResult()
+        if not skip_existing_domains or _domain_row_count(
+            target_db,
+            "usage_records",
+            normalized_usage_persona,
+        ) == 0:
+            usage_result = _import_usage(target_db, usage_path, normalized_usage_persona)
+
+        events_result = LegacyImportDomainResult()
+        if not skip_existing_domains or _domain_row_count(
+            target_db,
+            "event_log",
+            normalized_persona,
+        ) == 0:
+            events_result = _import_events(target_db, source_path, normalized_persona)
+
+        archive_result = LegacyImportDomainResult()
+        if not skip_existing_domains or _domain_row_count(
+            target_db,
+            "archive_messages",
+            normalized_persona,
+        ) == 0:
+            archive_result = _import_archive(target_db, source_path, normalized_persona)
+
+        persona_result = LegacyImportDomainResult()
+        if not skip_existing_domains or _persona_domain_row_count(
+            target_db,
+            normalized_persona,
+        ) == 0:
+            persona_result = _import_persona(target_db, source_path, normalized_persona)
     finally:
         if should_close_db:
             target_db.close()
@@ -324,10 +407,9 @@ def _upsert_rolling_summary(
 
 def _import_usage(
     db: DianaDB,
-    source_dir: Path,
+    path: Path,
     persona_id: str | None,
 ) -> LegacyImportDomainResult:
-    path = source_dir / "model_usage.jsonl"
     records, skipped, exists = _read_jsonl_objects(path)
     if not exists:
         return LegacyImportDomainResult()
@@ -1839,6 +1921,80 @@ def _connect_for_import(db: DianaDB) -> sqlite3.Connection:
     return conn
 
 
+def _domain_row_count(
+    db: DianaDB,
+    table: str,
+    persona_id: str | None,
+) -> int:
+    if table not in _PERSONA_SCOPED_IMPORT_TABLES:
+        raise ValueError(f"unsupported import domain table: {table}")
+    with closing(_connect_for_import(db)) as conn:
+        if persona_id is None:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {_quote_sql_identifier(table)}
+                WHERE persona_id IS NULL
+                """
+            ).fetchone()
+        else:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {_quote_sql_identifier(table)}
+                WHERE persona_id = ?
+                """,
+                (persona_id,),
+            ).fetchone()
+    return int(row[0])
+
+
+def _persona_domain_row_count(db: DianaDB, persona_id: str) -> int:
+    total = 0
+    with closing(_connect_for_import(db)) as conn:
+        for table in _PERSONA_DOMAIN_TABLES:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {_quote_sql_identifier(table)}
+                WHERE persona_id = ?
+                """,
+                (persona_id,),
+            ).fetchone()
+            total += int(row[0])
+    return total
+
+
+_PERSONA_SCOPED_IMPORT_TABLES = frozenset(
+    {
+        "history_records",
+        "important_memories",
+        "rolling_summary",
+        "usage_records",
+        "event_log",
+        "archive_messages",
+    }
+)
+
+
+_PERSONA_DOMAIN_TABLES = (
+    "persona_schema_version_legacy",
+    "persona_state",
+    "persona_state_log",
+    "persona_update_audits",
+    "persona_effects",
+    "persona_todos",
+    "persona_cues",
+    "persona_inner_monologues",
+    "persona_user_profiles",
+    "persona_important_state_legacy",
+    "persona_daily_trajectories",
+    "persona_arc",
+    "persona_sleep_records",
+    "persona_eat_records",
+)
+
+
 def _legacy_sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
         """
@@ -2048,4 +2204,5 @@ __all__ = [
     "LegacyImportDomainResult",
     "LegacyMemoryImportResult",
     "import_legacy_memory_files",
+    "import_legacy_memory_files_async",
 ]

@@ -5,11 +5,13 @@ import sqlite3
 from pathlib import Path
 
 import orjson
+import pytest
 
 from memory.diana_db import DIANA_DB_SCHEMA_VERSION, DianaDB
 from memory.diana_importers import (
     LegacyImportDomainResult,
     import_legacy_memory_files,
+    import_legacy_memory_files_async,
 )
 from memory.diana_stores import (
     DianaArchiveStore,
@@ -159,6 +161,54 @@ def test_import_legacy_memory_files_is_idempotent(tmp_path):
     assert _row_count(db_path, "history_records", "yuexi") == 2
     assert _row_count(db_path, "important_memories", "yuexi") == 1
     assert len(_usage_rows(db_path)) == 1
+
+
+def test_import_legacy_memory_files_can_read_explicit_usage_source(tmp_path):
+    source_dir = tmp_path / "legacy"
+    logs_dir = tmp_path / "logs"
+    db_path = tmp_path / "diana.db"
+    memory_usage = {
+        "ts": 1.0,
+        "agent": "memory-dir",
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    logs_usage = {
+        "ts": 2.0,
+        "agent": "logs-dir",
+        "prompt_tokens": 2,
+        "completion_tokens": 3,
+        "total_tokens": 5,
+    }
+    _write_jsonl(source_dir / "model_usage.jsonl", [memory_usage])
+    _write_jsonl(logs_dir / "model_usage.jsonl", [logs_usage])
+
+    result = import_legacy_memory_files(
+        db_path,
+        source_dir,
+        "yuexi",
+        usage_source_path=logs_dir / "model_usage.jsonl",
+    )
+
+    assert result.usage == LegacyImportDomainResult(imported=1, skipped=0)
+    rows = _usage_rows(db_path)
+    assert len(rows) == 1
+    assert orjson.loads(rows[0]["record_json"]) == logs_usage
+
+
+@pytest.mark.asyncio
+async def test_import_legacy_memory_files_async_public_entry(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    _write_jsonl(source_dir / "history.jsonl", [{"role": "user", "content": "async"}])
+
+    result = await import_legacy_memory_files_async(db_path, source_dir, "yuexi")
+
+    assert result.history == LegacyImportDomainResult(imported=1, skipped=0)
+    assert await DianaHistoryStore(db_path, "yuexi").load(force_reload=True) == [
+        {"role": "user", "content": "async"},
+    ]
 
 
 def test_import_legacy_memory_files_preserves_rolling_summary_raw_json(tmp_path):
@@ -1251,9 +1301,10 @@ def test_import_legacy_events_keeps_personas_isolated(tmp_path):
 
 
 def test_memory_package_exports_legacy_importer():
-    from memory import import_legacy_memory_files as package_importer
+    import memory
 
-    assert package_importer is import_legacy_memory_files
+    assert memory.import_legacy_memory_files is import_legacy_memory_files
+    assert memory.import_legacy_memory_files_async is import_legacy_memory_files_async
 
 
 def _write_json(path: Path, data: object) -> None:

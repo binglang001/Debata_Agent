@@ -132,10 +132,6 @@ class Runtime:
         self.secrets = SecretsManager(self.paths)
         self.secrets.initialize()
         self.config = load_config(self.paths)
-        from .usage_stats import UsageStatsStore
-
-        self.usage_stats = UsageStatsStore(self.paths.LOGS_DIR / "model_usage.jsonl")
-        await self.usage_stats.load()
         self._apply_feature_provider_overrides()
         try:
             from utils.token_budget import warm_token_estimator
@@ -185,42 +181,60 @@ class Runtime:
         stage_t0 = time.monotonic()
         from memory import (
             ArchiveStore,
+            DianaArchiveStore,
+            DianaEventStore,
+            DianaHistoryStore,
+            DianaImportantStore,
+            DianaPersonaDB,
+            DianaRollingSummaryStore,
+            DianaUsageStatsStore,
             EventJournal,
-            EventStore,
             HistoryManager,
             ImportantMemoryManager,
-            RollingSummaryStore,
+            import_legacy_memory_files_async,
         )
 
         mem_dir = self.paths.memory_dir_for(self.persona.name)
         mem_dir.mkdir(parents=True, exist_ok=True)
-        event_store = EventStore(mem_dir / "events.sqlite3")
+        diana_db_path = mem_dir / "diana.db"
+        usage_source_path = self.paths.LOGS_DIR / "model_usage.jsonl"
+        if self._needs_legacy_memory_import(
+            diana_db_path,
+            mem_dir,
+            self.persona.name,
+            usage_source_path,
+        ):
+            await import_legacy_memory_files_async(
+                diana_db_path,
+                mem_dir,
+                self.persona.name,
+                usage_source_path=usage_source_path,
+                skip_existing_domains=True,
+            )
+        self.usage_stats = DianaUsageStatsStore(diana_db_path, self.persona.name)
+        await self.usage_stats.load()
+        event_store = DianaEventStore(diana_db_path, self.persona.name)
         self.event_store = EventJournal(event_store)
         await self.event_store.start()
         self.history = HistoryManager(
             mem_dir / "history.jsonl",
             event_store=self.event_store,
+            store=DianaHistoryStore(diana_db_path, self.persona.name),
         )
         important_path = mem_dir / "important.json"
+        important_store = DianaImportantStore(diana_db_path, self.persona.name)
         if self._persona_management_enabled():
-            from mind.db import PersonaDB
-            from mind.important_store import SqliteImportantStore
-
-            self.persona_db = PersonaDB(mem_dir / "persona.db")
+            self.persona_db = DianaPersonaDB(diana_db_path, self.persona.name)
             await self.persona_db.load()
-            sqlite_important_store = SqliteImportantStore(self.persona_db)
-            await self._migrate_legacy_important_memory(
-                important_path,
-                sqlite_important_store,
-            )
-            self.important = ImportantMemoryManager(
-                important_path,
-                store=sqlite_important_store,
-            )
-        else:
-            self.important = ImportantMemoryManager(important_path)
-        self.archive = ArchiveStore(mem_dir / "archive.sqlite3")
-        self.rolling_summary = RollingSummaryStore(mem_dir / "rolling_summary.json")
+        self.important = ImportantMemoryManager(
+            important_path,
+            store=important_store,
+        )
+        self.archive = ArchiveStore(
+            mem_dir / "archive.sqlite3",
+            store=DianaArchiveStore(diana_db_path, self.persona.name),
+        )
+        self.rolling_summary = DianaRollingSummaryStore(diana_db_path, self.persona.name)
         await self.history.load()
         await self.important.load()
         await self.archive.load()
@@ -641,6 +655,108 @@ class Runtime:
                 "旧重要记忆迁移到 persona.db 失败，继续使用空 SQLite 存储：%s",
                 e,
             )
+
+    def _needs_legacy_memory_import(
+        self,
+        diana_db_path: Path,
+        mem_dir: Path,
+        persona_id: str,
+        usage_source_path: Path,
+    ) -> bool:
+        """仅当旧源存在且目标 diana 域为空时才触发旧文件导入。"""
+
+        persona_db_path = mem_dir / "persona.db"
+        legacy_sources = {
+            "history_records": (mem_dir / "history.jsonl",),
+            "important_memories": (mem_dir / "important.json", persona_db_path),
+            "rolling_summary": (mem_dir / "rolling_summary.json",),
+            "event_log": (
+                mem_dir / "events.sqlite3",
+                mem_dir / "events.sqlite3.append.jsonl",
+            ),
+            "archive_messages": (mem_dir / "archive.sqlite3",),
+            "usage_records": (usage_source_path,),
+        }
+        if not any(
+            path.exists()
+            for source_paths in legacy_sources.values()
+            for path in source_paths
+        ):
+            return False
+        if not diana_db_path.exists():
+            return True
+
+        try:
+            import sqlite3
+
+            with sqlite3.connect(diana_db_path) as conn:
+                for table, source_paths in legacy_sources.items():
+                    if not any(path.exists() for path in source_paths):
+                        continue
+                    if self._diana_persona_row_count(conn, table, persona_id) == 0:
+                        return True
+                if (
+                    persona_db_path.exists()
+                    and self._diana_persona_state_row_count(conn, persona_id) == 0
+                ):
+                    return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("检查 diana.db 旧文件导入状态失败，将尝试导入：%s", e)
+            return True
+        return False
+
+    @staticmethod
+    def _diana_persona_row_count(conn: Any, table: str, persona_id: str) -> int:
+        allowed_tables = {
+            "history_records",
+            "important_memories",
+            "rolling_summary",
+            "event_log",
+            "archive_messages",
+            "usage_records",
+        }
+        if table not in allowed_tables:
+            raise ValueError(f"unsupported diana import gate table: {table}")
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {table}
+            WHERE persona_id = ?
+            """,
+            (persona_id,),
+        ).fetchone()
+        return int(row[0])
+
+    @staticmethod
+    def _diana_persona_state_row_count(conn: Any, persona_id: str) -> int:
+        tables = (
+            "persona_schema_version_legacy",
+            "persona_state",
+            "persona_state_log",
+            "persona_update_audits",
+            "persona_effects",
+            "persona_todos",
+            "persona_cues",
+            "persona_inner_monologues",
+            "persona_user_profiles",
+            "persona_important_state_legacy",
+            "persona_daily_trajectories",
+            "persona_arc",
+            "persona_sleep_records",
+            "persona_eat_records",
+        )
+        total = 0
+        for table in tables:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {table}
+                WHERE persona_id = ?
+                """,
+                (persona_id,),
+            ).fetchone()
+            total += int(row[0])
+        return total
 
     async def _setup_persona_management_agents(self, chat_cfg: Any) -> None:
         if self.persona_db is None:

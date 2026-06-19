@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from types import SimpleNamespace
 
+import orjson
 import pytest
 import yaml
 
@@ -251,9 +253,23 @@ async def test_runtime_start_assembles_all_components(assembled_project):
         assert rt.social_agent is None
         assert rt.subconscious_agent is None
         assert rt.persona_db is None
-        from memory.store import JsonStore
+        from memory import (
+            DianaArchiveStore,
+            DianaEventStore,
+            DianaHistoryStore,
+            DianaImportantStore,
+            DianaRollingSummaryStore,
+            DianaUsageStatsStore,
+        )
 
-        assert isinstance(rt.important._store, JsonStore)
+        diana_db_path = paths.memory_dir_for("test_bot") / "diana.db"
+        assert diana_db_path.exists()
+        assert isinstance(rt.history._store, DianaHistoryStore)
+        assert isinstance(rt.event_store.store, DianaEventStore)
+        assert isinstance(rt.important._store, DianaImportantStore)
+        assert isinstance(rt.archive._store, DianaArchiveStore)
+        assert isinstance(rt.rolling_summary, DianaRollingSummaryStore)
+        assert isinstance(rt.usage_stats, DianaUsageStatsStore)
         assert not (paths.memory_dir_for("test_bot") / "persona.db").exists()
         assert rt.adapter is not None
         assert rt.tool_registry is not None
@@ -274,6 +290,149 @@ async def test_runtime_start_assembles_all_components(assembled_project):
 
     finally:
         await rt.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_imports_legacy_memory_into_diana_db_idempotently(assembled_project):
+    project_root, paths = assembled_project
+    mem_dir = paths.memory_dir_for("test_bot")
+    diana_db_path = mem_dir / "diana.db"
+    history_records = [
+        {"role": "user", "content": "旧历史 1", "conversation_id": "private:1001"},
+        {"role": "assistant", "content": "旧历史 2", "conversation_id": "private:1001"},
+    ]
+    important_json_items = [{"id": "json_only", "content": "important.json 记忆"}]
+    persona_items = [{"id": "persona_only", "content": "persona.db 记忆"}]
+    usage_record = {
+        "ts": 1_782_000_000.0,
+        "provider": "fake_main",
+        "model": "fake-chat",
+        "agent": "主模型",
+        "operation": "agent_loop",
+        "prompt_tokens": 3,
+        "completion_tokens": 4,
+        "total_tokens": 7,
+    }
+
+    _write_jsonl(mem_dir / "history.jsonl", history_records)
+    _write_json(mem_dir / "important.json", important_json_items)
+    _write_json(
+        mem_dir / "rolling_summary.json",
+        {
+            "summary_text": "旧滚动摘要",
+            "archived_until": {"history_index": 1},
+            "active_start_index": 2,
+            "updated_at": "2026-06-18T12:00:00Z",
+        },
+    )
+    _write_legacy_persona_db(mem_dir / "persona.db", persona_items)
+    _write_jsonl(paths.LOGS_DIR / "model_usage.jsonl", [usage_record])
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+
+        assert diana_db_path.exists()
+        assert await rt.history.records() == history_records
+        assert _memory_id_content_pairs(rt.important.items()) == [
+            ("persona_only", "persona.db 记忆"),
+            ("json_only", "important.json 记忆"),
+        ]
+        assert rt.rolling_summary.text() == "旧滚动摘要"
+        assert rt.rolling_summary.active_start_index() == 2
+        assert rt.usage_stats.count == 1
+        assert rt.usage_stats.summarize("all").total_tokens == 7
+
+        from memory import DianaPersonaDB
+
+        persona_db = DianaPersonaDB(diana_db_path, "test_bot")
+        assert await persona_db.read_important(default=[]) == persona_items
+        diana_only_record = {
+            "role": "user",
+            "content": "只写入 diana.db 的新历史",
+            "conversation_id": "private:1001",
+        }
+        await rt.history.add_records([diana_only_record])
+    finally:
+        await rt.shutdown()
+
+    backup_dir = diana_db_path.parent / "backups"
+    backup_count_before_second_start = _backup_count(backup_dir)
+    second = Runtime(project_root=project_root)
+    try:
+        await second.start()
+
+        expected_history = [*history_records, diana_only_record]
+        assert _diana_row_count(diana_db_path, "history_records", "test_bot") == 3
+        assert _diana_row_count(diana_db_path, "important_memories", "test_bot") == 2
+        assert _diana_usage_count(diana_db_path, "test_bot") == 1
+        assert await second.history.records() == expected_history
+        assert _memory_id_content_pairs(second.important.items()) == [
+            ("persona_only", "persona.db 记忆"),
+            ("json_only", "important.json 记忆"),
+        ]
+    finally:
+        await second.shutdown()
+
+    assert _backup_count(backup_dir) == backup_count_before_second_start
+    assert (mem_dir / "history.jsonl").exists()
+    assert (mem_dir / "important.json").exists()
+    assert (mem_dir / "rolling_summary.json").exists()
+    assert (mem_dir / "persona.db").exists()
+    assert (paths.LOGS_DIR / "model_usage.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_runtime_import_gate_includes_event_append_log(assembled_project):
+    project_root, paths = assembled_project
+    mem_dir = paths.memory_dir_for("test_bot")
+    event = _legacy_event(9, payload={"text": "append only"})
+    _write_jsonl(mem_dir / "events.sqlite3.append.jsonl", [event])
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+
+        loaded = await rt.event_store.get_event(9)
+        assert loaded is not None
+        assert loaded["payload"] == {"text": "append only"}
+        assert loaded["event_uuid"] == "uuid-9"
+    finally:
+        await rt.shutdown()
+
+    assert not (mem_dir / "events.sqlite3").exists()
+    assert (mem_dir / "events.sqlite3.append.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_runtime_import_gate_merges_persona_db_important_source_when_persona_domain_exists(
+    assembled_project,
+):
+    project_root, paths = assembled_project
+    mem_dir = paths.memory_dir_for("test_bot")
+    diana_db_path = mem_dir / "diana.db"
+    persona_items = [{"id": "persona_only", "content": "persona.db 记忆"}]
+    _write_legacy_persona_db(mem_dir / "persona.db", persona_items)
+
+    from memory import DianaImportantStore, DianaPersonaDB
+
+    persona_db = DianaPersonaDB(diana_db_path, "test_bot")
+    await persona_db.load()
+    assert await DianaImportantStore(diana_db_path, "test_bot").read(default=[]) == []
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+
+        assert _memory_id_content_pairs(rt.important.items()) == [
+            ("persona_only", "persona.db 记忆")
+        ]
+        assert await persona_db.read_important(default=[]) == []
+    finally:
+        await rt.shutdown()
+
+    assert _diana_row_count(diana_db_path, "important_memories", "test_bot") == 1
+    assert (mem_dir / "persona.db").exists()
 
 
 def test_runtime_idle_model_activity_text_is_realtime_idle(tmp_path):
@@ -360,16 +519,19 @@ async def test_runtime_persona_management_assembles_agents_and_pipeline(
         await rt.start()
 
         persona_db_path = paths.memory_dir_for("test_bot") / "persona.db"
-        assert persona_db_path.exists()
+        diana_db_path = paths.memory_dir_for("test_bot") / "diana.db"
+        assert not persona_db_path.exists()
+        assert diana_db_path.exists()
         assert rt.persona_db is not None
         assert rt.persona_agent is not None
         assert rt.social_agent is not None
         assert rt.subconscious_agent is not None
         assert rt.age_profile is None
 
-        from mind.important_store import SqliteImportantStore
+        from memory import DianaImportantStore, DianaPersonaDB
 
-        assert isinstance(rt.important._store, SqliteImportantStore)
+        assert isinstance(rt.persona_db, DianaPersonaDB)
+        assert isinstance(rt.important._store, DianaImportantStore)
         assert rt.persona_agent.cfg.provider == "fake_main"
         assert rt.persona_agent.cfg.model == "fake-chat"
         assert rt.persona_agent.cfg.temperature == 0.2
@@ -718,3 +880,110 @@ async def test_runtime_handles_missing_provider_reference(assembled_project):
     with pytest.raises((RuntimeError, Exception)):
         await rt.start()
     # 不强求清理（异常状态）；调用方应自己捕获
+
+
+def _write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(orjson.dumps(data))
+
+
+def _write_jsonl(path, records):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"".join(orjson.dumps(record) + b"\n" for record in records))
+
+
+def _write_legacy_persona_db(path, memories):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE important_memories (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                memories_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO schema_version (id, version, updated_at)
+            VALUES (1, 1, '2026-06-18 12:00:00')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO important_memories (id, memories_json, updated_at)
+            VALUES (1, ?, '2026-06-18 12:00:00')
+            """,
+            (orjson.dumps(memories).decode("utf-8"),),
+        )
+
+
+def _legacy_event(event_id, *, payload=None):
+    payload_data = {"event_id": event_id} if payload is None else payload
+    return {
+        "event_id": event_id,
+        "event_type": "message",
+        "event_uuid": f"uuid-{event_id}",
+        "conversation_id": "private:1",
+        "session_id": "session-1",
+        "turn_id": str(event_id),
+        "source": "runtime",
+        "external_id": f"external-{event_id}",
+        "tool_call_id": None,
+        "parent_event_id": None,
+        "idempotency_key": None,
+        "timestamp_unix": float(1000 + event_id),
+        "created_at_unix": float(2000 + event_id),
+        "payload_json": orjson.dumps(payload_data).decode("utf-8"),
+        "payload_hash": f"hash-{event_id}",
+        "schema_version": 2,
+    }
+
+
+def _diana_row_count(db_path, table, persona_id):
+    allowed_tables = {
+        "history_records": "history_records",
+        "important_memories": "important_memories",
+    }
+    table_name = allowed_tables[table]
+    with sqlite3.connect(db_path) as conn:
+        return int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM {table_name} WHERE persona_id = ?",
+                (persona_id,),
+            ).fetchone()[0]
+        )
+
+
+def _diana_usage_count(db_path, persona_id):
+    with sqlite3.connect(db_path) as conn:
+        return int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM usage_records
+                WHERE persona_id = ?
+                """,
+                (persona_id,),
+            ).fetchone()[0]
+        )
+
+
+def _memory_id_content_pairs(items):
+    return [(item.get("id"), item.get("content")) for item in items]
+
+
+def _backup_count(backup_dir):
+    if not backup_dir.exists():
+        return 0
+    return len(list(backup_dir.glob("*.db")))

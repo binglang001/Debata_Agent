@@ -46,8 +46,13 @@ HISTORY_JOURNAL_SCHEMA_VERSION = 1
 class HistoryManager:
     """对话历史管理器。一个 persona 对应一个实例。"""
 
-    def __init__(self, history_path: Path, event_store: Any = None) -> None:
-        self._store = JsonlStore(history_path)
+    def __init__(
+        self,
+        history_path: Path,
+        event_store: Any = None,
+        store: Any | None = None,
+    ) -> None:
+        self._store = store if store is not None else JsonlStore(history_path)
         self._event_store = event_store
         self._mutation_lock = asyncio.Lock()
         self._append_callbacks: list[AppendCallback] = []
