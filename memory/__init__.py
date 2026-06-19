@@ -17,7 +17,8 @@
     import_legacy_memory_files —— 旧 memory/logs 文件到 diana.db 的同步导入入口
     import_legacy_memory_files_async —— 旧 memory/logs 文件到 diana.db 的异步导入入口
     RagMemoryService          —— RAG 模式的会话向量检索服务
-    JsonStore / JsonlStore    —— 底层存储基类（如有特殊需求可直接用）
+    *StoreLike                —— 业务门面依赖的仓储协议
+    JsonStore / JsonlStore    —— 底层存储实现（如有特殊需求可直接用）
 
 per-persona 实例化：
     paths = AppPaths(project_root)
@@ -56,7 +57,18 @@ from .event_store import EventStore
 from .history import HistoryManager
 from .important import ImportantMemoryManager
 from .rag_memory import RagMemoryService, SqliteVectorStore
-from .store import JsonlStore, JsonStore, StoreError
+from .store import (
+    ArchiveStoreLike,
+    EventAppenderLike,
+    EventStoreLike,
+    JsonlStore,
+    JsonlStoreLike,
+    JsonStore,
+    JsonStoreLike,
+    RollingSummaryStoreLike,
+    StoreError,
+    UsageStatsStoreLike,
+)
 
 __all__ = [
     "ArchiveStore",
@@ -75,14 +87,21 @@ __all__ = [
     "EventStore",
     "HistoryManager",
     "ImportantMemoryManager",
+    "ArchiveStoreLike",
+    "EventAppenderLike",
+    "EventStoreLike",
     "JsonStore",
+    "JsonStoreLike",
     "JsonlStore",
+    "JsonlStoreLike",
     "LegacyImportDomainResult",
     "LegacyMemoryImportResult",
     "RagMemoryService",
     "RollingSummaryStore",
+    "RollingSummaryStoreLike",
     "SqliteVectorStore",
     "StoreError",
+    "UsageStatsStoreLike",
     "backup_existing_database",
     "import_legacy_memory_files",
     "import_legacy_memory_files_async",

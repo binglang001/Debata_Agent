@@ -68,6 +68,10 @@
 - `UsageStatsStore` 的运行时后端是 `DianaUsageStatsStore(diana_db, persona_id)`；旧 usage 导入源由 runtime 显式传入 `paths.LOGS_DIR / "model_usage.jsonl"`。
 - RAG/vector 相关存储由实例级 `paths.vector_dir_for(persona.name) / "rag_memory.sqlite3"` 负责，不在本阶段迁入 `diana.db`，也不由 diana 导入器处理。若旧 `memory/<persona>/rag_memory.sqlite3` 存在且新 vector 文件不存在，runtime 启动 RAG 前会复制旧主库及存在的 `-wal` / `-shm` sidecar 到新目录；旧文件保留，目标已存在时不覆盖。
 
+## 仓储抽象
+
+代码层统一仓储协议定义在 `memory.store`，并由 `memory` 包公开导出：`JsonStoreLike`、`JsonlStoreLike`、`ArchiveStoreLike`、`RollingSummaryStoreLike`、`EventAppenderLike`、`EventStoreLike` 与 `UsageStatsStoreLike`。业务门面只依赖这些协议形状：`HistoryManager` 注入 `JsonlStoreLike`，事件镜像只依赖 `EventAppenderLike`，`ImportantMemoryManager` 注入 `JsonStoreLike`，`ArchiveStore` 注入 `ArchiveStoreLike`，`EventJournal` 包装 `EventStoreLike`，滚动摘要 store 保持 `RollingSummaryStoreLike` 调用面。旧文件 store 与 `Diana*Store` 按结构实现相同协议，不要求继承共同基类。
+
 ## 第一批旧文件导入器
 
 `memory.diana_importers.import_legacy_memory_files(db, source_dir, persona_id, *, backup=True, usage_persona_id=None, usage_source_path=None, skip_existing_domains=False)` 是同步导入入口，用于把旧 `memory/` 与 `logs/` 中第一批文件导入已存在的 `diana.db` stores。`memory.diana_importers.import_legacy_memory_files_async(...)` 使用同一参数签名，是等价异步入口，供 `Runtime.start()` 等 running event loop 内调用；同步入口在 running event loop 中仍抛错。参数约定：
@@ -742,4 +746,3 @@ Persona state 域使用 `persona_*` 表名前缀复制现 `mind/db_schema.py` �
 ## 当前未实现
 
 - 未改 `mind/db.py` 或 `mind/db_schema.py`。
-- 未实现统一仓储抽象。

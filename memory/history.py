@@ -19,9 +19,8 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
 
-from .store import JsonlStore
+from .store import EventAppenderLike, JsonlStore, JsonlStoreLike
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +48,8 @@ class HistoryManager:
     def __init__(
         self,
         history_path: Path,
-        event_store: Any = None,
-        store: Any | None = None,
+        event_store: EventAppenderLike | None = None,
+        store: JsonlStoreLike | None = None,
     ) -> None:
         self._store = store if store is not None else JsonlStore(history_path)
         self._event_store = event_store

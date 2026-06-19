@@ -32,7 +32,7 @@ from uuid import uuid4
 
 from utils.token_budget import TokenEstimator
 
-from .store import JsonStore
+from .store import JsonStore, JsonStoreLike
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ class ImportantMemoryManager:
         self,
         path: Path,
         now_fn: Callable[[], str] | None = None,
-        store: Any | None = None,
+        store: JsonStoreLike | None = None,
     ) -> None:
         self._store = store if store is not None else JsonStore(path)
         self._items: list[dict] = []

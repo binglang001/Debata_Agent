@@ -7,6 +7,7 @@ from typing import Any
 
 from .archive_sqlite import SqliteArchiveStore
 from .archive_sqlite import real_chat_archive_records as real_chat_archive_records
+from .store import ArchiveStoreLike
 
 __all__ = ["ArchiveStore", "real_chat_archive_records"]
 
@@ -14,7 +15,7 @@ __all__ = ["ArchiveStore", "real_chat_archive_records"]
 class ArchiveStore:
     """全局统一历史归档，外部接口兼容旧 JSONL 版本。"""
 
-    def __init__(self, path: Path, store: Any | None = None) -> None:
+    def __init__(self, path: Path, store: ArchiveStoreLike | None = None) -> None:
         self._store = store if store is not None else SqliteArchiveStore(path)
         self._path = getattr(self._store, "path", path)
 

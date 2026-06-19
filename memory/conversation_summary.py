@@ -9,14 +9,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .store import JsonStore
+from .store import JsonStore, JsonStoreLike
 
 
 class RollingSummaryStore:
     """全局滚动摘要。"""
 
-    def __init__(self, path: Path) -> None:
-        self._store = JsonStore(path)
+    def __init__(self, path: Path, store: JsonStoreLike | None = None) -> None:
+        self._store = store if store is not None else JsonStore(path)
         self._data: dict[str, Any] = {
             "summary_text": "",
             "archived_until": None,
