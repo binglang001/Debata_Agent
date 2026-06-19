@@ -26,6 +26,7 @@ import asyncio
 import inspect
 import logging
 import os
+import shutil
 import signal
 import time
 from contextlib import suppress
@@ -359,7 +360,8 @@ class Runtime:
 
         # ----- 6.5 RAG 长期记忆（embedding + 向量存储）-----
         if self.config.features.long_term_memory.mode == "rag":
-            await self._setup_rag(mem_dir)
+            vector_dir = self.paths.vector_dir_for(self.persona.name)
+            await self._setup_rag(mem_dir, vector_dir)
         logger.debug("Runtime 阶段完成：Feature 服务 %.2fs", time.monotonic() - stage_t0)
 
         # ----- 6.6 插件扫描（ASR / TTS / 本地 embedding，按需）-----
@@ -935,7 +937,7 @@ class Runtime:
             logger.warning(f"获取好友列表失败: {e}")
             return set()
 
-    async def _setup_rag(self, mem_dir) -> None:
+    async def _setup_rag(self, mem_dir: Path, vector_dir: Path) -> None:
         """RAG 模式装配 EmbeddingService + 会话向量检索服务。
 
         失败仅 warn，不阻塞主流程。RAG 模式不再复用 important.json。
@@ -958,7 +960,8 @@ class Runtime:
                 self.embedding_service = get_local_service(model_dir)
                 from memory import RagMemoryService, SqliteVectorStore
 
-                self.rag_store = SqliteVectorStore(mem_dir / "rag_memory.sqlite3")
+                rag_db_path = self._prepare_rag_vector_db_path(mem_dir, vector_dir)
+                self.rag_store = SqliteVectorStore(rag_db_path)
                 await self.rag_store.load()
                 self.rag_memory = RagMemoryService(
                     embedding=self.embedding_service,
@@ -1012,7 +1015,8 @@ class Runtime:
                 )
                 from memory import RagMemoryService, SqliteVectorStore
 
-                self.rag_store = SqliteVectorStore(mem_dir / "rag_memory.sqlite3")
+                rag_db_path = self._prepare_rag_vector_db_path(mem_dir, vector_dir)
+                self.rag_store = SqliteVectorStore(rag_db_path)
                 await self.rag_store.load()
                 self.rag_memory = RagMemoryService(
                     embedding=self.embedding_service,
@@ -1034,6 +1038,66 @@ class Runtime:
                 self.embedding_service = None
                 self.rag_store = None
                 self.rag_memory = None
+
+    def _prepare_rag_vector_db_path(self, mem_dir: Path, vector_dir: Path) -> Path:
+        target_path = vector_dir / "rag_memory.sqlite3"
+        legacy_path = mem_dir / "rag_memory.sqlite3"
+        vector_dir.mkdir(parents=True, exist_ok=True)
+        if target_path.exists():
+            return target_path
+        if not legacy_path.exists():
+            return target_path
+
+        sidecars = [
+            (Path(str(legacy_path) + suffix), Path(str(target_path) + suffix))
+            for suffix in ("-wal", "-shm")
+            if Path(str(legacy_path) + suffix).exists()
+        ]
+        staging_pairs = [
+            (legacy_path, Path(str(target_path) + ".migrating")),
+            *[
+                (source, Path(str(destination) + ".migrating"))
+                for source, destination in sidecars
+            ],
+        ]
+        staging_paths = [staging for _source, staging in staging_pairs]
+        target_paths = [destination for _source, destination in sidecars]
+        published_paths: list[Path] = []
+        try:
+            self._cleanup_rag_migration_paths([*staging_paths, *target_paths])
+            for source, staging in staging_pairs:
+                shutil.copy2(source, staging)
+
+            if target_path.exists():
+                self._cleanup_rag_migration_paths(staging_paths)
+                return target_path
+
+            for _source, destination in sidecars:
+                staging = Path(str(destination) + ".migrating")
+                staging.replace(destination)
+                published_paths.append(destination)
+            Path(str(target_path) + ".migrating").replace(target_path)
+            published_paths.append(target_path)
+            logger.info("已复制旧 RAG 向量库到实例 vector 目录：%s", target_path)
+            return target_path
+        except Exception as e:  # noqa: BLE001
+            self._cleanup_rag_migration_paths([*staging_paths, *published_paths])
+            logger.warning(
+                "复制旧 RAG 向量库到 %s 失败，本次继续使用旧路径并在下次启动重试：%s",
+                target_path,
+                e,
+            )
+            return legacy_path
+        return target_path
+
+    @staticmethod
+    def _cleanup_rag_migration_paths(paths: list[Path]) -> None:
+        for path in paths:
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("清理 RAG 迁移临时文件失败 %s: %s", path, e)
 
     async def _setup_plugins(self) -> None:
         """扫描 plugins/ 并按 features.asr/tts 决定要不要 build。

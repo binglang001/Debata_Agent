@@ -12,6 +12,8 @@ def test_explicit_project_root_keeps_legacy_data_dir(tmp_path, monkeypatch):
     assert paths.INSTANCE_DIR == tmp_path / "data" / "instances" / "default"
     assert paths.DATA_DIR == tmp_path / "data"
     assert paths.CONFIG_FILE == tmp_path / "data" / "config.yaml"
+    assert paths.VECTOR_DIR == tmp_path / "data" / "vector"
+    assert paths.vector_dir_for("test_bot") == tmp_path / "data" / "vector" / "test_bot"
 
 
 def test_explicit_data_root_uses_default_instance_dir(tmp_path, monkeypatch):
@@ -24,6 +26,8 @@ def test_explicit_data_root_uses_default_instance_dir(tmp_path, monkeypatch):
     assert paths.INSTANCE_DIR == data_root / "instances" / "default"
     assert paths.DATA_DIR == paths.INSTANCE_DIR
     assert paths.MEMORY_DIR == paths.INSTANCE_DIR / "memory"
+    assert paths.VECTOR_DIR == paths.INSTANCE_DIR / "vector"
+    assert paths.vector_dir_for("test_bot") == paths.INSTANCE_DIR / "vector" / "test_bot"
 
 
 def test_env_data_root_overrides_project_root(tmp_path, monkeypatch):
@@ -81,6 +85,7 @@ def test_ensure_data_dirs_is_idempotent(tmp_path, monkeypatch):
 
     assert paths.DATA_DIR.is_dir()
     assert paths.MEMORY_DIR.is_dir()
+    assert paths.VECTOR_DIR.is_dir()
     assert paths.LOGS_DIR.is_dir()
     assert paths.EMOJI_DIR.is_dir()
     assert paths.MODELS_DIR.is_dir()

@@ -218,6 +218,55 @@ def assembled_project(tmp_path, fake_keyring, monkeypatch):
     return tmp_path, paths
 
 
+def _enable_rag_config(paths):
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data.setdefault("features", {})["long_term_memory"] = {
+        "mode": "rag",
+        "rag_top_k": 3,
+    }
+    data["features"]["embedding"] = {
+        "enabled": True,
+        "type": "api",
+        "provider": "fake_main",
+        "api_model": "fake-embedding",
+    }
+    with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+
+def _patch_rag_runtime_network(monkeypatch):
+    class FakeEmbeddingService:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+
+        async def warmup(self):
+            pass
+
+        async def embed_one(self, text):
+            return [1.0, 0.0, 0.0]
+
+        async def embed_batch(self, texts):
+            return [[1.0, 0.0, 0.0] for _text in texts]
+
+        @property
+        def dimension(self):
+            return 3
+
+        async def aclose(self):
+            self.closed = True
+
+    import features.embedding
+
+    monkeypatch.setattr(
+        features.embedding,
+        "OpenAICompatEmbeddingService",
+        FakeEmbeddingService,
+    )
+    monkeypatch.setattr(Runtime, "_schedule_provider_health_check", lambda self: None)
+
+
 # ============================================================
 # 烟雾测试
 # ============================================================
@@ -290,6 +339,120 @@ async def test_runtime_start_assembles_all_components(assembled_project):
 
     finally:
         await rt.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_rag_uses_instance_vector_dir(assembled_project, monkeypatch):
+    project_root, paths = assembled_project
+    _enable_rag_config(paths)
+    _patch_rag_runtime_network(monkeypatch)
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+
+        expected = paths.vector_dir_for("test_bot") / "rag_memory.sqlite3"
+        old_path = paths.memory_dir_for("test_bot") / "rag_memory.sqlite3"
+        assert rt.rag_store is not None
+        assert rt.rag_store.path == expected
+        assert rt.rag_store.path != old_path
+        assert expected.exists()
+        assert not old_path.exists()
+    finally:
+        await rt.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_copies_legacy_rag_vector_db_once(
+    assembled_project,
+    monkeypatch,
+):
+    project_root, paths = assembled_project
+    _enable_rag_config(paths)
+    _patch_rag_runtime_network(monkeypatch)
+
+    old_path = paths.memory_dir_for("test_bot") / "rag_memory.sqlite3"
+    new_path = paths.vector_dir_for("test_bot") / "rag_memory.sqlite3"
+    old_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(old_path) as conn:
+        conn.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO marker (value) VALUES ('legacy')")
+        conn.commit()
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+        assert rt.rag_store.path == new_path
+        assert old_path.exists()
+        assert new_path.exists()
+    finally:
+        await rt.shutdown()
+
+    with sqlite3.connect(new_path) as conn:
+        assert conn.execute("SELECT value FROM marker").fetchone()[0] == "legacy"
+        conn.execute("UPDATE marker SET value = 'new'")
+        conn.commit()
+
+    rt2 = Runtime(project_root=project_root)
+    try:
+        await rt2.start()
+        assert rt2.rag_store.path == new_path
+    finally:
+        await rt2.shutdown()
+
+    with sqlite3.connect(new_path) as conn:
+        assert conn.execute("SELECT value FROM marker").fetchone()[0] == "new"
+    with sqlite3.connect(old_path) as conn:
+        assert conn.execute("SELECT value FROM marker").fetchone()[0] == "legacy"
+
+
+@pytest.mark.asyncio
+async def test_runtime_rag_copy_failure_uses_legacy_path_and_retries(
+    assembled_project,
+    monkeypatch,
+):
+    project_root, paths = assembled_project
+    _enable_rag_config(paths)
+    _patch_rag_runtime_network(monkeypatch)
+
+    old_path = paths.memory_dir_for("test_bot") / "rag_memory.sqlite3"
+    new_path = paths.vector_dir_for("test_bot") / "rag_memory.sqlite3"
+    old_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(old_path) as conn:
+        conn.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO marker (value) VALUES ('legacy')")
+        conn.commit()
+
+    import core.runtime as runtime_module
+
+    original_copy2 = runtime_module.shutil.copy2
+
+    def fail_copy2(src, dst, *, follow_symlinks=True):
+        raise OSError("forced copy failure")
+
+    monkeypatch.setattr(runtime_module.shutil, "copy2", fail_copy2)
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+        assert rt.rag_store.path == old_path
+        assert old_path.exists()
+        assert not new_path.exists()
+    finally:
+        await rt.shutdown()
+
+    monkeypatch.setattr(runtime_module.shutil, "copy2", original_copy2)
+
+    rt2 = Runtime(project_root=project_root)
+    try:
+        await rt2.start()
+        assert rt2.rag_store.path == new_path
+        assert new_path.exists()
+    finally:
+        await rt2.shutdown()
+
+    with sqlite3.connect(new_path) as conn:
+        assert conn.execute("SELECT value FROM marker").fetchone()[0] == "legacy"
 
 
 @pytest.mark.asyncio

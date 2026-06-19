@@ -7,6 +7,7 @@
                 config.yaml         <- 主配置文件
                 secrets.enc         <- AES 加密后的 API 密钥库
                 memory/{name}/      <- 各人格的对话历史
+                vector/{name}/      <- 各人格的 RAG 向量库
                 logs/               <- 结构化日志
                 emoji/              <- 表情包资源
 
@@ -79,6 +80,7 @@ class AppPaths:
         self.RSA_PRIVATE_KEY_FILE: Path = self.DATA_DIR / "rsa_private.pem"
 
         self.MEMORY_DIR: Path = self.DATA_DIR / "memory"
+        self.VECTOR_DIR: Path = self.DATA_DIR / "vector"
         self.LOGS_DIR: Path = self.DATA_DIR / "logs"
         self.EMOJI_DIR: Path = self.DATA_DIR / "emoji"
         self.MODELS_DIR: Path = self.DATA_DIR / "models"
@@ -144,6 +146,7 @@ class AppPaths:
             self.INSTANCE_DIR,
             self.DATA_DIR,
             self.MEMORY_DIR,
+            self.VECTOR_DIR,
             self.LOGS_DIR,
             self.EMOJI_DIR,
             self.MODELS_DIR,
@@ -156,6 +159,10 @@ class AppPaths:
     def memory_dir_for(self, persona: str) -> Path:
         """获取指定人格的记忆目录。"""
         return self.MEMORY_DIR / persona
+
+    def vector_dir_for(self, persona: str) -> Path:
+        """获取指定人格的向量库目录。"""
+        return self.VECTOR_DIR / persona
 
     def persona_dir_for(self, persona: str) -> Path:
         """获取指定人格的资源目录。所有人格平级在 PERSONAS_DIR 下。"""

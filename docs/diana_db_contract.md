@@ -1,6 +1,6 @@
 # diana.db v1 契约
 
-本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records`、`DianaEventStore` 对 `event_log`、`DianaArchiveStore` 对 `archive_messages` / `archive_message_media`、`DianaPersonaDB` 对 `persona_*` legacy domains 的最小读写；旧文件导入器覆盖 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3` 与 `persona.db`；runtime 已接线到每人格 `memory/<persona>/diana.db`，但向量库/RAG 仍保持独立文件，未迁入 `diana.db`。
+本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records`、`DianaEventStore` 对 `event_log`、`DianaArchiveStore` 对 `archive_messages` / `archive_message_media`、`DianaPersonaDB` 对 `persona_*` legacy domains 的最小读写；旧文件导入器覆盖 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3` 与 `persona.db`；runtime 已接线到每人格 `memory/<persona>/diana.db`。向量库/RAG 不并入 `diana.db`，运行时使用实例级 `vector/<persona>/rag_memory.sqlite3` 独立文件，随实例目录搬迁。
 
 ## 文件与版本
 
@@ -66,7 +66,7 @@
 - Runtime 保留现有 Manager/门面调用面：`HistoryManager` 注入 `DianaHistoryStore`，`ImportantMemoryManager` 注入 `DianaImportantStore`，`ArchiveStore` 注入 `DianaArchiveStore`，`EventJournal` 包装 `DianaEventStore`，滚动摘要和 usage 分别直接使用 `DianaRollingSummaryStore` 与 `DianaUsageStatsStore`。
 - persona management 启用时，runtime 使用 `DianaPersonaDB(diana_db, persona_id)`，不再新建 `persona.db`，重要记忆仍通过 `DianaImportantStore` 作为运行时主后端。
 - `UsageStatsStore` 的运行时后端是 `DianaUsageStatsStore(diana_db, persona_id)`；旧 usage 导入源由 runtime 显式传入 `paths.LOGS_DIR / "model_usage.jsonl"`。
-- RAG/vector 相关存储仍由原独立文件负责，不在本阶段迁入，也不由导入器处理。
+- RAG/vector 相关存储由实例级 `paths.vector_dir_for(persona.name) / "rag_memory.sqlite3"` 负责，不在本阶段迁入 `diana.db`，也不由 diana 导入器处理。若旧 `memory/<persona>/rag_memory.sqlite3` 存在且新 vector 文件不存在，runtime 启动 RAG 前会复制旧主库及存在的 `-wal` / `-shm` sidecar 到新目录；旧文件保留，目标已存在时不覆盖。
 
 ## 第一批旧文件导入器
 
