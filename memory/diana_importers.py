@@ -38,6 +38,7 @@ class LegacyMemoryImportResult:
     usage: LegacyImportDomainResult
     events: LegacyImportDomainResult = LegacyImportDomainResult()
     archive: LegacyImportDomainResult = LegacyImportDomainResult()
+    persona: LegacyImportDomainResult = LegacyImportDomainResult()
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +94,19 @@ class _LegacyArchiveMediaRow:
     workspace_path: Any
     original_name: Any
     metadata_json: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyPersonaTableSpec:
+    source_table: str
+    target_table: str
+    target_columns: tuple[str, ...]
+    key_columns: tuple[str, ...]
+    optional_target_columns: tuple[str, ...] = ()
+    required_source_columns: tuple[str, ...] = ()
+    id_fixed_to_one: bool = False
+    id_must_be_one: bool = False
+    derive_eat_record_id: bool = False
 
 
 def import_legacy_memory_files(
@@ -156,6 +170,7 @@ async def _import_legacy_memory_files_async(
         usage_result = _import_usage(target_db, source_path, normalized_usage_persona)
         events_result = _import_events(target_db, source_path, normalized_persona)
         archive_result = _import_archive(target_db, source_path, normalized_persona)
+        persona_result = _import_persona(target_db, source_path, normalized_persona)
     finally:
         if should_close_db:
             target_db.close()
@@ -168,6 +183,7 @@ async def _import_legacy_memory_files_async(
         usage=usage_result,
         events=events_result,
         archive=archive_result,
+        persona=persona_result,
     )
 
 
@@ -319,6 +335,308 @@ def _import_archive(
         imported=imported,
         skipped=message_skipped + media_skipped + duplicate_or_conflict_skipped,
     )
+
+
+def _import_persona(
+    db: DianaDB,
+    source_dir: Path,
+    persona_id: str,
+) -> LegacyImportDomainResult:
+    path = source_dir / "persona.db"
+    if not path.exists():
+        return LegacyImportDomainResult()
+
+    rows, read_skipped = _read_legacy_persona_rows(path)
+    imported, duplicate_or_conflict_skipped = _insert_persona_rows(
+        db,
+        persona_id,
+        rows,
+    )
+    return LegacyImportDomainResult(
+        imported=imported,
+        skipped=read_skipped + duplicate_or_conflict_skipped,
+    )
+
+
+def _read_legacy_persona_rows(
+    path: Path,
+) -> tuple[list[tuple[_LegacyPersonaTableSpec, tuple[Any, ...]]], int]:
+    rows: list[tuple[_LegacyPersonaTableSpec, tuple[Any, ...]]] = []
+    skipped = 0
+    try:
+        with closing(sqlite3.connect(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            for spec in _LEGACY_PERSONA_TABLE_SPECS:
+                table_rows, table_skipped = _read_legacy_persona_table_rows(
+                    conn,
+                    path,
+                    spec,
+                )
+                rows.extend((spec, row) for row in table_rows)
+                skipped += table_skipped
+    except sqlite3.Error as exc:
+        logger.warning("读取旧 persona.db 失败，跳过 persona 导入: %s error=%s", path, exc)
+        return [], skipped
+    return rows, skipped
+
+
+def _read_legacy_persona_table_rows(
+    conn: sqlite3.Connection,
+    path: Path,
+    spec: _LegacyPersonaTableSpec,
+) -> tuple[list[tuple[Any, ...]], int]:
+    if not _legacy_sqlite_table_exists(conn, spec.source_table):
+        logger.warning("旧 persona.db 缺少 %s 表，跳过该表: %s", spec.source_table, path)
+        return [], 0
+
+    source_columns = _legacy_sqlite_table_columns(conn, spec.source_table)
+    missing_required = sorted(set(spec.required_source_columns) - source_columns)
+    if missing_required:
+        skipped = _legacy_sqlite_row_count(conn, spec.source_table)
+        logger.warning(
+            "旧 persona.db %s 缺少必要列，跳过该表: %s missing=%s",
+            spec.source_table,
+            path,
+            ",".join(missing_required),
+        )
+        return [], skipped
+
+    select_columns = _legacy_persona_select_columns(spec, source_columns)
+    if not select_columns:
+        skipped = _legacy_sqlite_row_count(conn, spec.source_table)
+        logger.warning(
+            "旧 persona.db %s 没有可导入列，跳过该表: %s",
+            spec.source_table,
+            path,
+        )
+        return [], skipped
+
+    source_rows = conn.execute(
+        f"""
+        SELECT {_sql_identifier_list(select_columns)}
+        FROM {_quote_sql_identifier(spec.source_table)}
+        ORDER BY {_legacy_persona_order_by(spec, source_columns)}
+        """
+    ).fetchall()
+
+    rows: list[tuple[Any, ...]] = []
+    skipped = 0
+    for index, source_row in enumerate(source_rows, start=1):
+        target_row = _legacy_persona_target_row_from_mapping(
+            source_row,
+            spec,
+            f"{path}:{spec.source_table} row {index}",
+        )
+        if target_row is None:
+            skipped += 1
+            continue
+        rows.append(target_row)
+    return rows, skipped
+
+
+def _legacy_persona_select_columns(
+    spec: _LegacyPersonaTableSpec,
+    source_columns: set[str],
+) -> list[str]:
+    columns = [
+        column
+        for column in spec.target_columns
+        if column in source_columns
+    ]
+    if spec.derive_eat_record_id and "record_json" in source_columns and "record_json" not in columns:
+        columns.append("record_json")
+    if spec.derive_eat_record_id and "rowid" not in columns:
+        columns.append("rowid")
+    return columns
+
+
+def _legacy_persona_order_by(
+    spec: _LegacyPersonaTableSpec,
+    source_columns: set[str],
+) -> str:
+    if "id" in source_columns:
+        return _quote_sql_identifier("id") + " ASC"
+    if "record_id" in source_columns:
+        return _quote_sql_identifier("record_id") + " ASC"
+    if spec.source_table in {"effects", "todos", "cues", "user_profiles"}:
+        key_column = spec.key_columns[0]
+        if key_column in source_columns:
+            return _quote_sql_identifier(key_column) + " ASC"
+    return "rowid ASC"
+
+
+def _legacy_persona_target_row_from_mapping(
+    record: sqlite3.Row,
+    spec: _LegacyPersonaTableSpec,
+    location: str,
+) -> tuple[Any, ...] | None:
+    values: list[Any] = []
+    row_mapping = {key: record[key] for key in record.keys()}
+    for column in spec.target_columns:
+        if spec.id_fixed_to_one and column == "id":
+            value = 1
+        elif spec.derive_eat_record_id and column == "record_id":
+            value = _legacy_eat_record_id(row_mapping)
+        elif column in row_mapping:
+            value = row_mapping[column]
+        elif column in spec.optional_target_columns:
+            value = None
+        else:
+            logger.warning("跳过缺少必要字段的旧 persona 行: %s column=%s", location, column)
+            return None
+        values.append(value)
+
+    row = tuple(values)
+    if not _legacy_persona_row_has_required_values(spec, row):
+        logger.warning("跳过缺少关键字段的旧 persona 行: %s", location)
+        return None
+    return row
+
+
+def _legacy_persona_row_has_required_values(
+    spec: _LegacyPersonaTableSpec,
+    row: tuple[Any, ...],
+) -> bool:
+    for column, value in zip(spec.target_columns, row, strict=True):
+        if column in spec.optional_target_columns:
+            continue
+        if value is None:
+            return False
+        if isinstance(value, str) and not value.strip():
+            return False
+    for column in spec.key_columns:
+        value = row[spec.target_columns.index(column)]
+        if value is None:
+            return False
+        if isinstance(value, str) and not value.strip():
+            return False
+    if spec.id_must_be_one:
+        id_value = _required_int(row[spec.target_columns.index("id")])
+        if id_value != 1:
+            return False
+    return True
+
+
+def _legacy_eat_record_id(record: dict[str, Any]) -> str | None:
+    record_id = _optional_text(record.get("record_id"))
+    if record_id:
+        return record_id
+    data = _json_loads(record.get("record_json"), default={})
+    if isinstance(data, dict):
+        for key in ("record_id", "eat_id", "id"):
+            record_id = _optional_text(data.get(key))
+            if record_id:
+                return record_id
+    fallback = record.get("id")
+    if fallback in (None, ""):
+        fallback = record.get("rowid")
+    fallback_text = _optional_text(fallback)
+    return f"eat_{fallback_text}" if fallback_text else None
+
+
+def _insert_persona_rows(
+    db: DianaDB,
+    persona_id: str,
+    rows: Sequence[tuple[_LegacyPersonaTableSpec, tuple[Any, ...]]],
+) -> tuple[int, int]:
+    if not rows:
+        return 0, 0
+
+    imported = 0
+    skipped = 0
+    with closing(_connect_for_import(db)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing_by_table = _existing_persona_rows_by_table(conn, persona_id)
+            for spec, row in rows:
+                key = _legacy_persona_row_key(spec, row)
+                existing = existing_by_table[spec.target_table].get(key)
+                if existing is not None:
+                    skipped += 1
+                    if not _legacy_persona_rows_equivalent(existing, spec, row):
+                        logger.warning(
+                            "跳过冲突的旧 persona 行 table=%s key=%s persona_id=%s",
+                            spec.source_table,
+                            ",".join(str(item) for item in key),
+                            persona_id,
+                        )
+                    continue
+
+                _insert_persona_row(conn, persona_id, spec, row)
+                existing_by_table[spec.target_table][key] = row
+                imported += 1
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+    return imported, skipped
+
+
+def _existing_persona_rows_by_table(
+    conn: sqlite3.Connection,
+    persona_id: str,
+) -> dict[str, dict[tuple[Any, ...], sqlite3.Row]]:
+    existing: dict[str, dict[tuple[Any, ...], sqlite3.Row]] = {}
+    for spec in _LEGACY_PERSONA_TABLE_SPECS:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM {_quote_sql_identifier(spec.target_table)}
+            WHERE persona_id = ?
+            """,
+            (persona_id,),
+        ).fetchall()
+        existing[spec.target_table] = {
+            tuple(row[column] for column in spec.key_columns): row
+            for row in rows
+        }
+    return existing
+
+
+def _legacy_persona_row_key(
+    spec: _LegacyPersonaTableSpec,
+    row: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    return tuple(row[spec.target_columns.index(column)] for column in spec.key_columns)
+
+
+def _insert_persona_row(
+    conn: sqlite3.Connection,
+    persona_id: str,
+    spec: _LegacyPersonaTableSpec,
+    row: tuple[Any, ...],
+) -> None:
+    columns = ("persona_id", *spec.target_columns)
+    conn.execute(
+        f"""
+        INSERT INTO {_quote_sql_identifier(spec.target_table)}
+            ({_sql_identifier_list(columns)})
+        VALUES ({", ".join("?" for _ in columns)})
+        """,
+        (persona_id, *row),
+    )
+
+
+def _legacy_persona_rows_equivalent(
+    existing: sqlite3.Row | tuple[Any, ...],
+    spec: _LegacyPersonaTableSpec,
+    incoming: tuple[Any, ...],
+) -> bool:
+    return all(
+        _persona_row_value(existing, spec, column) == value
+        for column, value in zip(spec.target_columns, incoming, strict=True)
+    )
+
+
+def _persona_row_value(
+    row: sqlite3.Row | tuple[Any, ...],
+    spec: _LegacyPersonaTableSpec,
+    column: str,
+) -> Any:
+    if isinstance(row, tuple):
+        return row[spec.target_columns.index(column)]
+    return row[column]
 
 
 def _read_legacy_archive_message_rows(
@@ -1035,6 +1353,178 @@ _LEGACY_ARCHIVE_MEDIA_COLUMNS = (
 )
 
 
+_LEGACY_PERSONA_TABLE_SPECS = (
+    _LegacyPersonaTableSpec(
+        source_table="schema_version",
+        target_table="persona_schema_version_legacy",
+        target_columns=("id", "version", "updated_at"),
+        key_columns=("id",),
+        required_source_columns=("version", "updated_at"),
+        id_fixed_to_one=True,
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="persona_state",
+        target_table="persona_state",
+        target_columns=("id", "state_json", "updated_at"),
+        key_columns=("id",),
+        required_source_columns=("id", "state_json", "updated_at"),
+        id_must_be_one=True,
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="persona_state_log",
+        target_table="persona_state_log",
+        target_columns=("id", "state_json", "created_at"),
+        key_columns=("id",),
+        required_source_columns=("id", "state_json", "created_at"),
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="persona_update_audits",
+        target_table="persona_update_audits",
+        target_columns=(
+            "id",
+            "audit_json",
+            "trigger",
+            "conversation_id",
+            "user_id",
+            "created_at",
+        ),
+        key_columns=("id",),
+        optional_target_columns=("trigger", "conversation_id", "user_id"),
+        required_source_columns=("id", "audit_json", "created_at"),
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="effects",
+        target_table="persona_effects",
+        target_columns=(
+            "effect_id",
+            "effect_json",
+            "expires_at",
+            "active",
+            "created_at",
+            "updated_at",
+        ),
+        key_columns=("effect_id",),
+        optional_target_columns=("expires_at",),
+        required_source_columns=(
+            "effect_id",
+            "effect_json",
+            "active",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="todos",
+        target_table="persona_todos",
+        target_columns=(
+            "todo_id",
+            "todo_json",
+            "completed",
+            "expires_at",
+            "created_at",
+            "updated_at",
+        ),
+        key_columns=("todo_id",),
+        optional_target_columns=("expires_at",),
+        required_source_columns=(
+            "todo_id",
+            "todo_json",
+            "completed",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="cues",
+        target_table="persona_cues",
+        target_columns=(
+            "cue_id",
+            "cue_json",
+            "expires_at",
+            "active",
+            "created_at",
+            "updated_at",
+        ),
+        key_columns=("cue_id",),
+        optional_target_columns=("expires_at",),
+        required_source_columns=(
+            "cue_id",
+            "cue_json",
+            "active",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="inner_monologues",
+        target_table="persona_inner_monologues",
+        target_columns=("id", "monologue_json", "created_at"),
+        key_columns=("id",),
+        required_source_columns=("id", "monologue_json", "created_at"),
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="user_profiles",
+        target_table="persona_user_profiles",
+        target_columns=("user_id", "profile_json", "created_at", "updated_at"),
+        key_columns=("user_id",),
+        required_source_columns=("user_id", "profile_json", "created_at", "updated_at"),
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="important_memories",
+        target_table="persona_important_state_legacy",
+        target_columns=("id", "memories_json", "updated_at"),
+        key_columns=("id",),
+        required_source_columns=("id", "memories_json", "updated_at"),
+        id_must_be_one=True,
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="daily_trajectories",
+        target_table="persona_daily_trajectories",
+        target_columns=("id", "trajectory_json", "created_at"),
+        key_columns=("id",),
+        required_source_columns=("id", "trajectory_json", "created_at"),
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="persona_arc",
+        target_table="persona_arc",
+        target_columns=("id", "event_json", "created_at"),
+        key_columns=("id",),
+        required_source_columns=("id", "event_json", "created_at"),
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="sleep_records",
+        target_table="persona_sleep_records",
+        target_columns=(
+            "record_id",
+            "record_json",
+            "started_at",
+            "ended_at",
+            "created_at",
+            "updated_at",
+        ),
+        key_columns=("record_id",),
+        optional_target_columns=("started_at", "ended_at"),
+        required_source_columns=("record_id", "record_json", "created_at", "updated_at"),
+    ),
+    _LegacyPersonaTableSpec(
+        source_table="eat_records",
+        target_table="persona_eat_records",
+        target_columns=(
+            "id",
+            "record_id",
+            "record_json",
+            "ended_at",
+            "status",
+            "created_at",
+        ),
+        key_columns=("id",),
+        optional_target_columns=("record_id", "ended_at", "status"),
+        required_source_columns=("id", "record_json", "created_at"),
+        derive_eat_record_id=True,
+    ),
+)
+
+
 def _legacy_archive_messages_equivalent(
     existing: sqlite3.Row | _LegacyArchiveMessageRow,
     incoming: _LegacyArchiveMessageRow,
@@ -1306,6 +1796,15 @@ def _important_import_count(data: Any) -> int:
 
 def _json_data(data: Any) -> str:
     return orjson.dumps(data).decode("utf-8")
+
+
+def _json_loads(data: Any, *, default: Any) -> Any:
+    if not isinstance(data, str) or not data.strip():
+        return default
+    try:
+        return orjson.loads(data)
+    except orjson.JSONDecodeError:
+        return default
 
 
 def _record_text(value: Any) -> str | None:

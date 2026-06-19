@@ -1,6 +1,6 @@
 # diana.db v1 契约
 
-本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records`、`DianaPersonaDB` 对 `persona_*` legacy domains 的最小读写；旧文件导入器覆盖 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`、`events.sqlite3`、`events.sqlite3.append.jsonl` 与 `archive.sqlite3`；不接 runtime，不实现 runtime 仓储。
+本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records`、`DianaPersonaDB` 对 `persona_*` legacy domains 的最小读写；旧文件导入器覆盖 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3` 与 `persona.db`；不接 runtime，不实现 runtime 仓储。
 
 ## 文件与版本
 
@@ -63,12 +63,12 @@
 `memory.diana_importers.import_legacy_memory_files(db, source_dir, persona_id, *, backup=True, usage_persona_id=None)` 是同步导入入口，用于把旧 `memory/` 与 `logs/` 中第一批文件导入已存在的 `diana.db` stores。参数约定：
 
 - `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。入口会主动 `load()` 并确保 schema 可用。
-- `source_dir`：旧 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3` 所在目录。
-- `persona_id`：写入 `history_records`、`important_memories`、`rolling_summary`、`event_log`、`event_projection_state`、`archive_messages`、`archive_message_media` 的目标 persona。
+- `source_dir`：旧 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3`、`persona.db` 所在目录。
+- `persona_id`：写入 `history_records`、`important_memories`、`rolling_summary`、`event_log`、`event_projection_state`、`archive_messages`、`archive_message_media` 与 `persona_*` 目标表的目标 persona。
 - `backup=True`：导入前如果目标 `diana.db` 已存在，调用 `backup_existing_database()`；目标库不存在时不创建备份。
 - `usage_persona_id=None`：默认跟随 `persona_id` 写入 `usage_records.persona_id`。显式传入空字符串表示全局 usage，写库时 `persona_id` 为 `NULL`。
 
-返回值是 `LegacyMemoryImportResult`，包含 `backup_path` 以及 `history`、`important`、`rolling_summary`、`usage`、`events`、`archive` 六个 `LegacyImportDomainResult(imported, skipped)` 统计，供 runtime 后续展示。`archive` 统计按归档消息行与归档媒体行合计。
+返回值是 `LegacyMemoryImportResult`，包含 `backup_path` 以及 `history`、`important`、`rolling_summary`、`usage`、`events`、`archive`、`persona` 七个 `LegacyImportDomainResult(imported, skipped)` 统计，供 runtime 后续展示。`archive` 统计按归档消息行与归档媒体行合计，`persona` 统计按旧 `persona.db` 导入到 `persona_*` 目标表的行合计。
 
 导入映射：
 
@@ -86,10 +86,12 @@
 - `usage` 按同一 `usage_persona_id` 下的 `record_json` 去重；重复导入同一旧记录时计入 skipped，不新增行。
 - `events` 按同一 `persona_id` 下的 `event_id` 与 `idempotency_key` 去重。相同 `event_id` 且除 `persona_id` 外的事件保真列完整一致视为重复并计入 skipped；相同 `event_id` 但任一事件保真列冲突，或相同 `idempotency_key` 指向不同事件时，记录 warning 并计入 skipped，不覆盖已有行。
 - `archive` 按同一 `persona_id` 下的消息 `rowid`、消息 `archive_id` 与媒体 `id` 去重。相同消息 `rowid` 或 `archive_id` 且除 `persona_id` 外的完整归档消息列一致视为重复并计入 skipped；任一列冲突时记录 warning 并计入 skipped，不覆盖已有行。相同媒体 `id` 且除 `persona_id` 外的完整媒体列一致视为重复并计入 skipped；任一列冲突时记录 warning 并计入 skipped，不覆盖已有行。同一 `archive_id` 可以有多条不同媒体 `id`。
+- `persona` 读取 `source_dir/persona.db`，在 `target_db.load()` 后用直接 SQLite 导入到 `persona_*` 表，不调用 `DianaPersonaDB` 写方法生成新 ID。缺少 `persona.db` 时 `persona.imported=0` 且 `persona.skipped=0`。缺表记录 warning 并跳过该表；源表缺关键主键/必要列时记录 warning，并按该表可数行计入 skipped；单行关键字段缺失或目标 NOT NULL 列无法满足时记录 warning 并跳过该行。
+- `persona` 按同一 `persona_id` 下的目标主键去重。相同主键且除 `persona_id` 外的完整目标列一致视为重复并计入 skipped；相同主键但任一目标列冲突时记录 warning 并计入 skipped，不覆盖已有行。旧 `eat_records` 兼容缺少 `record_id`、`ended_at`、`status` 的库；缺 `record_id` 时按 `record_json.record_id/eat_id/id` 推导，仍无值则使用 `eat_<id>` fallback。
 - JSONL 中空行、损坏行、非对象行会跳过并记录 warning；损坏 JSON 文件会跳过整个域并记录 warning，不让整体导入崩溃。
 - 事件 append log 中损坏行、非对象行、缺失关键字段行、损坏 `payload_json` 行会跳过并记录 warning，不让整体导入崩溃。`events.sqlite3` 缺失或缺少 `event_log` 表时按该域缺失处理。
 - `archive.sqlite3` 缺失时 `archive` 统计为 `imported=0, skipped=0`，不写库。缺少 `archive_messages` 表时按缺失域处理并记录 warning；缺少 `archive_message_media` 表时只导入消息并记录 warning。媒体导入只接受当前 persona 下已存在的 `archive_id`，孤儿媒体行跳过并记录 warning。损坏或缺少关键字段的归档消息/媒体单行跳过并记录 warning，不让整体导入崩溃。
-- 只有指定 persona 的 `history`、`important`、`rolling_summary` 会被替换；其他 persona 不受影响。`usage` 去重和写入按 `usage_persona_id` 隔离。`events` 的 `event_id` 与 `idempotency_key` 唯一性按 `persona_id` 隔离，同一旧事件可导入多个 persona。`archive` 的 `rowid`、`archive_id` 与媒体 `id` 也按 `persona_id` 隔离，同一旧归档库可导入多个 persona。
+- 只有指定 persona 的 `history`、`important`、`rolling_summary` 会被替换；其他 persona 不受影响。`usage` 去重和写入按 `usage_persona_id` 隔离。`events` 的 `event_id` 与 `idempotency_key` 唯一性按 `persona_id` 隔离，同一旧事件可导入多个 persona。`archive` 的 `rowid`、`archive_id` 与媒体 `id` 也按 `persona_id` 隔离，同一旧归档库可导入多个 persona。`persona` 的旧主键也按 `persona_id` 隔离，同一旧 `persona.db` 可导入多个 persona。
 
 ## 表结构
 
@@ -496,6 +498,23 @@ Persona state 域使用 `persona_*` 表名前缀复制现 `mind/db_schema.py` �
 
 接口覆盖旧 `PersonaDB` 的 state、state log、update audit、effect、todo、cue、profile、inner monologue、daily trajectory、persona arc、sleep/eat record 与旧聚合 important memory 读写方法。`load()` 只确保 diana schema 可用，并在 `persona_schema_version_legacy` 为当前 persona 写入旧 persona.db schema version；不接 runtime，不导入旧数据，不修改 diana schema version。
 
+旧 `persona.db` 导入映射：
+
+- `schema_version` -> `persona_schema_version_legacy`，补 `persona_id`，`id` 固定为 `1`。
+- `persona_state` -> `persona_state`。
+- `persona_state_log` -> `persona_state_log`。
+- `persona_update_audits` -> `persona_update_audits`。
+- `effects` -> `persona_effects`。
+- `todos` -> `persona_todos`。
+- `cues` -> `persona_cues`。
+- `inner_monologues` -> `persona_inner_monologues`。
+- `user_profiles` -> `persona_user_profiles`。
+- `important_memories` -> `persona_important_state_legacy`。本切片只保真导入旧 persona 聚合表，不合并进新 `important_memories`；来自 `important.json` 与 persona 聚合重要记忆的双源去重合并是后续切片。
+- `daily_trajectories` -> `persona_daily_trajectories`。
+- `persona_arc` -> `persona_arc`。
+- `sleep_records` -> `persona_sleep_records`。
+- `eat_records` -> `persona_eat_records`。
+
 写入语义：
 
 - 所有 `SELECT`、`INSERT`、`UPDATE`、`DELETE` 必须按当前 `persona_id` 隔离；同一 `diana.db` 中不同 persona 的记录、删除、过期处理和最近记录查询互不影响。
@@ -712,5 +731,5 @@ Persona state 域使用 `persona_*` 表名前缀复制现 `mind/db_schema.py` �
 - 未改现有 memory/history/important/event/archive manager。
 - 未改 `mind/db.py` 或 `mind/db_schema.py`。
 - 未实现统一仓储抽象。
-- 未实现旧 `persona.db` 的导入器。
+- 未实现 `important.json` 与旧 `persona.db important_memories` 的双源去重合并。
 - 未处理向量库搬迁；向量库按阶段计划保持独立文件。

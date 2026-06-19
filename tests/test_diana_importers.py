@@ -16,6 +16,7 @@ from memory.diana_stores import (
     DianaEventStore,
     DianaHistoryStore,
     DianaImportantStore,
+    DianaPersonaDB,
     DianaRollingSummaryStore,
     DianaUsageStatsStore,
 )
@@ -290,6 +291,263 @@ def test_import_legacy_memory_files_keeps_personas_isolated(tmp_path):
     assert [(row["persona_id"], orjson.loads(row["record_json"])) for row in _usage_rows(db_path)] == [
         ("yuexi", shared_usage),
         ("jiu", shared_usage),
+    ]
+
+
+def test_import_legacy_persona_db_full_sample_preserves_rows_and_store_reads(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    sample = _legacy_persona_sample()
+    important_items = [{"id": "json_mem", "content": "来自 important.json"}]
+    _write_json(source_dir / "important.json", important_items)
+    _write_legacy_persona_sqlite(source_dir / "persona.db", sample)
+
+    result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.important == LegacyImportDomainResult(imported=1, skipped=0)
+    assert result.persona == LegacyImportDomainResult(
+        imported=_legacy_persona_row_count(sample),
+        skipped=0,
+    )
+    for source_table, target_table in _LEGACY_PERSONA_TARGET_TABLES.items():
+        assert _persona_rows(db_path, target_table, "yuexi") == [
+            {"persona_id": "yuexi", **row}
+            for row in sample[source_table]
+        ]
+    assert _read_important(db_path, "yuexi") == important_items
+    assert asyncio.run(DianaImportantStore(db_path, "yuexi").read(default=[])) == important_items
+    assert [orjson.loads(row["item_json"]) for row in _important_rows(db_path, "yuexi")] == important_items
+
+    store = DianaPersonaDB(db_path, "yuexi")
+    assert asyncio.run(store.get_state()).mood == 72.0
+    assert asyncio.run(store.recent_state_logs(limit=2)) == [
+        {"mood": 73.0, "event": "after"},
+        {"mood": 72.0, "event": "before"},
+    ]
+    assert asyncio.run(store.recent_update_audits(limit=5)) == [
+        {
+            "trigger": "message",
+            "conversation_id": "private:u1",
+            "user_id": "u1",
+            "update": {"mood": 1},
+        }
+    ]
+    assert [effect.id for effect in asyncio.run(store.get_active_effects(now=100.0))] == [
+        "effect_1",
+    ]
+    assert [todo.id for todo in asyncio.run(store.get_todos(include_completed=False))] == [
+        "todo_1",
+    ]
+    assert [cue.id for cue in asyncio.run(store.get_cues(now=100.0))] == ["cue_1"]
+    assert asyncio.run(store.get_profile("u1")).display_name == "张三"
+    assert [profile.user_id for profile in asyncio.run(store.all_profiles())] == ["u1"]
+    assert asyncio.run(store.recent_monologues(limit=1)) == [{"text": "第二条"}]
+    assert asyncio.run(store.recent_trajectories(limit=5)) == [
+        {"date": "2026-06-18", "summary": "开始"}
+    ]
+    assert asyncio.run(store.recent_arc_events(limit=5)) == [{"event": "created"}]
+    assert asyncio.run(store.recent_sleep_records(limit=5)) == [
+        {"id": "sleep_1", "started_at": "22:00"}
+    ]
+    assert asyncio.run(store.recent_eat_records(limit=5)) == [
+        {"id": "eat_1", "food": "面包", "status": "active"}
+    ]
+    assert asyncio.run(store.read_important(default=[])) == [
+        {"id": "mem_1", "content": "旧 persona 重要记忆"}
+    ]
+
+
+def test_import_legacy_persona_db_is_idempotent(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    sample = _legacy_persona_sample()
+    _write_legacy_persona_sqlite(source_dir / "persona.db", sample)
+
+    first = import_legacy_memory_files(db_path, source_dir, "yuexi")
+    second = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    source_count = _legacy_persona_row_count(sample)
+    assert first.persona == LegacyImportDomainResult(imported=source_count, skipped=0)
+    assert second.persona == LegacyImportDomainResult(imported=0, skipped=source_count)
+    assert len(_persona_rows(db_path, "persona_state_log", "yuexi")) == 2
+    assert len(_persona_rows(db_path, "persona_eat_records", "yuexi")) == 1
+
+
+def test_import_legacy_persona_db_conflict_warns_and_keeps_existing(tmp_path, caplog):
+    source_dir = tmp_path / "legacy"
+    conflict_source = tmp_path / "legacy_conflict"
+    db_path = tmp_path / "diana.db"
+    original = _legacy_persona_sample()
+    conflict = _legacy_persona_sample()
+    conflict["effects"][0] = {
+        **conflict["effects"][0],
+        "effect_json": orjson.dumps({"id": "effect_1", "name": "changed"}).decode("utf-8"),
+    }
+    _write_legacy_persona_sqlite(source_dir / "persona.db", original)
+    _write_legacy_persona_sqlite(conflict_source / "persona.db", conflict)
+
+    first = import_legacy_memory_files(db_path, source_dir, "yuexi")
+    with caplog.at_level("WARNING"):
+        second = import_legacy_memory_files(db_path, conflict_source, "yuexi")
+
+    assert first.persona == LegacyImportDomainResult(
+        imported=_legacy_persona_row_count(original),
+        skipped=0,
+    )
+    assert second.persona == LegacyImportDomainResult(
+        imported=0,
+        skipped=_legacy_persona_row_count(conflict),
+    )
+    assert _persona_rows(db_path, "persona_effects", "yuexi") == [
+        {"persona_id": "yuexi", **original["effects"][0]},
+    ]
+    assert "跳过冲突的旧 persona 行 table=effects key=effect_1" in caplog.text
+
+
+def test_import_legacy_persona_db_keeps_personas_isolated(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    sample = _legacy_persona_sample()
+    _write_legacy_persona_sqlite(source_dir / "persona.db", sample)
+
+    first = import_legacy_memory_files(db_path, source_dir, "yuexi")
+    second = import_legacy_memory_files(db_path, source_dir, "jiu")
+
+    source_count = _legacy_persona_row_count(sample)
+    assert first.persona == LegacyImportDomainResult(imported=source_count, skipped=0)
+    assert second.persona == LegacyImportDomainResult(imported=source_count, skipped=0)
+    assert _persona_rows(db_path, "persona_state", "yuexi") == [
+        {"persona_id": "yuexi", **sample["persona_state"][0]},
+    ]
+    assert _persona_rows(db_path, "persona_state", "jiu") == [
+        {"persona_id": "jiu", **sample["persona_state"][0]},
+    ]
+    assert asyncio.run(DianaPersonaDB(db_path, "yuexi").read_important(default=[])) == [
+        {"id": "mem_1", "content": "旧 persona 重要记忆"}
+    ]
+    assert asyncio.run(DianaPersonaDB(db_path, "jiu").read_important(default=[])) == [
+        {"id": "mem_1", "content": "旧 persona 重要记忆"}
+    ]
+
+
+def test_import_legacy_persona_db_missing_file_table_and_bad_rows_do_not_crash(
+    tmp_path,
+    caplog,
+):
+    missing_source = tmp_path / "missing"
+    missing_source.mkdir()
+    db_path = tmp_path / "diana.db"
+
+    missing_result = import_legacy_memory_files(db_path, missing_source, "yuexi")
+
+    assert missing_result.persona == LegacyImportDomainResult(imported=0, skipped=0)
+
+    broken_source = tmp_path / "broken"
+    sqlite_path = broken_source / "persona.db"
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE persona_state (
+                id INTEGER PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO persona_state (id, state_json, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (2, orjson.dumps({"bad": "id"}).decode("utf-8"), "2026-06-18 09:00:00"),
+        )
+        conn.execute(
+            """
+            CREATE TABLE persona_state_log (
+                id INTEGER PRIMARY KEY,
+                state_json TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO persona_state_log (id, state_json, created_at)
+            VALUES (?, ?, ?)
+            """,
+            [
+                (1, orjson.dumps({"ok": True}).decode("utf-8"), "2026-06-18 10:00:00"),
+                (2, None, "2026-06-18 10:01:00"),
+            ],
+        )
+        conn.execute("CREATE TABLE effects(effect_id TEXT PRIMARY KEY, effect_json TEXT)")
+        conn.execute(
+            "INSERT INTO effects(effect_id, effect_json) VALUES (?, ?)",
+            ("effect_missing_columns", "{}"),
+        )
+
+    with caplog.at_level("WARNING"):
+        broken_result = import_legacy_memory_files(db_path, broken_source, "yuexi")
+
+    assert broken_result.persona == LegacyImportDomainResult(imported=1, skipped=3)
+    assert _persona_rows(db_path, "persona_state_log", "yuexi") == [
+        {
+            "persona_id": "yuexi",
+            "id": 1,
+            "state_json": orjson.dumps({"ok": True}).decode("utf-8"),
+            "created_at": "2026-06-18 10:00:00",
+        }
+    ]
+    assert "旧 persona.db 缺少 schema_version 表" in caplog.text
+    assert "旧 persona.db effects 缺少必要列" in caplog.text
+    assert "跳过缺少关键字段的旧 persona 行" in caplog.text
+
+
+def test_import_legacy_persona_db_legacy_eat_records_without_new_columns(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    record_json = orjson.dumps({"food": "苹果", "eat_id": "eat_from_json"}).decode("utf-8")
+    _write_legacy_persona_sqlite_legacy_eat_only(source_dir / "persona.db", record_json)
+
+    result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.persona == LegacyImportDomainResult(imported=1, skipped=0)
+    assert _persona_rows(db_path, "persona_eat_records", "yuexi") == [
+        {
+            "persona_id": "yuexi",
+            "id": 7,
+            "record_id": "eat_from_json",
+            "record_json": record_json,
+            "ended_at": None,
+            "status": None,
+            "created_at": "2026-06-18 12:00:00",
+        }
+    ]
+    assert asyncio.run(DianaPersonaDB(db_path, "yuexi").recent_eat_records(limit=5)) == [
+        {"food": "苹果", "eat_id": "eat_from_json"}
+    ]
+
+
+def test_import_legacy_persona_db_legacy_eat_records_falls_back_to_row_id(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    record_json = _json_text({"food": "苹果"})
+    _write_legacy_persona_sqlite_legacy_eat_only(source_dir / "persona.db", record_json)
+
+    result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.persona == LegacyImportDomainResult(imported=1, skipped=0)
+    assert _persona_rows(db_path, "persona_eat_records", "yuexi") == [
+        {
+            "persona_id": "yuexi",
+            "id": 7,
+            "record_id": "eat_7",
+            "record_json": record_json,
+            "ended_at": None,
+            "status": None,
+            "created_at": "2026-06-18 12:00:00",
+        }
     ]
 
 
@@ -808,6 +1066,176 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_bytes(b"".join(orjson.dumps(record) + b"\n" for record in records))
 
 
+def _legacy_persona_sample() -> dict[str, list[dict]]:
+    return {
+        "schema_version": [
+            {"id": 1, "version": 2, "updated_at": "2026-06-18 09:00:00"},
+        ],
+        "persona_state": [
+            {
+                "id": 1,
+                "state_json": _json_text({"mood": 72.0, "energy": 61.0}),
+                "updated_at": "2026-06-18 09:01:00",
+            },
+        ],
+        "persona_state_log": [
+            {
+                "id": 1,
+                "state_json": _json_text({"mood": 72.0, "event": "before"}),
+                "created_at": "2026-06-18 09:02:00",
+            },
+            {
+                "id": 2,
+                "state_json": _json_text({"mood": 73.0, "event": "after"}),
+                "created_at": "2026-06-18 09:03:00",
+            },
+        ],
+        "persona_update_audits": [
+            {
+                "id": 1,
+                "audit_json": _json_text(
+                    {
+                        "trigger": "message",
+                        "conversation_id": "private:u1",
+                        "user_id": "u1",
+                        "update": {"mood": 1},
+                    }
+                ),
+                "trigger": "message",
+                "conversation_id": "private:u1",
+                "user_id": "u1",
+                "created_at": "2026-06-18 09:04:00",
+            },
+        ],
+        "effects": [
+            {
+                "effect_id": "effect_1",
+                "effect_json": _json_text(
+                    {
+                        "id": "effect_1",
+                        "name": "buff",
+                        "effect_type": "mood",
+                        "intensity": 1.5,
+                        "expires_at": 4_102_444_800.0,
+                    }
+                ),
+                "expires_at": "4102444800.0",
+                "active": 1,
+                "created_at": "2026-06-18 09:05:00",
+                "updated_at": "2026-06-18 09:05:00",
+            },
+        ],
+        "todos": [
+            {
+                "todo_id": "todo_1",
+                "todo_json": _json_text(
+                    {
+                        "id": "todo_1",
+                        "title": "写测试",
+                        "priority": 2,
+                        "expires_at": 4_102_444_800.0,
+                    }
+                ),
+                "completed": 0,
+                "expires_at": "4102444800.0",
+                "created_at": "2026-06-18 09:06:00",
+                "updated_at": "2026-06-18 09:06:00",
+            },
+        ],
+        "cues": [
+            {
+                "cue_id": "cue_1",
+                "cue_json": _json_text(
+                    {
+                        "id": "cue_1",
+                        "cue_type": "conversation",
+                        "summary": "提醒喝水",
+                        "conversation_id": "private:u1",
+                        "expires_at": 4_102_444_800.0,
+                    }
+                ),
+                "expires_at": "4102444800.0",
+                "active": 1,
+                "created_at": "2026-06-18 09:07:00",
+                "updated_at": "2026-06-18 09:07:00",
+            },
+        ],
+        "inner_monologues": [
+            {
+                "id": 1,
+                "monologue_json": _json_text({"text": "第一条"}),
+                "created_at": "2026-06-18 09:08:00",
+            },
+            {
+                "id": 2,
+                "monologue_json": _json_text({"text": "第二条"}),
+                "created_at": "2026-06-18 09:09:00",
+            },
+        ],
+        "user_profiles": [
+            {
+                "user_id": "u1",
+                "profile_json": _json_text(
+                    {
+                        "user_id": "u1",
+                        "display_name": "张三",
+                        "summary": "喜欢咖啡",
+                    }
+                ),
+                "created_at": "2026-06-18 09:10:00",
+                "updated_at": "2026-06-18 09:10:00",
+            },
+        ],
+        "important_memories": [
+            {
+                "id": 1,
+                "memories_json": _json_text(
+                    [{"id": "mem_1", "content": "旧 persona 重要记忆"}]
+                ),
+                "updated_at": "2026-06-18 09:11:00",
+            },
+        ],
+        "daily_trajectories": [
+            {
+                "id": 1,
+                "trajectory_json": _json_text(
+                    {"date": "2026-06-18", "summary": "开始"}
+                ),
+                "created_at": "2026-06-18 09:12:00",
+            },
+        ],
+        "persona_arc": [
+            {
+                "id": 1,
+                "event_json": _json_text({"event": "created"}),
+                "created_at": "2026-06-18 09:13:00",
+            },
+        ],
+        "sleep_records": [
+            {
+                "record_id": "sleep_1",
+                "record_json": _json_text({"id": "sleep_1", "started_at": "22:00"}),
+                "started_at": "22:00",
+                "ended_at": None,
+                "created_at": "2026-06-18 09:14:00",
+                "updated_at": "2026-06-18 09:14:00",
+            },
+        ],
+        "eat_records": [
+            {
+                "id": 1,
+                "record_id": "eat_1",
+                "record_json": _json_text(
+                    {"id": "eat_1", "food": "面包", "status": "active"}
+                ),
+                "ended_at": None,
+                "status": "active",
+                "created_at": "2026-06-18 09:15:00",
+            },
+        ],
+    }
+
+
 def _write_legacy_event_sqlite(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
@@ -1006,6 +1434,187 @@ def _write_legacy_archive_sqlite_missing_message_column(
         )
 
 
+def _write_legacy_persona_sqlite(path: Path, sample: dict[str, list[dict]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE persona_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE persona_state_log (
+                id INTEGER PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE persona_update_audits (
+                id INTEGER PRIMARY KEY,
+                audit_json TEXT NOT NULL,
+                "trigger" TEXT,
+                conversation_id TEXT,
+                user_id TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE effects (
+                effect_id TEXT PRIMARY KEY,
+                effect_json TEXT NOT NULL,
+                expires_at TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE todos (
+                todo_id TEXT PRIMARY KEY,
+                todo_json TEXT NOT NULL,
+                completed INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE cues (
+                cue_id TEXT PRIMARY KEY,
+                cue_json TEXT NOT NULL,
+                expires_at TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE inner_monologues (
+                id INTEGER PRIMARY KEY,
+                monologue_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE user_profiles (
+                user_id TEXT PRIMARY KEY,
+                profile_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE important_memories (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                memories_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE daily_trajectories (
+                id INTEGER PRIMARY KEY,
+                trajectory_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE persona_arc (
+                id INTEGER PRIMARY KEY,
+                event_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE sleep_records (
+                record_id TEXT PRIMARY KEY,
+                record_json TEXT NOT NULL,
+                started_at TEXT,
+                ended_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE eat_records (
+                id INTEGER PRIMARY KEY,
+                record_id TEXT,
+                record_json TEXT NOT NULL,
+                ended_at TEXT,
+                status TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        for table, rows in sample.items():
+            columns = _LEGACY_PERSONA_COLUMNS[table]
+            placeholders = ", ".join("?" for _ in columns)
+            conn.executemany(
+                f"""
+                INSERT INTO {table} ({", ".join(_quote_identifier(column) for column in columns)})
+                VALUES ({placeholders})
+                """,
+                [tuple(row[column] for column in columns) for row in rows],
+            )
+
+
+def _write_legacy_persona_sqlite_legacy_eat_only(path: Path, record_json: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE eat_records (
+                id INTEGER PRIMARY KEY,
+                record_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO eat_records (id, record_json, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (7, record_json, "2026-06-18 12:00:00"),
+        )
+
+
 def _legacy_event(
     event_id: int,
     *,
@@ -1179,6 +1788,18 @@ def _legacy_archive_media_sql_values(row: dict) -> tuple:
     )
 
 
+def _json_text(data: object) -> str:
+    return orjson.dumps(data).decode("utf-8")
+
+
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _legacy_persona_row_count(sample: dict[str, list[dict]]) -> int:
+    return sum(len(rows) for rows in sample.values())
+
+
 def _load_history(db_path: Path, persona_id: str) -> list[dict]:
     return asyncio.run(DianaHistoryStore(db_path, persona_id).load(force_reload=True))
 
@@ -1294,6 +1915,22 @@ def _archive_media_rows(db_path: Path, persona_id: str) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def _persona_rows(db_path: Path, table: str, persona_id: str) -> list[dict]:
+    order_column = _PERSONA_ROW_ORDER_COLUMNS.get(table, "id")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM {_quote_identifier(table)}
+            WHERE persona_id = ?
+            ORDER BY {_quote_identifier(order_column)} ASC
+            """,
+            (persona_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def _projection_state_value(db_path: Path, persona_id: str) -> str | None:
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
@@ -1305,6 +1942,86 @@ def _projection_state_value(db_path: Path, persona_id: str) -> str | None:
             (persona_id,),
         ).fetchone()
     return None if row is None else str(row[0])
+
+
+_LEGACY_PERSONA_COLUMNS = {
+    "schema_version": ("id", "version", "updated_at"),
+    "persona_state": ("id", "state_json", "updated_at"),
+    "persona_state_log": ("id", "state_json", "created_at"),
+    "persona_update_audits": (
+        "id",
+        "audit_json",
+        "trigger",
+        "conversation_id",
+        "user_id",
+        "created_at",
+    ),
+    "effects": (
+        "effect_id",
+        "effect_json",
+        "expires_at",
+        "active",
+        "created_at",
+        "updated_at",
+    ),
+    "todos": (
+        "todo_id",
+        "todo_json",
+        "completed",
+        "expires_at",
+        "created_at",
+        "updated_at",
+    ),
+    "cues": (
+        "cue_id",
+        "cue_json",
+        "expires_at",
+        "active",
+        "created_at",
+        "updated_at",
+    ),
+    "inner_monologues": ("id", "monologue_json", "created_at"),
+    "user_profiles": ("user_id", "profile_json", "created_at", "updated_at"),
+    "important_memories": ("id", "memories_json", "updated_at"),
+    "daily_trajectories": ("id", "trajectory_json", "created_at"),
+    "persona_arc": ("id", "event_json", "created_at"),
+    "sleep_records": (
+        "record_id",
+        "record_json",
+        "started_at",
+        "ended_at",
+        "created_at",
+        "updated_at",
+    ),
+    "eat_records": ("id", "record_id", "record_json", "ended_at", "status", "created_at"),
+}
+
+
+_LEGACY_PERSONA_TARGET_TABLES = {
+    "schema_version": "persona_schema_version_legacy",
+    "persona_state": "persona_state",
+    "persona_state_log": "persona_state_log",
+    "persona_update_audits": "persona_update_audits",
+    "effects": "persona_effects",
+    "todos": "persona_todos",
+    "cues": "persona_cues",
+    "inner_monologues": "persona_inner_monologues",
+    "user_profiles": "persona_user_profiles",
+    "important_memories": "persona_important_state_legacy",
+    "daily_trajectories": "persona_daily_trajectories",
+    "persona_arc": "persona_arc",
+    "sleep_records": "persona_sleep_records",
+    "eat_records": "persona_eat_records",
+}
+
+
+_PERSONA_ROW_ORDER_COLUMNS = {
+    "persona_effects": "effect_id",
+    "persona_todos": "todo_id",
+    "persona_cues": "cue_id",
+    "persona_user_profiles": "user_id",
+    "persona_sleep_records": "record_id",
+}
 
 
 def _row_count(db_path: Path, table: str, persona_id: str) -> int:
