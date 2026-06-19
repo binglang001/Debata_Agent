@@ -743,4 +743,3 @@ Persona state 域使用 `persona_*` 表名前缀复制现 `mind/db_schema.py` �
 
 - 未改 `mind/db.py` 或 `mind/db_schema.py`。
 - 未实现统一仓储抽象。
-- 未处理向量库/RAG 搬迁；向量库按阶段计划保持独立文件。
