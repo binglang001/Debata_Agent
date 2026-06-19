@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import sqlite3
 from collections.abc import Sequence
@@ -109,6 +111,13 @@ class _LegacyPersonaTableSpec:
     derive_eat_record_id: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _LegacyImportantMergeSource:
+    items: list[Any]
+    skipped: int = 0
+    valid: bool = False
+
+
 def import_legacy_memory_files(
     db: DianaDB | str | Path,
     source_dir: str | Path,
@@ -160,8 +169,16 @@ async def _import_legacy_memory_files_async(
 
     try:
         target_db.load()
+        persona_important_source = _read_legacy_persona_important_source(
+            source_path / "persona.db"
+        )
         history_result = await _import_history(target_db, source_path, normalized_persona)
-        important_result = await _import_important(target_db, source_path, normalized_persona)
+        important_result = await _import_important(
+            target_db,
+            source_path,
+            normalized_persona,
+            persona_important_source,
+        )
         rolling_result = await _import_rolling_summary(
             target_db,
             source_path,
@@ -205,14 +222,49 @@ async def _import_important(
     db: DianaDB,
     source_dir: Path,
     persona_id: str,
+    persona_important_source: _LegacyImportantMergeSource | None = None,
 ) -> LegacyImportDomainResult:
+    persona_source = persona_important_source or _LegacyImportantMergeSource([])
     path = source_dir / "important.json"
     data, skipped, exists = _read_json_file(path)
-    if not exists or skipped:
-        return LegacyImportDomainResult(skipped=skipped)
+    total_skipped = persona_source.skipped + skipped
+
     store = DianaImportantStore(db, persona_id)
-    await store.write(data)
-    return LegacyImportDomainResult(imported=_important_import_count(data))
+    important_items: list[Any] = []
+    important_is_list = False
+    if exists and not skipped:
+        if isinstance(data, list):
+            important_items = data
+            important_is_list = True
+        elif persona_source.valid:
+            total_skipped += 1
+            logger.warning("跳过非列表旧 important JSON，无法合并重要记忆: %s", path)
+        else:
+            await store.write(data)
+            return LegacyImportDomainResult(
+                imported=_important_import_count(data),
+                skipped=total_skipped,
+            )
+
+    if persona_source.valid:
+        merged_items, duplicate_skipped = _merge_important_items(
+            persona_source.items,
+            important_items,
+        )
+        await store.write(merged_items)
+        return LegacyImportDomainResult(
+            imported=len(merged_items),
+            skipped=total_skipped + duplicate_skipped,
+        )
+
+    if important_is_list:
+        await store.write(data)
+        return LegacyImportDomainResult(
+            imported=_important_import_count(data),
+            skipped=total_skipped,
+        )
+
+    return LegacyImportDomainResult(skipped=total_skipped)
 
 
 async def _import_rolling_summary(
@@ -356,6 +408,87 @@ def _import_persona(
         imported=imported,
         skipped=read_skipped + duplicate_or_conflict_skipped,
     )
+
+
+def _read_legacy_persona_important_source(path: Path) -> _LegacyImportantMergeSource:
+    if not path.exists():
+        return _LegacyImportantMergeSource([])
+
+    try:
+        with closing(sqlite3.connect(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            if not _legacy_sqlite_table_exists(conn, "important_memories"):
+                return _LegacyImportantMergeSource([])
+
+            source_columns = _legacy_sqlite_table_columns(conn, "important_memories")
+            if "memories_json" not in source_columns:
+                skipped = _legacy_sqlite_row_count(conn, "important_memories")
+                logger.warning(
+                    "旧 persona.db important_memories 缺少 memories_json，跳过合并源: %s",
+                    path,
+                )
+                return _LegacyImportantMergeSource([], skipped=skipped)
+
+            order_by = "id ASC" if "id" in source_columns else "rowid ASC"
+            rows = conn.execute(
+                f"""
+                SELECT memories_json
+                FROM important_memories
+                ORDER BY {order_by}
+                """
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning(
+            "读取旧 persona.db important_memories 失败，跳过重要记忆合并源: %s error=%s",
+            path,
+            exc,
+        )
+        return _LegacyImportantMergeSource([])
+
+    items: list[Any] = []
+    skipped = 0
+    valid = False
+    for row in rows:
+        raw_json = row["memories_json"]
+        if not isinstance(raw_json, str) or not raw_json.strip():
+            skipped += 1
+            logger.warning("跳过空的旧 persona important_memories memories_json: %s", path)
+            continue
+        try:
+            data = orjson.loads(raw_json)
+        except orjson.JSONDecodeError as exc:
+            skipped += 1
+            logger.warning(
+                "跳过损坏的旧 persona important_memories memories_json: %s error=%s",
+                path,
+                exc,
+            )
+            continue
+        if not isinstance(data, list):
+            skipped += 1
+            logger.warning("跳过非列表旧 persona important_memories memories_json: %s", path)
+            continue
+        valid = True
+        items.extend(data)
+    return _LegacyImportantMergeSource(items, skipped=skipped, valid=valid)
+
+
+def _merge_important_items(
+    persona_items: Sequence[Any],
+    important_items: Sequence[Any],
+) -> tuple[list[Any], int]:
+    merged: list[Any] = list(persona_items)
+    persona_ids = {_important_memory_id(item) for item in persona_items}
+    skipped = 0
+
+    for item in important_items:
+        memory_id = _important_memory_id(item)
+        if memory_id in persona_ids:
+            skipped += 1
+            continue
+        merged.append(item)
+
+    return merged, skipped
 
 
 def _read_legacy_persona_rows(
@@ -1794,8 +1927,27 @@ def _important_import_count(data: Any) -> int:
     return 1
 
 
+def _important_memory_id(item: Any) -> str:
+    if isinstance(item, dict):
+        item_id = _optional_text(item.get("id"))
+        if item_id:
+            return item_id
+    digest = hashlib.sha256(_canonical_json_data(item).encode("utf-8")).hexdigest()[:32]
+    return f"fallback:{digest}"
+
+
 def _json_data(data: Any) -> str:
     return orjson.dumps(data).decode("utf-8")
+
+
+def _canonical_json_data(data: Any) -> str:
+    return json.dumps(
+        data,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _json_loads(data: Any, *, default: Any) -> Any:

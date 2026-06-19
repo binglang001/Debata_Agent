@@ -294,6 +294,198 @@ def test_import_legacy_memory_files_keeps_personas_isolated(tmp_path):
     ]
 
 
+def test_import_legacy_important_merges_persona_and_json_with_persona_precedence(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    sample = _legacy_persona_sample()
+    persona_item_without_id = {"content": "无 id 但内容完全相同", "scope": "global"}
+    persona_items = [
+        {"id": "shared", "content": "persona.db 权威版本"},
+        persona_item_without_id,
+    ]
+    important_items = [
+        {"id": "shared", "content": "important.json 残留版本"},
+        {"id": "json_only", "content": "只存在于 important.json"},
+        persona_item_without_id,
+    ]
+    sample["important_memories"][0] = {
+        **sample["important_memories"][0],
+        "memories_json": _json_text(persona_items),
+    }
+    _write_json(source_dir / "important.json", important_items)
+    _write_legacy_persona_sqlite(source_dir / "persona.db", sample)
+
+    result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    expected = [
+        {"id": "shared", "content": "persona.db 权威版本"},
+        persona_item_without_id,
+        {"id": "json_only", "content": "只存在于 important.json"},
+    ]
+    assert result.important == LegacyImportDomainResult(imported=3, skipped=2)
+    assert _read_important(db_path, "yuexi") == expected
+    assert [orjson.loads(row["item_json"]) for row in _important_rows(db_path, "yuexi")] == expected
+    assert _persona_rows(db_path, "persona_important_state_legacy", "yuexi") == [
+        {"persona_id": "yuexi", **sample["important_memories"][0]},
+    ]
+    assert asyncio.run(DianaPersonaDB(db_path, "yuexi").read_important(default=[])) == persona_items
+
+
+def test_import_legacy_important_from_persona_without_important_json(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    sample = _legacy_persona_sample()
+    persona_items = [{"id": "persona_only", "content": "只存在于 persona.db"}]
+    sample["important_memories"][0] = {
+        **sample["important_memories"][0],
+        "memories_json": _json_text(persona_items),
+    }
+    _write_legacy_persona_sqlite(source_dir / "persona.db", sample)
+
+    result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.important == LegacyImportDomainResult(imported=1, skipped=0)
+    assert _read_important(db_path, "yuexi") == persona_items
+    assert _persona_rows(db_path, "persona_important_state_legacy", "yuexi") == [
+        {"persona_id": "yuexi", **sample["important_memories"][0]},
+    ]
+
+
+def test_import_legacy_important_damaged_json_still_imports_persona_source(
+    tmp_path,
+    caplog,
+):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    sample = _legacy_persona_sample()
+    persona_items = [{"id": "persona_valid", "content": "有效 persona 重要记忆"}]
+    sample["important_memories"][0] = {
+        **sample["important_memories"][0],
+        "memories_json": _json_text(persona_items),
+    }
+    (source_dir / "important.json").parent.mkdir(parents=True, exist_ok=True)
+    (source_dir / "important.json").write_bytes(b'{"broken"')
+    _write_legacy_persona_sqlite(source_dir / "persona.db", sample)
+
+    with caplog.at_level("WARNING"):
+        result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.important == LegacyImportDomainResult(imported=1, skipped=1)
+    assert _read_important(db_path, "yuexi") == persona_items
+    assert "跳过损坏的旧 JSON 文件" in caplog.text
+
+
+def test_import_legacy_important_skips_invalid_persona_merge_source_but_preserves_legacy(
+    tmp_path,
+    caplog,
+):
+    db_path = tmp_path / "diana.db"
+    non_list_source = tmp_path / "non_list"
+    damaged_source = tmp_path / "damaged"
+    non_list_sample = _legacy_persona_sample()
+    damaged_sample = _legacy_persona_sample()
+    non_list_sample["important_memories"][0] = {
+        **non_list_sample["important_memories"][0],
+        "memories_json": _json_text({"not": "list"}),
+    }
+    damaged_sample["important_memories"][0] = {
+        **damaged_sample["important_memories"][0],
+        "memories_json": "{broken",
+    }
+    _write_legacy_persona_sqlite(non_list_source / "persona.db", non_list_sample)
+    _write_legacy_persona_sqlite(damaged_source / "persona.db", damaged_sample)
+
+    with caplog.at_level("WARNING"):
+        non_list_result = import_legacy_memory_files(db_path, non_list_source, "yuexi")
+        damaged_result = import_legacy_memory_files(db_path, damaged_source, "jiu")
+
+    assert non_list_result.important == LegacyImportDomainResult(imported=0, skipped=1)
+    assert damaged_result.important == LegacyImportDomainResult(imported=0, skipped=1)
+    assert _read_important(db_path, "yuexi") == []
+    assert _read_important(db_path, "jiu") == []
+    assert _persona_rows(db_path, "persona_important_state_legacy", "yuexi") == [
+        {"persona_id": "yuexi", **non_list_sample["important_memories"][0]},
+    ]
+    assert _persona_rows(db_path, "persona_important_state_legacy", "jiu") == [
+        {"persona_id": "jiu", **damaged_sample["important_memories"][0]},
+    ]
+    assert "跳过非列表旧 persona important_memories memories_json" in caplog.text
+    assert "跳过损坏的旧 persona important_memories memories_json" in caplog.text
+
+
+def test_import_legacy_important_valid_json_survives_invalid_persona_source(
+    tmp_path,
+    caplog,
+):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    sample = _legacy_persona_sample()
+    sample["important_memories"][0] = {
+        **sample["important_memories"][0],
+        "memories_json": _json_text({"not": "list"}),
+    }
+    important_items = [{"id": "json_valid", "content": "important.json 有效"}]
+    _write_json(source_dir / "important.json", important_items)
+    _write_legacy_persona_sqlite(source_dir / "persona.db", sample)
+
+    with caplog.at_level("WARNING"):
+        result = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    assert result.important == LegacyImportDomainResult(imported=1, skipped=1)
+    assert _read_important(db_path, "yuexi") == important_items
+    assert _persona_rows(db_path, "persona_important_state_legacy", "yuexi") == [
+        {"persona_id": "yuexi", **sample["important_memories"][0]},
+    ]
+    assert "跳过非列表旧 persona important_memories memories_json" in caplog.text
+
+
+def test_import_legacy_important_missing_sources_keep_existing_rows(tmp_path):
+    initial_source = tmp_path / "initial"
+    empty_source = tmp_path / "empty"
+    db_path = tmp_path / "diana.db"
+    existing_items = [{"id": "existing", "content": "已有重要记忆"}]
+    _write_json(initial_source / "important.json", existing_items)
+    empty_source.mkdir()
+
+    first = import_legacy_memory_files(db_path, initial_source, "yuexi")
+    second = import_legacy_memory_files(db_path, empty_source, "yuexi")
+
+    assert first.important == LegacyImportDomainResult(imported=1, skipped=0)
+    assert second.important == LegacyImportDomainResult(imported=0, skipped=0)
+    assert _read_important(db_path, "yuexi") == existing_items
+    assert _row_count(db_path, "important_memories", "yuexi") == 1
+
+
+def test_import_legacy_important_merge_is_idempotent(tmp_path):
+    source_dir = tmp_path / "legacy"
+    db_path = tmp_path / "diana.db"
+    sample = _legacy_persona_sample()
+    persona_items = [{"id": "shared", "content": "persona.db 权威"}]
+    important_items = [
+        {"id": "shared", "content": "important.json 残留"},
+        {"id": "json_only", "content": "important.json 独有"},
+    ]
+    sample["important_memories"][0] = {
+        **sample["important_memories"][0],
+        "memories_json": _json_text(persona_items),
+    }
+    _write_json(source_dir / "important.json", important_items)
+    _write_legacy_persona_sqlite(source_dir / "persona.db", sample)
+
+    first = import_legacy_memory_files(db_path, source_dir, "yuexi")
+    second = import_legacy_memory_files(db_path, source_dir, "yuexi")
+
+    expected = [
+        {"id": "shared", "content": "persona.db 权威"},
+        {"id": "json_only", "content": "important.json 独有"},
+    ]
+    assert first.important == LegacyImportDomainResult(imported=2, skipped=1)
+    assert second.important == LegacyImportDomainResult(imported=2, skipped=1)
+    assert _read_important(db_path, "yuexi") == expected
+    assert [orjson.loads(row["item_json"]) for row in _important_rows(db_path, "yuexi")] == expected
+    assert _row_count(db_path, "important_memories", "yuexi") == 2
+
+
 def test_import_legacy_persona_db_full_sample_preserves_rows_and_store_reads(tmp_path):
     source_dir = tmp_path / "legacy"
     db_path = tmp_path / "diana.db"
@@ -304,7 +496,11 @@ def test_import_legacy_persona_db_full_sample_preserves_rows_and_store_reads(tmp
 
     result = import_legacy_memory_files(db_path, source_dir, "yuexi")
 
-    assert result.important == LegacyImportDomainResult(imported=1, skipped=0)
+    merged_important_items = [
+        {"id": "mem_1", "content": "旧 persona 重要记忆"},
+        {"id": "json_mem", "content": "来自 important.json"},
+    ]
+    assert result.important == LegacyImportDomainResult(imported=2, skipped=0)
     assert result.persona == LegacyImportDomainResult(
         imported=_legacy_persona_row_count(sample),
         skipped=0,
@@ -314,9 +510,13 @@ def test_import_legacy_persona_db_full_sample_preserves_rows_and_store_reads(tmp
             {"persona_id": "yuexi", **row}
             for row in sample[source_table]
         ]
-    assert _read_important(db_path, "yuexi") == important_items
-    assert asyncio.run(DianaImportantStore(db_path, "yuexi").read(default=[])) == important_items
-    assert [orjson.loads(row["item_json"]) for row in _important_rows(db_path, "yuexi")] == important_items
+    assert _read_important(db_path, "yuexi") == merged_important_items
+    assert asyncio.run(DianaImportantStore(db_path, "yuexi").read(default=[])) == (
+        merged_important_items
+    )
+    assert [orjson.loads(row["item_json"]) for row in _important_rows(db_path, "yuexi")] == (
+        merged_important_items
+    )
 
     store = DianaPersonaDB(db_path, "yuexi")
     assert asyncio.run(store.get_state()).mood == 72.0

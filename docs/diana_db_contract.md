@@ -68,12 +68,12 @@
 - `backup=True`：导入前如果目标 `diana.db` 已存在，调用 `backup_existing_database()`；目标库不存在时不创建备份。
 - `usage_persona_id=None`：默认跟随 `persona_id` 写入 `usage_records.persona_id`。显式传入空字符串表示全局 usage，写库时 `persona_id` 为 `NULL`。
 
-返回值是 `LegacyMemoryImportResult`，包含 `backup_path` 以及 `history`、`important`、`rolling_summary`、`usage`、`events`、`archive`、`persona` 七个 `LegacyImportDomainResult(imported, skipped)` 统计，供 runtime 后续展示。`archive` 统计按归档消息行与归档媒体行合计，`persona` 统计按旧 `persona.db` 导入到 `persona_*` 目标表的行合计。
+返回值是 `LegacyMemoryImportResult`，包含 `backup_path` 以及 `history`、`important`、`rolling_summary`、`usage`、`events`、`archive`、`persona` 七个 `LegacyImportDomainResult(imported, skipped)` 统计，供 runtime 后续展示。`important.imported` 统计最终写入新 `important_memories` 域的 item 数；`important.skipped` 统计损坏/非列表合并源与双源去重丢弃的 item 数。`archive` 统计按归档消息行与归档媒体行合计，`persona` 统计按旧 `persona.db` 导入到 `persona_*` 目标表的行合计。
 
 导入映射：
 
 - `history.jsonl` -> `DianaHistoryStore.replace_all(...)`。
-- `important.json` -> `DianaImportantStore.write(...)`。
+- `important.json` 与 `persona.db important_memories.memories_json` -> 双源合并后 `DianaImportantStore.write(...)`。`persona.db` 是权威源，输出顺序为 persona 聚合列表项在前、`important.json` 中未被同 ID 覆盖的项在后；缺少 `id` 的 item 使用基于规范化 JSON 的稳定 fallback ID 做跨源去重，但不改写 item 本身。
 - `rolling_summary.json` -> 直写 `rolling_summary` 单行；查询列按 store 读取契约抽取，`summary_json` 完整保留旧 JSON 对象。
 - `model_usage.jsonl` -> 直接写入 `usage_records`，保留完整 `record_json`，并抽取 usage 常用列。
 - `events.sqlite3` 与 `events.sqlite3.append.jsonl` -> 直接写入 `event_log`；先导入 SQLite 已投影行，再导入 append log 行；保留旧事件自带 `event_id`、`event_uuid`、`schema_version`、`payload_json`、`payload_hash` 与其他事件列，不调用会重新分配 ID 的事件追加接口。导入完成后写入 `event_projection_state(persona_id, "last_projected_event_id")` 为当前 persona 最大 `event_id`。
@@ -82,13 +82,15 @@
 幂等与容错：
 
 - 缺失文件视为该域 `imported=0, skipped=0`，不写入该域。
-- `history`、`important`、`rolling_summary` 采用整体替换或 upsert 语义；重复导入不会追加重复记录。
+- `history`、`important`、`rolling_summary` 采用整体替换或 upsert 语义；重复导入不会追加重复记录。`important` 重跑时继续整体替换当前 persona 的新 `important_memories` 域。
+- `important` 双源合并按 item ID 去重；同 ID 冲突时保留 `persona.db important_memories.memories_json` 中的 persona 项，跳过 `important.json` 中的同 ID 项并计入 `important.skipped`。无 `id` item 使用与 `DianaImportantStore` 相同的稳定 fallback ID 判断跨源重复，避免双源完全相同的无 ID item 重复写入。
 - `usage` 按同一 `usage_persona_id` 下的 `record_json` 去重；重复导入同一旧记录时计入 skipped，不新增行。
 - `events` 按同一 `persona_id` 下的 `event_id` 与 `idempotency_key` 去重。相同 `event_id` 且除 `persona_id` 外的事件保真列完整一致视为重复并计入 skipped；相同 `event_id` 但任一事件保真列冲突，或相同 `idempotency_key` 指向不同事件时，记录 warning 并计入 skipped，不覆盖已有行。
 - `archive` 按同一 `persona_id` 下的消息 `rowid`、消息 `archive_id` 与媒体 `id` 去重。相同消息 `rowid` 或 `archive_id` 且除 `persona_id` 外的完整归档消息列一致视为重复并计入 skipped；任一列冲突时记录 warning 并计入 skipped，不覆盖已有行。相同媒体 `id` 且除 `persona_id` 外的完整媒体列一致视为重复并计入 skipped；任一列冲突时记录 warning 并计入 skipped，不覆盖已有行。同一 `archive_id` 可以有多条不同媒体 `id`。
 - `persona` 读取 `source_dir/persona.db`，在 `target_db.load()` 后用直接 SQLite 导入到 `persona_*` 表，不调用 `DianaPersonaDB` 写方法生成新 ID。缺少 `persona.db` 时 `persona.imported=0` 且 `persona.skipped=0`。缺表记录 warning 并跳过该表；源表缺关键主键/必要列时记录 warning，并按该表可数行计入 skipped；单行关键字段缺失或目标 NOT NULL 列无法满足时记录 warning 并跳过该行。
 - `persona` 按同一 `persona_id` 下的目标主键去重。相同主键且除 `persona_id` 外的完整目标列一致视为重复并计入 skipped；相同主键但任一目标列冲突时记录 warning 并计入 skipped，不覆盖已有行。旧 `eat_records` 兼容缺少 `record_id`、`ended_at`、`status` 的库；缺 `record_id` 时按 `record_json.record_id/eat_id/id` 推导，仍无值则使用 `eat_<id>` fallback。
-- JSONL 中空行、损坏行、非对象行会跳过并记录 warning；损坏 JSON 文件会跳过整个域并记录 warning，不让整体导入崩溃。
+- JSONL 中空行、损坏行、非对象行会跳过并记录 warning；损坏 JSON 文件会跳过该文件来源并记录 warning，不让整体导入崩溃。`important.json` 损坏时仍保留 warning/skipped；如果 `persona.db important_memories.memories_json` 有有效列表，仍会把 persona 来源项写入新 `important_memories`。
+- `persona.db important_memories.memories_json` 只在解析为 list 时参与新 `important_memories` 合并；非 list、空值或 JSON 损坏时记录 warning 并计入 `important.skipped`，不吸收该来源。无论合并源是否有效，旧 `persona.db important_memories` 到 `persona_important_state_legacy` 的保真复制与 `persona` 统计仍按 persona 导入规则独立处理。
 - 事件 append log 中损坏行、非对象行、缺失关键字段行、损坏 `payload_json` 行会跳过并记录 warning，不让整体导入崩溃。`events.sqlite3` 缺失或缺少 `event_log` 表时按该域缺失处理。
 - `archive.sqlite3` 缺失时 `archive` 统计为 `imported=0, skipped=0`，不写库。缺少 `archive_messages` 表时按缺失域处理并记录 warning；缺少 `archive_message_media` 表时只导入消息并记录 warning。媒体导入只接受当前 persona 下已存在的 `archive_id`，孤儿媒体行跳过并记录 warning。损坏或缺少关键字段的归档消息/媒体单行跳过并记录 warning，不让整体导入崩溃。
 - 只有指定 persona 的 `history`、`important`、`rolling_summary` 会被替换；其他 persona 不受影响。`usage` 去重和写入按 `usage_persona_id` 隔离。`events` 的 `event_id` 与 `idempotency_key` 唯一性按 `persona_id` 隔离，同一旧事件可导入多个 persona。`archive` 的 `rowid`、`archive_id` 与媒体 `id` 也按 `persona_id` 隔离，同一旧归档库可导入多个 persona。`persona` 的旧主键也按 `persona_id` 隔离，同一旧 `persona.db` 可导入多个 persona。
@@ -509,7 +511,7 @@ Persona state 域使用 `persona_*` 表名前缀复制现 `mind/db_schema.py` �
 - `cues` -> `persona_cues`。
 - `inner_monologues` -> `persona_inner_monologues`。
 - `user_profiles` -> `persona_user_profiles`。
-- `important_memories` -> `persona_important_state_legacy`。本切片只保真导入旧 persona 聚合表，不合并进新 `important_memories`；来自 `important.json` 与 persona 聚合重要记忆的双源去重合并是后续切片。
+- `important_memories` -> `persona_important_state_legacy`，并将其中 `memories_json` 的 list 项作为权威来源合并进新 `important_memories`；`important.json` 中同 ID 或同 fallback ID 的重复项会被跳过。
 - `daily_trajectories` -> `persona_daily_trajectories`。
 - `persona_arc` -> `persona_arc`。
 - `sleep_records` -> `persona_sleep_records`。
@@ -731,5 +733,4 @@ Persona state 域使用 `persona_*` 表名前缀复制现 `mind/db_schema.py` �
 - 未改现有 memory/history/important/event/archive manager。
 - 未改 `mind/db.py` 或 `mind/db_schema.py`。
 - 未实现统一仓储抽象。
-- 未实现 `important.json` 与旧 `persona.db important_memories` 的双源去重合并。
 - 未处理向量库搬迁；向量库按阶段计划保持独立文件。
