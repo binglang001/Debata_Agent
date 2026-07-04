@@ -235,6 +235,23 @@ def _enable_rag_config(paths):
         yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 
 
+def _enable_local_rag_config(paths):
+    with open(paths.CONFIG_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data.setdefault("features", {})["long_term_memory"] = {
+        "mode": "rag",
+        "rag_top_k": 3,
+    }
+    data["features"]["embedding"] = {
+        "enabled": True,
+        "type": "local",
+        "local_quality": "quality",
+        "local_model_dir": "data/models/embedding/bge-large-zh-v1.5",
+    }
+    with open(paths.CONFIG_FILE, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+
 def _patch_rag_runtime_network(monkeypatch):
     class FakeEmbeddingService:
         def __init__(self, **kwargs):
@@ -365,6 +382,57 @@ async def test_runtime_rag_uses_instance_vector_dir(assembled_project, monkeypat
         assert rt.rag_store.path != old_path
         assert expected.exists()
         assert not old_path.exists()
+    finally:
+        await rt.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_local_rag_missing_deps_install_in_background(
+    assembled_project,
+    monkeypatch,
+):
+    project_root, paths = assembled_project
+    _enable_local_rag_config(paths)
+    popen_calls = []
+
+    import core.runtime as runtime_module
+
+    original_find_spec = runtime_module.importlib.util.find_spec
+
+    def fake_find_spec(name, package=None):
+        if name == "sentence_transformers":
+            return None
+        return original_find_spec(name, package)
+
+    class FakeProcess:
+        pid = 2468
+
+    def fake_popen(args, **kwargs):
+        popen_calls.append((args, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(runtime_module.importlib.util, "find_spec", fake_find_spec)
+    monkeypatch.setattr(runtime_module.subprocess, "Popen", fake_popen)
+
+    rt = Runtime(project_root=project_root)
+    try:
+        await rt.start()
+
+        assert rt.embedding_service is None
+        assert rt.rag_store is None
+        assert rt.rag_memory is None
+        assert rt.config.features.embedding.enabled is True
+        assert rt.config.features.long_term_memory.mode == "rag"
+        assert rt.feature_failures["embedding"] == "缺少 sentence-transformers，正在后台安装"
+        assert len(popen_calls) == 1
+        args, kwargs = popen_calls[0]
+        assert args[:4] == [runtime_module.sys.executable, "-m", "pip", "install"]
+        assert "--no-input" in args
+        assert "sentence-transformers>=2.7.0" in args
+        assert kwargs["cwd"] == str(project_root)
+        assert kwargs["env"]["PIP_NO_INPUT"] == "1"
+        assert kwargs["stdout"] is runtime_module.subprocess.DEVNULL
+        assert kwargs["stderr"] is runtime_module.subprocess.DEVNULL
     finally:
         await rt.shutdown()
 

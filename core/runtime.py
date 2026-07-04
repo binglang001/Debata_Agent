@@ -23,11 +23,14 @@ main.py 调用此类即可。
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import inspect
 import logging
 import os
 import shutil
 import signal
+import subprocess
+import sys
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -107,6 +110,7 @@ class Runtime:
             "updated_at": time.time(),
         }
         self._provider_health_task: asyncio.Task | None = None
+        self._dependency_install_started: set[str] = set()
         self._shutdown_started = False
         self._shutdown_complete = False
 
@@ -953,6 +957,10 @@ class Runtime:
             logger.warning("long_term_memory.mode=rag 但 features.embedding.enabled=False；RAG 召回不可用")
             return
         if ecfg.type == "local":
+            if self._install_local_rag_deps_if_missing():
+                logger.warning("本地 embedding 依赖缺失，已在后台安装；本次启动跳过 RAG，安装完成后重启生效")
+                self.feature_failures["embedding"] = "缺少 sentence-transformers，正在后台安装"
+                return
             try:
                 from features.embedding import get_local_service
 
@@ -1240,6 +1248,52 @@ class Runtime:
         task = asyncio.create_task(_do(), name=f"warmup-{label}")
         self._warmup_tasks.add(task)
         task.add_done_callback(self._warmup_tasks.discard)
+
+    def _install_local_rag_deps_if_missing(self) -> bool:
+        """本地 RAG 缺 Python 依赖时后台安装，返回本次启动是否需要跳过 RAG。"""
+        if importlib.util.find_spec("sentence_transformers") is not None:
+            return False
+
+        deps = ["sentence-transformers>=2.7.0"]
+        key = "embedding-local"
+        if key in self._dependency_install_started:
+            return True
+        self._dependency_install_started.add(key)
+
+        args = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-input",
+            "-i",
+            "https://pypi.tuna.tsinghua.edu.cn/simple",
+            *deps,
+        ]
+        env = os.environ.copy()
+        env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+        env["PIP_NO_INPUT"] = "1"
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            env.pop(name, None)
+        try:
+            process = subprocess.Popen(  # noqa: S603
+                args,
+                cwd=str(self.project_root),
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:  # noqa: BLE001
+            self._dependency_install_started.discard(key)
+            logger.warning(f"本地 embedding 依赖后台安装进程启动失败：{e}")
+        else:
+            logger.info(
+                "本地 embedding 依赖缺失，已启动后台安装：pid=%s deps=%s",
+                process.pid,
+                deps,
+            )
+        return True
 
     def _resolve_project_path(self, path: str) -> str:
         p = Path(path)
