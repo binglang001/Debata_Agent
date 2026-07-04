@@ -30,6 +30,8 @@ from adapters.types import (
     FriendInfo,
     GroupInfo,
     GroupMemberInfo,
+    IncomingRequest,
+    RequestType,
     Target,
     UserInfo,
 )
@@ -63,6 +65,21 @@ def _server_bind_host(host: str) -> str:
     return raw
 
 
+def _is_friend_request_missing_error(message: str) -> bool:
+    text = message.lower()
+    return any(
+        marker in text
+        for marker in (
+            "请求不存在",
+            "请求已不存在",
+            "好友请求不存在",
+            "request not exist",
+            "request does not exist",
+            "request not found",
+        )
+    )
+
+
 class NapCatAdapter(IAdapter):
     """OneBot V11 协议的 NapCat 实现。"""
 
@@ -87,6 +104,7 @@ class NapCatAdapter(IAdapter):
         self._process = process_manager
         self._process_warmup_seconds = process_warmup_seconds
         self._voice_fetch_delay_seconds = voice_fetch_delay_seconds
+        self._friend_request_users_by_flag: dict[str, str] = {}
 
         # 安装消息分发
         connection.on_message(self._on_napcat_message)
@@ -219,6 +237,25 @@ class NapCatAdapter(IAdapter):
         event = parse_napcat_event(self.name, data)
         if event is None:
             return
+        if isinstance(event, IncomingRequest) and event.request_type == RequestType.FRIEND:
+            self._friend_request_users_by_flag[event.flag] = event.user_id
+            try:
+                if await self._is_friend(event.user_id, timeout_seconds=3.0):
+                    self._friend_request_users_by_flag.pop(event.flag, None)
+                    await self._emit_friend_confirmed(event.user_id)
+                    logger.info(
+                        "收到好友请求但对方已在好友列表中，跳过审批事件 flag=%s user_id=%s",
+                        event.flag,
+                        event.user_id,
+                    )
+                    return
+            except Exception as e:
+                logger.warning(
+                    "好友请求预检查好友列表失败，保留审批事件 flag=%s user_id=%s: %s",
+                    event.flag,
+                    event.user_id,
+                    e,
+                )
         await self._emit(event)
 
     # ============================================================
@@ -298,7 +335,10 @@ class NapCatAdapter(IAdapter):
     # ============================================================
 
     async def list_friends(self) -> list[FriendInfo]:
-        data = await self._api.call("get_friend_list", {})
+        return await self._list_friends()
+
+    async def _list_friends(self, timeout_seconds: float | None = None) -> list[FriendInfo]:
+        data = await self._api.call("get_friend_list", {}, timeout=timeout_seconds)
         items = data if isinstance(data, list) else data.get("friends", [])
         return [
             FriendInfo(
@@ -355,11 +395,49 @@ class NapCatAdapter(IAdapter):
 
     async def handle_friend_request(
         self, flag: str, approve: bool, remark: str = ""
-    ) -> None:
-        await self._api.call(
-            "set_friend_add_request",
-            {"flag": flag, "approve": approve, "remark": remark},
-        )
+    ) -> dict[str, Any] | None:
+        user_id = self._friend_request_users_by_flag.get(flag)
+        try:
+            await self._api.call(
+                "set_friend_add_request",
+                {"flag": flag, "approve": approve, "remark": remark},
+            )
+        except AdapterAPIError as e:
+            if not _is_friend_request_missing_error(str(e)) or not user_id:
+                raise
+            try:
+                if await self._is_friend(user_id):
+                    self._friend_request_users_by_flag.pop(flag, None)
+                    await self._emit_friend_confirmed(user_id)
+                    return {
+                        "ok": True,
+                        "status": "already_friend",
+                        "already_handled": True,
+                        "flag": flag,
+                        "approve": approve,
+                        "remark": remark,
+                        "user_id": user_id,
+                    }
+            except Exception as check_error:
+                logger.warning(
+                    "好友请求不存在后复查好友列表失败 flag=%s user_id=%s: %s",
+                    flag,
+                    user_id,
+                    check_error,
+                )
+            raise
+
+        self._friend_request_users_by_flag.pop(flag, None)
+        if approve and user_id:
+            await self._emit_friend_confirmed(user_id)
+        return {
+            "ok": True,
+            "status": "done",
+            "flag": flag,
+            "approve": approve,
+            "remark": remark,
+            "user_id": user_id,
+        }
 
     async def handle_group_request(
         self,
@@ -377,6 +455,15 @@ class NapCatAdapter(IAdapter):
                 "reason": reason,
             },
         )
+
+    async def _is_friend(
+        self,
+        user_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> bool:
+        friends = await self._list_friends(timeout_seconds)
+        return any(str(friend.user_id) == str(user_id) for friend in friends)
 
     # ============================================================
     # 媒体辅助（NapCat 专属 API）

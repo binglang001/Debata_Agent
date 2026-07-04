@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -59,13 +60,19 @@ def build_combined_system_prompt(
     important_memory_text: str = "",
     *,
     memory_mode: Literal["file", "rag"] = "file",
+    eat_tool: bool = False,
+    sleep_tool: bool = False,
 ) -> str:
     """组装稳定区（identity + persona + tools + memory）为单一 system 字符串。
 
     Args:
         persona: 已加载的人格
-        important_memory_text: 已按当前会话 scope / RAG 规则选出的重要记忆文本
-        memory_mode: "file" = 文件模式（默认）；"rag" = 自动会话向量检索
+        important_memory_text: 已按当前会话 scope 选出的重要记忆文本。
+            这始终来自 ImportantMemoryManager，不受 RAG 开关影响。
+        memory_mode: "file" = 文件模式（默认）；"rag" = 自动会话向量检索。
+            这里只影响工具协议说明，不决定 important_memory_text 是否注入。
+        eat_tool: 本轮工具列表是否提供 eat。
+        sleep_tool: 本轮工具列表是否提供 sleep。
 
     稳定性递减顺序：
         critical: core_rules（永不变）
@@ -75,7 +82,7 @@ def build_combined_system_prompt(
         high:     conversation_protocol（场景规则）
         reference: qq_format（格式参考，不变）
         medium:   self_reflection（行为约束）
-        medium:   memory（变化时整体替换）
+        medium:   memory（重要记忆，变化时整体替换）
     """
     parts: list[str] = []
 
@@ -91,7 +98,13 @@ def build_combined_system_prompt(
     parts.append(HUMAN_CHAT_PATTERNS.strip())
 
     # 4. 工具使用协议（按 memory_mode 注入正确的 memory 块）
-    parts.append(build_tool_use_protocol(memory_mode).strip())
+    parts.append(
+        build_tool_use_protocol(
+            memory_mode,
+            eat_tool=eat_tool,
+            sleep_tool=sleep_tool,
+        ).strip()
+    )
 
     # 5. 对话场景协议
     parts.append(CONVERSATION_PROTOCOL.strip())
@@ -102,15 +115,14 @@ def build_combined_system_prompt(
     # 7. QQ 格式参考（最末，方便模型查询）
     parts.append(QQ_FORMAT_REFERENCE.strip())
 
-    # 8. 文件模式重要记忆（较稳定，可留在 system 前缀）。
-    # RAG 召回每轮按 query 变化，不能放在稳定前缀；build_messages 会把它追加到尾部。
+    # 8. 重要记忆（较稳定，可留在 system 前缀）。RAG 召回每轮按 query 变化，
+    # 不能放在稳定前缀；build_messages 会把它作为尾部运行时上下文追加。
     if important_memory_text:
-        if memory_mode == "file":
-            parts.append(
-                f'<long_term_memory priority="medium">\n'
-                f"{important_memory_text.strip()}\n"
-                f"</long_term_memory>"
-            )
+        parts.append(
+            f'<long_term_memory priority="medium">\n'
+            f"{important_memory_text.strip()}\n"
+            f"</long_term_memory>"
+        )
 
     return "\n\n".join(parts)
 
@@ -135,22 +147,96 @@ def build_task_context(
     current_context: str = "",
     *,
     refocus_hint: str = "",
+    persona_context: str = "",
 ) -> str:
     """构造本轮的 ephemeral 上下文。放在 history 末尾。
 
     Args:
         current_context: 来自调用方的上下文（时间、表情包、提示等）
         refocus_hint: Task Contract 重注入内容（由 runner 决定何时插入）
+        persona_context: 动态人格状态上下文（只进入 task_context，避免污染稳定前缀）
     """
     parts: list[str] = []
     if current_context:
         parts.append(current_context.strip())
+    if persona_context:
+        parts.append(persona_context.strip())
     if refocus_hint:
         parts.append(f"[本轮焦点提醒] {refocus_hint.strip()}")
     if not parts:
         return ""
     content = "\n\n".join([RUNTIME_CONTEXT_NOTICE, *parts])
     return f'<task_context priority="medium">\n{content}\n</task_context>'
+
+
+def _provider_safe_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把无法合法回放的工具记录转为系统上下文，原始 history 不变。"""
+    safe: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(history):
+        record = history[idx]
+        role = record.get("role")
+        if role == "assistant" and record.get("tool_calls"):
+            ids = _assistant_tool_call_ids(record)
+            tool_group: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            cursor = idx + 1
+            while cursor < len(history) and history[cursor].get("role") == "tool":
+                tool_record = history[cursor]
+                tool_call_id = str(tool_record.get("tool_call_id") or "")
+                if tool_call_id not in ids:
+                    break
+                tool_group.append(tool_record)
+                seen.add(tool_call_id)
+                cursor += 1
+                if seen >= ids:
+                    break
+            if ids and seen >= ids:
+                safe.append(record)
+                safe.extend(tool_group)
+                idx = cursor
+                continue
+            safe.append(_tool_like_record_as_system(record, kind="assistant_tool_call"))
+            idx += 1
+            continue
+        if role == "tool":
+            safe.append(_tool_like_record_as_system(record, kind="tool_result"))
+            idx += 1
+            continue
+        safe.append(record)
+        idx += 1
+    return safe
+
+
+def _assistant_tool_call_ids(record: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for tool_call in record.get("tool_calls") or []:
+        if not isinstance(tool_call, dict):
+            continue
+        call_id = str(tool_call.get("id") or "")
+        if call_id:
+            ids.add(call_id)
+    return ids
+
+
+def _tool_like_record_as_system(record: dict[str, Any], *, kind: str) -> dict[str, Any]:
+    payload = {
+        "kind": kind,
+        "role": record.get("role"),
+        "tool_call_id": record.get("tool_call_id"),
+        "tool_calls": record.get("tool_calls"),
+        "content": record.get("content"),
+    }
+    return {
+        "role": "system",
+        "content": (
+            "<historical_tool_record_unreplayable>\n"
+            "以下是历史中的工具调用/工具结果记录。由于缺少可直接回放给 provider 的相邻配对，"
+            "运行时已把它转为普通上下文；原始事件仍保存在历史中。\n"
+            f"{json.dumps(payload, ensure_ascii=False, default=str)}\n"
+            "</historical_tool_record_unreplayable>"
+        ),
+    }
 
 
 def build_messages(
@@ -162,7 +248,11 @@ def build_messages(
     current_context_record: dict[str, Any] | None = None,
     system_override: str | None = None,
     *,
+    rag_context_text: str = "",
     memory_mode: Literal["file", "rag"] = "file",
+    persona_context: str = "",
+    eat_tool: bool = False,
+    sleep_tool: bool = False,
     user_event: str | None = None,
 ) -> list[dict[str, Any]]:
     """组装一次 LLM 调用的完整 messages（不含 Task Contract 重注入，由 runner 处理）。
@@ -170,12 +260,18 @@ def build_messages(
     Args:
         persona: 已加载的人格
         history: 历史对话（来自 HistoryManager）
-        important_memory_text: 已按当前会话 scope / RAG 规则选出的重要记忆文本
+        important_memory_text: 已按当前会话 scope 选出的重要记忆文本。
+            始终注入 <long_term_memory>，不受 memory_mode 是否为 rag 影响。
+        rag_context_text: RAG 从历史对话向量索引中召回的相关片段。
+            只作为尾部 <retrieved_conversation_context> 注入，避免污染稳定前缀。
         current_context: 本次调用的临时上下文（时间、表情包等）
         current_context_record: 已持久化的 task_context 运行时上下文记录。主回复路径用它
             保证下一轮重建 history 时字节前缀与上一轮请求一致。
         system_override: 完全自定义的 system prompt（仅特殊用途，如 proactive 路由）
         memory_mode: "file" / "rag"，决定 tool_use_protocol 内的 memory 块写法
+        persona_context: 动态人格状态上下文；无 current_context_record 时进入 task_context。
+        eat_tool: 本轮工具列表是否提供 eat；普通 system prompt 路径透传到工具协议。
+        sleep_tool: 本轮工具列表是否提供 sleep；普通 system prompt 路径透传到工具协议。
         user_event: 带外触发轮的尾部 user 事件。仅用于唤醒/主动/请求等没有真实用户消息的轮次。
 
     Returns:
@@ -186,7 +282,7 @@ def build_messages(
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_override}
         ]
-        messages.extend(history)
+        messages.extend(_provider_safe_history(history))
         if current_context:
             messages.append({"role": "system", "content": current_context})
         if user_event:
@@ -195,8 +291,10 @@ def build_messages(
 
     system_content = build_combined_system_prompt(
         persona,
-        important_memory_text if memory_mode == "file" else "",
+        important_memory_text,
         memory_mode=memory_mode,
+        eat_tool=eat_tool,
+        sleep_tool=sleep_tool,
     )
     messages = [{"role": "system", "content": system_content}]
 
@@ -216,7 +314,7 @@ def build_messages(
             }
         )
 
-    messages.extend(history)
+    messages.extend(_provider_safe_history(history))
 
     if current_context_record is not None:
         content = str(current_context_record.get("content") or "")
@@ -228,11 +326,14 @@ def build_messages(
                 }
             )
     else:
-        task_ctx = build_task_context(current_context)
+        task_ctx = build_task_context(
+            current_context,
+            persona_context=persona_context,
+        )
         if task_ctx:
             messages.append({"role": "user", "content": task_ctx})
 
-    if memory_mode == "rag" and important_memory_text:
+    if rag_context_text:
         messages.append(
             {
                 "role": "user",
@@ -240,7 +341,7 @@ def build_messages(
                     '<retrieved_conversation_context priority="medium" source="rag">\n'
                     f"{RUNTIME_CONTEXT_NOTICE}\n"
                     "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不代表新的用户消息。\n"
-                    f"{important_memory_text.strip()}\n"
+                    f"{rag_context_text.strip()}\n"
                     "</retrieved_conversation_context>"
                 ),
             }

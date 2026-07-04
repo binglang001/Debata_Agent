@@ -58,10 +58,7 @@ class SummaryAgent:
         if not history_slice:
             return None
 
-        history_text = "\n".join(
-            f"[{m.get('role', '?')}] {m.get('content', '') or ''}"
-            for m in history_slice
-        )
+        history_text = "\n".join(_format_history_line(m) for m in history_slice)
         prompt = (
             "你是当前角色的记忆管理系统。请把一段旧对话历史并入全局滚动摘要。\n\n"
             f"<现有滚动摘要>\n{existing_summary_text or '（无）'}\n</现有滚动摘要>\n\n"
@@ -70,12 +67,24 @@ class SummaryAgent:
             "<任务>\n"
             "1. 输出合并后的滚动摘要，保留人物关系、长期约定、未完成事项、关键决定和跨会话背景。\n"
             "2. 不要逐条流水复述，不要保留一次性工具执行细节。\n"
-            "3. 提取少量值得长期保存的新重要记忆；没有则返回空数组。\n"
+            "3. 根据待归档对话提取少量值得长期保存的新重要记忆补充候选；没有则返回空数组。\n"
             "</任务>\n\n"
+            "<重要记忆规范>\n"
+            "1. 现存重要记忆是已经保存的事实，不要重复保存；new_important 只是补充候选，不是完整替换列表。\n"
+            "2. new_important 最多返回 3-5 条候选；只保存长期稳定事实：人物身份、偏好、稳定约定、长期目标、"
+            "管理员反馈或系统行为改进。\n"
+            "3. 每条 content 必须客观、完整、有明确主语；已有同主体事实应补充或合并，不要重复新增。\n"
+            "4. 禁止保存系统消息、task_context、send_receipt、工具结果、no_action、临时 URL、密钥、token、"
+            "cookie、rkey、clientkey 等运行时噪声。\n"
+            "5. scope 可选，只能是 global、user:QQ、group:群号；不能判断就省略，让调用方保持旧行为。\n"
+            "6. 历史里的 conversation_id=private:QQ 如果用于 scope，应写成 user:QQ；"
+            "conversation_id=group:群号 应写成 group:群号；不要把 private:QQ 当 scope 返回。\n"
+            "7. pinned 可选，只用于任何场景都必须常驻的极稳定事实；普通偏好不要设置 pinned。\n"
+            "</重要记忆规范>\n\n"
             "返回 JSON：\n"
             "```json\n"
             '{"summary_text": "合并后的滚动摘要", '
-            '"new_important": [{"timestamp": "时间", "content": "一句话描述"}, ...]}\n'
+            '"new_important": [{"content": "一句话描述", "scope": "user:123456", "pinned": false}, ...]}\n'
             "```"
         )
 
@@ -248,94 +257,6 @@ class SummaryAgent:
             logger.debug("更新总结模型状态失败", exc_info=True)
 
 
-class DuplicateChecker:
-    """重要记忆去重判定器（用小模型）。
-
-    旧版的 check_important_memory_duplicate。
-    """
-
-    def __init__(
-        self,
-        provider: IProvider,
-        cfg: AgentConfig,
-        *,
-        usage_recorder: UsageRecorder | None = None,
-        status_callback: StatusCallback | None = None,
-    ) -> None:
-        self.provider = provider
-        self.cfg = cfg
-        self.usage_recorder = usage_recorder
-        self.status_callback = status_callback
-
-    async def __call__(self, existing: list[dict[str, Any]], new_text: str) -> bool:
-        if not existing or not new_text:
-            return False
-
-        existing_list = "\n".join(f"- {m.get('content', '')}" for m in existing)
-        prompt = (
-            f"现有重要记忆：\n{existing_list}\n\n"
-            f"新记忆：{new_text}\n\n"
-            f"新记忆的信息是否已被现有记忆覆盖？回复 JSON："
-            f'{{"duplicate": true/false}}'
-        )
-
-        try:
-            # 去重判定只要一个布尔结果，用 cfg 的温度和窗口
-            self._emit_status("thinking", "记忆去重判断中")
-            result = await self.provider.chat_completion(
-                [{"role": "user", "content": prompt}],
-                model=self.cfg.model,
-                tools=None,
-                temperature=self.cfg.temperature,
-                top_p=self.cfg.top_p,
-                max_tokens=64,
-                reasoning=None,
-                stream=True,
-                timeout=self.cfg.first_token_timeout_seconds,
-                first_token_timeout=self.cfg.first_token_timeout_seconds,
-            )
-            await self._record_usage(result.usage, operation="duplicate_check")
-        except Exception as e:
-            logger.warning(f"去重检查失败: {e}，默认不跳过")
-            self._emit_status("error", "记忆去重失败")
-            return False
-
-        text = (result.content or "").strip().lower()
-        self._emit_status("idle", "记忆去重完成")
-        return '"duplicate": true' in text or '"duplicate":true' in text
-
-    async def _record_usage(self, usage, **metadata: Any) -> None:
-        if self.usage_recorder is None:
-            return
-        try:
-            await self.usage_recorder(
-                usage,
-                {
-                    "provider": self.provider.name,
-                    "model": self.cfg.model,
-                    "agent": "记忆去重",
-                    **metadata,
-                },
-            )
-        except Exception:
-            logger.debug("记录记忆去重用量失败", exc_info=True)
-
-    def _emit_status(self, state: str, text: str) -> None:
-        if self.status_callback is None:
-            return
-        try:
-            self.status_callback(
-                {
-                    "state": state,
-                    "text": text,
-                    "model": self.cfg.model,
-                    "agent": "记忆去重",
-                }
-            )
-        except Exception:
-            logger.debug("更新记忆去重状态失败", exc_info=True)
-
-
 def _parse_json_object(text: str) -> dict[str, Any] | None:
     text = (text or "").strip()
     start = text.find("{")
@@ -348,3 +269,10 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
         logger.error(f"总结 JSON 解析失败: {e}, raw={text[start:end][:200]}")
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _format_history_line(record: dict[str, Any]) -> str:
+    role = record.get("role", "?")
+    conversation_id = str(record.get("conversation_id") or "").strip()
+    scope_hint = f" conversation_id={conversation_id}" if conversation_id else ""
+    return f"[{role}{scope_hint}] {record.get('content', '') or ''}"

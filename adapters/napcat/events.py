@@ -96,6 +96,8 @@ def _parse_message(adapter_name: str, raw: dict[str, Any]) -> IncomingMessage | 
     # 重建可读文本（保留 @、表情、reply 等结构化标记）
     # 与 message_pipeline._build_readable_text 用同一份实现，避免漂移
     text = parse_raw_cq(raw_message_str, self_id)
+    if not text and message_segments:
+        text = _render_onebot_segments(message_segments, self_id)
 
     return IncomingMessage(
         adapter=adapter_name,
@@ -165,9 +167,61 @@ def _extract_media(segments: list[Any]) -> list[MediaSegment]:
                 MediaSegment(
                     type=MediaType.FORWARD,
                     file_id=_clean_cq_value(data.get("id")),
+                    extra=_forward_extra(data),
                 )
             )
     return out
+
+
+def _render_onebot_segments(segments: list[Any], self_id: str) -> str:
+    """把 OneBot 结构化 message 段数组渲染为可读文本。"""
+    head: list[str] = []
+    body: list[str] = []
+    for seg in segments:
+        text = _render_onebot_segment(seg, self_id)
+        if not text:
+            continue
+        if isinstance(seg, dict) and seg.get("type") == "reply":
+            head.append(text)
+        else:
+            body.append(text)
+    return "".join(head + body)
+
+
+def _render_onebot_segment(segment: Any, self_id: str) -> str:
+    if not isinstance(segment, dict):
+        return str(segment)
+    seg_type = str(segment.get("type") or "unknown")
+    data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+
+    if seg_type == "text":
+        return unescape(str(data.get("text") or ""))
+    if seg_type == "at":
+        qq = str(data.get("qq") or "")
+        if qq == "all":
+            return "@全体成员"
+        if qq == self_id:
+            return "@我"
+        return f"@QQ{qq}"
+    if seg_type == "reply":
+        return f"[引用msg_id={data.get('id') or ''}]"
+    if seg_type == "image":
+        return "[图片]"
+    if seg_type in {"record", "voice"}:
+        return "[语音]"
+    if seg_type == "video":
+        return "[视频]"
+    if seg_type == "face":
+        return f"[表情{data.get('id') or ''}]"
+    if seg_type == "file":
+        return "[文件]"
+    if seg_type == "forward":
+        return _forward_label(data.get("id") or segment.get("id") or "", data)
+    if seg_type == "json":
+        return "[JSON]"
+    if seg_type == "node":
+        return "[合并转发节点]"
+    return f"[{seg_type}]"
 
 
 _CQ_SEGMENT_RE = re.compile(r"\[CQ:(?P<body>[^\]]+)\]")
@@ -227,7 +281,40 @@ def _extract_media_from_cq(raw_message: str) -> list[MediaSegment]:
                     url=url,
                 )
             )
+        elif cq_type == "forward":
+            out.append(
+                MediaSegment(
+                    type=MediaType.FORWARD,
+                    file_id=params.get("id"),
+                    extra=_forward_extra(params),
+                )
+            )
     return out
+
+
+def _forward_label(forward_id: Any, data: dict[str, Any]) -> str:
+    fid = _clean_cq_value(forward_id) or ""
+    title = _forward_title(data)
+    if title:
+        return f"[合并转发 id={fid} title={title}]"
+    return f"[合并转发 id={fid}]"
+
+
+def _forward_title(data: dict[str, Any]) -> str | None:
+    for key in ("title", "summary", "name", "content"):
+        value = _clean_cq_value(data.get(key))
+        if value:
+            return value
+    return None
+
+
+def _forward_extra(data: dict[str, Any]) -> dict[str, str]:
+    extra: dict[str, str] = {}
+    for key in ("title", "summary", "name", "content"):
+        value = _clean_cq_value(data.get(key))
+        if value:
+            extra[key] = value
+    return extra
 
 
 def _parse_cq_params(params_str: str) -> dict[str, str]:

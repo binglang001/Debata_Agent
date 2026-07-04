@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import time
 from collections.abc import Iterable
@@ -399,7 +400,7 @@ def _record_to_candidate(
     text = _record_content_text(record.get("content"))
     if not text:
         return None
-    text = _compact_text(text)[:max_text_chars]
+    text = _compact_text(_clean_text_for_rag(text))[:max_text_chars]
     if not text:
         return None
     if _text_is_runtime_context(text):
@@ -473,6 +474,57 @@ def _record_content_text(content: Any) -> str:
 def _compact_text(text: str) -> str:
     lines = [line.strip() for line in text.splitlines()]
     return "\n".join(line for line in lines if line)
+
+
+def _clean_text_for_rag(text: str) -> str:
+    """清理真实聊天里的运行时媒体属性，只保留可用于语义检索的内容。"""
+    text = _normalize_media_placeholders(text)
+    text = _URL_PATTERN.sub("[链接]", text)
+    text = _WINDOWS_PATH_PATTERN.sub("[本地路径]", text)
+    text = _MEDIA_ATTR_PATTERN.sub("", text)
+    text = re.sub(r"\s+\]", "]", text)
+    text = re.sub(r"\[链接\](?:\s*\[链接\])+", "[链接]", text)
+    return text.strip()
+
+
+def _normalize_media_placeholders(text: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        kind = match.group(1)
+        attrs = match.group(2) or ""
+        workspace = _extract_media_workspace(attrs)
+        if kind == "音频消息":
+            transcript = _MEDIA_RUNTIME_ATTR_PATTERN.sub("", attrs).strip()
+            transcript = re.sub(r"^[:：]\s*", "", transcript).strip()
+            if transcript:
+                return (
+                    f"[音频消息: {transcript} workspace={workspace}]"
+                    if workspace
+                    else f"[音频消息: {transcript}]"
+                )
+            return f"[音频消息 workspace={workspace}]" if workspace else "[音频消息]"
+        return f"[{kind} workspace={workspace}]" if workspace else f"[{kind}]"
+
+    return _MEDIA_PLACEHOLDER_PATTERN.sub(repl, text)
+
+
+def _extract_media_workspace(attrs: str) -> str:
+    match = re.search(r"(?:^|\s)workspace=([^\]\s]+)", attrs or "")
+    return match.group(1).strip() if match else ""
+
+
+_MEDIA_PLACEHOLDER_PATTERN = re.compile(
+    r"\[(图片|文件|音频消息)([^\]]*(?:url=|workspace=)[^\]]*)\]"
+)
+_MEDIA_ATTR_PATTERN = re.compile(
+    r"\surl=(?:[^\]\s]+)"
+)
+_MEDIA_RUNTIME_ATTR_PATTERN = re.compile(
+    r"\s(?:url|workspace)=(?:[^\]\s]+)"
+)
+_URL_PATTERN = re.compile(r"https?://[^\s\]）)>\"']+")
+_WINDOWS_PATH_PATTERN = re.compile(
+    r"(?<![\w/\\])[A-Za-z]:[\\/][^\s\]）)>\"']+"
+)
 
 
 def _format_hit_line(hit: RagHit) -> str:

@@ -16,21 +16,242 @@ import asyncio
 import logging
 import sys
 from getpass import getpass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
+
+import main_cli as _main_cli
 
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(level: str = "INFO") -> None:
+def _gui_instance_lock_path(paths: Any) -> Path:
+    """返回当前数据实例的 GUI 单实例锁文件。"""
+    return paths.INSTANCE_DIR / "debata.gui.lock"
+
+
+def _acquire_gui_instance_lock(lock_path: Path) -> Any | None:
+    """尝试获取 GUI 单实例锁；失败表示该数据实例已有 GUI 在运行。"""
+    from PySide6.QtCore import QLockFile
+
+    lock = QLockFile(str(lock_path))
+    if lock.tryLock(100):
+        return lock
+    return None
+
+
+def _notify_gui_instance_running(lock_path: Path) -> None:
+    """提示用户已有实例运行；避免为了提示再启动完整 Qt 应用。"""
+    message = f"Debata_Agent 已有一个 GUI 实例在运行。\n\n实例锁：{lock_path}"
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, message, "Debata_Agent", 0x40)
+            return
+        except Exception:
+            pass
+    print(message, file=sys.stderr)
+
+
+def _install_qasync_timer_multiplexer(qasync_module: Any) -> None:
+    """把 qasync 的每回调一个 Qt timer 改成单 Qt timer 多路复用。
+
+    qasync 默认会把每个 asyncio.call_later/asyncio.sleep 映射成一个
+    QObject.startTimer()。业务里存在大量延时任务时，Windows 会先打到
+    Qt 原生 timer 上限并刷 registerTimer 失败。这里保留 qasync 接口，
+    但内部只持有一个 QTimer。
+    """
+    if getattr(qasync_module, "_debata_timer_multiplexer_installed", False):
+        return
+    if not hasattr(qasync_module, "_SimpleTimer"):
+        logger.warning("qasync 未暴露 _SimpleTimer，跳过 timer 多路复用补丁")
+        return
+
+    import heapq
+    import itertools
+    import math
+    import time as _time
+
+    from PySide6 import QtCore
+
+    class _MultiplexTimer(QtCore.QObject):
+        _MAX_NATIVE_TIMER_MS = 60_000
+        _COMPACT_CANCELLED_THRESHOLD = 100
+        _COMPACT_HEAP_RATIO = 2
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.__callbacks: dict[int, Any] = {}
+            self.__heap: list[tuple[float, int, int]] = []
+            self.__seq = itertools.count()
+            self.__ids = itertools.count(1)
+            self.__stopped = False
+            self.__debug_enabled = False
+            self.__cancelled_since_compact = 0
+            self.__next_compact_scan_at = self._COMPACT_CANCELLED_THRESHOLD * 2
+            self.__timer = QtCore.QTimer(self)
+            self.__timer.setSingleShot(True)
+            self.__timer.timeout.connect(self.__run_due)
+            self._logger = logging.getLogger(f"{qasync_module.__name__}._SimpleTimer")
+
+        def add_callback(self, handle: Any, delay: float = 0) -> Any:
+            if self.__stopped:
+                return handle
+            callback_id = next(self.__ids)
+            deadline = _time.monotonic() + max(0.0, float(delay))
+            self.__callbacks[callback_id] = handle
+            heapq.heappush(self.__heap, (deadline, next(self.__seq), callback_id))
+            self.__schedule_next()
+            return handle
+
+        def stop(self) -> None:
+            self.__log_debug("Stopping timers")
+            self.__stopped = True
+            self.__timer.stop()
+            self.__callbacks.clear()
+            self.__heap.clear()
+
+        def set_debug(self, enabled: bool) -> None:
+            self.__debug_enabled = enabled
+
+        def __discard_cancelled_head(self) -> None:
+            while self.__heap:
+                _deadline, _seq, callback_id = self.__heap[0]
+                handle = self.__callbacks.get(callback_id)
+                if handle is None:
+                    heapq.heappop(self.__heap)
+                    continue
+                if getattr(handle, "_cancelled", False):
+                    self.__log_debug("Handle %s cancelled", handle)
+                    heapq.heappop(self.__heap)
+                    self.__callbacks.pop(callback_id, None)
+                    self.__cancelled_since_compact += 1
+                    continue
+                break
+
+        def __compact_heap_if_needed(self) -> None:
+            should_scan = (
+                self.__cancelled_since_compact >= self._COMPACT_CANCELLED_THRESHOLD
+                or len(self.__heap) >= self.__next_compact_scan_at
+            )
+            if not should_scan:
+                return
+            active_heap = [
+                item
+                for item in self.__heap
+                if (handle := self.__callbacks.get(item[2])) is not None
+                and not getattr(handle, "_cancelled", False)
+            ]
+            if len(self.__heap) <= len(active_heap) * self._COMPACT_HEAP_RATIO:
+                self.__cancelled_since_compact = 0
+                self.__next_compact_scan_at = max(
+                    len(self.__heap) * 2,
+                    self._COMPACT_CANCELLED_THRESHOLD * 2,
+                )
+                return
+            self.__heap = active_heap
+            heapq.heapify(self.__heap)
+            self.__callbacks = {callback_id: self.__callbacks[callback_id] for _, _, callback_id in self.__heap}
+            self.__cancelled_since_compact = 0
+            self.__next_compact_scan_at = max(
+                len(self.__heap) * 2,
+                self._COMPACT_CANCELLED_THRESHOLD * 2,
+            )
+
+        def __schedule_next(self) -> None:
+            if self.__stopped:
+                return
+            self.__discard_cancelled_head()
+            self.__compact_heap_if_needed()
+            if not self.__heap:
+                self.__timer.stop()
+                return
+            deadline, _seq, _callback_id = self.__heap[0]
+            delay_ms = max(0, math.ceil((deadline - _time.monotonic()) * 1000))
+            self.__timer.start(min(delay_ms, self._MAX_NATIVE_TIMER_MS))
+
+        def __run_due(self) -> None:
+            if self.__stopped:
+                return
+            now = _time.monotonic()
+            due: list[tuple[float, int, int]] = []
+            while self.__heap and self.__heap[0][0] <= now:
+                due.append(heapq.heappop(self.__heap))
+            for _deadline, _seq, callback_id in due:
+                handle = self.__callbacks.pop(callback_id, None)
+                if handle is None or getattr(handle, "_cancelled", False):
+                    self.__cancelled_since_compact += 1
+                    continue
+                if self.__debug_enabled:
+                    loop = asyncio.get_event_loop()
+                    try:
+                        loop._current_handle = handle
+                        self._logger.debug("Calling handle %s", handle)
+                        started_at = _time.time()
+                        handle._run()
+                        duration = _time.time() - started_at
+                        if duration >= loop.slow_callback_duration:
+                            self._logger.warning(
+                                "Executing %s took %.3f seconds",
+                                self.__format_handle(handle),
+                                duration,
+                            )
+                    finally:
+                        loop._current_handle = None
+                else:
+                    handle._run()
+            self.__schedule_next()
+
+        def __log_debug(self, *args: Any, **kwargs: Any) -> None:
+            if self.__debug_enabled:
+                self._logger.debug(*args, **kwargs)
+
+        @staticmethod
+        def __format_handle(handle: asyncio.Handle) -> str:
+            callback = getattr(handle, "_callback", None)
+            if isinstance(getattr(callback, "__self__", None), asyncio.tasks.Task):
+                return repr(callback.__self__)
+            return str(handle)
+
+    qasync_module._SimpleTimer = _MultiplexTimer
+    qasync_module._debata_timer_multiplexer_installed = True
+    logger.info("已启用 qasync timer 多路复用补丁")
+
+
+def setup_logging(
+    level: str = "INFO",
+    *,
+    project_root: Path | None = None,
+    logs_dir: Path | None = None,
+) -> None:
     """配置标准 logging。
 
     格式：[YYYY-MM-DD HH:MM:SS] [LEVEL] [module] message
     """
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+    root = project_root or Path(__file__).resolve().parent
+    logs_dir = logs_dir or root / "data" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    fmt = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    file_handler = RotatingFileHandler(
+        logs_dir / "debata.log",
+        maxBytes=20 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(fmt)
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        handlers=[console, file_handler],
+        force=True,
+    )
+    for noisy_logger in ("qasync", "websockets"):
+        logging.getLogger(noisy_logger).setLevel(logging.INFO)
 
 
 def install_uvloop() -> None:
@@ -135,12 +356,26 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
     import signal as _signal
     from pathlib import Path
 
+    from app_config import AppPaths, SecretsManager, initialize_runtime_data
+
+    paths = AppPaths(project_root=project_root, config_file=config_file)
+    paths.ensure_data_dirs()
+    initialize_runtime_data(paths, project_root=project_root)
+
+    lock_path = _gui_instance_lock_path(paths)
+    instance_lock = _acquire_gui_instance_lock(lock_path)
+    if instance_lock is None:
+        logger.warning("已有 Debata GUI 实例在运行，拒绝重复启动：%s", lock_path)
+        _notify_gui_instance_running(lock_path)
+        return
+
     import qasync  # type: ignore
     from PySide6.QtCore import QTimer
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
-    from app_config import AppPaths, SecretsManager
+    _install_qasync_timer_multiplexer(qasync)
+
     from core import Runtime
     from ui.dashboard.main_window import DashboardWindow
     from ui.theme import cached_qss, palette_for_theme
@@ -161,9 +396,6 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
 
     loop = qasync.QEventLoop(app)
     _asyncio.set_event_loop(loop)
-
-    paths = AppPaths(project_root=project_root, config_file=config_file)
-    paths.ensure_data_dirs()
 
     state: dict = {
         "rt": None,
@@ -404,8 +636,14 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
     sigint_timer.timeout.connect(_check_sigint)
     sigint_timer.start()
 
-    with loop:
-        loop.run_forever()
+    try:
+        with loop:
+            loop.run_forever()
+    finally:
+        try:
+            instance_lock.unlock()
+        except Exception:
+            logger.debug("释放 GUI 单实例锁失败", exc_info=True)
 
 
 # ============================================================
@@ -418,14 +656,14 @@ def main() -> None:
     args = parse_args()
     project_root = Path(__file__).resolve().parent
 
-    setup_logging("INFO")
-    install_uvloop()
-
-    from app_config import AppPaths
+    from app_config import AppPaths, initialize_runtime_data
 
     config_file = Path(args.config) if args.config else None
     paths = AppPaths(project_root=project_root, config_file=config_file)
     paths.ensure_data_dirs()
+    initialize_runtime_data(paths, project_root=project_root)
+    setup_logging("INFO", project_root=project_root, logs_dir=paths.LOGS_DIR)
+    install_uvloop()
 
     if args.napcat:
         _run_napcat_setup(paths)
@@ -453,345 +691,114 @@ def main() -> None:
         run_with_gui(project_root, force_wizard=args.setup, config_file=config_file)
 
 
+def _sync_cli_io() -> None:
+    _main_cli.getpass = getpass
+
+
+def _cli_text(prompt: str, default: str | None = None) -> str:
+    return _main_cli._cli_text(prompt, default)
+
+
+def _cli_int(prompt: str, default: int) -> int:
+    return _main_cli._cli_int(prompt, default)
+
+
+def _cli_yes_no(prompt: str, default: bool = False) -> bool:
+    return _main_cli._cli_yes_no(prompt, default)
+
+
+def _cli_secret(prompt: str, *, has_existing: bool = False) -> str:
+    _sync_cli_io()
+    return _main_cli._cli_secret(prompt, has_existing=has_existing)
+
+
+def _cli_choose(
+    prompt: str,
+    choices: list[tuple[str, str]],
+    *,
+    default: str,
+) -> str:
+    return _main_cli._cli_choose(prompt, choices, default=default)
+
+
+def _cli_load_presets(paths) -> dict[str, Any]:
+    return _main_cli._cli_load_presets(paths)
+
+
+def _cli_default_model(
+    presets: dict[str, Any],
+    preset_id: str,
+    fallback: str = "",
+) -> str:
+    return _main_cli._cli_default_model(presets, preset_id, fallback)
+
+
+def _cli_provider_config(
+    *,
+    paths,
+    secrets,
+    cfg,
+    provider_id: str,
+    current_provider,
+    current_model: str,
+    title: str,
+    default_preset: str = "deepseek",
+) -> tuple[str, str]:
+    _sync_cli_io()
+    return _main_cli._cli_provider_config(
+        paths=paths,
+        secrets=secrets,
+        cfg=cfg,
+        provider_id=provider_id,
+        current_provider=current_provider,
+        current_model=current_model,
+        title=title,
+        default_preset=default_preset,
+    )
+
+
+def _cli_agent_config(
+    provider_id: str,
+    model: str,
+    *,
+    temperature: float,
+    max_tokens: int,
+):
+    return _main_cli._cli_agent_config(
+        provider_id,
+        model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+def _cli_configure_napcat(secrets, current):
+    _sync_cli_io()
+    return _main_cli._cli_configure_napcat(secrets, current)
+
+
+def _cli_configure_features(paths, secrets, cfg, main_provider_id: str) -> None:
+    _sync_cli_io()
+    _main_cli._cli_configure_features(paths, secrets, cfg, main_provider_id)
+
+
+def _run_cli_wizard_legacy(paths) -> None:
+    _sync_cli_io()
+    _main_cli._run_cli_wizard_legacy(paths)
+
+
 def _run_cli_wizard(paths) -> None:
-    """CLI 向导。两种模式自动切换：
-
-    - 现有 config.yaml 可加载 → **amend 模式**：每项默认值是当前值，用户 Enter 保留。
-    - 没有 config 或加载失败 → **fresh 模式**：用仓库默认值。
-
-    密钥：secrets 里已有的不会重新询问，prompt 写"留空复用"。
-    """
-    from app_config import SecretsManager
-    from app_config.loader import load_config, save_config
-    from app_config.schema import (
-        AgentConfig,
-        AgentsConfig,
-        BehaviorConfig,
-        FeaturesConfig,
-        LongTermMemoryConfig,
-        NapCatAdapterConfig,
-        PersonaConfig,
-        ProviderConfig,
-        RootConfig,
-        WhitelistConfig,
-    )
-
-    # 尝试加载现有 config 作"amend 模式"的默认值
-    existing: RootConfig | None = None
-    if paths.CONFIG_FILE.exists():
-        try:
-            existing = load_config(paths, set_global=False)
-        except Exception as e:
-            print(f"⚠ 现有 config 加载失败（{e}）。将走全新配置流程。")
-            existing = None
-
-    cur_napcat = existing.adapters.get("default") if existing else None
-    cur_persona = existing.persona.active if existing else "debata"
-
-    print("=" * 60)
-    if existing:
-        print("Debata_Agent 配置向导 · amend 模式")
-        print("（每项 Enter 保留当前值；只问需要的几项）")
-    else:
-        print("Debata_Agent 首次配置向导")
-    print("=" * 60)
-
-    secrets = SecretsManager(paths)
-    secrets.initialize()
-    has_deepseek = secrets.has("deepseek_main")
-    has_napcat_token = secrets.has("napcat_default_token")
-
-    # 1. DeepSeek
-    print("\n[1/4] LLM 提供商配置")
-    if existing and "deepseek_main" in existing.providers:
-        print("  已有 DeepSeek provider 配置（model 等参数保留）。")
-    else:
-        print("  推荐使用 DeepSeek（注册：https://platform.deepseek.com）")
-    if has_deepseek:
-        api_key_prompt = "  粘贴新的 DeepSeek API Key（留空复用已保存的）: "
-    else:
-        api_key_prompt = "  粘贴你的 DeepSeek API Key: "
-    api_key = getpass(api_key_prompt).strip()
-    if not api_key and not has_deepseek:
-        print("✗ 未提供 API Key 且 secrets 里也没有，向导退出。")
-        sys.exit(1)
-
-    # 2. NapCat 连接（现有值作默认）
-    print("\n[2/4] NapCat 连接配置")
-    print("  请对照 NapCat 那边的配置选择：")
-    print("    1 = client：NapCat「正向 WS」（NapCat 监听等程序连入）→ 推荐")
-    print("    2 = server：NapCat「反向 WS」（NapCat 主动连出到程序）")
-    default_mode_choice = "1" if (cur_napcat is None or cur_napcat.mode == "client") else "2"
-    ws_mode_input = input(f"  选择 [{default_mode_choice}]: ").strip() or default_mode_choice
-
-    if ws_mode_input == "2":
-        mode = "server"
-        d_host = cur_napcat.host if (cur_napcat and cur_napcat.mode == "server") else "0.0.0.0"
-        d_port = cur_napcat.port if cur_napcat else 8080
-        d_path = cur_napcat.path if (cur_napcat and cur_napcat.mode == "server") else "/onebot/v11/ws"
-    else:
-        mode = "client"
-        d_host = cur_napcat.host if cur_napcat else "127.0.0.1"
-        d_port = cur_napcat.port if cur_napcat else 3001
-        d_path = cur_napcat.path if (cur_napcat and cur_napcat.mode == "client") else "/"
-
-    host_label = "程序监听地址" if mode == "server" else "NapCat 地址"
-    host = input(f"  {host_label} [{d_host}]: ").strip() or d_host
-    port = int(input(f"  端口 [{d_port}]: ").strip() or str(d_port))
-    path = input(f"  WS 路径 [{d_path}]: ").strip() or d_path
-
-    if has_napcat_token:
-        napcat_token_prompt = "  粘贴新 access token（留空复用已存的；输入 'clear' 清除）: "
-    else:
-        napcat_token_prompt = "  NapCat access token（可留空）: "
-    napcat_token = getpass(napcat_token_prompt).strip()
-
-    # 3. 人格（默认 = 现有 active）
-    print("\n[3/4] 人格选择")
-    if existing:
-        print(f"  当前激活：{cur_persona}")
-    else:
-        print("  仓库自带：debata（开箱即用）")
-    persona_name = input(f"  人格目录名 [{cur_persona}]: ").strip() or cur_persona
-
-    # 4. admin QQ（可选）
-    print("\n[4/4] 管理员 QQ（用于好友/群验证通知，可选）")
-    admin_qq = input("  你的 QQ 号（Enter 跳过）: ").strip()
-
-    # ----- 写 secrets -----
-    if api_key:
-        secrets.set("deepseek_main", api_key)
-
-    napcat_token_id: str | None
-    if napcat_token == "clear":
-        secrets.delete("napcat_default_token")
-        napcat_token_id = None
-    elif napcat_token:
-        secrets.set("napcat_default_token", napcat_token)
-        napcat_token_id = "napcat_default_token"
-    elif has_napcat_token:
-        napcat_token_id = "napcat_default_token"
-    else:
-        napcat_token_id = None
-
-    # ----- 构造 RootConfig（amend 模式下基于现有，否则全新）-----
-    new_napcat = NapCatAdapterConfig(
-        type="napcat",
-        enabled=True,
-        mode=mode,
-        host=host,
-        port=port,
-        path=path,
-        access_token_id=napcat_token_id,
-        whitelist=(cur_napcat.whitelist if cur_napcat else WhitelistConfig(mode="verify")),
-    )
-
-    if existing is not None:
-        # amend：复用现有结构，只替换 NapCat / persona / 必要的 providers
-        cfg = existing.model_copy(deep=True)
-        cfg.adapters["default"] = new_napcat
-        cfg.persona = PersonaConfig(active=persona_name)
-        # 确保 deepseek_main provider 存在
-        if "deepseek_main" not in cfg.providers:
-            cfg.providers["deepseek_main"] = ProviderConfig(
-                preset="deepseek",
-                display_name="DeepSeek",
-                api_key_id="deepseek_main",
-            )
-    else:
-        # fresh
-        cfg = RootConfig(
-            version=2,
-            adapters={"default": new_napcat},
-            providers={
-                "deepseek_main": ProviderConfig(
-                    preset="deepseek",
-                    display_name="DeepSeek",
-                    api_key_id="deepseek_main",
-                )
-            },
-            agents=AgentsConfig(
-                chat=AgentConfig(
-                    provider="deepseek_main",
-                    model="deepseek-v4-flash",
-                    temperature=0.6,
-                    max_tokens=16384,
-                ),
-                proactive=AgentConfig(
-                    provider="deepseek_main",
-                    model="deepseek-v4-flash",
-                    temperature=0.3,
-                    max_tokens=64,
-                ),
-                summary=AgentConfig(
-                    provider="deepseek_main",
-                    model="deepseek-v4-flash",
-                    temperature=0.1,
-                    max_tokens=8192,
-                ),
-            ),
-            features=FeaturesConfig(
-                long_term_memory=LongTermMemoryConfig(mode="file", keyword_trigger_save=True),
-            ),
-            persona=PersonaConfig(active=persona_name),
-            behavior=BehaviorConfig(),
-        )
-
-    # 写入前预览，让用户确认（避免输错后又得手编 YAML）
-    print("\n" + "-" * 60)
-    print("即将写入以下配置：")
-    print(f"  人格        : {persona_name}")
-    print("  Provider    : DeepSeek（model=deepseek-v4-flash）")
-    print(f"  Adapter mode: {mode}")
-    print(f"  WS endpoint : ws://{host}:{port}{path}")
-    if mode == "server":
-        print("  NapCat 反向 WS 目标：填这台机器的局域网 IP，不要填 0.0.0.0 或 localhost")
-    print(f"  Token       : {'(已绑定)' if napcat_token_id else '(无)'}")
-    if admin_qq:
-        print(f"  Admin QQ    : {admin_qq}（需手动添加到 persona_prompt.py）")
-    print("-" * 60)
-    confirm = input("确认写入？[Y/n]: ").strip().lower()
-    if confirm in ("n", "no"):
-        print("✗ 已取消，未写入。重跑 `python main.py --no-gui --setup` 可重新填。")
-        sys.exit(0)
-
-    save_config(paths, cfg)
-
-    print("\n" + "=" * 60)
-    print("✓ 配置已写入：")
-    print(f"   {paths.CONFIG_FILE}")
-    print(f"   密钥保存在 {paths.SECRETS_FILE}（已加密）")
-    if admin_qq:
-        print(f"\n注意：你提供的 admin QQ={admin_qq} 未写入 persona。")
-        print(f"如需 admin 通知功能，请编辑 personas/{persona_name}/persona_prompt.py")
-        print(f"在 PERSONA_VARS['admins'] 中追加 {{'name': '...', 'qq': '{admin_qq}'}}。")
-    print("\n现在可以启动：python main.py --no-gui")
-    print("=" * 60)
-
-
-# ============================================================
-# --list-secrets：列出所有密钥 ID
-# ============================================================
+    _sync_cli_io()
+    _main_cli._run_cli_wizard(paths)
 
 
 def _run_list_secrets(paths) -> None:
-    """列出 secrets.enc 中保存的所有密钥 ID（不显示值）。"""
-    from app_config import SecretsManager
-
-    secrets = SecretsManager(paths)
-    secrets.initialize()
-    ids = secrets.list_ids()
-    if not ids:
-        print("secrets 为空。")
-    else:
-        print(f"secrets 中已存储 {len(ids)} 条密钥：")
-        for sid in ids:
-            print(f"  - {sid}")
-
-
-# ============================================================
-# --napcat：只重新配置 NapCat 段
-# ============================================================
+    _main_cli._run_list_secrets(paths)
 
 
 def _run_napcat_setup(paths) -> None:
-    """只重新配置 NapCat 适配器，不动其它配置。
-
-    用于：用户改了 NapCat 那边的连接模式 / 端口 / token，想快速更新程序配置。
-    """
-    from app_config import SecretsManager
-    from app_config.loader import load_config, save_config
-    from app_config.schema import NapCatAdapterConfig, WhitelistConfig
-
-    if not paths.CONFIG_FILE.exists():
-        print(f"✗ 找不到 {paths.CONFIG_FILE}，请先跑 `python main.py --no-gui --setup`")
-        sys.exit(1)
-
-    secrets = SecretsManager(paths)
-    secrets.initialize()
-    has_napcat_token = secrets.has("napcat_default_token")
-
-    cfg = load_config(paths)
-    if "default" not in cfg.adapters:
-        print("✗ 配置里没有 adapters.default 段。请用 --setup 重跑完整向导。")
-        sys.exit(1)
-    current = cfg.adapters["default"]
-
-    print("=" * 60)
-    print("NapCat 适配器配置")
-    print("=" * 60)
-    print(f"当前：mode={current.mode}, "
-          f"endpoint=ws://{current.host}:{current.port}{current.path}, "
-          f"token_id={current.access_token_id}")
-    print()
-    print("请对照你 NapCat 那边的配置选择：")
-    print("    1 = client 模式：NapCat 配「正向 WS」（NapCat 监听等连入）→ 推荐")
-    print("    2 = server 模式：NapCat 配「反向 WS」（NapCat 主动连出）")
-    default_mode_choice = "1" if current.mode == "client" else "2"
-    ws_mode_input = input(f"  选择 [{default_mode_choice}]: ").strip() or default_mode_choice
-
-    if ws_mode_input == "2":
-        mode = "server"
-        default_path = current.path if current.mode == "server" else "/onebot/v11/ws"
-        default_host = current.host if current.mode == "server" else "0.0.0.0"
-        host = input(f"  程序监听地址 [{default_host}]: ").strip() or default_host
-        port = int(input(f"  程序监听端口 [{current.port}]: ").strip() or str(current.port))
-        path = input(f"  WS 路径 [{default_path}]: ").strip() or default_path
-    else:
-        mode = "client"
-        default_path = current.path if current.mode == "client" else "/"
-        host = input(f"  NapCat 地址 [{current.host}]: ").strip() or current.host
-        port = int(input(f"  NapCat 端口 [{current.port}]: ").strip() or str(current.port))
-        path = input(f"  WS 路径 [{default_path}]: ").strip() or default_path
-
-    # Token
-    if has_napcat_token:
-        token_prompt = "  粘贴新 access token（留空复用 secrets 里已存的；输入 'clear' 清掉）: "
-    else:
-        token_prompt = "  access token（留空表示不用 token）: "
-    new_token = getpass(token_prompt).strip()
-
-    napcat_token_id: str | None
-    if new_token == "clear":
-        secrets.delete("napcat_default_token")
-        napcat_token_id = None
-    elif new_token:
-        secrets.set("napcat_default_token", new_token)
-        napcat_token_id = "napcat_default_token"
-    elif has_napcat_token:
-        napcat_token_id = "napcat_default_token"
-    else:
-        napcat_token_id = None
-
-    # 写回 config
-    new_napcat = NapCatAdapterConfig(
-        type="napcat",
-        enabled=True,
-        mode=mode,
-        host=host,
-        port=port,
-        path=path,
-        access_token_id=napcat_token_id,
-        whitelist=current.whitelist if current.whitelist else WhitelistConfig(),
-    )
-    cfg.adapters["default"] = new_napcat
-    save_config(paths, cfg)
-
-    endpoint = f"ws://{host}:{port}{path}"
-    print()
-    print("=" * 60)
-    print("✓ NapCat 配置已更新。")
-    if mode == "client":
-        print(f"  程序将连接到: {endpoint}")
-        print("  请确认 NapCat 那边「正向 WS」监听地址与此一致。")
-    else:
-        print(f"  程序将监听: {endpoint}")
-        print("  跨设备时，NapCat 那边「反向 WS」目标地址要填这台机器的局域网 IP，不要填 0.0.0.0 或 localhost。")
-    print(f"  Token: {'(已设置)' if napcat_token_id else '(无)'}")
-    print()
-    print("测试连接：python main.py --test-adapter")
-    print("启动：    python main.py --no-gui")
-    print("=" * 60)
+    _sync_cli_io()
+    _main_cli._run_napcat_setup(paths)
 
 
 # ============================================================

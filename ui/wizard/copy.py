@@ -127,23 +127,23 @@ COPY: dict[str, str] = {
     "features.web_search_desc": "走 DuckDuckGo 免费搜索，不需要额外密钥。建议开启。",
     "features.long_term_memory_title": "长期记忆方式",
     "features.long_term_memory_desc": (
-        "Debata 怎么记住跨对话的重要信息？两种方式各有优劣，选一种适合自己的："
+        "重要记忆始终启用。这里选择是否额外启用 RAG 历史向量召回增强："
     ),
-    "features.lt_memory_file_title": "文件模式 · 简洁",
+    "features.lt_memory_file_title": "仅重要记忆 · 简洁",
     "features.lt_memory_file_pros": (
-        "  · 零配置即用\n"
-        "  · 完全透明，可直接看 important.json\n"
-        "  · 零运行时开销"
+        "  · 重要记忆始终可用\n"
+        "  · 无需 embedding 服务\n"
+        "  · 运行时开销最低"
     ),
     "features.lt_memory_file_cons": (
-        "  · 依赖 AI 主动调工具保存（可能遗漏）\n"
-        "  · 记忆条目多时整体注入会增加成本\n"
-        "  · 不能基于语义检索远期对话"
+        "  · 不额外语义召回远期历史原文\n"
+        "  · 历史很长时更依赖重要记忆质量\n"
+        "  · 不适合从大量普通聊天里找细节"
     ),
-    "features.lt_memory_rag_title": "向量模式 · 精准",
+    "features.lt_memory_rag_title": "重要记忆 + RAG 历史召回",
     "features.lt_memory_rag_pros": (
-        "  · 后台自动提取，不依赖 AI 主动调用\n"
-        "  · 长期运行也能精准召回相关历史\n"
+        "  · 重要记忆仍照常保存和注入\n"
+        "  · 额外从历史对话中召回相关内容\n"
         "  · 召回结果与当前话题语义相关"
     ),
     "features.lt_memory_rag_cons": (
@@ -151,10 +151,10 @@ COPY: dict[str, str] = {
         "  · 启动慢、占内存\n"
         "  · 调试相对复杂"
     ),
-    "features.lt_memory_recommend": "单人聊天文件模式就够了。多群、多用户、长期开着的话，向量模式更靠谱。",
+    "features.lt_memory_recommend": "先用重要记忆就能跑起来。多群、多用户、长期开着的话，再启用 RAG 历史召回。",
 
     # ============================================================
-    # Embedding（RAG 模式才出现）
+    # Embedding（启用 RAG 历史召回时才出现）
     # ============================================================
     "embedding.type_title": "embedding 服务类型",
     "embedding.type_api": "API 服务",

@@ -67,6 +67,7 @@ NAV_ITEMS: list[NavItem] = [
     NavItem(key="overview", icon="house"),
     NavItem(key="chats", icon="chats-circle", badge_supplier="unread_count"),
     NavItem(key="memory", icon="note-pencil"),
+    NavItem(key="persona_mind", icon="brain"),
     NavItem(key="logs", icon="terminal-window"),
     NavItem(key="personas", icon="user-circle"),
     NavItem(key="models", icon="hard-drives"),

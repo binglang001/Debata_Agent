@@ -65,9 +65,21 @@ class ConnectionStatus:
 class NapCatConnection(ABC):
     """WebSocket 连接抽象基类。"""
 
+    _DISPATCH_QUEUE_WARN_SIZE = 1024
+    _DISPATCH_DRAIN_TIMEOUT_SECONDS = 2.0
+    _DISPATCH_QUEUE_WARNING_INTERVAL_SECONDS = 5.0
+
     def __init__(self) -> None:
         self._callback: MessageCallback | None = None
         self._lost_callbacks: list[ConnectionLostCallback] = []
+        self._dispatch_queue: asyncio.Queue[dict] | None = None
+        self._dispatch_task: asyncio.Task | None = None
+        self._dispatch_queue_warn_size = self._DISPATCH_QUEUE_WARN_SIZE
+        self._dispatch_drain_timeout_seconds = self._DISPATCH_DRAIN_TIMEOUT_SECONDS
+        self._dispatch_queue_warning_interval_seconds = (
+            self._DISPATCH_QUEUE_WARNING_INTERVAL_SECONDS
+        )
+        self._last_dispatch_queue_warning_at = 0.0
 
     def on_message(self, callback: MessageCallback) -> None:
         """注册接收到 NapCat 消息时的回调。"""
@@ -91,6 +103,97 @@ class NapCatConnection(ABC):
             await self._callback(data)
         except Exception as e:
             logger.exception(f"NapCat 消息回调失败: {type(e).__name__}: {e}")
+
+    def _ensure_dispatch_worker(self) -> None:
+        task = self._dispatch_task
+        if task is not None and not task.done():
+            return
+        self._dispatch_queue = asyncio.Queue()
+        self._dispatch_task = asyncio.create_task(
+            self._dispatch_worker(), name="napcat-message-dispatch"
+        )
+
+    async def _dispatch_worker(self) -> None:
+        queue = self._dispatch_queue
+        if queue is None:
+            return
+        try:
+            while True:
+                data = await queue.get()
+                try:
+                    await self._dispatch(data)
+                finally:
+                    queue.task_done()
+        except asyncio.CancelledError:
+            raise
+
+    async def _dispatch_received(self, data: dict) -> None:
+        if data.get("echo"):
+            await self._dispatch(data)
+            return
+
+        self._ensure_dispatch_worker()
+        queue = self._dispatch_queue
+        if queue is None:
+            return
+        queue.put_nowait(data)
+        self._warn_if_dispatch_queue_high(queue)
+
+    def _warn_if_dispatch_queue_high(self, queue: asyncio.Queue[dict]) -> None:
+        size = queue.qsize()
+        if size < self._dispatch_queue_warn_size:
+            return
+        now = time.monotonic()
+        if (
+            now - self._last_dispatch_queue_warning_at
+            < self._dispatch_queue_warning_interval_seconds
+        ):
+            return
+        self._last_dispatch_queue_warning_at = now
+        logger.warning(
+            "NapCat 消息分发队列积压较多（size=%s warn_size=%s），继续收包并保留 echo 直通",
+            size,
+            self._dispatch_queue_warn_size,
+        )
+
+    async def _stop_dispatch_worker(self, *, drain: bool) -> None:
+        task = self._dispatch_task
+        queue = self._dispatch_queue
+        if task is None:
+            self._dispatch_queue = None
+            return
+        if task.done():
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self._dispatch_task = None
+                self._dispatch_queue = None
+            return
+        if drain and queue is not None:
+            try:
+                await asyncio.wait_for(
+                    queue.join(), timeout=self._dispatch_drain_timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "NapCat 消息分发队列 drain 超时（%.1fs），取消消费者；队列中仍有 %s 条未处理上报",
+                    self._dispatch_drain_timeout_seconds,
+                    queue.qsize(),
+                )
+        elif queue is not None and queue.qsize() > 0:
+            logger.warning(
+                "NapCat 消息分发消费者停止，队列中仍有 %s 条未处理上报",
+                queue.qsize(),
+            )
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        self._dispatch_task = None
+        self._dispatch_queue = None
 
     @abstractmethod
     async def start(self) -> None: ...
@@ -181,6 +284,21 @@ class ReverseWSConnection(NapCatConnection):
         return self.is_connected
 
     async def start(self) -> None:
+        if self._loop_task is not None and not self._loop_task.done():
+            logger.info("NapCat WS 重连循环已在运行: %s", self.ws_url)
+            if self.initial_connect_timeout <= 0:
+                return
+            try:
+                await asyncio.wait_for(
+                    self._connected_event.wait(), timeout=self.initial_connect_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"NapCat 初次连接 {self.initial_connect_timeout}s 内未成功，"
+                    f"重连循环已在后台运行"
+                )
+            return
+
         self._stop_event.clear()
         self._connected_event.clear()
         self._loop_task = asyncio.create_task(self._run_forever(), name="napcat-reverse-ws")
@@ -214,6 +332,7 @@ class ReverseWSConnection(NapCatConnection):
             except asyncio.CancelledError:
                 pass
             self._loop_task = None
+        await self._stop_dispatch_worker(drain=False)
         self._set_state("idle")
 
     async def send(self, data: dict) -> None:
@@ -240,6 +359,7 @@ class ReverseWSConnection(NapCatConnection):
                     ping_interval=self.ping_interval,
                     ping_timeout=self.ping_timeout,
                     max_size=2**24,  # 16 MB，支持大消息（如长群历史）
+                    proxy=None,
                 ) as ws:
                     self._ws = ws
                     self._connected_event.set()
@@ -262,8 +382,24 @@ class ReverseWSConnection(NapCatConnection):
                         except json.JSONDecodeError as e:
                             logger.warning(f"NapCat 消息 JSON 解析失败: {e}")
                             continue
-                        # 异步分发，不阻塞接收循环
-                        asyncio.create_task(self._dispatch(data))
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "NapCat WS 收到上报 post_type=%s message_type=%s notice_type=%s "
+                                "request_type=%s meta_event_type=%s self_id=%s user_id=%s group_id=%s "
+                                "message_id=%s raw_bytes=%s keys=%s",
+                                data.get("post_type"),
+                                data.get("message_type"),
+                                data.get("notice_type"),
+                                data.get("request_type"),
+                                data.get("meta_event_type"),
+                                data.get("self_id"),
+                                data.get("user_id"),
+                                data.get("group_id"),
+                                data.get("message_id"),
+                                len(raw) if isinstance(raw, (str, bytes)) else None,
+                                sorted(str(key) for key in data.keys()),
+                            )
+                        await self._dispatch_received(data)
 
                     logger.info("NapCat WS 连接已关闭")
 
@@ -303,6 +439,7 @@ class ReverseWSConnection(NapCatConnection):
                         last_disconnected_at=time.time(),
                     )
                     self._notify_connection_lost()
+                    await self._stop_dispatch_worker(drain=not self._stop_event.is_set())
 
             if self._stop_event.is_set():
                 break
@@ -386,6 +523,7 @@ class ForwardWSConnection(NapCatConnection):
 
         self._server = None
         self._client: _WSServer | None = None
+        self._stopping = False
         self._connected_event = asyncio.Event()
         self._state: ConnectionStatus = ConnectionStatus(
             state="idle",
@@ -420,6 +558,7 @@ class ForwardWSConnection(NapCatConnection):
         return self.is_connected
 
     async def start(self) -> None:
+        self._stopping = False
         self._set_state("connecting", last_error=None)
         self._server = await websockets.serve(
             self._handle_client,
@@ -435,6 +574,7 @@ class ForwardWSConnection(NapCatConnection):
         self._set_state("disconnected")
 
     async def stop(self) -> None:
+        self._stopping = True
         self._set_state("stopping")
         if self._server is not None:
             self._server.close()
@@ -447,6 +587,7 @@ class ForwardWSConnection(NapCatConnection):
                 pass
             self._client = None
         self._connected_event.clear()
+        await self._stop_dispatch_worker(drain=False)
         self._set_state("idle")
 
     async def send(self, data: dict) -> None:
@@ -503,7 +644,7 @@ class ForwardWSConnection(NapCatConnection):
                 except json.JSONDecodeError:
                     logger.warning("NapCat 消息 JSON 解析失败，跳过")
                     continue
-                asyncio.create_task(self._dispatch(data))
+                await self._dispatch_received(data)
         finally:
             self._client = None
             self._connected_event.clear()
@@ -513,6 +654,7 @@ class ForwardWSConnection(NapCatConnection):
                 last_disconnected_at=time.time(),
             )
             self._notify_connection_lost()
+            await self._stop_dispatch_worker(drain=not self._stopping)
             logger.info("NapCat 连接已断开")
 
     def _set_state(

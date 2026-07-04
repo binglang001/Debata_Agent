@@ -111,7 +111,21 @@ class PersonaChoice:
 
     brief: PersonaBrief | None = None
     generated_xml: str = ""
+    refined_count: int = 0
+    edit_history: list[dict[str, str]] = field(default_factory=list)
     import_path: str = ""
+
+
+def append_persona_edit_history(
+    edit_history: list[dict[str, str]],
+    user_content: str,
+    assistant_content: str,
+) -> list[dict[str, str]]:
+    return [
+        *edit_history,
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": assistant_content},
+    ]
 
 
 # ============================================================
@@ -139,9 +153,8 @@ class WizardContext:
         default_factory=lambda: FeatureChoice(enabled=True)
     )
     long_term_memory_mode: Literal["file", "rag"] = "file"
-    long_term_memory_keyword_trigger_save: bool = True
 
-    # RAG embedding（mode=rag 时才用）
+    # RAG 历史召回 embedding（mode=rag 时才用）
     embedding_type: Literal["api", "local"] = "api"
     embedding_provider: str = "volcengine"
     embedding_provider_preset: str = ""
@@ -218,5 +231,6 @@ __all__ = [
     "FeatureChoice",
     "AdapterChoice",
     "PersonaChoice",
+    "append_persona_edit_history",
     "BaseStepView",
 ]

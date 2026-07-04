@@ -141,7 +141,7 @@ def _make_config() -> RootConfig:
         adapters={"fake": NapCatAdapterConfig()},
         agents=AgentsConfig(chat=_make_agent_cfg()),
         features=FeaturesConfig(
-            long_term_memory=LongTermMemoryConfig(mode="file", keyword_trigger_save=True),
+            long_term_memory=LongTermMemoryConfig(mode="file"),
         ),
         persona=PersonaConfig(active="test"),
         behavior=BehaviorConfig(
@@ -149,13 +149,11 @@ def _make_config() -> RootConfig:
             recall_merge_window_seconds=0.05,
             proactive_think_interval_seconds=600.0,
             default_history_fetch_count=100,
-            typing=TypingConfig(chars_per_second=999.0, max_delay_seconds=0.01),
-            rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
-            summarize=SummarizeConfig(
-                trigger_at_messages=99999,
-                range_start_messages=50,
-                range_end_messages=150,
+            typing=TypingConfig(
+                chars_per_second=999.0,
             ),
+            rate_limit=RateLimitConfig(window_seconds=60, max_messages=100, enabled=False),
+            summarize=SummarizeConfig(),
         ),
     )
 
@@ -213,8 +211,14 @@ async def test_private_message_napcat_json_to_send(tmp_path):
                     id="tc-1",
                     name="send_private_messages",
                     arguments=json.dumps({
-                        "targets": [{"target_qq": "123456", "content": "收到，回复中", "order": 1}],
-                        "send_only": True,
+                        "targets": [
+                            {
+                                "target_qq": "123456",
+                                "content": "收到，回复中",
+                                "order": 1,
+                                "delay": 0,
+                            }
+                        ],
                     }),
                 ),
             ],
@@ -288,8 +292,7 @@ async def test_group_message_napcat_json_to_send(tmp_path):
                     name="send_group_message",
                     arguments=json.dumps({
                         "group_id": 5555,
-                        "targets": [{"content": "收到群聊", "order": 1}],
-                        "send_only": True,
+                        "targets": [{"content": "收到群聊", "order": 1, "delay": 0}],
                     }),
                 ),
             ],

@@ -3,6 +3,7 @@
 数据格式：
     [
         {
+            "id": "mem_...",
             "timestamp": "2026-03-05 10:00:00",
             "content": "...",
             "scope": "global",
@@ -15,28 +16,28 @@
     - 体量小（通常几十到几百条），用整体 JSON 存储
     - 缓存为文本形式（"[重要记忆]\n- ...\n- ..."），便于直接嵌入 system prompt
     - scope / pinned 只影响注入选择，不拆分全局存储
-    - 添加时支持外部去重回调（用 flash 模型判断语义重复）
-    - 删除支持关键词模糊匹配
+    - 添加时只做完全相同文本拦截；语义更新由 AI 调 update 工具处理
+    - 模型可见的记忆 ID 是持久保存的专用 id；旧数据加载时自动补齐
+    - 删除优先使用专用 id；关键词删除仅保留给旧调用兼容
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from utils.token_budget import TokenEstimator
 
-from .store import JsonStore
+from .store import JsonStore, JsonStoreLike
 
 logger = logging.getLogger(__name__)
 
-# 去重回调签名：(已存在的条目, 新内容) -> True 表示重复
-DuplicateChecker = Callable[[list[dict], str], Awaitable[bool]]
-
 GLOBAL_SCOPE = "global"
+MEMORY_ID_PREFIX = "mem_"
 _VALID_SCOPE_RE = re.compile(r"^(global|user:[^:\s]+|group:[^:\s]+)$")
 
 
@@ -71,21 +72,16 @@ def scope_from_conversation_id(conversation_id: str | None) -> str | None:
     return None
 
 
-# 默认的"记住"类关键词。命中即强制保存（绕过 AI 主动判断）
-DEFAULT_FORCE_SAVE_KEYWORDS: list[str] = [
-    "记住", "请记住", "一定要记住", "记一下", "记下", "帮我记", "帮我记一下",
-    "记一笔", "记：", "记:", "重要的是",
-    "约定", "约好", "承诺",
-    "我叫", "我是", "我的名字",
-    "我的 QQ", "我的qq", "QQ 是", "qq是",
-]
-
-
 class ImportantMemoryManager:
     """重要记忆管理器。"""
 
-    def __init__(self, path: Path, now_fn: Callable[[], str] | None = None) -> None:
-        self._store = JsonStore(path)
+    def __init__(
+        self,
+        path: Path,
+        now_fn: Callable[[], str] | None = None,
+        store: JsonStoreLike | None = None,
+    ) -> None:
+        self._store = store if store is not None else JsonStore(path)
         self._items: list[dict] = []
         self._cached_text: str = ""
         self._loaded: bool = False
@@ -183,6 +179,7 @@ class ImportantMemoryManager:
                     text=item["content"],
                     vector=vec,
                     meta={
+                        "id": self._item_id(item),
                         "timestamp": item["timestamp"],
                         "scope": item.get("scope", GLOBAL_SCOPE),
                         "pinned": bool(item.get("pinned")),
@@ -198,9 +195,15 @@ class ImportantMemoryManager:
         if not isinstance(data, list):
             logger.warning("重要记忆文件格式不是 list，重置为空")
             data = []
-        self._items = [self._normalize_item(item) for item in data if isinstance(item, dict)]
+            should_persist = False
+        else:
+            should_persist = True
+        raw_items = [item for item in data if isinstance(item, dict)]
+        self._items, changed = self._normalize_items(raw_items)
         self._refresh_text_cache()
         self._loaded = True
+        if should_persist and (changed or len(raw_items) != len(data)):
+            await self._store.write(self._items)
 
     def text(self) -> str:
         """获取完整缓存文本。保留给管理界面/兼容调用；模型注入优先用 text_for_context。"""
@@ -212,14 +215,18 @@ class ImportantMemoryManager:
         *,
         token_budget: int | None = None,
         estimator: TokenEstimator | None = None,
+        member_qqs: set[int] | None = None,
     ) -> str:
         """按当前会话 scope 选择要注入的记忆文本。
 
         记忆仍是一份全局存储；scope 只影响本轮优先 surface 哪些条目。
         pinned 条目永远注入，其余条目只注入 global 与当前 scope 匹配项。
+
+        群聊中可传入 member_qqs，让 user:QQ 范围的记忆在该用户所在群里也可见。
+        None 保持旧行为；空集合表示已确认群成员为空或不包含相关用户。
         """
         scope = scope_from_conversation_id(conversation_id)
-        selected = self._select_for_scope(scope)
+        selected = self._select_for_scope(scope, member_qqs=member_qqs)
         return self._format_items(selected, token_budget=token_budget, estimator=estimator)
 
     def items(self) -> list[dict]:
@@ -229,7 +236,6 @@ class ImportantMemoryManager:
     async def save(
         self,
         content: str,
-        check_dup: DuplicateChecker | None = None,
         *,
         scope: str | None = None,
         pinned: bool = False,
@@ -238,10 +244,9 @@ class ImportantMemoryManager:
 
         Args:
             content: 记忆内容（一句话概括）
-            check_dup: 可选的去重检查器（async）
 
         Returns:
-            {"saved": bool, "duplicate": bool}
+            {"saved": bool, "duplicate": bool, "id": str}
         """
         if not self._loaded:
             raise RuntimeError("ImportantMemoryManager 尚未调用 load()")
@@ -250,17 +255,19 @@ class ImportantMemoryManager:
         if not content:
             return {"saved": False, "duplicate": False}
 
-        if check_dup and self._items:
-            try:
-                is_dup = await check_dup(self._items, content)
-                if is_dup:
-                    logger.info(f"重要记忆去重跳过: {content[:40]}")
-                    return {"saved": False, "duplicate": True}
-            except Exception as e:
-                logger.warning(f"去重检查失败，继续保存: {e}")
+        duplicate_id = self._find_exact_duplicate_id(content)
+        if duplicate_id:
+            logger.info(f"重要记忆精确重复跳过: {content[:40]}")
+            return {
+                "saved": False,
+                "duplicate": True,
+                "duplicate_type": "exact",
+                "existing_id": duplicate_id,
+            }
 
         item = self._normalize_item(
             {
+                "id": self._new_item_id(),
                 "timestamp": self._now_fn(),
                 "content": content,
                 "scope": normalize_scope(scope),
@@ -272,7 +279,60 @@ class ImportantMemoryManager:
         self._refresh_text_cache()
         logger.info(f"重要记忆已保存: {content}")
         await self._index_in_rag(item)
-        return {"saved": True, "duplicate": False}
+        return {"saved": True, "duplicate": False, "id": self._item_id(item)}
+
+    async def update(
+        self,
+        item_id: str,
+        content: str,
+        *,
+        scope: str | None = None,
+        pinned: bool | None = None,
+    ) -> dict:
+        """按 id 覆写一条重要记忆的正文，并可同时更新 scope / pinned。
+
+        程序只拦截完全相同文本写到其它条目；语义重复、冲突或合并由 AI 决定。
+        """
+        if not self._loaded:
+            raise RuntimeError("ImportantMemoryManager 尚未调用 load()")
+        item_id = (item_id or "").strip()
+        content = (content or "").strip()
+        if not item_id:
+            return {"updated": False, "missing": True}
+        if not content:
+            return {"updated": False, "empty": True}
+
+        duplicate_id = self._find_exact_duplicate_id(content, exclude_id=item_id)
+        if duplicate_id:
+            return {
+                "updated": False,
+                "duplicate": True,
+                "duplicate_type": "exact",
+                "existing_id": duplicate_id,
+            }
+
+        for item in self._items:
+            if not self._matches_item_id(item, item_id):
+                continue
+            old_content = str(item.get("content") or "")
+            actual_id = self._item_id(item)
+            item["content"] = content
+            if scope is not None:
+                item["scope"] = normalize_scope(scope)
+            if pinned is not None:
+                item["pinned"] = bool(pinned)
+            item["updated_at"] = self._now_fn()
+            await self._store.write(self._items)
+            self._refresh_text_cache()
+            await self._rebuild_rag_index()
+            logger.info(f"重要记忆已更新: id={actual_id}")
+            return {
+                "updated": True,
+                "id": actual_id,
+                "old_content": old_content,
+                "content": content,
+            }
+        return {"updated": False, "missing": True}
 
     async def delete_by_keyword(self, keyword: str) -> int:
         """按关键词模糊匹配删除。返回删除数。"""
@@ -305,7 +365,7 @@ class ImportantMemoryManager:
         return deleted
 
     async def delete_by_id(self, item_id: str) -> bool:
-        """按 timestamp/id 精确删除一条记忆，返回是否删除。"""
+        """按专用 id 精确删除一条记忆，返回是否删除。"""
         if not self._loaded:
             raise RuntimeError("ImportantMemoryManager 尚未调用 load()")
         item_id = (item_id or "").strip()
@@ -315,8 +375,7 @@ class ImportantMemoryManager:
         keep: list[dict] = []
         removed: dict | None = None
         for item in self._items:
-            current_id = self._item_id(item)
-            if removed is None and current_id == item_id:
+            if removed is None and self._matches_item_id(item, item_id):
                 removed = item
                 continue
             keep.append(item)
@@ -327,61 +386,16 @@ class ImportantMemoryManager:
         self._items = keep
         await self._store.write(self._items)
         self._refresh_text_cache()
-        logger.info(f"重要记忆删除 1 条 (id={item_id})")
+        removed_id = self._item_id(removed) or item_id
+        logger.info(f"重要记忆删除 1 条 (id={removed_id})")
         if self.rag_enabled:
             try:
-                await self._rag_store.remove_by_id(item_id)  # type: ignore[union-attr]
+                await self._rag_store.remove_by_id(removed_id)  # type: ignore[union-attr]
+                if removed_id != item_id:
+                    await self._rag_store.remove_by_id(item_id)  # type: ignore[union-attr]
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"RAG 索引移除失败：{e}")
         return True
-
-    async def force_save_from_keyword(
-        self,
-        text: str,
-        keywords: list[str] | None = None,
-        *,
-        scope: str | None = None,
-        pinned: bool = False,
-    ) -> dict:
-        """关键词触发的强制保存（不走去重检查，用于"记住 X"/"我叫 X"等场景）。
-
-        Args:
-            text: 待提取的原始消息文本
-            keywords: 关键词列表，命中任一即触发保存。None 时使用默认列表
-
-        Returns:
-            {"saved": bool, "matched_keyword": str | None, "content": str}
-        """
-        if not self._loaded:
-            raise RuntimeError("ImportantMemoryManager 尚未调用 load()")
-
-        if keywords is None:
-            keywords = DEFAULT_FORCE_SAVE_KEYWORDS
-
-        text = (text or "").strip()
-        if not text:
-            return {"saved": False, "matched_keyword": None, "content": ""}
-
-        matched = next((k for k in keywords if k in text), None)
-        if matched is None:
-            return {"saved": False, "matched_keyword": None, "content": ""}
-
-        content = _strip_memory_keyword(text, matched)
-        item = self._normalize_item(
-            {
-                "timestamp": self._now_fn(),
-                "content": content,
-                "source": f"keyword:{matched}",
-                "scope": normalize_scope(scope),
-                "pinned": bool(pinned),
-            }
-        )
-        self._items.append(item)
-        await self._store.write(self._items)
-        self._refresh_text_cache()
-        logger.info(f"关键词强制保存触发 ({matched}): {content[:50]}")
-        await self._index_in_rag(item)
-        return {"saved": True, "matched_keyword": matched, "content": content}
 
     async def update_metadata(
         self,
@@ -399,7 +413,7 @@ class ImportantMemoryManager:
 
         changed = False
         for item in self._items:
-            if self._item_id(item) != item_id:
+            if not self._matches_item_id(item, item_id):
                 continue
             if scope is not None:
                 item["scope"] = normalize_scope(scope)
@@ -421,13 +435,13 @@ class ImportantMemoryManager:
     async def replace_all(self, items: list[dict]) -> None:
         """整体替换（总结后用）。"""
         # 校验：每条至少应有 content
-        cleaned: list[dict] = []
+        raw_items: list[dict] = []
         for item in items:
             content = (item.get("content") or "").strip()
             if not content:
                 continue
-            normalized = self._normalize_item({**item, "content": content})
-            cleaned.append(normalized)
+            raw_items.append({**item, "content": content})
+        cleaned, _ = self._normalize_items(raw_items)
         self._items = cleaned
         await self._store.write(self._items)
         self._refresh_text_cache()
@@ -451,6 +465,7 @@ class ImportantMemoryManager:
                         text=item["content"],
                         vector=vec,
                         meta={
+                            "id": self._item_id(item),
                             "timestamp": item["timestamp"],
                             "scope": item.get("scope", GLOBAL_SCOPE),
                             "pinned": bool(item.get("pinned")),
@@ -470,6 +485,8 @@ class ImportantMemoryManager:
     def _normalize_item(self, item: dict[str, Any]) -> dict[str, Any]:
         content = str(item.get("content") or "").strip()
         normalized = dict(item)
+        item_id = str(item.get("id") or "").strip()
+        normalized["id"] = item_id or self._new_item_id()
         normalized["timestamp"] = str(item.get("timestamp") or self._now_fn())
         normalized["content"] = content
         normalized["scope"] = normalize_scope(str(item.get("scope") or GLOBAL_SCOPE))
@@ -477,20 +494,102 @@ class ImportantMemoryManager:
         return normalized
 
     def _item_id(self, item: dict[str, Any]) -> str:
-        return str(item.get("id") or item.get("timestamp") or "")
+        return str(item.get("id") or "").strip()
 
-    def _scope_matches(self, item_scope: str | None, current_scope: str | None) -> bool:
+    def _matches_item_id(self, item: dict[str, Any], item_id: str) -> bool:
+        requested_id = (item_id or "").strip()
+        if not requested_id:
+            return False
+        if self._item_id(item) == requested_id:
+            return True
+        # 兼容旧调用方曾把 timestamp 当作 id 传入；新上下文不再展示 timestamp。
+        legacy_id = str(item.get("timestamp") or "").strip()
+        return bool(legacy_id and legacy_id == requested_id)
+
+    def _new_item_id(self, existing_ids: set[str] | None = None) -> str:
+        if existing_ids is None:
+            existing_ids = {self._item_id(item) for item in self._items}
+        while True:
+            item_id = f"{MEMORY_ID_PREFIX}{uuid4().hex[:16]}"
+            if item_id not in existing_ids:
+                return item_id
+
+    def _normalize_items(
+        self,
+        raw_items: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        normalized_items: list[dict[str, Any]] = []
+        used_ids: set[str] = set()
+        changed = False
+        for item in raw_items:
+            normalized = self._normalize_item(item)
+            item_id = self._item_id(normalized)
+            if not item_id or item_id in used_ids:
+                normalized["id"] = self._new_item_id(used_ids)
+                changed = True
+            used_ids.add(self._item_id(normalized))
+            if normalized != item:
+                changed = True
+            normalized_items.append(normalized)
+        return normalized_items, changed
+
+    def _find_exact_duplicate_id(
+        self,
+        content: str,
+        *,
+        exclude_id: str | None = None,
+    ) -> str | None:
+        normalized_content = _normalize_memory_text_for_exact_match(content)
+        exclude_id = (exclude_id or "").strip()
+        for item in self._items:
+            item_id = self._item_id(item)
+            if exclude_id and self._matches_item_id(item, exclude_id):
+                continue
+            if _normalize_memory_text_for_exact_match(str(item.get("content") or "")) == normalized_content:
+                return item_id
+        return None
+
+    def _scope_matches(
+        self,
+        item_scope: str | None,
+        current_scope: str | None,
+        *,
+        member_qqs: set[int] | None = None,
+    ) -> bool:
         scope = normalize_scope(item_scope)
         if scope == GLOBAL_SCOPE:
             return True
-        return bool(current_scope and scope == current_scope)
+        if current_scope and scope == current_scope:
+            return True
+        if (
+            member_qqs is not None
+            and current_scope
+            and current_scope.startswith("group:")
+            and scope.startswith("user:")
+        ):
+            try:
+                qq = int(scope.split(":", 1)[1])
+            except (ValueError, IndexError):
+                return False
+            return qq in member_qqs
+        return False
 
-    def _select_for_scope(self, current_scope: str | None) -> list[dict[str, Any]]:
+    def _select_for_scope(
+        self,
+        current_scope: str | None,
+        *,
+        member_qqs: set[int] | None = None,
+    ) -> list[dict[str, Any]]:
         pinned = [item for item in self._items if item.get("pinned")]
         regular = [
             item
             for item in self._items
-            if not item.get("pinned") and self._scope_matches(item.get("scope"), current_scope)
+            if not item.get("pinned")
+            and self._scope_matches(
+                item.get("scope"),
+                current_scope,
+                member_qqs=member_qqs,
+            )
         ]
 
         def sort_key(item: dict[str, Any]) -> tuple[int, str]:
@@ -524,6 +623,9 @@ class ImportantMemoryManager:
         if not item:
             return ""
         parts: list[str] = []
+        item_id = self._item_id(item)
+        if item_id:
+            parts.append(f"[{item_id}]")
         if item.get("pinned"):
             parts.append("[置顶]")
         scope = normalize_scope(str(item.get("scope") or GLOBAL_SCOPE))
@@ -562,10 +664,5 @@ def _default_now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _strip_memory_keyword(text: str, keyword: str) -> str:
-    """去掉用户显式“记住/记一下”等引导词，保存真正的事实内容。"""
-    content = text.strip()
-    if keyword and content.startswith(keyword):
-        content = content[len(keyword):]
-        content = re.sub(r"^[\s:：,，。.!！-]+", "", content).strip()
-    return content or text.strip()
+def _normalize_memory_text_for_exact_match(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())

@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import inspect
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -25,8 +27,11 @@ from .types import (
     UserInfo,
 )
 
+logger = logging.getLogger(__name__)
+
 # 事件回调签名：async (event) -> None
 EventCallback = Callable[[AnyEvent], Awaitable[None]]
+FriendConfirmedCallback = Callable[[str], Awaitable[None] | None]
 
 
 class AdapterError(Exception):
@@ -50,6 +55,7 @@ class IAdapter(ABC):
     def __init__(self, name: str) -> None:
         self.name = name
         self._callback: EventCallback | None = None
+        self._friend_confirmed_callback: FriendConfirmedCallback | None = None
 
     # ============================================================
     # 生命周期
@@ -80,6 +86,25 @@ class IAdapter(ABC):
         """适配器实现内部调用此方法投递事件。"""
         if self._callback is not None:
             await self._callback(event)
+
+    def set_friend_confirmed_callback(
+        self,
+        callback: FriendConfirmedCallback | None,
+    ) -> None:
+        """注册“确认已是好友”的回调，供运行时刷新好友白名单缓存。"""
+        self._friend_confirmed_callback = callback
+
+    async def _emit_friend_confirmed(self, user_id: str) -> None:
+        """适配器确认 user_id 已是好友时调用。"""
+        callback = self._friend_confirmed_callback
+        if callback is None:
+            return
+        try:
+            result = callback(str(user_id))
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:
+            logger.warning("好友确认回调失败 user_id=%s: %s", user_id, e)
 
     # ============================================================
     # 消息发送
@@ -131,7 +156,7 @@ class IAdapter(ABC):
     @abstractmethod
     async def handle_friend_request(
         self, flag: str, approve: bool, remark: str = ""
-    ) -> None:
+    ) -> dict[str, Any] | None:
         ...
 
     @abstractmethod

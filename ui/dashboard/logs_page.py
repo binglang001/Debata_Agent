@@ -195,6 +195,11 @@ class LogsPage(QWidget):
         else:
             item.setForeground(QColor(palette.text_secondary))
         self._list.addItem(item)
+        self._trim_list_items()
+
+    def _trim_list_items(self) -> None:
+        while self._list.count() > self.MAX_BUFFER:
+            self._list.takeItem(0)
 
     def _refilter(self, *_: Any) -> None:
         self._list.clear()

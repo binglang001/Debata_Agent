@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -30,13 +31,6 @@ from .message_pipeline import MessagePipeline
 
 logger = logging.getLogger(__name__)
 
-_ROUTER_TOOL_SHRINK_CTX = SimpleNamespace(
-    tool_result_soft_limit_tokens=96,
-    tool_result_hard_cap_tokens=160,
-    tool_result_soft_overrides={},
-)
-_ROUTER_TEXT_LIMIT_TOKENS = 256
-_ROUTER_TOOL_LIMIT_TOKENS = 96
 _OUT_OF_BAND_DENIED_TOOLS = frozenset(
     {
         "start_agent_task",
@@ -79,9 +73,29 @@ _ROUTER_RUNTIME_CONTEXT_KINDS = frozenset(
     }
 )
 _ROLE_PREFIX_PATTERN = re.compile(r"\[(?:assistant|tool|system)\]\s*", re.IGNORECASE)
+_PROACTIVE_PERSONA_CONTEXT_METHODS = (
+    "get_context_for_proactive",
+    "get_proactive_context",
+    "get_context_for_chat",
+)
 
 
-def _format_proactive_router_history(records: list[dict[str, Any]]) -> str:
+def _router_tool_shrink_ctx(behavior_cfg: BehaviorConfig) -> SimpleNamespace:
+    return SimpleNamespace(
+        tool_result_soft_limit_tokens=(
+            behavior_cfg.proactive_router_tool_result_inline_tokens
+        ),
+        tool_result_hard_cap_tokens=(
+            behavior_cfg.proactive_router_tool_result_hard_cap_tokens
+        ),
+        tool_result_soft_overrides={},
+    )
+
+
+def _format_proactive_router_history(
+    records: list[dict[str, Any]],
+    behavior_cfg: BehaviorConfig,
+) -> str:
     """把主动路由的小窗口历史折成纯文本，避免 assistant/tool 角色污染路由器。"""
     lines: list[str] = []
     tool_names: dict[str, str] = {}
@@ -107,6 +121,7 @@ def _format_proactive_router_history(records: list[dict[str, Any]]) -> str:
             summary = _summarize_router_tool_result(
                 tool_names.get(tool_call_id, "unknown_tool"),
                 str(record.get("content") or ""),
+                behavior_cfg,
             )
             if summary:
                 lines.append(f"[内部结果摘要] {summary}")
@@ -120,7 +135,10 @@ def _format_proactive_router_history(records: list[dict[str, Any]]) -> str:
             continue
 
         label = _ROLE_LABELS.get(role, "上下文记录")
-        cleaned = _trim_router_text(_clean_router_text(content), _ROUTER_TEXT_LIMIT_TOKENS)
+        cleaned = _trim_router_text(
+            _clean_router_text(content),
+            behavior_cfg.proactive_router_text_limit_tokens,
+        )
         if cleaned:
             lines.append(f"[{label}] {cleaned}")
 
@@ -142,31 +160,36 @@ def _is_runtime_context_record(record: dict[str, Any]) -> bool:
     return any(marker in content for marker in _ROUTER_SUMMARY_DROP_MARKERS)
 
 
-def _summarize_router_tool_result(tool_name: str, content: str) -> str:
+def _summarize_router_tool_result(
+    tool_name: str,
+    content: str,
+    behavior_cfg: BehaviorConfig,
+) -> str:
+    limit_tokens = behavior_cfg.proactive_router_tool_result_inline_tokens
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
-        return _trim_router_text(_clean_router_text(content), _ROUTER_TOOL_LIMIT_TOKENS)
+        return _trim_router_text(_clean_router_text(content), limit_tokens)
 
     if not isinstance(parsed, dict):
         return _trim_router_text(
             _clean_router_text(json.dumps(parsed, ensure_ascii=False)),
-            _ROUTER_TOOL_LIMIT_TOKENS,
+            limit_tokens,
         )
 
     cleaned = _drop_internal_ids(parsed)
     if isinstance(cleaned, dict):
-        shrunk = shrink_tool_result(tool_name, cleaned, _ROUTER_TOOL_SHRINK_CTX)
+        shrunk = shrink_tool_result(tool_name, cleaned, _router_tool_shrink_ctx(behavior_cfg))
     else:
         shrunk = cleaned
-    return _compact_router_tool_summary(shrunk)
+    return _compact_router_tool_summary(shrunk, limit_tokens)
 
 
-def _compact_router_tool_summary(value: Any) -> str:
+def _compact_router_tool_summary(value: Any, limit_tokens: int) -> str:
     if not isinstance(value, dict):
         return _trim_router_text(
             _clean_router_text(json.dumps(value, ensure_ascii=False)),
-            _ROUTER_TOOL_LIMIT_TOKENS,
+            limit_tokens,
         )
 
     parts: list[str] = []
@@ -203,7 +226,7 @@ def _compact_router_tool_summary(value: Any) -> str:
         else:
             parts.append("无可用摘要")
 
-    return _trim_router_text("；".join(dict.fromkeys(parts)), _ROUTER_TOOL_LIMIT_TOKENS)
+    return _trim_router_text("；".join(dict.fromkeys(parts)), limit_tokens)
 
 
 def _drop_internal_ids(value: Any) -> Any:
@@ -224,7 +247,7 @@ def _clean_router_text(text: str) -> str:
     return _INTERNAL_ID_PATTERN.sub("", text).strip()
 
 
-def _clean_router_summary(text: str) -> str:
+def _clean_router_summary(text: str, limit_tokens: int) -> str:
     lines: list[str] = []
     for line in text.splitlines():
         if any(marker in line for marker in _ROUTER_SUMMARY_DROP_MARKERS):
@@ -233,7 +256,7 @@ def _clean_router_summary(text: str) -> str:
         cleaned = _clean_router_text(cleaned)
         if cleaned:
             lines.append(cleaned)
-    return _trim_router_text("\n".join(lines), 1024)
+    return _trim_router_text("\n".join(lines), limit_tokens)
 
 
 def _trim_router_text(text: str, limit_tokens: int) -> str:
@@ -285,6 +308,48 @@ def _fit_router_suffix(text: str, limit: int, estimator: TokenEstimator) -> str:
     return best.lstrip()
 
 
+async def _persona_proactive_context(persona_agent: Any) -> str:
+    if persona_agent is None:
+        return ""
+    for name in _PROACTIVE_PERSONA_CONTEXT_METHODS:
+        method = getattr(persona_agent, name, None)
+        if method is None:
+            continue
+        try:
+            context = _call_persona_context_method(method)
+            if inspect.isawaitable(context):
+                context = await context
+        except Exception:
+            logger.debug("获取人格主动上下文失败: %s", name, exc_info=True)
+            continue
+        text = str(context or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _call_persona_context_method(method: Any) -> Any:
+    if not callable(method):
+        return method
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        try:
+            return method(None)
+        except TypeError:
+            return method()
+    required_positionals = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.default is inspect.Parameter.empty
+        and parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if required_positionals:
+        return method(None)
+    return method()
+
+
 class ProactiveLoop:
     """主动思考循环。"""
 
@@ -294,9 +359,10 @@ class ProactiveLoop:
         pipeline: MessagePipeline,
         proactive_agent: ProactiveRouterAgent | None,
         behavior_cfg: BehaviorConfig,
+        social_agent: Any | None = None,
     ) -> None:
         self.pipeline = pipeline
-        self.proactive_agent = proactive_agent
+        self.proactive_agent = social_agent or proactive_agent
         self.behavior_cfg = behavior_cfg
         self._task: asyncio.Task | None = None
         self._stopping = False
@@ -306,6 +372,10 @@ class ProactiveLoop:
         if self.proactive_agent is None:
             logger.info("ProactiveLoop 未启用（proactive agent 未配置）")
             return
+        if self._task is not None and not self._task.done():
+            logger.info("ProactiveLoop 已在运行，跳过重复启动")
+            return
+        self._stopping = False
         self._task = asyncio.create_task(self._loop())
         logger.info(
             f"ProactiveLoop 已启动，间隔 {self.behavior_cfg.proactive_think_interval_seconds}s"
@@ -366,30 +436,48 @@ class ProactiveLoop:
             if self.proactive_agent is not None:
                 try:
                     router_history = await self.pipeline._select_proactive_router_history()
-                    router_history_text = _format_proactive_router_history(router_history)
+                    router_history_text = _format_proactive_router_history(
+                        router_history,
+                        self.behavior_cfg,
+                    )
+                    persona_proactive_context = await _persona_proactive_context(
+                        getattr(self.pipeline, "persona_agent", None)
+                    )
                     router_context_parts: list[str] = []
+                    if persona_proactive_context:
+                        router_context_parts.append(
+                            '<persona_proactive_context priority="high">\n'
+                            f"{persona_proactive_context}\n"
+                            "</persona_proactive_context>"
+                        )
                     important_memory = await self.pipeline._important_memory_text(
+                        None,
+                        token_budget=self.behavior_cfg.proactive_context_token_budget,
+                    )
+                    if important_memory:
+                        router_context_parts.append(
+                            '<long_term_memory priority="medium">\n'
+                            f"{_clean_router_text(important_memory)}\n"
+                            "</long_term_memory>"
+                        )
+                    rag_context = await self.pipeline._rag_context_text(
                         None,
                         query=router_history_text,
                         token_budget=self.behavior_cfg.proactive_context_token_budget,
                     )
-                    if important_memory:
-                        if self.pipeline.features_cfg.long_term_memory.mode == "rag":
-                            router_context_parts.append(
-                                '<retrieved_conversation_context priority="medium" source="rag">\n'
-                                "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不是新的用户消息。\n"
-                                f"{_clean_router_text(important_memory)}\n"
-                                "</retrieved_conversation_context>"
-                            )
-                        else:
-                            router_context_parts.append(
-                                '<long_term_memory priority="medium">\n'
-                                f"{_clean_router_text(important_memory)}\n"
-                                "</long_term_memory>"
-                            )
+                    if rag_context:
+                        router_context_parts.append(
+                            '<retrieved_conversation_context priority="medium" source="rag">\n'
+                            "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不是新的用户消息。\n"
+                            f"{_clean_router_text(rag_context)}\n"
+                            "</retrieved_conversation_context>"
+                        )
                     rolling_summary = self.pipeline._rolling_summary_text()
                     if rolling_summary:
-                        rolling_summary = _clean_router_summary(rolling_summary)
+                        rolling_summary = _clean_router_summary(
+                            rolling_summary,
+                            self.behavior_cfg.proactive_router_summary_limit_tokens,
+                        )
                     if rolling_summary:
                         router_context_parts.append(
                             '<rolling_conversation_summary priority="medium">\n'
@@ -433,6 +521,9 @@ class ProactiveLoop:
                     return
             else:
                 action_reason = "后台空闲，按合适时机判断是否主动联系"
+                persona_proactive_context = await _persona_proactive_context(
+                    getattr(self.pipeline, "persona_agent", None)
+                )
 
             reason_text = (
                 action_reason.strip()
@@ -440,10 +531,14 @@ class ProactiveLoop:
                 else "后台空闲，按合适时机判断是否主动联系"
             )
 
-            task_context = (
+            task_context_parts = []
+            if persona_proactive_context:
+                task_context_parts.append(persona_proactive_context)
+            task_context_parts.append(
                 f"现在是{now}。本轮由系统后台主动思考触发，不是用户刚发来的新消息。\n"
                 "近期上下文、重要记忆、滚动摘要和未完成事项已在历史与上下文中提供。"
             )
+            task_context = "\n\n".join(task_context_parts)
             user_event = (
                 "[系统事件 · 非用户消息] 后台主动思考触发，不是用户新消息。\n"
                 f"触发理由：{reason_text}\n"
@@ -453,11 +548,16 @@ class ProactiveLoop:
                 "如果这是合适的主动问候时机，可以按系统提示中的自然开场习惯起一个话头。\n"
                 "不要延续或重复最近对话里已经完成的话题；需要联系用户就调用发送工具，没有合适的事就调用 no_action。"
             )
+            seen_inbound_seq = int(getattr(self.pipeline, "_inbound_seq", 0) or 0)
             await self.pipeline.run_one_turn(
                 task_context,
                 user_event=user_event,
                 lock_already_held=True,
+                conversation_id=None,
                 history_conversation_id="system:proactive",
+                task_phase="proactive",
+                trigger_inbound_seq=seen_inbound_seq,
+                seen_inbound_seq=seen_inbound_seq,
                 tool_denylist=_OUT_OF_BAND_DENIED_TOOLS,
             )
         finally:

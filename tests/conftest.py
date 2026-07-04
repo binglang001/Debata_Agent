@@ -11,6 +11,8 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+pytest_plugins = ["tests.integration_pipeline.helpers"]
+
 
 class FakeKeyringBackend:
     """内存版 keyring 后端，避免污染系统密钥环。"""

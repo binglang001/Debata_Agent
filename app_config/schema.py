@@ -25,9 +25,9 @@ class StrictModel(BaseModel):
     作为 `Field.description`，避免在每个字段重复写 `Field(description=...)`。
     GUI 编辑器 / JSON schema 生成器可以直接读到说明。
     """
-    """禁止未知字段，避免拼写错误被静默吞掉。"""
+    """容忍未知字段，避免旧配置或前置阶段字段导致启动失败。"""
 
-    model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
+    model_config = ConfigDict(extra="ignore", use_attribute_docstrings=True)
 
 
 # ============================================================
@@ -269,7 +269,19 @@ class AgentConfig(StrictModel):
     """首 token 超时（秒）。流式模式下，首字未到即超时重试。"""
 
     max_loops: int = 25
-    """工具循环最大轮次（仅 chat agent 用）。"""
+    """兼容旧配置；不再作为主 runner 的普通硬截断上限。"""
+
+    tool_loop_reminder_interval: int = Field(default=8, ge=1)
+    """连续多少个工具轮后触发一次普通提醒。"""
+
+    tool_loop_final_warning_count: int = Field(default=4, ge=1)
+    """普通提醒达到多少次后进入最终警告周期。"""
+
+    tool_loop_final_grace_loops: int = Field(default=2, ge=0)
+    """最终警告发出后还允许多少个工具轮。"""
+
+    tool_loop_final_max_tokens: int = Field(default=4096, ge=512)
+    """工具循环最终收尾/部分结果整理输出上限。"""
 
     refocus_interval: int = Field(default=5, ge=0)
     """Task Contract 重注入间隔（轮）。0 = 禁用。"""
@@ -311,6 +323,9 @@ class VisionFeatureConfig(StrictModel):
 
     model: str = ""
     """多模态模型 ID（如 doubao-seed-1-6-vision / glm-4v / qwen-vl-max）。"""
+
+    max_tokens: int = Field(default=1024, ge=128)
+    """图像理解模型单次输出上限。"""
 
     api_key_id: str | None = None
     """可独立指定密钥 ID（不填则用 providers[provider].api_key_id）。"""
@@ -471,17 +486,14 @@ class LongTermMemoryConfig(StrictModel):
     """长期记忆配置。"""
 
     mode: Literal["file", "rag"] = "file"
-    """file = 纯文件模式（默认，零开销，AI 主动调 save_important_memory 工具触发）;
-    rag = 会话历史向量检索（需 features.embedding 启用，不使用 important.json）"""
-
-    keyword_trigger_save: bool = True
-    """命中关键词（"记住"/"约定"/"我叫"等）时强制保存为重要记忆，不依赖 AI 主动调用工具。"""
+    """file = 不启用 RAG 历史召回，重要记忆仍保存并注入；
+    rag = 在重要记忆之外增加会话历史向量检索（需 features.embedding 启用）"""
 
     rag_top_k: int = 5
     """RAG 模式下每次召回的相关历史条目数（仅 mode=rag 生效）"""
 
     rag_extractor_interval: int = 15
-    """预留：被动结构化抽取触发间隔。当前 RAG 索引历史原文，不使用重要记忆抽取。"""
+    """预留：被动结构化抽取触发间隔。当前 RAG 索引历史原文，不替代重要记忆。"""
 
 
 class EmbeddingFeatureConfig(StrictModel):
@@ -524,18 +536,384 @@ class PersonaConfig(StrictModel):
 
 
 # ============================================================
+# 人格管理
+# ============================================================
+
+
+class PersonaManagementAgentConfig(StrictModel):
+    """人格管理后台 Agent 的模型参数配置。"""
+
+    provider: str = ""
+    """provider ID。留空则运行时继承 agents.chat.provider。"""
+
+    model: str = ""
+    """模型 ID。留空则运行时继承 agents.chat.model。"""
+
+    temperature: float = Field(default=0.6, ge=0.0, le=2.0)
+    """采样温度。默认与主聊天 Agent 保持一致。"""
+
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0)
+    """nucleus sampling 阈值。通常保持 1.0。"""
+
+    max_tokens: int = Field(default=16384, ge=1)
+    """单次响应最长 token 数。"""
+
+    reasoning: ReasoningConfig | None = None
+    """思考/推理配置。不填则不启用。"""
+
+    first_token_timeout_seconds: float = 30.0
+    """首 token 超时（秒）。流式模式下，首字未到即超时重试。"""
+
+
+class PersonaManagementPersonaAgentConfig(PersonaManagementAgentConfig):
+    """人格档案维护 Agent。"""
+
+    timer_interval_minutes: int = Field(default=30, ge=1)
+    """定时维护人格档案的间隔（分钟）。"""
+
+    min_interval_seconds: int = Field(default=300, ge=0)
+    """两次人格档案维护之间的最小间隔（秒）。"""
+
+
+class PersonaManagementSocialAgentConfig(PersonaManagementAgentConfig):
+    """社交关系维护 Agent。"""
+
+    enabled: bool = True
+    """是否启用社交关系后台维护。"""
+
+    interval_minutes: int = Field(default=30, ge=1)
+    """社交关系后台维护间隔（分钟）。"""
+
+
+class PersonaManagementSubconsciousConfig(PersonaManagementAgentConfig):
+    """潜意识后台处理配置。"""
+
+    enabled: bool = True
+    """是否启用潜意识后台处理。"""
+
+    interval_minutes: int = Field(default=30, ge=1)
+    """潜意识后台处理间隔（分钟）。"""
+
+    merge_window_seconds: float = Field(default=30.0, ge=0.0)
+    """潜意识事件合并窗口（秒）。"""
+
+    max_window_seconds: float = Field(default=300.0, ge=0.0)
+    """潜意识事件最长等待窗口（秒）。"""
+
+    wake_keywords: list[str] = Field(default_factory=list)
+    """触发潜意识唤醒的关键词列表。为空则仅按分数判断。"""
+
+    min_wake_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    """触发潜意识唤醒的最低分数。"""
+
+
+class PersonaManagementCollapseConfig(StrictModel):
+    """精力耗尽后的昏睡兜底配置。"""
+
+    grace_minutes: int = Field(default=60, ge=0)
+    """精力归零后允许维持清醒的宽限时间（分钟）。"""
+
+    sleep_hours: float = Field(default=12.0, ge=0.0)
+    """触发昏睡后的默认睡眠时长。"""
+
+    mood_penalty: float = Field(default=20.0, ge=0.0)
+    """触发昏睡后的心情惩罚。"""
+
+
+class PersonaManagementEnergyConfig(StrictModel):
+    """精力状态配置。"""
+
+    mode: Literal["disabled", "tool"] = "disabled"
+    """disabled = 关闭；tool = 由工具/运行时状态提供。"""
+
+    decay_per_hour: float = Field(default=1.5, ge=0.0)
+    """清醒时每小时精力衰减。"""
+
+    recovery_per_hour_sleep: float = Field(default=8.333, ge=0.0)
+    """睡眠时每小时精力恢复。"""
+
+    recovery_per_hour_eat: float = Field(default=15.0, ge=0.0)
+    """进食时每小时精力恢复。"""
+
+    long_sleep_threshold_minutes: int = Field(default=120, ge=0)
+    """长睡眠判定阈值（分钟）。"""
+
+    max_sleep_minutes: int = Field(default=720, ge=0)
+    """单次睡眠最长时长（分钟）。"""
+
+    collapse: PersonaManagementCollapseConfig = Field(
+        default_factory=PersonaManagementCollapseConfig
+    )
+    """精力耗尽后的昏睡兜底。"""
+
+
+class PersonaManagementSatietyConfig(StrictModel):
+    """饱腹状态配置。"""
+
+    mode: Literal["disabled", "tool"] = "disabled"
+    """disabled = 关闭；tool = 由工具/运行时状态提供。"""
+
+    decay_per_hour: float = Field(default=1.0, ge=0.0)
+    """非进食时每小时饱腹衰减。"""
+
+    recovery_per_minute: float = Field(default=0.5, ge=0.0)
+    """进食时每分钟饱腹恢复。"""
+
+    max_eat_minutes: int = Field(default=60, ge=0)
+    """单次进食最长时长（分钟）。"""
+
+
+class PersonaManagementMoodConfig(StrictModel):
+    """心情状态配置。"""
+
+    decay_per_hour: float = Field(default=0.5, ge=0.0)
+    """心情每小时自然回落量。"""
+
+    social_boost: float = Field(default=3.0, ge=0.0)
+    """良性社交带来的心情增益。"""
+
+
+class PersonaManagementConsolidationConfig(StrictModel):
+    """人格管理记忆整合配置。"""
+
+    daily_fallback_hour: int = Field(default=4, ge=0, le=23)
+    """每日兜底整合小时。"""
+
+
+class PersonaManagementPhysiologyConfig(StrictModel):
+    """生理状态配置。"""
+
+    energy: PersonaManagementEnergyConfig = Field(default_factory=PersonaManagementEnergyConfig)
+    """精力状态。"""
+
+    satiety: PersonaManagementSatietyConfig = Field(default_factory=PersonaManagementSatietyConfig)
+    """饱腹状态。"""
+
+
+class AgeBracketConfig(StrictModel):
+    """年龄分档规则。"""
+
+    name: str
+    """分档名称。"""
+
+    min: int = Field(ge=0)
+    """命中此分档的最小年龄（含）。"""
+
+    max: int | None = Field(default=None, ge=0)
+    """命中此分档的最大年龄（含）。None 表示无上限。"""
+
+    energy_decay_mult: float = Field(default=1.0, ge=0.0)
+    """精力衰减乘数。"""
+
+    energy_recovery_mult: float = Field(default=1.0, ge=0.0)
+    """精力睡眠恢复乘数。"""
+
+    satiety_decay_mult: float = Field(default=1.0, ge=0.0)
+    """饱腹衰减乘数。"""
+
+    mood_volatility_mult: float = Field(default=1.0, ge=0.0)
+    """心情波动乘数。"""
+
+    bedtime_hour: float = Field(default=23.0, ge=0.0, lt=24.0)
+    """建议入睡小时。"""
+
+    wakeup_hour: float = Field(default=7.0, ge=0.0, lt=24.0)
+    """建议醒来小时。"""
+
+    ideal_sleep_hours: float = Field(default=8.0, ge=0.0)
+    """理想睡眠时长。"""
+
+    monologue_style: str = ""
+    """独白风格提示。"""
+
+    emotional_hint: str = ""
+    """情绪提示。"""
+
+    social_hint: str = ""
+    """社交提示。"""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_age_bounds(cls, data: object) -> object:
+        if isinstance(data, dict):
+            data = dict(data)
+            if "min" not in data and "min_age" in data:
+                data["min"] = data.pop("min_age")
+            if "max" not in data and "max_age" in data:
+                data["max"] = data.pop("max_age")
+        return data
+
+
+def default_age_brackets() -> list[AgeBracketConfig]:
+    """人格年龄系统的默认六档分表。"""
+    return [
+        AgeBracketConfig(
+            name="幼年",
+            min=0,
+            max=5,
+            energy_decay_mult=1.25,
+            energy_recovery_mult=1.15,
+            satiety_decay_mult=1.25,
+            mood_volatility_mult=1.4,
+            bedtime_hour=20.0,
+            wakeup_hour=7.0,
+            ideal_sleep_hours=11.0,
+            monologue_style="短句、直觉、依赖照护",
+            emotional_hint="情绪表达直接，容易因需求未满足而波动。",
+            social_hint="更依赖熟悉对象的回应和陪伴。",
+        ),
+        AgeBracketConfig(
+            name="儿童",
+            min=6,
+            max=12,
+            energy_decay_mult=1.15,
+            energy_recovery_mult=1.1,
+            satiety_decay_mult=1.15,
+            mood_volatility_mult=1.25,
+            bedtime_hour=21.0,
+            wakeup_hour=7.0,
+            ideal_sleep_hours=10.0,
+            monologue_style="好奇、具体、带一点跳跃",
+            emotional_hint="对新鲜事物反应强，挫败后恢复也较快。",
+            social_hint="需要明确、温和、及时的互动反馈。",
+        ),
+        AgeBracketConfig(
+            name="少年",
+            min=13,
+            max=17,
+            energy_decay_mult=1.05,
+            energy_recovery_mult=1.05,
+            satiety_decay_mult=1.1,
+            mood_volatility_mult=1.2,
+            bedtime_hour=22.0,
+            wakeup_hour=7.0,
+            ideal_sleep_hours=9.0,
+            monologue_style="自我意识强，表达更敏感",
+            emotional_hint="关系和评价更容易牵动情绪。",
+            social_hint="重视被理解和被尊重。",
+        ),
+        AgeBracketConfig(
+            name="青年",
+            min=18,
+            max=29,
+            energy_decay_mult=1.0,
+            energy_recovery_mult=1.0,
+            satiety_decay_mult=1.0,
+            mood_volatility_mult=1.0,
+            bedtime_hour=23.0,
+            wakeup_hour=7.0,
+            ideal_sleep_hours=8.0,
+            monologue_style="自然、灵活、有探索感",
+            emotional_hint="情绪表达较完整，仍保留即时反应。",
+            social_hint="能在独处和互动之间保持平衡。",
+        ),
+        AgeBracketConfig(
+            name="成年",
+            min=30,
+            max=59,
+            energy_decay_mult=1.05,
+            energy_recovery_mult=0.95,
+            satiety_decay_mult=0.95,
+            mood_volatility_mult=0.85,
+            bedtime_hour=22.5,
+            wakeup_hour=6.5,
+            ideal_sleep_hours=7.5,
+            monologue_style="稳定、克制、重视因果",
+            emotional_hint="情绪波动较缓，更偏向整理和消化。",
+            social_hint="重视可靠、持续、边界清楚的关系。",
+        ),
+        AgeBracketConfig(
+            name="年长",
+            min=60,
+            max=None,
+            energy_decay_mult=1.2,
+            energy_recovery_mult=0.85,
+            satiety_decay_mult=0.9,
+            mood_volatility_mult=0.75,
+            bedtime_hour=21.5,
+            wakeup_hour=5.5,
+            ideal_sleep_hours=7.0,
+            monologue_style="沉稳、回顾、慢节奏",
+            emotional_hint="情绪表达更内敛，但会受长期关系牵动。",
+            social_hint="重视陪伴、记忆延续和稳定回应。",
+        ),
+    ]
+
+
+class PersonaManagementAgeConfig(StrictModel):
+    """人格年龄系统配置。"""
+
+    default_age: int | None = Field(default=None, ge=0)
+    """默认年龄。None 表示未设置年龄，运行时不注入年龄系统。"""
+
+    overrides: dict[str, int] = Field(default_factory=dict)
+    """按对象 ID 覆盖年龄。键由运行时约定，值为年龄。"""
+
+    brackets: list[AgeBracketConfig] = Field(default_factory=default_age_brackets)
+    """年龄分档表。运行时按年龄命中对应分档。"""
+
+
+class PersonaManagementConfig(StrictModel):
+    """人格管理功能总开关和后台配置。"""
+
+    enabled: bool = False
+    """是否启用人格管理后台系统。默认关闭。"""
+
+    persona_agent: PersonaManagementPersonaAgentConfig = Field(
+        default_factory=PersonaManagementPersonaAgentConfig
+    )
+    """人格档案维护 Agent。provider/model 留空时继承 agents.chat。"""
+
+    social_agent: PersonaManagementSocialAgentConfig = Field(
+        default_factory=PersonaManagementSocialAgentConfig
+    )
+    """社交关系维护 Agent。provider/model 留空时继承 agents.chat。"""
+
+    subconscious: PersonaManagementSubconsciousConfig = Field(
+        default_factory=PersonaManagementSubconsciousConfig
+    )
+    """潜意识后台处理配置。provider/model 留空时继承 agents.chat。"""
+
+    physiology: PersonaManagementPhysiologyConfig = Field(
+        default_factory=PersonaManagementPhysiologyConfig
+    )
+    """生理状态配置。"""
+
+    mood: PersonaManagementMoodConfig = Field(default_factory=PersonaManagementMoodConfig)
+    """心情状态配置。"""
+
+    consolidation: PersonaManagementConsolidationConfig = Field(
+        default_factory=PersonaManagementConsolidationConfig
+    )
+    """人格管理记忆整合配置。"""
+
+    age: PersonaManagementAgeConfig = Field(default_factory=PersonaManagementAgeConfig)
+    """人格年龄系统配置。default_age=None 时不启用年龄注入。"""
+
+
+# ============================================================
 # 行为参数
 # ============================================================
 
 
 class TypingConfig(StrictModel):
-    """模拟真人打字速度（决定多条消息之间的发送间隔）。"""
+    """遗留打字速度配置；发送间隔由模型逐条填写 target.delay。"""
 
     chars_per_second: float = 1.0
-    """每秒打几个字。1 字/秒贴近真人正常聊天速度（含思考停顿）。"""
+    """已废弃：不再用于发送工具。"""
 
-    max_delay_seconds: float = 2.0
-    """单条消息最大延迟（秒）。再长的消息也不会等超过这个时间。"""
+    english_chars_per_second: float = 5.0
+    """已废弃：不再用于发送工具。"""
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_deprecated_delay_fields(cls, data: object) -> object:
+        if isinstance(data, dict):
+            data = dict(data)
+            data.pop("min_delay_seconds", None)
+            data.pop("max_delay_seconds", None)
+            data.pop("clamp_model_delay", None)
+        return data
 
 
 class RateLimitConfig(StrictModel):
@@ -552,25 +930,32 @@ class RateLimitConfig(StrictModel):
 
 
 class SummarizeConfig(StrictModel):
-    """历史总结触发阈值。
-
-    Phase A 起按 token 触发 compaction；旧的消息条数字段保留为兼容配置。
-    """
-
-    trigger_at_messages: int = 200
-    """达到多少条 history 记录后触发总结。"""
-
-    range_start_messages: int = 50
-    """SummaryAgent 选择 cut_point 的下限（保留这之后的对话）。"""
-
-    range_end_messages: int = 150
-    """SummaryAgent 选择 cut_point 的上限。"""
+    """滚动摘要压缩触发阈值。"""
 
     trigger_at_tokens: int | None = None
-    """活跃 history 估算 token 达到此值时触发 compaction。None 表示按模型工作预算自动推导。"""
+    """活跃窗口估算 token 达到此值时触发滚动摘要。显式配置优先于百分比推导。"""
 
     target_after_tokens: int | None = None
-    """compaction 后活跃 history 目标 token。None 表示按模型工作预算自动推导。"""
+    """滚动摘要后活跃窗口目标 token。显式配置优先于百分比推导。"""
+
+    trigger_at_context_percent: int = Field(default=75, ge=50, le=100)
+    """未显式配置 trigger_at_tokens 时，按工作上下文预算此百分比推导滚动摘要触发阈值。"""
+
+    target_after_context_percent: int = Field(default=50, ge=50, le=100)
+    """未显式配置 target_after_tokens 时，按工作上下文预算此百分比推导活跃窗口目标。"""
+
+    retry_target_after_context_percent: int = Field(default=30, ge=5, le=100)
+    """第一次压缩后仍超预算或压缩失败时，重试压缩使用的活跃窗口目标百分比。"""
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_deprecated_working_range_fields(cls, data: object) -> object:
+        if isinstance(data, dict):
+            data = dict(data)
+            data.pop("range_start_messages", None)
+            data.pop("range_end_messages", None)
+            data.pop("trigger_at_messages", None)
+        return data
 
 
 class ToolResultBudgetConfig(StrictModel):
@@ -584,6 +969,56 @@ class ToolResultBudgetConfig(StrictModel):
     inline_budget_tokens: int = Field(default=800, ge=256)
     artifact_threshold_tokens: int | None = Field(default=None, ge=256)
     hard_cap_tokens: int | None = Field(default=None, ge=512)
+
+
+class ContextLengthBudgetRule(StrictModel):
+    """按 provider 预设 context_length 推导工作上下文预算的规则。"""
+
+    min_context_length_tokens: int = Field(ge=1)
+    """模型 context_length 至少达到此值时命中。"""
+
+    budget_tokens: int = Field(ge=1024)
+    """命中后使用的工作上下文预算。"""
+
+
+class ContextBudgetRecommendationConfig(StrictModel):
+    """max_context_tokens 为空时的自动推荐规则。"""
+
+    model_name_budget_tokens: dict[str, int] = Field(
+        default_factory=lambda: {
+            "deepseek-v4-pro": 350_000,
+            "deepseek-v4": 300_000,
+            "claude": 150_000,
+        }
+    )
+    """模型名包含指定片段时使用的预算。按配置顺序匹配。"""
+
+    context_length_rules: list[ContextLengthBudgetRule] = Field(
+        default_factory=lambda: [
+            ContextLengthBudgetRule(
+                min_context_length_tokens=1_000_000,
+                budget_tokens=300_000,
+            ),
+            ContextLengthBudgetRule(
+                min_context_length_tokens=200_000,
+                budget_tokens=150_000,
+            ),
+            ContextLengthBudgetRule(
+                min_context_length_tokens=128_000,
+                budget_tokens=96_000,
+            ),
+        ]
+    )
+    """provider 预设 context_length 命中规则。按配置顺序匹配。"""
+
+    context_length_scale_percent: int = Field(default=75, ge=1, le=100)
+    """低于所有阈值时，按模型 context_length 的此百分比推导。"""
+
+    min_scaled_budget_tokens: int = Field(default=4096, ge=1024)
+    """按百分比推导时的最低工作上下文预算。"""
+
+    fallback_budget_tokens: int = Field(default=96_000, ge=1024)
+    """模型名和 context_length 都无法命中时的兜底预算。"""
 
 
 def default_tool_result_budgets() -> dict[str, ToolResultBudgetConfig]:
@@ -645,8 +1080,16 @@ class ContextConfig(StrictModel):
     max_context_tokens: int | None = None
     """None = 根据当前模型预设 context_length 推导工作预算。"""
 
+    recommended_context_budget: ContextBudgetRecommendationConfig = Field(
+        default_factory=ContextBudgetRecommendationConfig
+    )
+    """max_context_tokens=None 时使用的自动推荐规则。"""
+
     reserve_output_tokens: int = Field(default=8192, ge=1024)
     """为模型输出保留的 token。"""
+
+    prompt_overhead_estimate_tokens: int = Field(default=12000, ge=0)
+    """系统提示、工具 schema 等非历史内容的预估开销。"""
 
     memory_token_budget: int = Field(default=4096, ge=256)
     """长期重要记忆注入预算。Phase A 先作为预算字段预留，Phase D 精细使用。"""
@@ -674,6 +1117,21 @@ class ContextConfig(StrictModel):
     tool_result_soft_overrides: dict[str, int] = Field(default_factory=dict)
     """旧配置兼容：按工具名覆盖软阈值，如 {"describe_image": 900}。"""
 
+    @model_validator(mode="before")
+    @classmethod
+    def drop_deprecated_working_window_fields(cls, data: object) -> object:
+        if isinstance(data, dict):
+            data = dict(data)
+            for field in (
+                "min_working_history_tokens",
+                "current_conversation_min_records",
+                "runtime_record_keep_count",
+                "send_receipt_keep_count",
+                "no_action_keep_count",
+            ):
+                data.pop(field, None)
+        return data
+
 
 class BehaviorConfig(StrictModel):
     merge_window_seconds: float = Field(default=0.5, ge=0.0)
@@ -689,6 +1147,21 @@ class BehaviorConfig(StrictModel):
     proactive_context_token_budget: int = Field(default=4096, ge=1024)
     """主动思考路由器可使用的上下文预算。默认 4K，避免后台判断吃掉过多上下文和成本。"""
 
+    proactive_router_text_limit_tokens: int = Field(default=256, ge=32)
+    """主动路由输入文本片段的截断预算。"""
+
+    proactive_router_tool_result_inline_tokens: int = Field(default=96, ge=32)
+    """主动路由工具结果内联预算。"""
+
+    proactive_router_tool_result_hard_cap_tokens: int = Field(default=160, ge=64)
+    """主动路由工具结果事故兜底上限。"""
+
+    proactive_router_summary_limit_tokens: int = Field(default=1024, ge=128)
+    """主动路由历史摘要文本上限。"""
+
+    proactive_router_history_token_budget: int = Field(default=16384, ge=1024)
+    """主动路由可读取的历史 token 预算。"""
+
     pending_request_timeout_seconds: float = Field(default=1800.0, ge=60.0)
     """好友/群加入请求暂存的过期时间（秒）。超时后未审核的请求被丢弃。"""
 
@@ -700,6 +1173,14 @@ class BehaviorConfig(StrictModel):
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     summarize: SummarizeConfig = Field(default_factory=SummarizeConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_deprecated_persona_refine_history_turns(cls, data: object) -> object:
+        if isinstance(data, dict) and "persona_refine_history_turns" in data:
+            data = dict(data)
+            data.pop("persona_refine_history_turns", None)
+        return data
 
 
 # ============================================================
@@ -718,6 +1199,9 @@ class RootConfig(StrictModel):
     agents: AgentsConfig
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     persona: PersonaConfig = Field(default_factory=PersonaConfig)
+    persona_management: PersonaManagementConfig = Field(
+        default_factory=PersonaManagementConfig
+    )
     behavior: BehaviorConfig = Field(default_factory=BehaviorConfig)
 
     @field_validator("version")
@@ -734,17 +1218,26 @@ class RootConfig(StrictModel):
         """确保所有 provider 引用、密钥 ID 引用都指向已存在的对象。"""
         provider_ids = set(self.providers.keys())
 
+        def ensure_provider_exists(path: str, provider: str) -> None:
+            if provider in provider_ids:
+                return
+            example_id = sorted(provider_ids)[0] if provider_ids else "deepseek_main"
+            raise ValueError(
+                f"{path}.provider = '{provider}' 未在 providers 中定义。\n"
+                f"  已定义的 providers: {sorted(provider_ids)}\n"
+                f"  修法：编辑 config.yaml 把 {path}.provider "
+                f"改成上面已存在的 ID（如 '{example_id}'），"
+                f"或在 providers 段新增 '{provider}' 的配置。"
+            )
+
         # 检查每个 Agent 的 provider 引用
         for name, agent in self._iter_agents():
-            if agent.provider not in provider_ids:
-                example_id = sorted(provider_ids)[0] if provider_ids else "deepseek_main"
-                raise ValueError(
-                    f"agents.{name}.provider = '{agent.provider}' 未在 providers 中定义。\n"
-                    f"  已定义的 providers: {sorted(provider_ids)}\n"
-                    f"  修法：编辑 config.yaml 把 agents.{name}.provider "
-                    f"改成上面已存在的 ID（如 '{example_id}'），"
-                    f"或在 providers 段新增 '{agent.provider}' 的配置。"
-                )
+            ensure_provider_exists(f"agents.{name}", agent.provider)
+
+        # 人格管理后台 Agent 允许空 provider/model，由运行时继承 agents.chat。
+        for name, agent in self._iter_persona_management_agents():
+            if agent.provider:
+                ensure_provider_exists(f"persona_management.{name}", agent.provider)
 
         # 检查 features 中的 provider 引用（如有）
         for _feat_name, feat in [
@@ -767,3 +1260,9 @@ class RootConfig(StrictModel):
             agent = getattr(self.agents, name)
             if agent is not None:
                 yield name, agent
+
+    def _iter_persona_management_agents(self):
+        """遍历人格管理后台 Agent，返回 (name, PersonaManagementAgentConfig)。"""
+        yield "persona_agent", self.persona_management.persona_agent
+        yield "social_agent", self.persona_management.social_agent
+        yield "subconscious", self.persona_management.subconscious

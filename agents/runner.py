@@ -8,17 +8,18 @@
 
 循环退出条件（保留 V1 语义）：
     1. AI 调用了 no_action → finish_reason='no_action'
-    2. AI 全部调用 send_* 且 send_only=True 且全部成功 → 'send_only_complete'
-    3. AI 调用的全是 no_feedback 类工具且全部成功 → 'all_no_feedback'
-    4. AI 未调用工具，提示重试后仍不调用 → 'no_tool_after_retry'
-    5. 达到 max_loops → 'max_loops'，随后追加一次无工具收尾，让模型说明部分结果
+    2. 所有非 no_action 工具显式允许成功后结束 → 'finish_after_success'
+    3. AI 未调用工具，提示重试后仍不调用 → 'no_tool_after_retry'
+    4. 工具循环提醒宽限用完 → 'tool_loop_finalized'，随后无工具收尾
 """
 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -34,28 +35,42 @@ from providers.base import (
     normalize_messages,
 )
 
-from .base import AgentRunResult, FinishReason, StatusCallback, ToolExecutor, UsageRecorder
+from .base import (
+    AgentRunResult,
+    FinishReason,
+    RuntimeEventCallback,
+    StatusCallback,
+    ToolExecutor,
+    UsageRecorder,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# 工具属于"调用成功后无需 LLM 反馈"的类别——它们的结果对后续没影响，
-# 调用完直接结束循环
+# 兼容旧导出；runner 不再根据这个集合提前结束。
 DEFAULT_NO_FEEDBACK_TOOLS: set[str] = {
     "save_important_memory",
+    "update_important_memory",
     "delete_important_memory",
     "no_action",
+    "send_poke",
+    "set_msg_emoji_like",
     "set_friend_add_request",
     "set_group_add_request",
     "schedule_wakeup",
 }
 
-# 发送类工具：send_only=True 时同样算作终止信号
+# 发送类工具需要把结果回填给模型；发送成功不等于本轮结束。
 SEND_TOOL_NAMES: set[str] = {
     "send_private_messages",
     "send_group_message",
     "send_voice_message",
 }
+
+LOOP_REMINDER_MESSAGE = (
+    "你已连续多轮调用工具。请重新审视任务内容和执行情况，不要在同一个错误上反复无意义尝试；"
+    "必要时更换方向、汇报进展或收尾。"
+)
 
 
 class AgentRunner:
@@ -67,12 +82,14 @@ class AgentRunner:
         agent_cfg: AgentConfig,
         *,
         no_feedback_tools: set[str] | None = None,
+        runtime_event_callback: RuntimeEventCallback | None = None,
     ) -> None:
         self.provider = provider
         self.cfg = agent_cfg
         self.no_feedback_tools = (
             no_feedback_tools if no_feedback_tools is not None else DEFAULT_NO_FEEDBACK_TOOLS
         )
+        self.runtime_event_callback = runtime_event_callback
 
     async def run(
         self,
@@ -85,6 +102,7 @@ class AgentRunner:
         max_loops: int | None = None,
         usage_recorder: UsageRecorder | None = None,
         status_callback: StatusCallback | None = None,
+        runtime_event_callback: RuntimeEventCallback | None = None,
         status_label: str = "主模型",
     ) -> AgentRunResult:
         """执行多轮工具循环。
@@ -97,19 +115,30 @@ class AgentRunner:
         records: list[dict[str, Any]] = []
         reasoning_logs: list[str] = []
         final_content = ""
-        finish_reason: FinishReason = "max_loops"
+        finish_reason: FinishReason = "no_response"
         loop_count = 0
+        no_tool_retry_count = 0
         prompt_tokens_total = 0
-        effective_max_loops = max(1, int(max_loops or self.cfg.max_loops))
         refocus_interval = self.cfg.refocus_interval
-        has_pending_send_actions = False
+        reminder_interval = max(1, int(self.cfg.tool_loop_reminder_interval))
+        final_warning_count = max(1, int(self.cfg.tool_loop_final_warning_count))
+        final_grace_loops = max(0, int(self.cfg.tool_loop_final_grace_loops))
+        tool_rounds_since_reminder = 0
+        tool_loop_reminder_count = 0
+        final_warning_sent = False
+        final_grace_remaining: int | None = None
+        final_no_tool_mode = False
+        runtime_events = runtime_event_callback or self.runtime_event_callback
 
         reasoning = self._to_provider_reasoning(self.cfg.reasoning)
         tool_names_dbg = [t["function"]["name"] for t in tools] if tools else []
         logger.info(
             f"AgentRunner[{self.provider.name}] 启动 model={self.cfg.model}, "
             f"tools={tool_names_dbg}, refocus={refocus_interval}, "
-            f"max_loops={effective_max_loops}, "
+            f"tool_loop_reminder_interval={reminder_interval}, "
+            f"tool_loop_final_warning_count={final_warning_count}, "
+            f"tool_loop_final_grace_loops={final_grace_loops}, "
+            f"legacy_max_loops={max_loops or self.cfg.max_loops}, "
             f"task_contract={task_contract[:60] if task_contract else None!r}"
         )
 
@@ -124,7 +153,11 @@ class AgentRunner:
             logger.info("注入发送回执/新消息上下文 %s 条", len(pending))
             return True
 
-        while loop_count < effective_max_loops:
+        while True:
+            if final_no_tool_mode:
+                finish_reason = "tool_loop_finalized"
+                break
+
             loop_count += 1
 
             if await append_pending_context():
@@ -144,12 +177,31 @@ class AgentRunner:
                     "content": (
                         f"[本轮焦点提醒] {task_contract}\n"
                         f"已执行 {loop_count - 1} 轮。检查当前操作是否仍在为这个目标服务，"
-                        f"若已完成请用 send_only=true 或 no_action 收尾。"
+                        f"若已完成请用 no_action 收尾。"
                     ),
                 }
                 msgs.append(refocus)
                 records.append(refocus)
                 logger.debug(f"Task Contract 重注入（轮次 {loop_count}）")
+
+            if (
+                not final_warning_sent
+                and tool_loop_reminder_count >= final_warning_count
+                and tool_rounds_since_reminder >= max(0, reminder_interval - final_grace_loops)
+            ):
+                warning = self._build_tool_loop_final_warning(final_grace_loops)
+                msgs.append(warning)
+                records.append(warning)
+                final_warning_sent = True
+                final_grace_remaining = final_grace_loops
+                if final_grace_remaining <= 0:
+                    final_no_tool_mode = True
+                    continue
+                logger.warning(
+                    "工具循环进入最终警告：grace_loops=%s loop=%s",
+                    final_grace_remaining,
+                    loop_count,
+                )
 
             try:
                 self._emit_status(
@@ -248,17 +300,13 @@ class AgentRunner:
 
             # === 分支 1：无工具调用 → 引导重试或终止 ===
             if not result.tool_calls:
-                if await append_pending_context() and loop_count < effective_max_loops:
+                if await append_pending_context():
                     continue
-                content = (result.content or "").strip()
-                if has_pending_send_actions:
-                    final_content = content
-                    finish_reason = "send_only_complete"
-                    break
-                if loop_count < effective_max_loops:
-                    # 还有下一轮：丢弃纯文本草稿，只插入系统纠正后继续。
+                if no_tool_retry_count <= 0:
+                    # 允许一次纠正重试：丢弃纯文本草稿，只插入系统纠正后继续。
                     # 不能把无效 assistant 文本放回上下文，否则下一轮可能把
                     # 内部分析/RAG 解释原样当作可发送消息。
+                    no_tool_retry_count += 1
                     err = {
                         "role": "system",
                         "content": (
@@ -269,10 +317,12 @@ class AgentRunner:
                     msgs.append(err)
                     records.append(err)
                     continue
-                # 最后一次仍未调用工具，丢弃文本
+                # 重试后仍未调用工具，丢弃文本
                 final_content = ""
                 finish_reason = "no_tool_after_retry"
                 break
+
+            no_tool_retry_count = 0
 
             assistant_record = self._build_assistant_record(result)
             msgs.append(assistant_record)
@@ -287,12 +337,60 @@ class AgentRunner:
                 loop=loop_count,
                 tool_names=[tc.name for tc in result.tool_calls],
             )
-            tc_results = await self._execute_tools(result.tool_calls, tool_executor)
-            if any(
-                r["name"] in SEND_TOOL_NAMES and r["result"].get("ok", True)
+            tc_results = await self._execute_tools(
+                result.tool_calls,
+                tool_executor,
+                runtime_event_callback=runtime_events,
+                loop=loop_count,
+            )
+
+            stop_results = [
+                r for r in tc_results if r["result"].get("stop_after_tool")
+            ]
+            no_action_finished = any(
+                r["name"] == "no_action"
+                and not self._tool_result_blocks_completion(r["result"])
                 for r in tc_results
-            ):
-                has_pending_send_actions = True
+            )
+            blocked_by_result = any(
+                self._tool_result_blocks_completion(r["result"]) for r in tc_results
+            )
+            finish_after_success = (
+                not blocked_by_result
+                and self._all_non_no_action_results_allow_completion(tc_results)
+            )
+            normal_finish = bool(stop_results or no_action_finished or finish_after_success)
+
+            append_final_warning_after_tool_records = False
+            if not normal_finish:
+                tool_rounds_since_reminder += 1
+                if final_grace_remaining is not None:
+                    final_grace_remaining -= 1
+                    if final_grace_remaining <= 0:
+                        final_no_tool_mode = True
+                elif (
+                    final_grace_loops <= 0
+                    and not final_warning_sent
+                    and tool_loop_reminder_count >= final_warning_count
+                    and tool_rounds_since_reminder >= reminder_interval
+                ):
+                    final_warning_sent = True
+                    final_grace_remaining = 0
+                    final_no_tool_mode = True
+                    append_final_warning_after_tool_records = True
+                if (
+                    not final_warning_sent
+                    and tool_rounds_since_reminder >= reminder_interval
+                ):
+                    tool_loop_reminder_count += 1
+                    tool_rounds_since_reminder = 0
+                    self._append_loop_reminder(
+                        tc_results,
+                        reminder_interval=reminder_interval,
+                        reminder_count=tool_loop_reminder_count,
+                        final_warning_count=final_warning_count,
+                    )
+
             for tcr in tc_results:
                 tool_record = {
                     "role": "tool",
@@ -302,44 +400,48 @@ class AgentRunner:
                 msgs.append(tool_record)
                 records.append(tool_record)
 
-            stop_results = [
-                r for r in tc_results if r["result"].get("stop_after_tool")
-            ]
+            if append_final_warning_after_tool_records:
+                warning = self._build_tool_loop_final_warning(final_grace_loops)
+                msgs.append(warning)
+                records.append(warning)
+                logger.warning(
+                    "工具循环进入最终警告：grace_loops=%s loop=%s",
+                    final_grace_remaining,
+                    loop_count,
+                )
+
             if stop_results:
                 final_content = result.content or ""
                 finish_reason = "tool_stop"
                 break
 
-            if await append_pending_context() and loop_count < effective_max_loops:
+            if await append_pending_context():
                 continue
 
             # === 终止条件检查 ===
-            if any(
-                r["name"] == "no_action" and r["result"].get("ok", True)
-                for r in tc_results
-            ):
+            if no_action_finished:
                 final_content = "NO_ACTIONS"
                 finish_reason = "no_action"
                 break
 
-            if self._all_no_feedback(tc_results):
+            if blocked_by_result:
+                continue
+
+            if finish_after_success:
                 final_content = result.content or ""
-                finish_reason = self._classify_no_feedback(tc_results)
+                finish_reason = "finish_after_success"
                 break
 
-        if loop_count >= effective_max_loops and finish_reason == "max_loops":
-            logger.warning(f"达到最大循环次数 {effective_max_loops}")
-            limit_record = {
-                "role": "system",
-                "content": (
-                    f"工具循环达到上限 {effective_max_loops} 轮，"
-                    "现在禁止继续调用工具。请基于已有消息和工具结果，"
-                    "用自然语言给出当前部分结果、已完成事项、未完成原因和建议下一步。"
-                ),
-            }
-            msgs.append(limit_record)
-            records.append(limit_record)
-            final_result = await self._finalize_after_max_loops(
+            if final_no_tool_mode:
+                finish_reason = "tool_loop_finalized"
+                break
+
+        if finish_reason == "tool_loop_finalized":
+            logger.warning("工具循环最终宽限已用完，进入无工具收尾")
+            stop_record = self._build_tool_loop_stop()
+            msgs.append(stop_record)
+            records.append(stop_record)
+            final_result = await self._finalize_tool_loop(
                 msgs,
                 usage_recorder=usage_recorder,
                 status_callback=status_callback,
@@ -438,7 +540,53 @@ class AgentRunner:
         except Exception:
             logger.debug("记录模型用量失败", exc_info=True)
 
-    async def _finalize_after_max_loops(
+    @staticmethod
+    def _append_loop_reminder(
+        tc_results: list[dict[str, Any]],
+        *,
+        reminder_interval: int,
+        reminder_count: int,
+        final_warning_count: int,
+    ) -> None:
+        if not tc_results:
+            return
+        result = dict(tc_results[-1]["result"])
+        result["loop_reminder"] = {
+            "level": "reminder",
+            "message": LOOP_REMINDER_MESSAGE,
+            "tool_loop_reminder_interval": reminder_interval,
+            "reminder_count": reminder_count,
+            "final_warning_count": final_warning_count,
+        }
+        tc_results[-1]["result"] = result
+
+    @staticmethod
+    def _build_tool_loop_final_warning(grace_loops: int) -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": (
+                '<tool_loop_final_warning priority="high">\n'
+                "系统提示：工具调用轮数过多，即将结束循环。\n"
+                f"你还有 {grace_loops} 轮工具调用机会。\n"
+                "请停止反复尝试同一错误，利用剩余机会完成必要操作、汇报当前结果并收尾。\n"
+                "</tool_loop_final_warning>"
+            ),
+        }
+
+    @staticmethod
+    def _build_tool_loop_stop() -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": (
+                '<tool_loop_stop priority="high">\n'
+                "系统提示：工具调用机会已用完。\n"
+                "请不要再调用工具。基于已有结果完成最终汇报、说明未完成原因，"
+                "或在无需回复时结束。\n"
+                "</tool_loop_stop>"
+            ),
+        }
+
+    async def _finalize_tool_loop(
         self,
         messages: list[dict[str, Any]],
         *,
@@ -446,7 +594,7 @@ class AgentRunner:
         status_callback: StatusCallback | None,
         status_label: str,
     ) -> CompletionResult | None:
-        """工具轮数用尽后做一次无工具收尾。
+        """工具循环最终宽限用尽后做一次无工具收尾。
 
         这一步不再传 tools，避免模型继续循环；结果只作为记录和上层 fallback 使用。
         """
@@ -463,7 +611,10 @@ class AgentRunner:
                 tools=None,
                 temperature=self.cfg.temperature,
                 top_p=self.cfg.top_p,
-                max_tokens=min(int(self.cfg.max_tokens or 2048), 4096),
+                max_tokens=min(
+                    int(self.cfg.max_tokens or self.cfg.tool_loop_final_max_tokens),
+                    int(self.cfg.tool_loop_final_max_tokens),
+                ),
                 reasoning=self._to_provider_reasoning(self.cfg.reasoning),
                 stream=True,
                 timeout=self.cfg.first_token_timeout_seconds * 4 + 60.0,
@@ -473,7 +624,7 @@ class AgentRunner:
                 usage_recorder,
                 result.usage,
                 agent=status_label,
-                operation="agent_loop_max_loops_final",
+                operation="agent_loop_tool_loop_final",
                 **_kv_prompt_diagnostics(
                     messages,
                     None,
@@ -483,7 +634,7 @@ class AgentRunner:
             )
             return result
         except Exception as e:
-            logger.warning("AgentRunner 达到上限后的无工具收尾失败: %s", e)
+            logger.warning("AgentRunner 工具循环无工具收尾失败: %s", e)
             self._emit_status(
                 status_callback,
                 state="error",
@@ -505,54 +656,318 @@ class AgentRunner:
         self,
         tool_calls: list[ToolCall],
         executor: ToolExecutor,
+        *,
+        runtime_event_callback: RuntimeEventCallback | None = None,
+        loop: int | None = None,
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
-        for tc in tool_calls:
+        for step, tc in enumerate(tool_calls, start=1):
             name = tc.name
             try:
                 args = json.loads(tc.arguments) if tc.arguments else {}
                 if not isinstance(args, dict):
                     raise ValueError(f"工具参数必须是对象: {tc.arguments!r}")
             except (json.JSONDecodeError, ValueError) as e:
-                result = {"ok": False, "error": f"参数解析失败: {e}"}
+                result = _build_runner_tool_error_result(
+                    name,
+                    brief="工具参数解析失败。",
+                    error=f"参数解析失败: {e}",
+                )
+                await self._emit_runtime_event(
+                    runtime_event_callback,
+                    _build_tool_result_event(
+                        tc,
+                        args=None,
+                        result=result,
+                        error_type=type(e).__name__,
+                        loop=loop,
+                        step=step,
+                    ),
+                )
                 results.append({"id": tc.id, "name": name, "args": {}, "result": result})
                 continue
 
+            await self._emit_runtime_event(
+                runtime_event_callback,
+                _build_tool_started_event(tc, args, loop=loop, step=step),
+            )
             try:
-                result = await executor(name, args)
+                if _executor_accepts_tool_call_id(executor):
+                    result = await executor(name, args, tool_call_id=tc.id)
+                else:
+                    result = await executor(name, args)
                 if not isinstance(result, dict):
                     result = {"ok": True, "value": result}
             except Exception as e:
                 logger.exception(f"工具 {name} 执行失败: {e}")
-                result = {"ok": False, "error": str(e)}
+                result = _build_runner_tool_error_result(
+                    name,
+                    brief="工具执行失败。",
+                    error=str(e),
+                )
+                error_type = type(e).__name__
+            else:
+                error_type = None
 
+            result = self._maybe_mark_turn_completion(name, args, result)
+            await self._emit_runtime_event(
+                runtime_event_callback,
+                _build_tool_result_event(
+                    tc,
+                    args=args,
+                    result=result,
+                    error_type=error_type,
+                    loop=loop,
+                    step=step,
+                ),
+            )
             results.append({"id": tc.id, "name": name, "args": args, "result": result})
         return results
 
-    def _all_no_feedback(self, tc_results: list[dict[str, Any]]) -> bool:
-        """所有工具调用都不需要 LLM 反馈才能终止。"""
-        for r in tc_results:
-            name = r["name"]
-            ok = r["result"].get("ok", True)
-            if name in SEND_TOOL_NAMES:
-                if name == "send_voice_message":
-                    if not ok:
-                        return False
-                elif not r["args"].get("send_only", False) or not ok:
-                    return False
-            elif name in self.no_feedback_tools:
-                if not ok:
-                    return False
-            else:
-                return False
-        return True
+    @staticmethod
+    async def _emit_runtime_event(
+        callback: RuntimeEventCallback | None,
+        event: dict[str, Any],
+    ) -> None:
+        if callback is None:
+            return
+        maybe_awaitable = callback(event)
+        if inspect.isawaitable(maybe_awaitable):
+            await maybe_awaitable
 
     @staticmethod
-    def _classify_no_feedback(tc_results: list[dict[str, Any]]) -> FinishReason:
-        for r in tc_results:
-            if r["name"] in SEND_TOOL_NAMES:
-                return "send_only_complete"
-        return "all_no_feedback"
+    def _maybe_mark_turn_completion(
+        name: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if name == "no_action" or args.get("finish_after_success") is not True:
+            return result
+        if AgentRunner._tool_result_blocks_completion(result):
+            return result
+        marked = dict(result)
+        completion = dict(marked.get("turn_completion") or {})
+        completion["allowed"] = True
+        completion.setdefault("reason", "finish_after_success")
+        marked["turn_completion"] = completion
+        return marked
+
+    @staticmethod
+    def _tool_result_blocks_completion(result: dict[str, Any]) -> bool:
+        if result.get("ok") is False:
+            return True
+        if result.get("errors"):
+            return True
+        status = result.get("status")
+        pending_statuses = {
+            "needs_review",
+            "needs_review_again",
+            "stale",
+            "failed",
+            "partial",
+            "unsupported",
+            "need_tool_search",
+        }
+        if isinstance(status, str):
+            return status in pending_statuses
+        if isinstance(status, (list, tuple, set)):
+            return any(str(item) in pending_statuses for item in status)
+        return False
+
+    @staticmethod
+    def _all_non_no_action_results_allow_completion(
+        tc_results: list[dict[str, Any]],
+    ) -> bool:
+        non_no_action = [r for r in tc_results if r["name"] != "no_action"]
+        if not non_no_action:
+            return False
+        return all(
+            r["result"].get("turn_completion", {}).get("allowed") is True
+            for r in non_no_action
+        )
+
+
+def _build_runner_tool_error_result(
+    tool_name: str,
+    *,
+    brief: str,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "failed",
+        "tool": tool_name,
+        "result_format": "structured_json",
+        "brief": brief,
+        "error": error,
+    }
+
+
+def _build_tool_started_event(
+    tc: ToolCall,
+    args: dict[str, Any],
+    *,
+    loop: int | None,
+    step: int,
+) -> dict[str, Any]:
+    payload = {
+        "tool_call_id": tc.id,
+        "tool_name": tc.name,
+        "args": args,
+        "raw_arguments": tc.arguments,
+        **_tool_args_summary(args=args, raw_arguments=tc.arguments),
+    }
+    _add_loop_step(payload, loop=loop, step=step)
+    return {
+        "event_type": "tool_call_started",
+        "source": "agent_runner",
+        "tool_call_id": tc.id,
+        "payload": payload,
+    }
+
+
+def _build_tool_result_event(
+    tc: ToolCall,
+    *,
+    args: dict[str, Any] | None,
+    result: dict[str, Any],
+    error_type: str | None,
+    loop: int | None,
+    step: int,
+) -> dict[str, Any]:
+    payload = {
+        "tool_call_id": tc.id,
+        "tool_name": tc.name,
+        "raw_arguments": tc.arguments,
+        "result": result,
+        **_tool_args_summary(args=args, raw_arguments=tc.arguments),
+        **_tool_result_summary(result, error_type=error_type),
+    }
+    if args is not None:
+        payload["args"] = args
+    _add_loop_step(payload, loop=loop, step=step)
+    return {
+        "event_type": "tool_result_received",
+        "source": "agent_runner",
+        "tool_call_id": tc.id,
+        "payload": payload,
+    }
+
+
+def _tool_args_summary(
+    *,
+    args: dict[str, Any] | None,
+    raw_arguments: str,
+) -> dict[str, Any]:
+    if args is None:
+        args_length = len(raw_arguments or "")
+        args_keys: list[str] = []
+        args_key_count = 0
+        args_hash = _short_hash(raw_arguments or "")
+    else:
+        text = _stable_json_text(args)
+        args_keys, args_key_count = _limited_keys(args)
+        args_length = len(text)
+        args_hash = _short_hash(text)
+    return {
+        "args_hash": args_hash,
+        "args_keys": args_keys,
+        "args_key_count": args_key_count,
+        "args_length": args_length,
+        "args_preview": _summary_preview(
+            "args",
+            keys=args_keys,
+            key_count=args_key_count,
+            length=args_length,
+        ),
+    }
+
+
+def _tool_result_summary(
+    result: dict[str, Any],
+    *,
+    error_type: str | None,
+) -> dict[str, Any]:
+    text = _stable_json_text(result)
+    result_keys, result_key_count = _limited_keys(result)
+    payload: dict[str, Any] = {
+        "result_hash": _short_hash(text),
+        "result_keys": result_keys,
+        "result_key_count": result_key_count,
+        "result_length": len(text),
+        "result_preview": _summary_preview(
+            "result",
+            keys=result_keys,
+            key_count=result_key_count,
+            length=len(text),
+        ),
+    }
+    ok = result.get("ok")
+    if isinstance(ok, bool):
+        payload["ok"] = ok
+    status = _light_status(result.get("status"))
+    if status is not None:
+        payload["status"] = status
+    event_error_type = _event_error_type(result, error_type)
+    if event_error_type:
+        payload["error_type"] = event_error_type
+    return payload
+
+
+def _limited_keys(value: dict[str, Any]) -> tuple[list[str], int]:
+    keys = sorted(str(key) for key in value.keys())
+    return keys[:20], len(keys)
+
+
+def _summary_preview(
+    kind: str,
+    *,
+    keys: list[str],
+    key_count: int,
+    length: int,
+) -> str:
+    joined = ",".join(keys) if keys else "-"
+    suffix = ",..." if key_count > len(keys) else ""
+    return f"{kind}: keys={joined}{suffix}; length={length}"[:80]
+
+
+def _stable_json_text(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _light_status(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        return value[:80]
+    if isinstance(value, list | tuple | set | frozenset):
+        return [str(item)[:40] for item in list(value)[:5]]
+    return type(value).__name__
+
+
+def _event_error_type(result: dict[str, Any], explicit: str | None) -> str | None:
+    if explicit:
+        return str(explicit)[:80]
+    value = result.get("error_type")
+    if value:
+        return str(value)[:80]
+    if result.get("ok") is False and result.get("error"):
+        return "tool_error"
+    return None
+
+
+def _add_loop_step(payload: dict[str, Any], *, loop: int | None, step: int) -> None:
+    if loop is not None:
+        payload["loop"] = loop
+    payload["step"] = step
 
 
 def _kv_prompt_diagnostics(
@@ -573,6 +988,12 @@ def _kv_prompt_diagnostics(
     )
     roles = [str(m.get("role") or "") for m in normalized]
     joined_content = "\n".join(str(m.get("content") or "") for m in normalized)
+    role_char_counts: dict[str, int] = {}
+    for message in normalized:
+        role = str(message.get("role") or "")
+        role_char_counts[role] = role_char_counts.get(role, 0) + len(
+            str(message.get("content") or "")
+        )
     tools_text = json.dumps(
         tools or [],
         ensure_ascii=False,
@@ -580,6 +1001,7 @@ def _kv_prompt_diagnostics(
         separators=(",", ":"),
         default=str,
     )
+    tool_schema_modes = _tool_schema_mode_counts(tools or [])
     diag: dict[str, Any] = {
         "kv_loop": int(loop),
         "kv_message_count": len(normalized),
@@ -587,14 +1009,40 @@ def _kv_prompt_diagnostics(
         "kv_system_count": sum(1 for role in roles if role == "system"),
         "kv_assistant_count": sum(1 for role in roles if role == "assistant"),
         "kv_tool_count": sum(1 for role in roles if role == "tool"),
+        "kv_user_count": sum(1 for role in roles if role == "user"),
+        "kv_content_char_count": len(joined_content),
+        "kv_serialized_char_count": len(serialized),
+        "kv_system_char_count": role_char_counts.get("system", 0),
+        "kv_user_char_count": role_char_counts.get("user", 0),
+        "kv_assistant_char_count": role_char_counts.get("assistant", 0),
+        "kv_tool_char_count": role_char_counts.get("tool", 0),
         "kv_tools_count": len(tools or []),
         "kv_tools_hash": _short_hash(tools_text),
+        "kv_tools_char_count": len(tools_text),
+        "kv_tools_full_count": tool_schema_modes["full"],
+        "kv_tools_stub_count": tool_schema_modes["stub"],
         "kv_prefix_8k_hash": _short_hash(serialized[:8192]),
         "kv_prefix_16k_hash": _short_hash(serialized[:16384]),
         "kv_prefix_24k_hash": _short_hash(serialized[:24576]),
         "kv_has_send_receipt": "<send_receipt" in joined_content,
+        "kv_send_receipt_block_count": joined_content.count("<send_receipt"),
+        "kv_send_receipt_char_count": _tagged_block_char_count(
+            joined_content,
+            "send_receipt",
+        ),
+        "kv_task_context_block_count": joined_content.count("<task_context"),
+        "kv_task_context_char_count": _tagged_block_char_count(
+            joined_content,
+            "task_context",
+        ),
         "kv_has_recent_group_messages": "<recent_group_messages" in joined_content,
+        "kv_recent_group_message_line_count": joined_content.count(" msg_id="),
         "kv_has_rag": "<retrieved_conversation_context" in joined_content,
+        "kv_rag_block_count": joined_content.count("<retrieved_conversation_context"),
+        "kv_rag_char_count": _tagged_block_char_count(
+            joined_content,
+            "retrieved_conversation_context",
+        ),
     }
     return diag
 
@@ -603,3 +1051,43 @@ def _short_hash(text: str) -> str:
     if not text:
         return ""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _tool_schema_mode_counts(tools: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"full": 0, "stub": 0}
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        parameters = function.get("parameters") if isinstance(function, dict) else None
+        properties = parameters.get("properties") if isinstance(parameters, dict) else None
+        if isinstance(properties, dict) and "_tool_search_required" in properties:
+            counts["stub"] += 1
+        else:
+            counts["full"] += 1
+    return counts
+
+
+def _tagged_block_char_count(text: str, tag_name: str) -> int:
+    pattern = re.compile(
+        rf"<{re.escape(tag_name)}(?:\s[^>]*)?>.*?</{re.escape(tag_name)}>",
+        re.DOTALL,
+    )
+    return sum(len(match.group(0)) for match in pattern.finditer(text))
+
+
+def _executor_accepts_tool_call_id(executor: ToolExecutor) -> bool:
+    try:
+        signature = inspect.signature(executor)
+    except (TypeError, ValueError):
+        return False
+    positional_count = 0
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "tool_call_id":
+            return True
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_count += 1
+    return positional_count >= 3

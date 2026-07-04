@@ -18,6 +18,7 @@ DASHBOARD_COPY: dict[str, str] = {
     "nav.overview": "总览",
     "nav.chats": "对话",
     "nav.memory": "记忆",
+    "nav.persona_mind": "人格后台",
     "nav.logs": "日志",
     "nav.personas": "角色",
     "nav.settings": "设置",
@@ -89,6 +90,13 @@ DASHBOARD_COPY: dict[str, str] = {
     "memory.delete_confirm_body": "Debata 之后不会再用它做参考。这是不可逆的操作。",
     "memory.export_button": "导出",
     "memory.import_button": "导入",
+
+    # ============================================================
+    # 人格后台
+    # ============================================================
+    "persona_mind.title": "人格后台",
+    "persona_mind.empty_title": "人格后台未启用",
+    "persona_mind.empty_subtitle": "启用人格管理并完成运行时初始化后，状态和后台记录会显示在这里",
 
     # ============================================================
     # 日志查看器

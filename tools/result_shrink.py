@@ -46,7 +46,8 @@ def shrink_tool_result(tool_name: str, result: dict[str, Any], ctx: Any) -> dict
 
 
 def add_condensed_marker(result: dict[str, Any], *, reason: str, full: str) -> dict[str, Any]:
-    marker = dict(result.get("_condensed") or {})
+    existing = result.get("_condensed")
+    marker = dict(existing) if isinstance(existing, dict) else {}
     marker.update({"reason": reason, "full": full})
     result["_condensed"] = marker
     return result
@@ -272,36 +273,76 @@ def _hard_cap(
     if _estimate_dict(result, estimator) <= hard_cap:
         return result
 
+    field_budget = max(24, hard_cap // max(8, len(result) * 2))
     compact = {
-        "ok": result.get("ok", True),
-        "status": result.get("status", "truncated"),
-        "tool": tool_name,
-        "brief": result.get(
-            "brief",
-            "工具结果超过硬上限，已拒绝把不完整正文作为完整结果交给模型。",
-        ),
+        key: _hard_cap_value(value, field_budget, estimator)
+        for key, value in result.items()
     }
-    if "artifact" in result:
-        compact["artifact"] = result.get("artifact")
-    if "path" in result:
-        compact["path"] = result.get("path")
-    if "count" in result:
-        compact["count"] = result.get("count")
-    if "data" in result:
-        compact["data"] = result.get("data")
-    if "next" in result:
-        compact["next"] = result.get("next")
+    compact["ok"] = result.get("ok", True)
+    status = result.get("status")
+    compact["status"] = status if isinstance(status, str) and status.strip() else "truncated"
+    compact["tool"] = tool_name
+    compact["result_format"] = "structured_json"
+    brief = result.get("brief")
+    if isinstance(brief, str) and brief.strip() and estimator.estimate_text(brief) <= field_budget:
+        compact["brief"] = brief
+    else:
+        compact["brief"] = "工具结果超过硬上限，已保留字段名并截断过大的字段值。"
     if "artifact" not in compact:
-        compact["preview"] = _trim_head_tail(
-            json.dumps(result, ensure_ascii=False, sort_keys=True),
-            hard_cap,
-            estimator,
+        compact.setdefault(
+            "preview",
+            {
+                "_truncated": True,
+                "original_type": "object",
+                "top_level_fields": list(result.keys()),
+                "content": _trim_head_tail(
+                    _json_dumps(result),
+                    max(24, hard_cap // 3),
+                    estimator,
+                ),
+                "next": "这是原始工具结果的整体预览；完整结果未内联给模型。",
+            },
         )
     return add_condensed_marker(
         compact,
         reason="工具结果超过中央 hard cap，已通用截断",
-        full="请使用更窄参数重调工具，或让工具把完整结果写入 workspace 文件。",
+        full="已保留原始顶层字段名；过大的字段值会替换为截断说明。请使用更窄参数重调工具，或让工具把完整结果写入 workspace 文件。",
     )
+
+
+def _hard_cap_value(value: Any, limit_tokens: int, estimator: TokenEstimator) -> Any:
+    if isinstance(value, str):
+        if estimator.estimate_text(value) <= limit_tokens:
+            return value
+        return {
+            "_truncated": True,
+            "original_type": "string",
+            "characters": len(value),
+            "preview": _trim_head_tail(value, limit_tokens, estimator),
+            "next": "字段值超过 hard cap，已只保留预览。",
+        }
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+
+    encoded = _json_dumps(value)
+    if estimator.estimate_text(encoded) <= limit_tokens:
+        return copy.deepcopy(value)
+
+    summary: dict[str, Any] = {
+        "_truncated": True,
+        "original_type": type(value).__name__,
+        "preview": _trim_head_tail(encoded, limit_tokens, estimator),
+        "next": "字段值超过 hard cap，已只保留结构摘要和预览。",
+    }
+    if isinstance(value, dict):
+        summary["keys"] = list(value.keys())
+    elif isinstance(value, list):
+        summary["count"] = len(value)
+    return summary
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def _trim_chars(text: str, limit: int) -> str:

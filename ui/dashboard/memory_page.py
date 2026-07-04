@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QTabBar,
     QVBoxLayout,
     QWidget,
 )
@@ -54,6 +55,14 @@ class MemoryPage(QWidget):
         self._rag_status.setWordWrap(True)
         outer.addWidget(self._rag_status)
 
+        self._tabs = QTabBar()
+        self._tabs.setObjectName("MemoryModeTabs")
+        self._tabs.addTab("重要记忆")
+        self._tabs.addTab("RAG 历史索引")
+        self._tabs.currentChanged.connect(lambda *_: self.refresh())
+        outer.addWidget(self._tabs)
+        self._tabs.hide()
+
         self._list = QListWidget()
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         outer.addWidget(self._list, 1)
@@ -80,7 +89,8 @@ class MemoryPage(QWidget):
         metadata_row.addWidget(self._scope_edit, 1)
         self._pinned_check = QCheckBox("置顶")
         metadata_row.addWidget(self._pinned_check)
-        self._metadata_btn = QPushButton("保存范围")
+        self._metadata_btn_default_text = "保存范围"
+        self._metadata_btn = QPushButton(self._metadata_btn_default_text)
         self._metadata_btn.setProperty("role", "secondary")
         self._metadata_btn.clicked.connect(self._on_update_metadata)
         metadata_row.addWidget(self._metadata_btn)
@@ -124,12 +134,18 @@ class MemoryPage(QWidget):
         if rt is None or rt.important is None:
             self._show_empty(True)
             return
-        if self._is_rag_mode():
+        is_rag = self._is_rag_mode()
+        self._tabs.setVisible(is_rag)
+        if is_rag and self._current_view() == "rag":
             self._refresh_rag_mode(rt)
             return
 
         self._title.setText(DASHBOARD_COPY["memory.important_section"])
-        self._rag_status.hide()
+        if is_rag:
+            self._rag_status.setText("重要记忆始终启用；RAG 历史索引可在旁边页签查看。")
+            self._rag_status.show()
+        else:
+            self._rag_status.hide()
         self._action_row_widget.show()
         self._add_row_widget.show()
         items = rt.important.items()
@@ -153,11 +169,11 @@ class MemoryPage(QWidget):
         entries = rag_store.all_entries() if rag_store is not None else []
         if rag_store is None or embedding is None:
             self._rag_status.setText(
-                "RAG 当前未就绪。RAG 模式使用历史向量检索，不会读写重要记忆文件。"
+                "RAG 当前未就绪。重要记忆仍照常可用；历史向量索引会在 embedding 服务就绪后显示。"
             )
         else:
             self._rag_status.setText(
-                f"按语义向量检索历史消息。索引 {len(entries)} 条。"
+                f"RAG 会按语义向量检索历史消息。索引 {len(entries)} 条；重要记忆仍单独保存和注入。"
             )
 
         if not entries:
@@ -174,37 +190,36 @@ class MemoryPage(QWidget):
         except Exception:
             return False
 
+    def _current_view(self) -> str:
+        return "rag" if self._is_rag_mode() and self._tabs.currentIndex() == 1 else "important"
+
     def _show_empty(self, on: bool) -> None:
         self._list.setVisible(not on)
-        if self._is_rag_mode():
+        if self._current_view() == "rag":
             self._action_row_widget.hide()
             self._add_row_widget.hide()
             self._metadata_row_widget.hide()
         else:
             self._delete_btn.setVisible(not on)
             self._metadata_row_widget.setVisible(not on)
-        self._empty.setVisible(on and not self._is_rag_mode())
-        self._rag_empty.setVisible(on and self._is_rag_mode())
+        self._empty.setVisible(on and self._current_view() != "rag")
+        self._rag_empty.setVisible(on and self._current_view() == "rag")
 
     def _add_memory_item(self, item: dict, *, rag_mode: bool = False) -> None:
-        ts = item.get("timestamp", "")
-        content = item.get("content", "")
-        scope = item.get("scope", "global")
-        pinned = bool(item.get("pinned"))
-        flags = f"[{scope}{' / 置顶' if pinned else ''}]"
-        line = f"{ts}  ·  {flags}  {content}" if ts else f"{flags}  {content}"
-        li = QListWidgetItem(line)
+        li = QListWidgetItem()
         if rag_mode:
             li.setToolTip("RAG 模式下编辑原始重要记忆的 scope / pinned，保存后会重建索引。")
         li.setData(
             Qt.ItemDataRole.UserRole,
             {
                 "id": str(item.get("id") or item.get("timestamp") or ""),
-                "content": content,
-                "scope": scope,
-                "pinned": pinned,
+                "timestamp": item.get("timestamp", ""),
+                "content": item.get("content", ""),
+                "scope": item.get("scope", "global"),
+                "pinned": bool(item.get("pinned")),
             },
         )
+        self._refresh_memory_item_text(li)
         self._list.addItem(li)
 
     def _add_rag_entry(self, entry: Any) -> None:
@@ -239,6 +254,38 @@ class MemoryPage(QWidget):
         self._scope_edit.setEnabled(has_item)
         self._pinned_check.setEnabled(has_item)
         self._metadata_btn.setEnabled(has_item)
+        self._metadata_btn.setText(self._metadata_btn_default_text)
+
+    def _refresh_memory_item_text(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.ItemDataRole.UserRole) or {}
+        ts = data.get("timestamp", "")
+        content = data.get("content", "")
+        scope = data.get("scope", "global")
+        pinned = bool(data.get("pinned"))
+        flags = f"[{scope}{' / 置顶' if pinned else ''}]"
+        item.setText(f"{ts}  ·  {flags}  {content}" if ts else f"{flags}  {content}")
+
+    def _update_selected_memory_metadata(self, item_id: str, scope: str, pinned: bool) -> bool:
+        item = self._select_memory_item(item_id)
+        if item is None:
+            return False
+        data = item.data(Qt.ItemDataRole.UserRole) or {}
+        data["scope"] = scope or "global"
+        data["pinned"] = bool(pinned)
+        item.setData(Qt.ItemDataRole.UserRole, data)
+        self._refresh_memory_item_text(item)
+        self._scope_edit.setText(data["scope"])
+        self._pinned_check.setChecked(data["pinned"])
+        return True
+
+    def _select_memory_item(self, item_id: str) -> QListWidgetItem | None:
+        for index in range(self._list.count()):
+            item = self._list.item(index)
+            data = item.data(Qt.ItemDataRole.UserRole) or {}
+            if data.get("id") == item_id:
+                self._list.setCurrentItem(item)
+                return item
+        return None
 
     def _on_delete(self) -> None:
         item = self._list.currentItem()
@@ -320,6 +367,8 @@ class MemoryPage(QWidget):
         if not item_id:
             show_message(self, "无法保存", "这条记忆缺少唯一时间戳，请刷新后再试。")
             return
+        scope = self._scope_edit.text().strip()
+        pinned = self._pinned_check.isChecked()
         rt = self._runtime
         if rt is None or rt.important is None:
             return
@@ -330,20 +379,26 @@ class MemoryPage(QWidget):
 
         async def _do() -> None:
             self._set_busy(True)
+            ok = False
             try:
                 ok = await rt.important.update_metadata(
                     item_id,
-                    scope=self._scope_edit.text().strip(),
-                    pinned=self._pinned_check.isChecked(),
+                    scope=scope,
+                    pinned=pinned,
                 )
                 if not ok:
                     show_message(self, "没有保存", "未找到这条记忆，可能已经被刷新。")
+                else:
+                    self._update_selected_memory_metadata(item_id, scope, pinned)
             except Exception as e:
                 logger.warning(f"更新重要记忆元数据失败: {e}")
                 show_message(self, "保存失败", str(e), is_danger=True)
             finally:
                 self._set_busy(False)
                 self.refresh()
+                if ok:
+                    self._select_memory_item(item_id)
+                    self._metadata_btn.setText("已保存")
 
         loop.create_task(_do())
 

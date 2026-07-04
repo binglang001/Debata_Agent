@@ -1,4 +1,4 @@
-"""记忆方式配置：文件模式或 RAG 向量检索。"""
+"""RAG 历史召回配置；重要记忆始终启用。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import asyncio
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
-    QCheckBox,
     QComboBox,
     QFormLayout,
     QFrame,
@@ -36,8 +35,8 @@ from .main_model_custom import _PRESET_DEFAULTS
 
 _EMBEDDING_PRESETS: dict[str, dict[str, str]] = {
     "volcengine": {
-        "display": "火山方舟 · 独立 Embedding（推荐 · 文本向量）",
-        "model": "doubao-embedding-text-240515",
+        "display": "火山方舟 · 独立 Embedding（推荐）",
+        "model": "doubao-embedding-vision-251215",
     },
     "openai": {
         "display": "OpenAI · 独立 Embedding",
@@ -71,7 +70,7 @@ _EMBEDDING_PRESETS: dict[str, dict[str, str]] = {
 
 
 class EmbeddingStepView(BaseStepView):
-    """长期记忆模式 + RAG embedding 配置。"""
+    """重要记忆基础上的 RAG 历史召回配置。"""
 
     def __init__(self, context: WizardContext, parent=None) -> None:
         super().__init__(context, parent)
@@ -81,9 +80,10 @@ class EmbeddingStepView(BaseStepView):
         outer.setSpacing(Spacing.MD)
 
         card = SectionCard(
-            title="记忆方式",
+            title="重要记忆与历史召回",
             subtitle=(
-                "文件模式更轻，RAG 模式会用 embedding 模型做语义检索。"
+                "重要记忆始终启用，会继续保存并注入关键事实。"
+                "RAG 是可选的历史向量召回增强，需要 embedding 服务。"
                 "本页完成后再进入渠道配置。"
             ),
             compact=True,
@@ -92,13 +92,13 @@ class EmbeddingStepView(BaseStepView):
 
         self._mode_group = QButtonGroup(self)
         self._mode_group.setExclusive(True)
-        self._rb_file = QRadioButton("文件模式（默认 · 零开销 · AI 主动调工具）")
-        self._rb_rag = QRadioButton("RAG 向量检索（语义召回 · 需要 embedding）")
+        self._rb_file = QRadioButton("不启用 RAG 历史召回（默认 · 重要记忆仍启用）")
+        self._rb_rag = QRadioButton("启用 RAG 历史召回增强（需要 embedding）")
         self._mode_group.addButton(self._rb_file)
         self._mode_group.addButton(self._rb_rag)
         self._rb_file.toggled.connect(self._refresh_visibility)
         card.add_content(self._rb_file)
-        card.add_content(self._mk_secondary("不加载额外模型，适合先跑通功能。"))
+        card.add_content(self._mk_secondary("只使用重要记忆和文件重要记忆，不额外做历史向量召回。"))
 
         rag_row = QWidget()
         rag_lay = QHBoxLayout(rag_row)
@@ -111,11 +111,7 @@ class EmbeddingStepView(BaseStepView):
         guide_btn.clicked.connect(lambda: open_feature_guide("embedding_rag", self))
         rag_lay.addWidget(guide_btn)
         card.add_content(rag_row)
-        card.add_content(self._mk_secondary("适合长期运行后从大量记忆中取最相关内容。"))
-
-        self._keyword_chk = QCheckBox("命中关键词强制保存（记住 / 约定 / 我叫等）")
-        self._keyword_chk.setChecked(True)
-        card.add_content(self._keyword_chk)
+        card.add_content(self._mk_secondary("在重要记忆之外，从历史对话中按语义召回相关内容。"))
 
         sep = QFrame()
         sep.setProperty("role", "separator")
@@ -131,7 +127,7 @@ class EmbeddingStepView(BaseStepView):
         title.setProperty("role", "title-3")
         body.addWidget(title)
 
-        desc = QLabel("API 模式可复用已配置 provider，也可单独配置 Embedding provider；本地模式模型放在项目 data/models 下。")
+        desc = QLabel("只在启用 RAG 历史召回时需要。API 模式可复用已配置 provider，也可单独配置 Embedding provider；本地模式模型放在项目 data/models 下。")
         desc.setProperty("role", "secondary")
         desc.setWordWrap(True)
         body.addWidget(desc)
@@ -156,7 +152,7 @@ class EmbeddingStepView(BaseStepView):
         form.addRow(QLabel("Base URL"), self._api_base_url)
 
         self._api_model = ModelComboBox()
-        self._api_model.setPlaceholderText("如 text-embedding-v4 / embedding-3 / doubao-embedding-text-240515")
+        self._api_model.setPlaceholderText("如 doubao-embedding-vision-251215 / text-embedding-v4 / embedding-3")
         form.addRow(QLabel("模型 ID"), self._api_model)
 
         self._api_key = ApiKeyInput(
@@ -316,7 +312,7 @@ class EmbeddingStepView(BaseStepView):
             self._hint.setText("切到下一页前会检查模型目录。未就绪时可查看安装指引。")
             self._check_local_model()
         else:
-            self._hint.setText("RAG 只能使用支持 embedding 的模型。若已有聊天 provider 不支持 embedding，请选择独立 Embedding provider 并填写其密钥。")
+            self._hint.setText("RAG 历史召回只能使用支持 embedding 的模型。若已有聊天 provider 不支持 embedding，请选择独立 Embedding provider 并填写其密钥。")
 
     def _agent_provider_supports_embedding(self, preset: str, model: str) -> bool:
         try:
@@ -341,6 +337,8 @@ class EmbeddingStepView(BaseStepView):
         return "volcengine"
 
     def _recommended_embedding_model(self, preset: str) -> str:
+        if preset == "volcengine":
+            return _EMBEDDING_PRESETS["volcengine"]["model"]
         try:
             from providers.model_capabilities import recommended_model
 
@@ -509,7 +507,6 @@ class EmbeddingStepView(BaseStepView):
 
     def refresh(self) -> None:
         self._refresh_provider_choices()
-        self._keyword_chk.setChecked(self.context.long_term_memory_keyword_trigger_save)
         if self.context.long_term_memory_mode == "rag":
             self._rb_rag.setChecked(True)
         else:
@@ -528,6 +525,8 @@ class EmbeddingStepView(BaseStepView):
             self._api_provider.setCurrentIndex(idx_p)
         self._api_base_url.setText(self.context.embedding_provider_base_url or "")
         self._api_model.setText(self.context.embedding_model or "")
+        if not self.context.embedding_model and self.context.embedding_type == "api":
+            self._on_provider_changed()
         if self.context.embedding_api_key:
             self._api_key.set_text(self.context.embedding_api_key)
 
@@ -541,7 +540,6 @@ class EmbeddingStepView(BaseStepView):
 
     def save(self) -> bool:
         self.context.long_term_memory_mode = "rag" if self._rb_rag.isChecked() else "file"
-        self.context.long_term_memory_keyword_trigger_save = self._keyword_chk.isChecked()
 
         if self.context.long_term_memory_mode == "file":
             return True
