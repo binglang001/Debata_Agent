@@ -7,26 +7,26 @@ from pathlib import Path
 import orjson
 import pytest
 
-from memory.diana_db import DIANA_DB_SCHEMA_VERSION, DianaDB
-from memory.diana_importers import (
+from memory.debata_db import DEBATA_DB_SCHEMA_VERSION, DebataDB
+from memory.debata_importers import (
     LegacyImportDomainResult,
     import_legacy_memory_files,
     import_legacy_memory_files_async,
 )
-from memory.diana_stores import (
-    DianaArchiveStore,
-    DianaEventStore,
-    DianaHistoryStore,
-    DianaImportantStore,
-    DianaPersonaDB,
-    DianaRollingSummaryStore,
-    DianaUsageStatsStore,
+from memory.debata_stores import (
+    DebataArchiveStore,
+    DebataEventStore,
+    DebataHistoryStore,
+    DebataImportantStore,
+    DebataPersonaDB,
+    DebataRollingSummaryStore,
+    DebataUsageStatsStore,
 )
 
 
 def test_import_legacy_memory_files_full_sample_roundtrip(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "db" / "diana.db"
+    db_path = tmp_path / "db" / "debata.db"
     history_records = [
         {
             "role": "user",
@@ -122,7 +122,7 @@ def test_import_legacy_memory_files_full_sample_roundtrip(tmp_path):
     assert rows[0]["prompt_tokens"] == 10
     assert rows[0]["cached_tokens"] == 5
 
-    usage_store = DianaUsageStatsStore(db_path, "yuexi")
+    usage_store = DebataUsageStatsStore(db_path, "yuexi")
     asyncio.run(usage_store.load())
     assert usage_store.count == 2
     assert usage_store.summarize("all").total_tokens == 36
@@ -130,7 +130,7 @@ def test_import_legacy_memory_files_full_sample_roundtrip(tmp_path):
 
 def test_import_legacy_memory_files_is_idempotent(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     history_records = [
         {"role": "user", "content": "one"},
         {"role": "assistant", "content": "two"},
@@ -166,7 +166,7 @@ def test_import_legacy_memory_files_is_idempotent(tmp_path):
 def test_import_legacy_memory_files_can_read_explicit_usage_source(tmp_path):
     source_dir = tmp_path / "legacy"
     logs_dir = tmp_path / "logs"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     memory_usage = {
         "ts": 1.0,
         "agent": "memory-dir",
@@ -200,20 +200,20 @@ def test_import_legacy_memory_files_can_read_explicit_usage_source(tmp_path):
 @pytest.mark.asyncio
 async def test_import_legacy_memory_files_async_public_entry(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     _write_jsonl(source_dir / "history.jsonl", [{"role": "user", "content": "async"}])
 
     result = await import_legacy_memory_files_async(db_path, source_dir, "yuexi")
 
     assert result.history == LegacyImportDomainResult(imported=1, skipped=0)
-    assert await DianaHistoryStore(db_path, "yuexi").load(force_reload=True) == [
+    assert await DebataHistoryStore(db_path, "yuexi").load(force_reload=True) == [
         {"role": "user", "content": "async"},
     ]
 
 
 def test_import_legacy_memory_files_preserves_rolling_summary_raw_json(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     rolling_summary = {
         "summary_text": "  带额外字段的摘要  ",
         "archived_until": {"history_index": 9, "marker": {"nested": True}},
@@ -240,7 +240,7 @@ def test_import_legacy_memory_files_preserves_rolling_summary_raw_json(tmp_path)
 def test_import_legacy_memory_files_backup_existing_database_only(tmp_path):
     source_dir = tmp_path / "legacy_missing_target"
     source_dir.mkdir()
-    missing_db_path = tmp_path / "missing" / "diana.db"
+    missing_db_path = tmp_path / "missing" / "debata.db"
 
     missing_result = import_legacy_memory_files(missing_db_path, source_dir, "yuexi")
 
@@ -248,9 +248,9 @@ def test_import_legacy_memory_files_backup_existing_database_only(tmp_path):
     assert not (missing_db_path.parent / "backups").exists()
 
     existing_source = tmp_path / "legacy_existing_target"
-    existing_db_path = tmp_path / "existing" / "diana.db"
+    existing_db_path = tmp_path / "existing" / "debata.db"
     _write_jsonl(existing_source / "history.jsonl", [{"role": "assistant", "content": "new"}])
-    db = DianaDB(existing_db_path)
+    db = DebataDB(existing_db_path)
     try:
         db.load()
         db.connect().execute(
@@ -270,7 +270,7 @@ def test_import_legacy_memory_files_backup_existing_database_only(tmp_path):
     assert existing_result.backup_path is not None
     assert existing_result.backup_path.exists()
     with sqlite3.connect(existing_result.backup_path) as backup_conn:
-        assert backup_conn.execute("PRAGMA user_version").fetchone()[0] == DIANA_DB_SCHEMA_VERSION
+        assert backup_conn.execute("PRAGMA user_version").fetchone()[0] == DEBATA_DB_SCHEMA_VERSION
         backup_record = backup_conn.execute(
             "SELECT record_json FROM history_records WHERE persona_id = 'yuexi'"
         ).fetchone()[0]
@@ -281,7 +281,7 @@ def test_import_legacy_memory_files_backup_existing_database_only(tmp_path):
 def test_import_legacy_memory_files_skips_missing_and_damaged_files(tmp_path, caplog):
     source_dir = tmp_path / "legacy"
     source_dir.mkdir()
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     (source_dir / "history.jsonl").write_bytes(
         b'\n{"role":"user","content":"ok"}\n{broken\n[]\n'
     )
@@ -310,7 +310,7 @@ def test_import_legacy_memory_files_skips_missing_and_damaged_files(tmp_path, ca
 
 
 def test_import_legacy_memory_files_keeps_personas_isolated(tmp_path):
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     first_source = tmp_path / "legacy_yuexi"
     second_source = tmp_path / "legacy_jiu"
     shared_usage = {
@@ -346,7 +346,7 @@ def test_import_legacy_memory_files_keeps_personas_isolated(tmp_path):
 
 def test_import_legacy_important_merges_persona_and_json_with_persona_precedence(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     sample = _legacy_persona_sample()
     persona_item_without_id = {"content": "无 id 但内容完全相同", "scope": "global"}
     persona_items = [
@@ -378,12 +378,12 @@ def test_import_legacy_important_merges_persona_and_json_with_persona_precedence
     assert _persona_rows(db_path, "persona_important_state_legacy", "yuexi") == [
         {"persona_id": "yuexi", **sample["important_memories"][0]},
     ]
-    assert asyncio.run(DianaPersonaDB(db_path, "yuexi").read_important(default=[])) == persona_items
+    assert asyncio.run(DebataPersonaDB(db_path, "yuexi").read_important(default=[])) == persona_items
 
 
 def test_import_legacy_important_from_persona_without_important_json(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     sample = _legacy_persona_sample()
     persona_items = [{"id": "persona_only", "content": "只存在于 persona.db"}]
     sample["important_memories"][0] = {
@@ -406,7 +406,7 @@ def test_import_legacy_important_damaged_json_still_imports_persona_source(
     caplog,
 ):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     sample = _legacy_persona_sample()
     persona_items = [{"id": "persona_valid", "content": "有效 persona 重要记忆"}]
     sample["important_memories"][0] = {
@@ -429,7 +429,7 @@ def test_import_legacy_important_skips_invalid_persona_merge_source_but_preserve
     tmp_path,
     caplog,
 ):
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     non_list_source = tmp_path / "non_list"
     damaged_source = tmp_path / "damaged"
     non_list_sample = _legacy_persona_sample()
@@ -468,7 +468,7 @@ def test_import_legacy_important_valid_json_survives_invalid_persona_source(
     caplog,
 ):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     sample = _legacy_persona_sample()
     sample["important_memories"][0] = {
         **sample["important_memories"][0],
@@ -492,7 +492,7 @@ def test_import_legacy_important_valid_json_survives_invalid_persona_source(
 def test_import_legacy_important_missing_sources_keep_existing_rows(tmp_path):
     initial_source = tmp_path / "initial"
     empty_source = tmp_path / "empty"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     existing_items = [{"id": "existing", "content": "已有重要记忆"}]
     _write_json(initial_source / "important.json", existing_items)
     empty_source.mkdir()
@@ -508,7 +508,7 @@ def test_import_legacy_important_missing_sources_keep_existing_rows(tmp_path):
 
 def test_import_legacy_important_merge_is_idempotent(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     sample = _legacy_persona_sample()
     persona_items = [{"id": "shared", "content": "persona.db 权威"}]
     important_items = [
@@ -538,7 +538,7 @@ def test_import_legacy_important_merge_is_idempotent(tmp_path):
 
 def test_import_legacy_persona_db_full_sample_preserves_rows_and_store_reads(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     sample = _legacy_persona_sample()
     important_items = [{"id": "json_mem", "content": "来自 important.json"}]
     _write_json(source_dir / "important.json", important_items)
@@ -561,14 +561,14 @@ def test_import_legacy_persona_db_full_sample_preserves_rows_and_store_reads(tmp
             for row in sample[source_table]
         ]
     assert _read_important(db_path, "yuexi") == merged_important_items
-    assert asyncio.run(DianaImportantStore(db_path, "yuexi").read(default=[])) == (
+    assert asyncio.run(DebataImportantStore(db_path, "yuexi").read(default=[])) == (
         merged_important_items
     )
     assert [orjson.loads(row["item_json"]) for row in _important_rows(db_path, "yuexi")] == (
         merged_important_items
     )
 
-    store = DianaPersonaDB(db_path, "yuexi")
+    store = DebataPersonaDB(db_path, "yuexi")
     assert asyncio.run(store.get_state()).mood == 72.0
     assert asyncio.run(store.recent_state_logs(limit=2)) == [
         {"mood": 73.0, "event": "after"},
@@ -609,7 +609,7 @@ def test_import_legacy_persona_db_full_sample_preserves_rows_and_store_reads(tmp
 
 def test_import_legacy_persona_db_is_idempotent(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     sample = _legacy_persona_sample()
     _write_legacy_persona_sqlite(source_dir / "persona.db", sample)
 
@@ -626,7 +626,7 @@ def test_import_legacy_persona_db_is_idempotent(tmp_path):
 def test_import_legacy_persona_db_conflict_warns_and_keeps_existing(tmp_path, caplog):
     source_dir = tmp_path / "legacy"
     conflict_source = tmp_path / "legacy_conflict"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     original = _legacy_persona_sample()
     conflict = _legacy_persona_sample()
     conflict["effects"][0] = {
@@ -656,7 +656,7 @@ def test_import_legacy_persona_db_conflict_warns_and_keeps_existing(tmp_path, ca
 
 def test_import_legacy_persona_db_keeps_personas_isolated(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     sample = _legacy_persona_sample()
     _write_legacy_persona_sqlite(source_dir / "persona.db", sample)
 
@@ -672,10 +672,10 @@ def test_import_legacy_persona_db_keeps_personas_isolated(tmp_path):
     assert _persona_rows(db_path, "persona_state", "jiu") == [
         {"persona_id": "jiu", **sample["persona_state"][0]},
     ]
-    assert asyncio.run(DianaPersonaDB(db_path, "yuexi").read_important(default=[])) == [
+    assert asyncio.run(DebataPersonaDB(db_path, "yuexi").read_important(default=[])) == [
         {"id": "mem_1", "content": "旧 persona 重要记忆"}
     ]
-    assert asyncio.run(DianaPersonaDB(db_path, "jiu").read_important(default=[])) == [
+    assert asyncio.run(DebataPersonaDB(db_path, "jiu").read_important(default=[])) == [
         {"id": "mem_1", "content": "旧 persona 重要记忆"}
     ]
 
@@ -686,7 +686,7 @@ def test_import_legacy_persona_db_missing_file_table_and_bad_rows_do_not_crash(
 ):
     missing_source = tmp_path / "missing"
     missing_source.mkdir()
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
 
     missing_result = import_legacy_memory_files(db_path, missing_source, "yuexi")
 
@@ -756,7 +756,7 @@ def test_import_legacy_persona_db_missing_file_table_and_bad_rows_do_not_crash(
 
 def test_import_legacy_persona_db_legacy_eat_records_without_new_columns(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     record_json = orjson.dumps({"food": "苹果", "eat_id": "eat_from_json"}).decode("utf-8")
     _write_legacy_persona_sqlite_legacy_eat_only(source_dir / "persona.db", record_json)
 
@@ -774,14 +774,14 @@ def test_import_legacy_persona_db_legacy_eat_records_without_new_columns(tmp_pat
             "created_at": "2026-06-18 12:00:00",
         }
     ]
-    assert asyncio.run(DianaPersonaDB(db_path, "yuexi").recent_eat_records(limit=5)) == [
+    assert asyncio.run(DebataPersonaDB(db_path, "yuexi").recent_eat_records(limit=5)) == [
         {"food": "苹果", "eat_id": "eat_from_json"}
     ]
 
 
 def test_import_legacy_persona_db_legacy_eat_records_falls_back_to_row_id(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     record_json = _json_text({"food": "苹果"})
     _write_legacy_persona_sqlite_legacy_eat_only(source_dir / "persona.db", record_json)
 
@@ -803,7 +803,7 @@ def test_import_legacy_persona_db_legacy_eat_records_falls_back_to_row_id(tmp_pa
 
 def test_import_legacy_archive_preserves_messages_media_and_store_reads(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     first = _legacy_archive_message(
         3,
         archive_id="old-3",
@@ -832,7 +832,7 @@ def test_import_legacy_archive_preserves_messages_media_and_store_reads(tmp_path
         {"persona_id": "yuexi", **media},
     ]
 
-    store = DianaArchiveStore(db_path, "yuexi")
+    store = DebataArchiveStore(db_path, "yuexi")
     assert [record["archive_id"] for record in asyncio.run(store.records())] == [
         "old-3",
         "old-8",
@@ -871,7 +871,7 @@ def test_import_legacy_archive_preserves_messages_media_and_store_reads(tmp_path
 
 def test_import_legacy_archive_is_idempotent(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     message = _legacy_archive_message(1, archive_id="same-1", content="重复归档")
     media = _legacy_archive_media(1, archive_id="same-1", workspace_path="same.jpg")
     _write_legacy_archive_sqlite(source_dir / "archive.sqlite3", [message], [media])
@@ -888,7 +888,7 @@ def test_import_legacy_archive_is_idempotent(tmp_path):
 def test_import_legacy_archive_message_conflict_warns_and_keeps_existing(tmp_path, caplog):
     source_dir = tmp_path / "legacy"
     conflict_source = tmp_path / "legacy_conflict"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     original = _legacy_archive_message(1, archive_id="old-1", content="原始")
     rowid_conflict = _legacy_archive_message(1, archive_id="other-1", content="冲突 rowid")
     archive_id_conflict = _legacy_archive_message(2, archive_id="old-1", content="冲突 id")
@@ -913,7 +913,7 @@ def test_import_legacy_archive_message_conflict_warns_and_keeps_existing(tmp_pat
 def test_import_legacy_archive_media_orphan_and_conflict_warn(tmp_path, caplog):
     source_dir = tmp_path / "legacy"
     conflict_source = tmp_path / "legacy_conflict"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     message = _legacy_archive_message(1, archive_id="old-1", content="有媒体")
     original_media = _legacy_archive_media(1, archive_id="old-1", workspace_path="keep.jpg")
     orphan_media = _legacy_archive_media(2, archive_id="missing", workspace_path="orphan.jpg")
@@ -940,7 +940,7 @@ def test_import_legacy_archive_media_orphan_and_conflict_warn(tmp_path, caplog):
 
 def test_import_legacy_archive_without_record_json_uses_store_fallback(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     message = _legacy_archive_message(4, archive_id="no-record", content="无原始 JSON")
     _write_legacy_archive_sqlite(
         source_dir / "archive.sqlite3",
@@ -954,7 +954,7 @@ def test_import_legacy_archive_without_record_json_uses_store_fallback(tmp_path)
     assert result.archive == LegacyImportDomainResult(imported=1, skipped=0)
     row = _archive_message_rows(db_path, "yuexi")[0]
     assert row["record_json"] is None
-    loaded = asyncio.run(DianaArchiveStore(db_path, "yuexi").records())
+    loaded = asyncio.run(DebataArchiveStore(db_path, "yuexi").records())
     assert loaded == [
         {
             "role": "user",
@@ -972,7 +972,7 @@ def test_import_legacy_archive_missing_required_message_column_skips_media(
 ):
     source_dir = tmp_path / "legacy"
     broken_source = tmp_path / "broken"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     existing_message = _legacy_archive_message(1, archive_id="shared", content="已有归档")
     existing_media = _legacy_archive_media(
         1,
@@ -1014,7 +1014,7 @@ def test_import_legacy_archive_missing_required_message_column_skips_media(
 
 def test_import_legacy_archive_skips_bad_rows_without_aborting(tmp_path, caplog):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     valid = _legacy_archive_message(1, archive_id="valid", content="有效行")
     bad_message = _legacy_archive_message(2, archive_id=" ", content="缺 archive_id")
     bad_media = _legacy_archive_media(1, archive_id=" ", workspace_path="bad.jpg")
@@ -1037,7 +1037,7 @@ def test_import_legacy_archive_skips_bad_rows_without_aborting(tmp_path, caplog)
 def test_import_legacy_archive_missing_file_and_tables_do_not_crash(tmp_path, caplog):
     source_dir = tmp_path / "missing"
     source_dir.mkdir()
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
 
     missing_result = import_legacy_memory_files(db_path, source_dir, "yuexi")
 
@@ -1073,7 +1073,7 @@ def test_import_legacy_archive_missing_file_and_tables_do_not_crash(tmp_path, ca
 
 def test_import_legacy_archive_keeps_personas_isolated(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     message = _legacy_archive_message(1, archive_id="shared", content="共享旧归档")
     media = _legacy_archive_media(1, archive_id="shared", workspace_path="shared.jpg")
     _write_legacy_archive_sqlite(source_dir / "archive.sqlite3", [message], [media])
@@ -1087,13 +1087,13 @@ def test_import_legacy_archive_keeps_personas_isolated(tmp_path):
     assert _archive_message_rows(db_path, "jiu") == [{"persona_id": "jiu", **message}]
     assert _archive_media_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **media}]
     assert _archive_media_rows(db_path, "jiu") == [{"persona_id": "jiu", **media}]
-    assert asyncio.run(DianaArchiveStore(db_path, "yuexi").records())[0]["archive_id"] == "shared"
-    assert asyncio.run(DianaArchiveStore(db_path, "jiu").records())[0]["archive_id"] == "shared"
+    assert asyncio.run(DebataArchiveStore(db_path, "yuexi").records())[0]["archive_id"] == "shared"
+    assert asyncio.run(DebataArchiveStore(db_path, "jiu").records())[0]["archive_id"] == "shared"
 
 
 def test_import_legacy_events_sqlite_preserves_fields_and_store_reads(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     payload = {"text": "旧事件", "nested": {"a": 1}}
     event = _legacy_event(
         7,
@@ -1111,7 +1111,7 @@ def test_import_legacy_events_sqlite_preserves_fields_and_store_reads(tmp_path):
     for key, value in event.items():
         assert row[key] == value
 
-    store = DianaEventStore(db_path, "yuexi")
+    store = DebataEventStore(db_path, "yuexi")
     loaded = asyncio.run(store.get_event(7))
     assert loaded is not None
     assert loaded["payload"] == payload
@@ -1128,14 +1128,14 @@ def test_import_legacy_events_sqlite_preserves_fields_and_store_reads(tmp_path):
 
 def test_import_legacy_events_append_log_preserves_event_id_and_projection(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     event = _legacy_event(9, payload={"append": True}, idempotency_key="append:9")
     _write_jsonl(source_dir / "events.sqlite3.append.jsonl", [event])
 
     result = import_legacy_memory_files(db_path, source_dir, "yuexi")
 
     assert result.events == LegacyImportDomainResult(imported=1, skipped=0)
-    loaded = asyncio.run(DianaEventStore(db_path, "yuexi").get_event(9))
+    loaded = asyncio.run(DebataEventStore(db_path, "yuexi").get_event(9))
     assert loaded is not None
     assert loaded["event_id"] == 9
     assert loaded["payload"] == {"append": True}
@@ -1144,7 +1144,7 @@ def test_import_legacy_events_append_log_preserves_event_id_and_projection(tmp_p
 
 def test_import_legacy_events_union_deduplicates_and_rerun_is_idempotent(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     event = _legacy_event(5, payload={"same": "event"}, idempotency_key="same:5")
     _write_legacy_event_sqlite(source_dir / "events.sqlite3", [event])
     _write_jsonl(source_dir / "events.sqlite3.append.jsonl", [event])
@@ -1161,7 +1161,7 @@ def test_import_legacy_events_union_deduplicates_and_rerun_is_idempotent(tmp_pat
 
 def test_import_legacy_events_same_id_same_hash_different_row_warns(tmp_path, caplog):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     original = _legacy_event(
         6,
         event_uuid="uuid-original",
@@ -1184,7 +1184,7 @@ def test_import_legacy_events_same_id_same_hash_different_row_warns(tmp_path, ca
 
     assert result.events == LegacyImportDomainResult(imported=1, skipped=1)
     assert _event_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **original}]
-    loaded = asyncio.run(DianaEventStore(db_path, "yuexi").get_event(6))
+    loaded = asyncio.run(DebataEventStore(db_path, "yuexi").get_event(6))
     assert loaded["event_uuid"] == "uuid-original"
     assert loaded["payload"] == {"text": "原始"}
     assert loaded["schema_version"] == 1
@@ -1193,7 +1193,7 @@ def test_import_legacy_events_same_id_same_hash_different_row_warns(tmp_path, ca
 
 def test_import_legacy_events_conflicts_skip_without_overwrite(tmp_path, caplog):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     original = _legacy_event(
         1,
         event_type="message",
@@ -1226,14 +1226,14 @@ def test_import_legacy_events_conflicts_skip_without_overwrite(tmp_path, caplog)
 
     assert result.events == LegacyImportDomainResult(imported=1, skipped=2)
     assert _event_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **original}]
-    assert asyncio.run(DianaEventStore(db_path, "yuexi").get_event(2)) is None
+    assert asyncio.run(DebataEventStore(db_path, "yuexi").get_event(2)) is None
     assert "跳过冲突的旧事件 event_id=1" in caplog.text
     assert "跳过冲突的旧事件 idempotency_key=msg:1" in caplog.text
 
 
 def test_import_legacy_events_skips_bad_append_log_lines(tmp_path, caplog):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     append_log_path = source_dir / "events.sqlite3.append.jsonl"
     append_log_path.parent.mkdir(parents=True, exist_ok=True)
     valid = _legacy_event(3, payload={"ok": True})
@@ -1262,7 +1262,7 @@ def test_import_legacy_events_skips_bad_append_log_lines(tmp_path, caplog):
 
 def test_import_legacy_events_sqlite_without_event_log_is_missing_domain(tmp_path, caplog):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     sqlite_path = source_dir / "events.sqlite3"
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(sqlite_path) as conn:
@@ -1279,7 +1279,7 @@ def test_import_legacy_events_sqlite_without_event_log_is_missing_domain(tmp_pat
 
 def test_import_legacy_events_keeps_personas_isolated(tmp_path):
     source_dir = tmp_path / "legacy"
-    db_path = tmp_path / "diana.db"
+    db_path = tmp_path / "debata.db"
     event = _legacy_event(11, payload={"shared": True}, idempotency_key="shared:11")
     _write_legacy_event_sqlite(source_dir / "events.sqlite3", [event])
 
@@ -1290,10 +1290,10 @@ def test_import_legacy_events_keeps_personas_isolated(tmp_path):
     assert second.events == LegacyImportDomainResult(imported=1, skipped=0)
     assert _event_rows(db_path, "yuexi") == [{"persona_id": "yuexi", **event}]
     assert _event_rows(db_path, "jiu") == [{"persona_id": "jiu", **event}]
-    assert asyncio.run(DianaEventStore(db_path, "yuexi").get_event(11))["payload"] == {
+    assert asyncio.run(DebataEventStore(db_path, "yuexi").get_event(11))["payload"] == {
         "shared": True,
     }
-    assert asyncio.run(DianaEventStore(db_path, "jiu").get_event(11))["payload"] == {
+    assert asyncio.run(DebataEventStore(db_path, "jiu").get_event(11))["payload"] == {
         "shared": True,
     }
     assert _projection_state_value(db_path, "yuexi") == "11"
@@ -2052,15 +2052,15 @@ def _legacy_persona_row_count(sample: dict[str, list[dict]]) -> int:
 
 
 def _load_history(db_path: Path, persona_id: str) -> list[dict]:
-    return asyncio.run(DianaHistoryStore(db_path, persona_id).load(force_reload=True))
+    return asyncio.run(DebataHistoryStore(db_path, persona_id).load(force_reload=True))
 
 
 def _read_important(db_path: Path, persona_id: str) -> object:
-    return asyncio.run(DianaImportantStore(db_path, persona_id).read(default=[]))
+    return asyncio.run(DebataImportantStore(db_path, persona_id).read(default=[]))
 
 
 def _load_rolling_summary(db_path: Path, persona_id: str) -> dict:
-    return asyncio.run(DianaRollingSummaryStore(db_path, persona_id).load())
+    return asyncio.run(DebataRollingSummaryStore(db_path, persona_id).load())
 
 
 def _history_rows(db_path: Path, persona_id: str) -> list[dict]:

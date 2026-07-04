@@ -26,7 +26,7 @@ DEFAULT_SCHEMA_VERSIONS: dict[str, int] = {
     "root": 2,
     "instance": 1,
     "secrets": 1,
-    "diana_db": 1,
+    "debata_db": 1,
     "persona_data": 1,
 }
 

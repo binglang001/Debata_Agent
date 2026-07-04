@@ -84,7 +84,9 @@ class MediaPipelineMixin:
                         text = f"{text} {placeholder}".strip()
                 elif seg.type == MediaType.FILE:
                     url: str | None = seg.url
+                    tried_file_url_ids: set[str] = set()
                     if not url and seg.file_id:
+                        tried_file_url_ids.add(seg.file_id)
                         try:
                             url = await self.adapter.get_file_url(seg.file_id)
                         except NotImplementedError:
@@ -99,6 +101,27 @@ class MediaPipelineMixin:
                             suggested_name=seg.name
                             or f"file_{event.message_id}",
                         )
+                    if not ws_path:
+                        for candidate in self._file_url_fallback_candidates(seg, source):
+                            if candidate in tried_file_url_ids:
+                                continue
+                            tried_file_url_ids.add(candidate)
+                            try:
+                                fallback_source = await self.adapter.get_file_url(candidate)
+                            except NotImplementedError:
+                                break
+                            except Exception as e:
+                                logger.warning(f"获取文件 URL 失败 file_id={candidate}: {e}")
+                                continue
+                            if not fallback_source or fallback_source == source:
+                                continue
+                            ws_path = await self._save_media_to_workspace(
+                                fallback_source,
+                                suggested_name=seg.name
+                                or f"file_{event.message_id}",
+                            )
+                            if ws_path:
+                                break
                     suffix_parts = []
                     if source:
                         suffix_parts.append(f"url={source}")
@@ -119,6 +142,32 @@ class MediaPipelineMixin:
                 logger.exception(f"媒体段处理失败 type={seg.type}: {e}")
 
         return text
+
+    @staticmethod
+    def _file_url_fallback_candidates(
+        seg: MediaSegment,
+        source: str | None,
+    ) -> list[str]:
+        """文件原始路径不可读时，用保守线索向适配器查询真实来源。"""
+        from urllib.parse import unquote, urlparse
+
+        candidates = [seg.file_id, seg.name]
+        if source:
+            parsed = urlparse(source)
+            path = unquote(parsed.path) if parsed.scheme else source
+            basename = Path(path).name
+            candidates.append(basename)
+
+        out: list[str] = []
+        seen: set[str] = set()
+        original = (source or "").strip()
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if not value or value == original or value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        return out
 
     async def _forward_media_text(self, seg: MediaSegment) -> str:
         """合并转发要让模型看到可展开线索，能读到时附带短预览。"""

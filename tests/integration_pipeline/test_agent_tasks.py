@@ -58,7 +58,7 @@ async def test_agent_task_materializes_sources_without_url(build_pipeline, tmp_p
 
             {
 
-                "sender": {"nickname": "Diana"},
+                "sender": {"nickname": "Debata"},
 
                 "raw_message": "内层消息",
 

@@ -303,22 +303,29 @@ async def test_runtime_start_assembles_all_components(assembled_project):
         assert rt.subconscious_agent is None
         assert rt.persona_db is None
         from memory import (
-            DianaArchiveStore,
-            DianaEventStore,
-            DianaHistoryStore,
-            DianaImportantStore,
-            DianaRollingSummaryStore,
-            DianaUsageStatsStore,
+            DebataArchiveStore,
+            DebataEventStore,
+            DebataHistoryStore,
+            DebataImportantStore,
+            DebataRollingSummaryStore,
+            DebataUsageStatsStore,
         )
 
-        diana_db_path = paths.memory_dir_for("test_bot") / "diana.db"
-        assert diana_db_path.exists()
-        assert isinstance(rt.history._store, DianaHistoryStore)
-        assert isinstance(rt.event_store.store, DianaEventStore)
-        assert isinstance(rt.important._store, DianaImportantStore)
-        assert isinstance(rt.archive._store, DianaArchiveStore)
-        assert isinstance(rt.rolling_summary, DianaRollingSummaryStore)
-        assert isinstance(rt.usage_stats, DianaUsageStatsStore)
+        runtime_db_path = paths.memory_dir_for("test_bot") / "test_bot.db"
+        assert runtime_db_path.exists()
+        assert not (paths.memory_dir_for("test_bot") / "debata.db").exists()
+        assert isinstance(rt.history._store, DebataHistoryStore)
+        assert isinstance(rt.event_store.store, DebataEventStore)
+        assert isinstance(rt.important._store, DebataImportantStore)
+        assert isinstance(rt.archive._store, DebataArchiveStore)
+        assert isinstance(rt.rolling_summary, DebataRollingSummaryStore)
+        assert isinstance(rt.usage_stats, DebataUsageStatsStore)
+        assert rt.history._store.db.path == runtime_db_path
+        assert rt.event_store.store.db.path == runtime_db_path
+        assert rt.important._store.db.path == runtime_db_path
+        assert rt.archive._store.db.path == runtime_db_path
+        assert rt.rolling_summary.db.path == runtime_db_path
+        assert rt.usage_stats.db.path == runtime_db_path
         assert not (paths.memory_dir_for("test_bot") / "persona.db").exists()
         assert rt.adapter is not None
         assert rt.tool_registry is not None
@@ -456,10 +463,10 @@ async def test_runtime_rag_copy_failure_uses_legacy_path_and_retries(
 
 
 @pytest.mark.asyncio
-async def test_runtime_imports_legacy_memory_into_diana_db_idempotently(assembled_project):
+async def test_runtime_imports_legacy_memory_into_persona_db_idempotently(assembled_project):
     project_root, paths = assembled_project
     mem_dir = paths.memory_dir_for("test_bot")
-    diana_db_path = mem_dir / "diana.db"
+    runtime_db_path = mem_dir / "test_bot.db"
     history_records = [
         {"role": "user", "content": "旧历史 1", "conversation_id": "private:1001"},
         {"role": "assistant", "content": "旧历史 2", "conversation_id": "private:1001"},
@@ -495,7 +502,8 @@ async def test_runtime_imports_legacy_memory_into_diana_db_idempotently(assemble
     try:
         await rt.start()
 
-        assert diana_db_path.exists()
+        assert runtime_db_path.exists()
+        assert not (mem_dir / "debata.db").exists()
         assert await rt.history.records() == history_records
         assert _memory_id_content_pairs(rt.important.items()) == [
             ("persona_only", "persona.db 记忆"),
@@ -506,29 +514,29 @@ async def test_runtime_imports_legacy_memory_into_diana_db_idempotently(assemble
         assert rt.usage_stats.count == 1
         assert rt.usage_stats.summarize("all").total_tokens == 7
 
-        from memory import DianaPersonaDB
+        from memory import DebataPersonaDB
 
-        persona_db = DianaPersonaDB(diana_db_path, "test_bot")
+        persona_db = DebataPersonaDB(runtime_db_path, "test_bot")
         assert await persona_db.read_important(default=[]) == persona_items
-        diana_only_record = {
+        runtime_only_record = {
             "role": "user",
-            "content": "只写入 diana.db 的新历史",
+            "content": "只写入 test_bot.db 的新历史",
             "conversation_id": "private:1001",
         }
-        await rt.history.add_records([diana_only_record])
+        await rt.history.add_records([runtime_only_record])
     finally:
         await rt.shutdown()
 
-    backup_dir = diana_db_path.parent / "backups"
+    backup_dir = runtime_db_path.parent / "backups"
     backup_count_before_second_start = _backup_count(backup_dir)
     second = Runtime(project_root=project_root)
     try:
         await second.start()
 
-        expected_history = [*history_records, diana_only_record]
-        assert _diana_row_count(diana_db_path, "history_records", "test_bot") == 3
-        assert _diana_row_count(diana_db_path, "important_memories", "test_bot") == 2
-        assert _diana_usage_count(diana_db_path, "test_bot") == 1
+        expected_history = [*history_records, runtime_only_record]
+        assert _debata_row_count(runtime_db_path, "history_records", "test_bot") == 3
+        assert _debata_row_count(runtime_db_path, "important_memories", "test_bot") == 2
+        assert _debata_usage_count(runtime_db_path, "test_bot") == 1
         assert await second.history.records() == expected_history
         assert _memory_id_content_pairs(second.important.items()) == [
             ("persona_only", "persona.db 记忆"),
@@ -573,15 +581,15 @@ async def test_runtime_import_gate_merges_persona_db_important_source_when_perso
 ):
     project_root, paths = assembled_project
     mem_dir = paths.memory_dir_for("test_bot")
-    diana_db_path = mem_dir / "diana.db"
+    runtime_db_path = mem_dir / "test_bot.db"
     persona_items = [{"id": "persona_only", "content": "persona.db 记忆"}]
     _write_legacy_persona_db(mem_dir / "persona.db", persona_items)
 
-    from memory import DianaImportantStore, DianaPersonaDB
+    from memory import DebataImportantStore, DebataPersonaDB
 
-    persona_db = DianaPersonaDB(diana_db_path, "test_bot")
+    persona_db = DebataPersonaDB(runtime_db_path, "test_bot")
     await persona_db.load()
-    assert await DianaImportantStore(diana_db_path, "test_bot").read(default=[]) == []
+    assert await DebataImportantStore(runtime_db_path, "test_bot").read(default=[]) == []
 
     rt = Runtime(project_root=project_root)
     try:
@@ -594,7 +602,7 @@ async def test_runtime_import_gate_merges_persona_db_important_source_when_perso
     finally:
         await rt.shutdown()
 
-    assert _diana_row_count(diana_db_path, "important_memories", "test_bot") == 1
+    assert _debata_row_count(runtime_db_path, "important_memories", "test_bot") == 1
     assert (mem_dir / "persona.db").exists()
 
 
@@ -682,19 +690,20 @@ async def test_runtime_persona_management_assembles_agents_and_pipeline(
         await rt.start()
 
         persona_db_path = paths.memory_dir_for("test_bot") / "persona.db"
-        diana_db_path = paths.memory_dir_for("test_bot") / "diana.db"
+        runtime_db_path = paths.memory_dir_for("test_bot") / "test_bot.db"
         assert not persona_db_path.exists()
-        assert diana_db_path.exists()
+        assert runtime_db_path.exists()
+        assert not (paths.memory_dir_for("test_bot") / "debata.db").exists()
         assert rt.persona_db is not None
         assert rt.persona_agent is not None
         assert rt.social_agent is not None
         assert rt.subconscious_agent is not None
         assert rt.age_profile is None
 
-        from memory import DianaImportantStore, DianaPersonaDB
+        from memory import DebataImportantStore, DebataPersonaDB
 
-        assert isinstance(rt.persona_db, DianaPersonaDB)
-        assert isinstance(rt.important._store, DianaImportantStore)
+        assert isinstance(rt.persona_db, DebataPersonaDB)
+        assert isinstance(rt.important._store, DebataImportantStore)
         assert rt.persona_agent.cfg.provider == "fake_main"
         assert rt.persona_agent.cfg.model == "fake-chat"
         assert rt.persona_agent.cfg.temperature == 0.2
@@ -1113,7 +1122,7 @@ def _legacy_event(event_id, *, payload=None):
     }
 
 
-def _diana_row_count(db_path, table, persona_id):
+def _debata_row_count(db_path, table, persona_id):
     allowed_tables = {
         "history_records": "history_records",
         "important_memories": "important_memories",
@@ -1128,7 +1137,7 @@ def _diana_row_count(db_path, table, persona_id):
         )
 
 
-def _diana_usage_count(db_path, persona_id):
+def _debata_usage_count(db_path, persona_id):
     with sqlite3.connect(db_path) as conn:
         return int(
             conn.execute(

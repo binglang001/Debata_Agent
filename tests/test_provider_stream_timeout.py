@@ -109,8 +109,8 @@ def test_openai_raw_prompt_dump_payload_only_keeps_request_fields():
 
 
 def test_openai_raw_prompt_dump_writes_when_enabled(tmp_path, monkeypatch):
-    monkeypatch.setenv("DIANA_KV_RAW_PROMPT_DUMP", "1")
-    monkeypatch.setenv("DIANA_KV_RAW_PROMPT_DUMP_DIR", str(tmp_path))
+    monkeypatch.setenv("DEBATA_KV_RAW_PROMPT_DUMP", "1")
+    monkeypatch.setenv("DEBATA_KV_RAW_PROMPT_DUMP_DIR", str(tmp_path))
 
     path = _dump_raw_prompt_request(
         provider="deepseek_main",
@@ -260,7 +260,7 @@ async def test_openai_reasoning_mode_does_not_replay_reasoning_content_by_defaul
 
 @pytest.mark.asyncio
 async def test_openai_reasoning_replay_can_be_enabled_temporarily(monkeypatch):
-    monkeypatch.setenv("DIANA_OPENAI_COMPAT_REPLAY_REASONING_CONTENT", "1")
+    monkeypatch.setenv("DEBATA_OPENAI_COMPAT_REPLAY_REASONING_CONTENT", "1")
     provider = OpenAICompatProvider(
         "deepseek_test",
         base_url="https://example.com/v1",

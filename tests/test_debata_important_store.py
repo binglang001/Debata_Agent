@@ -6,14 +6,14 @@ from pathlib import Path
 import orjson
 import pytest
 
-from memory.diana_db import DianaDB
-from memory.diana_stores import DianaImportantStore
+from memory.debata_db import DebataDB
+from memory.debata_stores import DebataImportantStore
 
 
 @pytest.mark.asyncio
-async def test_diana_important_store_list_roundtrip_and_extracted_columns(tmp_path):
-    db = DianaDB(tmp_path / "diana.db")
-    store = DianaImportantStore(db, "yuexi")
+async def test_debata_important_store_list_roundtrip_and_extracted_columns(tmp_path):
+    db = DebataDB(tmp_path / "debata.db")
+    store = DebataImportantStore(db, "yuexi")
     items = [
         {
             "id": "mem_a",
@@ -57,15 +57,15 @@ async def test_diana_important_store_list_roundtrip_and_extracted_columns(tmp_pa
     ]
     assert [orjson.loads(row["item_json"]) for row in rows] == items
 
-    reloaded = DianaImportantStore(db.path, "yuexi")
+    reloaded = DebataImportantStore(db.path, "yuexi")
     assert await reloaded.read(default=[]) == items
 
 
 @pytest.mark.asyncio
-async def test_diana_important_store_replaces_current_persona_only(tmp_path):
-    db_path = tmp_path / "diana.db"
-    yuexi = DianaImportantStore(db_path, "yuexi")
-    jiu = DianaImportantStore(db_path, "jiu")
+async def test_debata_important_store_replaces_current_persona_only(tmp_path):
+    db_path = tmp_path / "debata.db"
+    yuexi = DebataImportantStore(db_path, "yuexi")
+    jiu = DebataImportantStore(db_path, "jiu")
     original = [
         {"id": "mem_1", "timestamp": "t1", "content": "one", "scope": "global"},
         {"id": "mem_2", "timestamp": "t2", "content": "two", "scope": "user:1"},
@@ -86,9 +86,9 @@ async def test_diana_important_store_replaces_current_persona_only(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_diana_important_store_missing_id_fallback_is_stable(tmp_path):
-    db_path = tmp_path / "diana.db"
-    store = DianaImportantStore(db_path, "yuexi")
+async def test_debata_important_store_missing_id_fallback_is_stable(tmp_path):
+    db_path = tmp_path / "debata.db"
+    store = DebataImportantStore(db_path, "yuexi")
     item = {
         "timestamp": "2026-06-18 12:00:00",
         "content": "没有 id 的旧重要记忆",
@@ -108,10 +108,10 @@ async def test_diana_important_store_missing_id_fallback_is_stable(tmp_path):
     assert await store.read(default=[]) == [item]
 
 
-def test_memory_package_exports_diana_important_store():
-    from memory import DianaImportantStore as PackageDianaImportantStore
+def test_memory_package_exports_debata_important_store():
+    from memory import DebataImportantStore as PackageDebataImportantStore
 
-    assert PackageDianaImportantStore is DianaImportantStore
+    assert PackageDebataImportantStore is DebataImportantStore
 
 
 def _important_rows(db_path: Path, persona_id: str) -> list[dict]:

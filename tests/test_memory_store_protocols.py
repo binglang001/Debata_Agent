@@ -9,12 +9,12 @@ import pytest
 from memory import (
     ArchiveStore,
     ArchiveStoreLike,
-    DianaArchiveStore,
-    DianaEventStore,
-    DianaHistoryStore,
-    DianaImportantStore,
-    DianaRollingSummaryStore,
-    DianaUsageStatsStore,
+    DebataArchiveStore,
+    DebataEventStore,
+    DebataHistoryStore,
+    DebataImportantStore,
+    DebataRollingSummaryStore,
+    DebataUsageStatsStore,
     EventAppenderLike,
     EventJournal,
     EventStoreLike,
@@ -272,15 +272,15 @@ def test_store_protocols_are_exported_and_runtime_checkable(tmp_path):
     assert isinstance(MemoryUsageStatsStore(), UsageStatsStoreLike)
 
 
-def test_diana_stores_match_store_protocols(tmp_path):
-    db_path = tmp_path / "diana.db"
+def test_debata_stores_match_store_protocols(tmp_path):
+    db_path = tmp_path / "debata.db"
 
-    assert isinstance(DianaHistoryStore(db_path, "yuexi"), JsonlStoreLike)
-    assert isinstance(DianaImportantStore(db_path, "yuexi"), JsonStoreLike)
-    assert isinstance(DianaArchiveStore(db_path, "yuexi"), ArchiveStoreLike)
-    assert isinstance(DianaRollingSummaryStore(db_path, "yuexi"), RollingSummaryStoreLike)
-    assert isinstance(DianaEventStore(db_path, "yuexi"), EventStoreLike)
-    assert isinstance(DianaUsageStatsStore(db_path, "yuexi"), UsageStatsStoreLike)
+    assert isinstance(DebataHistoryStore(db_path, "yuexi"), JsonlStoreLike)
+    assert isinstance(DebataImportantStore(db_path, "yuexi"), JsonStoreLike)
+    assert isinstance(DebataArchiveStore(db_path, "yuexi"), ArchiveStoreLike)
+    assert isinstance(DebataRollingSummaryStore(db_path, "yuexi"), RollingSummaryStoreLike)
+    assert isinstance(DebataEventStore(db_path, "yuexi"), EventStoreLike)
+    assert isinstance(DebataUsageStatsStore(db_path, "yuexi"), UsageStatsStoreLike)
 
 
 @pytest.mark.asyncio

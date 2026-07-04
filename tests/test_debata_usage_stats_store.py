@@ -9,19 +9,19 @@ from pathlib import Path
 import orjson
 import pytest
 
-from memory.diana_db import DianaDB
-from memory.diana_stores import DianaUsageStatsStore
+from memory.debata_db import DebataDB
+from memory.debata_stores import DebataUsageStatsStore
 from providers.base import Usage
 
 
 @pytest.mark.asyncio
-async def test_diana_usage_stats_store_records_and_summarizes_ranges(tmp_path, monkeypatch):
-    db_path = tmp_path / "diana.db"
+async def test_debata_usage_stats_store_records_and_summarizes_ranges(tmp_path, monkeypatch):
+    db_path = tmp_path / "debata.db"
     now = time.mktime((2026, 6, 4, 12, 0, 0, 3, 155, -1))
     current_time = now - 2 * 86400
     monkeypatch.setattr(time, "time", lambda: current_time)
 
-    store = DianaUsageStatsStore(db_path, "yuexi")
+    store = DebataUsageStatsStore(db_path, "yuexi")
     await store.load()
     await store.record(
         Usage(prompt_tokens=50, completion_tokens=10, total_tokens=60),
@@ -63,16 +63,16 @@ async def test_diana_usage_stats_store_records_and_summarizes_ranges(tmp_path, m
     assert all_time.completion_tokens == 30
     assert all_time.total_tokens == 180
 
-    reloaded = DianaUsageStatsStore(db_path, "yuexi")
+    reloaded = DebataUsageStatsStore(db_path, "yuexi")
     await reloaded.load()
     assert reloaded.count == 2
     assert reloaded.summarize("all") == all_time
 
 
 @pytest.mark.asyncio
-async def test_diana_usage_stats_store_zero_tokens_do_not_write(tmp_path):
-    db_path = tmp_path / "diana.db"
-    store = DianaUsageStatsStore(db_path, "yuexi")
+async def test_debata_usage_stats_store_zero_tokens_do_not_write(tmp_path):
+    db_path = tmp_path / "debata.db"
+    store = DebataUsageStatsStore(db_path, "yuexi")
     await store.load()
 
     await store.record(
@@ -89,11 +89,11 @@ async def test_diana_usage_stats_store_zero_tokens_do_not_write(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_diana_usage_stats_store_preserves_extra_and_extracted_columns(tmp_path, monkeypatch):
-    db_path = tmp_path / "diana.db"
+async def test_debata_usage_stats_store_preserves_extra_and_extracted_columns(tmp_path, monkeypatch):
+    db_path = tmp_path / "debata.db"
     now = time.mktime((2026, 6, 4, 12, 0, 0, 3, 155, -1))
     monkeypatch.setattr(time, "time", lambda: now)
-    store = DianaUsageStatsStore(db_path, "  yuexi  ")
+    store = DebataUsageStatsStore(db_path, "  yuexi  ")
 
     await store.record(
         Usage(prompt_tokens=10, completion_tokens=1, total_tokens=0),
@@ -137,22 +137,22 @@ async def test_diana_usage_stats_store_preserves_extra_and_extracted_columns(tmp
 
 
 @pytest.mark.asyncio
-async def test_diana_usage_stats_store_persona_scope_loads_all_or_one(tmp_path):
-    db_path = tmp_path / "diana.db"
-    yuexi = DianaUsageStatsStore(db_path, "yuexi")
-    jiu = DianaUsageStatsStore(db_path, "jiu")
-    unscoped = DianaUsageStatsStore(db_path, "")
+async def test_debata_usage_stats_store_persona_scope_loads_all_or_one(tmp_path):
+    db_path = tmp_path / "debata.db"
+    yuexi = DebataUsageStatsStore(db_path, "yuexi")
+    jiu = DebataUsageStatsStore(db_path, "jiu")
+    unscoped = DebataUsageStatsStore(db_path, "")
 
     await yuexi.record(Usage(prompt_tokens=1), agent="yuexi")
     await jiu.record(Usage(prompt_tokens=2), agent="jiu")
     await unscoped.record(Usage(prompt_tokens=3), agent="global")
 
-    all_records = DianaUsageStatsStore(db_path)
+    all_records = DebataUsageStatsStore(db_path)
     await all_records.load()
     assert all_records.count == 3
     assert all_records.summarize("all").prompt_tokens == 6
 
-    yuexi_only = DianaUsageStatsStore(db_path, "yuexi")
+    yuexi_only = DebataUsageStatsStore(db_path, "yuexi")
     await yuexi_only.load()
     assert yuexi_only.count == 1
     assert yuexi_only.summarize("all").prompt_tokens == 1
@@ -162,14 +162,14 @@ async def test_diana_usage_stats_store_persona_scope_loads_all_or_one(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_diana_usage_stats_store_skips_broken_record_json_on_load(tmp_path, caplog):
-    db_path = tmp_path / "diana.db"
-    store = DianaUsageStatsStore(db_path, "yuexi")
+async def test_debata_usage_stats_store_skips_broken_record_json_on_load(tmp_path, caplog):
+    db_path = tmp_path / "debata.db"
+    store = DebataUsageStatsStore(db_path, "yuexi")
     await store.record(Usage(prompt_tokens=10), agent="ok")
     _insert_usage_record_json(db_path, persona_id="yuexi", record_json="{broken")
     _insert_usage_record_json(db_path, persona_id="yuexi", record_json="[]")
 
-    reloaded = DianaUsageStatsStore(db_path, "yuexi")
+    reloaded = DebataUsageStatsStore(db_path, "yuexi")
     with caplog.at_level("WARNING"):
         await reloaded.load()
 
@@ -178,19 +178,19 @@ async def test_diana_usage_stats_store_skips_broken_record_json_on_load(tmp_path
     assert "usage record_json" in caplog.text
 
 
-def test_memory_package_exports_diana_usage_stats_store():
-    from memory import DianaUsageStatsStore as PackageDianaUsageStatsStore
+def test_memory_package_exports_debata_usage_stats_store():
+    from memory import DebataUsageStatsStore as PackageDebataUsageStatsStore
 
-    assert PackageDianaUsageStatsStore is DianaUsageStatsStore
+    assert PackageDebataUsageStatsStore is DebataUsageStatsStore
 
 
-def test_memory_import_exports_diana_usage_stats_store_without_core_cycle():
+def test_memory_import_exports_debata_usage_stats_store_without_core_cycle():
     result = subprocess.run(
         [
             sys.executable,
             "-B",
             "-c",
-            "import memory; from memory import DianaUsageStatsStore",
+            "import memory; from memory import DebataUsageStatsStore",
         ],
         check=False,
         capture_output=True,
@@ -219,7 +219,7 @@ def _insert_usage_record_json(
     persona_id: str | None,
     record_json: str,
 ) -> None:
-    db = DianaDB(db_path)
+    db = DebataDB(db_path)
     try:
         db.load()
         db.connect().execute(

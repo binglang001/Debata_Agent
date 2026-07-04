@@ -175,6 +175,28 @@ def test_parse_message_string_file_cq_with_local_path():
     assert event.media[0].url == "D:\\QQ_data\\Tencent Files\\NapCat\\temp\\问卷.pdf"
 
 
+def test_parse_message_string_file_cq_with_only_url_extracts_name():
+    raw = {
+        "post_type": "message",
+        "message_type": "private",
+        "message_id": 1,
+        "user_id": 1001,
+        "self_id": 9999,
+        "time": 1,
+        "raw_message": "[CQ:file,url=/app/.config/QQ/NapCat/temp/AI 研究路线.md]",
+        "message": "[CQ:file,url=/app/.config/QQ/NapCat/temp/AI 研究路线.md]",
+        "sender": {"user_id": 1001, "nickname": "Alice"},
+    }
+
+    event = parse_napcat_event("nc", raw)
+
+    assert event is not None
+    assert event.media[0].type == MediaType.FILE
+    assert event.media[0].file_id is None
+    assert event.media[0].name == "AI 研究路线.md"
+    assert event.media[0].url == "/app/.config/QQ/NapCat/temp/AI 研究路线.md"
+
+
 def test_parse_message_with_reply():
     raw = {
         "post_type": "message",

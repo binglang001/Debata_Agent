@@ -155,7 +155,7 @@ vector/<persona>/rag_memory.sqlite3
 RagMemoryService            → 监听 HistoryManager 追加并启动归档/活跃历史 bootstrap
 ```
 
-向量库是实例级独立文件，不并入 `memory/<persona>/diana.db`；旧 `memory/<persona>/rag_memory.sqlite3` 首次启用 RAG 时会复制到新路径，旧文件保留。
+向量库是实例级独立文件，不并入 `memory/<persona>/<persona>.db`；旧 `memory/<persona>/rag_memory.sqlite3` 首次启用 RAG 时会复制到新路径，旧文件保留。
 `message_pipeline` 拼上下文时用最后一条用户消息当 query 调 `retrieve_for_query()`：
 先按当前 `conversation_id` 过滤候选，再做 cosine top-k，最后与重要记忆上下文合并，省 token 且减少跨群/私聊误召回。
 

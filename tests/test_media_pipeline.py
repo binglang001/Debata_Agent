@@ -240,6 +240,299 @@ async def test_build_readable_text_exposes_file_workspace_path(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_build_readable_text_falls_back_file_url_when_container_path_unreadable(tmp_path):
+    src = tmp_path / "NapCat" / "temp" / "连炳宇.md"
+    src.parent.mkdir(parents=True)
+    src.write_text("# demo", encoding="utf-8")
+    calls: list[str] = []
+
+    class FakeAdapter:
+        async def get_file_url(self, file_id):
+            calls.append(file_id)
+            return str(src)
+
+    pipeline = MessagePipeline.__new__(MessagePipeline)
+    pipeline.workspace_dir = tmp_path / "workspace"
+    pipeline.adapter = FakeAdapter()
+    pipeline.asr = None
+
+    event = IncomingMessage(
+        adapter="napcat",
+        timestamp=0,
+        self_id="1",
+        message_id="42",
+        scope="private",
+        user_id="10001",
+        nickname="Alice",
+        text="[文件]",
+        raw_message="[CQ:file,file=file123,file_name=连炳宇.md,url=/app/.config/QQ/NapCat/temp/连炳宇.md]",
+        media=[
+            MediaSegment(
+                type=MediaType.FILE,
+                file_id="file123",
+                url="/app/.config/QQ/NapCat/temp/连炳宇.md",
+                name="连炳宇.md",
+            )
+        ],
+    )
+
+    text = await MessagePipeline._build_readable_text(pipeline, event)
+
+    assert calls == ["file123"]
+    assert "url=/app/.config/QQ/NapCat/temp/连炳宇.md" in text
+    assert "workspace=incoming/连炳宇.md" in text
+    assert (pipeline.workspace_dir / "incoming" / "连炳宇.md").read_text(encoding="utf-8") == "# demo"
+
+
+@pytest.mark.asyncio
+async def test_build_readable_text_falls_back_file_url_by_name_without_file_id(tmp_path):
+    src = tmp_path / "NapCat" / "temp" / "AI 研究路线.md"
+    src.parent.mkdir(parents=True)
+    src.write_text("# route", encoding="utf-8")
+    calls: list[str] = []
+
+    class FakeAdapter:
+        async def get_file_url(self, file_id):
+            calls.append(file_id)
+            if file_id == "AI 研究路线.md":
+                return str(src)
+            return None
+
+    pipeline = MessagePipeline.__new__(MessagePipeline)
+    pipeline.workspace_dir = tmp_path / "workspace"
+    pipeline.adapter = FakeAdapter()
+    pipeline.asr = None
+
+    event = IncomingMessage(
+        adapter="napcat",
+        timestamp=0,
+        self_id="1",
+        message_id="42",
+        scope="private",
+        user_id="10001",
+        nickname="Alice",
+        text="[文件]",
+        raw_message="[CQ:file,url=/app/.config/QQ/NapCat/temp/AI 研究路线.md]",
+        media=[
+            MediaSegment(
+                type=MediaType.FILE,
+                url="/app/.config/QQ/NapCat/temp/AI 研究路线.md",
+                name="AI 研究路线.md",
+                file_id=None,
+            )
+        ],
+    )
+
+    text = await MessagePipeline._build_readable_text(pipeline, event)
+
+    assert calls == ["AI 研究路线.md"]
+    assert "url=/app/.config/QQ/NapCat/temp/AI 研究路线.md" in text
+    assert "workspace=incoming/AI_研究路线.md" in text
+    assert (pipeline.workspace_dir / "incoming" / "AI_研究路线.md").read_text(encoding="utf-8") == "# route"
+
+
+@pytest.mark.asyncio
+async def test_build_readable_text_falls_back_file_url_by_name_after_file_id_path_unreadable(
+    tmp_path,
+):
+    src = tmp_path / "NapCat" / "temp" / "good.md"
+    src.parent.mkdir(parents=True)
+    src.write_text("# good", encoding="utf-8")
+    calls: list[str] = []
+
+    class FakeAdapter:
+        async def get_file_url(self, file_id):
+            calls.append(file_id)
+            if file_id == "file123":
+                return "/app/.config/QQ/NapCat/temp/bad.md"
+            if file_id == "good.md":
+                return str(src)
+            return None
+
+    pipeline = MessagePipeline.__new__(MessagePipeline)
+    pipeline.workspace_dir = tmp_path / "workspace"
+    pipeline.adapter = FakeAdapter()
+    pipeline.asr = None
+
+    event = IncomingMessage(
+        adapter="napcat",
+        timestamp=0,
+        self_id="1",
+        message_id="42",
+        scope="private",
+        user_id="10001",
+        nickname="Alice",
+        text="[文件]",
+        raw_message="[CQ:file,file=file123,file_name=good.md]",
+        media=[
+            MediaSegment(
+                type=MediaType.FILE,
+                file_id="file123",
+                name="good.md",
+            )
+        ],
+    )
+
+    text = await MessagePipeline._build_readable_text(pipeline, event)
+
+    assert calls == ["file123", "good.md"]
+    assert "url=/app/.config/QQ/NapCat/temp/bad.md" in text
+    assert "workspace=incoming/good.md" in text
+    assert (pipeline.workspace_dir / "incoming" / "good.md").read_text(encoding="utf-8") == "# good"
+
+
+@pytest.mark.asyncio
+async def test_build_readable_text_does_not_fetch_file_url_when_local_path_readable(tmp_path):
+    src = tmp_path / "NapCat" / "temp" / "问卷.pdf"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(b"%PDF-demo")
+
+    class FakeAdapter:
+        async def get_file_url(self, file_id):
+            raise AssertionError(f"不应获取文件 URL: {file_id}")
+
+    pipeline = MessagePipeline.__new__(MessagePipeline)
+    pipeline.workspace_dir = tmp_path / "workspace"
+    pipeline.adapter = FakeAdapter()
+    pipeline.asr = None
+
+    event = IncomingMessage(
+        adapter="napcat",
+        timestamp=0,
+        self_id="1",
+        message_id="42",
+        scope="private",
+        user_id="10001",
+        nickname="Alice",
+        text="[文件]",
+        raw_message="[CQ:file,file=file123,file_name=问卷.pdf]",
+        media=[
+            MediaSegment(
+                type=MediaType.FILE,
+                file_id="file123",
+                url=str(src),
+                name="问卷.pdf",
+            )
+        ],
+    )
+
+    text = await MessagePipeline._build_readable_text(pipeline, event)
+
+    assert "workspace=incoming/问卷.pdf" in text
+    assert (pipeline.workspace_dir / "incoming" / "问卷.pdf").read_bytes() == b"%PDF-demo"
+
+
+@pytest.mark.asyncio
+async def test_build_readable_text_does_not_fetch_file_url_when_http_file_saved(
+    tmp_path,
+    monkeypatch,
+):
+    remote_url = "https://example.test/files/report.md"
+    seen: list[str] = []
+
+    class FakeAdapter:
+        async def get_file_url(self, file_id):
+            raise AssertionError(f"不应获取文件 URL: {file_id}")
+
+    class FakeResponse:
+        content = b"# report"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            seen.append(url)
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", FakeClient)
+
+    pipeline = MessagePipeline.__new__(MessagePipeline)
+    pipeline.workspace_dir = tmp_path / "workspace"
+    pipeline.adapter = FakeAdapter()
+    pipeline.asr = None
+
+    event = IncomingMessage(
+        adapter="napcat",
+        timestamp=0,
+        self_id="1",
+        message_id="42",
+        scope="private",
+        user_id="10001",
+        nickname="Alice",
+        text="[文件]",
+        raw_message="[CQ:file,file=file123,file_name=report.md,url=https://example.test/files/report.md]",
+        media=[
+            MediaSegment(
+                type=MediaType.FILE,
+                file_id="file123",
+                url=remote_url,
+                name="report.md",
+            )
+        ],
+    )
+
+    text = await MessagePipeline._build_readable_text(pipeline, event)
+
+    assert seen == [remote_url]
+    assert f"url={remote_url}" in text
+    assert "workspace=incoming/report.md" in text
+    assert (pipeline.workspace_dir / "incoming" / "report.md").read_bytes() == b"# report"
+
+
+@pytest.mark.asyncio
+async def test_build_readable_text_unreadable_file_path_without_file_id_tries_name_and_basename(
+    tmp_path,
+):
+    calls: list[str] = []
+
+    class FakeAdapter:
+        async def get_file_url(self, file_id):
+            calls.append(file_id)
+            return None
+
+    pipeline = MessagePipeline.__new__(MessagePipeline)
+    pipeline.workspace_dir = tmp_path / "workspace"
+    pipeline.adapter = FakeAdapter()
+    pipeline.asr = None
+
+    event = IncomingMessage(
+        adapter="napcat",
+        timestamp=0,
+        self_id="1",
+        message_id="42",
+        scope="private",
+        user_id="10001",
+        nickname="Alice",
+        text="[文件]",
+        raw_message="[CQ:file,file_name=missing.md,url=/app/.config/QQ/NapCat/temp/missing.md]",
+        media=[
+            MediaSegment(
+                type=MediaType.FILE,
+                url="/app/.config/QQ/NapCat/temp/missing.md",
+                name="missing.md",
+            )
+        ],
+    )
+
+    text = await MessagePipeline._build_readable_text(pipeline, event)
+
+    assert calls == ["missing.md"]
+    assert "url=/app/.config/QQ/NapCat/temp/missing.md" in text
+    assert "workspace=" not in text
+    assert not (pipeline.workspace_dir / "incoming" / "missing.md").exists()
+
+
+@pytest.mark.asyncio
 async def test_build_readable_text_appends_forward_placeholder_when_text_empty(tmp_path):
     pipeline = MessagePipeline.__new__(MessagePipeline)
     pipeline.workspace_dir = tmp_path / "workspace"

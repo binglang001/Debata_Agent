@@ -1,4 +1,4 @@
-"""DianaPersonaDB legacy persona domains 测试。"""
+"""DebataPersonaDB legacy persona domains 测试。"""
 
 from __future__ import annotations
 
@@ -6,21 +6,21 @@ import sqlite3
 
 import pytest
 
-from memory.diana_db import DianaDB
-from memory.diana_stores import DianaPersonaDB
+from memory.debata_db import DebataDB
+from memory.debata_stores import DebataPersonaDB
 from mind import Cue, Effect, PersonaState, Todo, UserProfile
 from mind.db import SCHEMA_VERSION
 
 
 @pytest.mark.asyncio
-async def test_diana_persona_db_load_schema_version_empty_persona_and_export(tmp_path):
-    db = DianaPersonaDB(tmp_path / "diana.db", " yuexi ")
+async def test_debata_persona_db_load_schema_version_empty_persona_and_export(tmp_path):
+    db = DebataPersonaDB(tmp_path / "debata.db", " yuexi ")
 
     assert db.persona_id == "yuexi"
-    assert isinstance(db.db, DianaDB)
+    assert isinstance(db.db, DebataDB)
     await db.load()
 
-    with sqlite3.connect(tmp_path / "diana.db") as conn:
+    with sqlite3.connect(tmp_path / "debata.db") as conn:
         row = conn.execute(
             """
             SELECT version FROM persona_schema_version_legacy
@@ -31,18 +31,18 @@ async def test_diana_persona_db_load_schema_version_empty_persona_and_export(tmp
 
     assert row == (SCHEMA_VERSION,)
     with pytest.raises(ValueError, match="persona_id must not be empty"):
-        DianaPersonaDB(tmp_path / "diana.db", "  ")
+        DebataPersonaDB(tmp_path / "debata.db", "  ")
 
-    from memory import DianaPersonaDB as PackageDianaPersonaDB
+    from memory import DebataPersonaDB as PackageDebataPersonaDB
 
-    assert PackageDianaPersonaDB is DianaPersonaDB
+    assert PackageDebataPersonaDB is DebataPersonaDB
 
 
 @pytest.mark.asyncio
-async def test_diana_persona_db_state_logs_and_update_audits_are_persona_scoped(tmp_path):
-    db_path = tmp_path / "diana.db"
-    yuexi = DianaPersonaDB(db_path, "yuexi")
-    jiu = DianaPersonaDB(db_path, "jiu")
+async def test_debata_persona_db_state_logs_and_update_audits_are_persona_scoped(tmp_path):
+    db_path = tmp_path / "debata.db"
+    yuexi = DebataPersonaDB(db_path, "yuexi")
+    jiu = DebataPersonaDB(db_path, "jiu")
     await yuexi.load()
     await jiu.load()
 
@@ -113,8 +113,8 @@ async def test_diana_persona_db_state_logs_and_update_audits_are_persona_scoped(
 
 
 @pytest.mark.asyncio
-async def test_diana_persona_db_effect_todo_cue_profile_crud_and_types(tmp_path):
-    db = DianaPersonaDB(tmp_path / "diana.db", "yuexi")
+async def test_debata_persona_db_effect_todo_cue_profile_crud_and_types(tmp_path):
+    db = DebataPersonaDB(tmp_path / "debata.db", "yuexi")
     await db.load()
 
     active_effect = Effect(
@@ -148,7 +148,7 @@ async def test_diana_persona_db_effect_todo_cue_profile_crud_and_types(tmp_path)
     todo = Todo(
         id="todo_1",
         title="写测试",
-        reason="覆盖 diana persona",
+        reason="覆盖 Debata persona",
         priority=2,
         scope="persona",
         created_at=10.0,
@@ -173,7 +173,7 @@ async def test_diana_persona_db_effect_todo_cue_profile_crud_and_types(tmp_path)
     await db.upsert_todo({"id": "todo_1", "title": "写更多测试"})
     patched = (await db.get_todos(include_completed=False))[0]
     assert patched.title == "写更多测试"
-    assert patched.reason == "覆盖 diana persona"
+    assert patched.reason == "覆盖 Debata persona"
     assert await db.mark_expired_todos_missed(now=150.0) == 1
     missed = {todo.id: todo for todo in await db.get_todos(include_completed=True)}
     assert missed["todo_expired"].status == "missed"
@@ -218,8 +218,8 @@ async def test_diana_persona_db_effect_todo_cue_profile_crud_and_types(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_diana_persona_db_recent_records_updates_and_important(tmp_path):
-    db = DianaPersonaDB(tmp_path / "diana.db", "yuexi")
+async def test_debata_persona_db_recent_records_updates_and_important(tmp_path):
+    db = DebataPersonaDB(tmp_path / "debata.db", "yuexi")
     await db.load()
 
     assert await db.add_monologue({"text": "第一条"}) == 1
@@ -267,7 +267,7 @@ async def test_diana_persona_db_recent_records_updates_and_important(tmp_path):
     assert await db.read_important(default=[]) == memories
     assert await db.important_count() == 1
 
-    with sqlite3.connect(tmp_path / "diana.db") as conn:
+    with sqlite3.connect(tmp_path / "debata.db") as conn:
         row = conn.execute(
             """
             SELECT ended_at, status FROM persona_eat_records
@@ -279,10 +279,10 @@ async def test_diana_persona_db_recent_records_updates_and_important(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_diana_persona_db_personas_have_independent_ids_and_mutations(tmp_path):
-    db_path = tmp_path / "diana.db"
-    yuexi = DianaPersonaDB(db_path, "yuexi")
-    jiu = DianaPersonaDB(db_path, "jiu")
+async def test_debata_persona_db_personas_have_independent_ids_and_mutations(tmp_path):
+    db_path = tmp_path / "debata.db"
+    yuexi = DebataPersonaDB(db_path, "yuexi")
+    jiu = DebataPersonaDB(db_path, "jiu")
     await yuexi.load()
     await jiu.load()
 

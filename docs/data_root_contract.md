@@ -55,7 +55,7 @@
 
 `root.json` 位于数据根，阶段 0 写入以下字段：
 
-- `schema`：当前为 `diana.data_root.v0`。
+- `schema`：当前为 `debata.data_root.v0`。
 - `app_version`：执行初始化时的应用版本。
 - `created_at`：首次创建清单的 UTC 时间戳。
 - `updated_at`：最近一次写入迁移记录的 UTC 时间戳。
@@ -66,7 +66,7 @@
 
 `instance.json` 位于实例目录，阶段 0 写入以下字段：
 
-- `schema`：当前为 `diana.data_instance.v0`。
+- `schema`：当前为 `debata.data_instance.v0`。
 - `app_version`：执行初始化时的应用版本。
 - `created_at`：首次创建清单的 UTC 时间戳。
 - `updated_at`：最近一次写入迁移记录的 UTC 时间戳。
@@ -93,6 +93,6 @@
 阶段 0 只完成数据根入根和启动编排，不实现以下内容：
 
 - 配置历史键迁移链。
-- `diana.db` 的结构迁移或集中化。
+- `debata.db` 的结构迁移或集中化。
 - 人格数据化。
 - 多实例之间的模型共享策略。

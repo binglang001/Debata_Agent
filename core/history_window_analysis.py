@@ -500,7 +500,7 @@ def _filter_noise_view(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Analyze Diana history window selection")
+    parser = argparse.ArgumentParser(description="Analyze Debata history window selection")
     parser.add_argument("path", help="Path to history.jsonl")
     parser.add_argument("--budget", type=int, default=96_000, help="Working history token budget")
     parser.add_argument("--conversation-id", default=None, help="Current conversation id")

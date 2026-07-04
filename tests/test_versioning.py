@@ -48,7 +48,7 @@ def test_default_registry_registers_phase_0_schema_planes():
         "root",
         "instance",
         "secrets",
-        "diana_db",
+        "debata_db",
         "persona_data",
     } <= set(registry.schema_versions)
     assert all(isinstance(version, int) for version in registry.schema_versions.values())

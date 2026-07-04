@@ -1,4 +1,4 @@
-"""旧 memory/logs 文件到 diana.db 的同步导入入口。"""
+"""旧 memory/logs 文件到 debata.db 的同步导入入口。"""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ from typing import Any
 
 import orjson
 
-from .diana_db import DianaDB, backup_existing_database
-from .diana_stores import DianaHistoryStore, DianaImportantStore
+from .debata_db import DebataDB, backup_existing_database
+from .debata_stores import DebataHistoryStore, DebataImportantStore
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ class _LegacyImportantMergeSource:
 
 
 def import_legacy_memory_files(
-    db: DianaDB | str | Path,
+    db: DebataDB | str | Path,
     source_dir: str | Path,
     persona_id: str,
     *,
@@ -128,7 +128,7 @@ def import_legacy_memory_files(
     usage_source_path: str | Path | None = None,
     skip_existing_domains: bool = False,
 ) -> LegacyMemoryImportResult:
-    """同步导入第一批旧 memory/logs 文件到 diana.db。
+    """同步导入第一批旧 memory/logs 文件到 debata.db。
 
     `usage_persona_id=None` 表示跟随 `persona_id`；传入空字符串表示全局 usage。
     `usage_source_path=None` 保持旧行为，从 `source_dir / "model_usage.jsonl"` 导入。
@@ -153,7 +153,7 @@ def import_legacy_memory_files(
 
 
 async def import_legacy_memory_files_async(
-    db: DianaDB | str | Path,
+    db: DebataDB | str | Path,
     source_dir: str | Path,
     persona_id: str,
     *,
@@ -162,7 +162,7 @@ async def import_legacy_memory_files_async(
     usage_source_path: str | Path | None = None,
     skip_existing_domains: bool = False,
 ) -> LegacyMemoryImportResult:
-    """异步导入第一批旧 memory/logs 文件到 diana.db。"""
+    """异步导入第一批旧 memory/logs 文件到 debata.db。"""
 
     return await _import_legacy_memory_files_async(
         db,
@@ -176,7 +176,7 @@ async def import_legacy_memory_files_async(
 
 
 async def _import_legacy_memory_files_async(
-    db: DianaDB | str | Path,
+    db: DebataDB | str | Path,
     source_dir: str | Path,
     persona_id: str,
     *,
@@ -185,8 +185,8 @@ async def _import_legacy_memory_files_async(
     usage_source_path: str | Path | None,
     skip_existing_domains: bool,
 ) -> LegacyMemoryImportResult:
-    target_db = db if isinstance(db, DianaDB) else DianaDB(db)
-    should_close_db = not isinstance(db, DianaDB)
+    target_db = db if isinstance(db, DebataDB) else DebataDB(db)
+    should_close_db = not isinstance(db, DebataDB)
     source_path = Path(source_dir)
     usage_path = (
         Path(usage_source_path)
@@ -288,7 +288,7 @@ async def _import_legacy_memory_files_async(
 
 
 async def _import_history(
-    db: DianaDB,
+    db: DebataDB,
     source_dir: Path,
     persona_id: str,
 ) -> LegacyImportDomainResult:
@@ -296,13 +296,13 @@ async def _import_history(
     records, skipped, exists = _read_jsonl_objects(path)
     if not exists:
         return LegacyImportDomainResult()
-    store = DianaHistoryStore(db, persona_id)
+    store = DebataHistoryStore(db, persona_id)
     await store.replace_all(records)
     return LegacyImportDomainResult(imported=len(records), skipped=skipped)
 
 
 async def _import_important(
-    db: DianaDB,
+    db: DebataDB,
     source_dir: Path,
     persona_id: str,
     persona_important_source: _LegacyImportantMergeSource | None = None,
@@ -312,7 +312,7 @@ async def _import_important(
     data, skipped, exists = _read_json_file(path)
     total_skipped = persona_source.skipped + skipped
 
-    store = DianaImportantStore(db, persona_id)
+    store = DebataImportantStore(db, persona_id)
     important_items: list[Any] = []
     important_is_list = False
     if exists and not skipped:
@@ -351,7 +351,7 @@ async def _import_important(
 
 
 async def _import_rolling_summary(
-    db: DianaDB,
+    db: DebataDB,
     source_dir: Path,
     persona_id: str,
 ) -> LegacyImportDomainResult:
@@ -368,7 +368,7 @@ async def _import_rolling_summary(
 
 
 def _upsert_rolling_summary(
-    db: DianaDB,
+    db: DebataDB,
     persona_id: str,
     data: dict[str, Any],
 ) -> None:
@@ -406,7 +406,7 @@ def _upsert_rolling_summary(
 
 
 def _import_usage(
-    db: DianaDB,
+    db: DebataDB,
     path: Path,
     persona_id: str | None,
 ) -> LegacyImportDomainResult:
@@ -421,7 +421,7 @@ def _import_usage(
 
 
 def _import_events(
-    db: DianaDB,
+    db: DebataDB,
     source_dir: Path,
     persona_id: str,
 ) -> LegacyImportDomainResult:
@@ -446,7 +446,7 @@ def _import_events(
 
 
 def _import_archive(
-    db: DianaDB,
+    db: DebataDB,
     source_dir: Path,
     persona_id: str,
 ) -> LegacyImportDomainResult:
@@ -472,7 +472,7 @@ def _import_archive(
 
 
 def _import_persona(
-    db: DianaDB,
+    db: DebataDB,
     source_dir: Path,
     persona_id: str,
 ) -> LegacyImportDomainResult:
@@ -750,7 +750,7 @@ def _legacy_eat_record_id(record: dict[str, Any]) -> str | None:
 
 
 def _insert_persona_rows(
-    db: DianaDB,
+    db: DebataDB,
     persona_id: str,
     rows: Sequence[tuple[_LegacyPersonaTableSpec, tuple[Any, ...]]],
 ) -> tuple[int, int]:
@@ -1018,7 +1018,7 @@ def _legacy_archive_media_row_from_mapping(
 
 
 def _insert_archive_rows(
-    db: DianaDB,
+    db: DebataDB,
     persona_id: str,
     message_rows: Sequence[_LegacyArchiveMessageRow],
     media_rows: Sequence[_LegacyArchiveMediaRow],
@@ -1354,7 +1354,7 @@ def _legacy_event_row_from_mapping(
 
 
 def _insert_event_rows(
-    db: DianaDB,
+    db: DebataDB,
     persona_id: str,
     rows: Sequence[_LegacyEventRow],
 ) -> tuple[int, int]:
@@ -1768,7 +1768,7 @@ def _archive_message_identity(row: sqlite3.Row | _LegacyArchiveMessageRow) -> tu
 
 
 def _insert_usage_records(
-    db: DianaDB,
+    db: DebataDB,
     records: Sequence[dict[str, Any]],
     persona_id: str | None,
 ) -> tuple[int, int]:
@@ -1913,7 +1913,7 @@ def _read_json_file(path: Path) -> tuple[Any, int, bool]:
         return None, 1, True
 
 
-def _connect_for_import(db: DianaDB) -> sqlite3.Connection:
+def _connect_for_import(db: DebataDB) -> sqlite3.Connection:
     conn = sqlite3.connect(db.path, timeout=db.busy_timeout_ms / 1000)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout={int(db.busy_timeout_ms)}")
@@ -1922,7 +1922,7 @@ def _connect_for_import(db: DianaDB) -> sqlite3.Connection:
 
 
 def _domain_row_count(
-    db: DianaDB,
+    db: DebataDB,
     table: str,
     persona_id: str | None,
 ) -> int:
@@ -1949,7 +1949,7 @@ def _domain_row_count(
     return int(row[0])
 
 
-def _persona_domain_row_count(db: DianaDB, persona_id: str) -> int:
+def _persona_domain_row_count(db: DebataDB, persona_id: str) -> int:
     total = 0
     with closing(_connect_for_import(db)) as conn:
         for table in _PERSONA_DOMAIN_TABLES:

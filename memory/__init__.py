@@ -7,15 +7,15 @@
     EventStore                —— 磁盘 append-only 全量事件库
     EventJournal              —— 单 worker 顺序写入事件库
     RollingSummaryStore       —— 全局滚动会话摘要
-    DianaDB                   —— diana.db 基础 schema / 版本 / 备份入口
-    DianaArchiveStore         —— diana.db archive_messages 轻量归档仓储
-    DianaEventStore            —— diana.db event_log 轻量事件仓储
-    DianaImportantStore        —— diana.db important_memories 轻量仓储
-    DianaPersonaDB             —— diana.db persona_* legacy domains 仓储
-    DianaRollingSummaryStore   —— diana.db rolling_summary 轻量仓储
-    DianaUsageStatsStore       —— diana.db usage_records 轻量仓储
-    import_legacy_memory_files —— 旧 memory/logs 文件到 diana.db 的同步导入入口
-    import_legacy_memory_files_async —— 旧 memory/logs 文件到 diana.db 的异步导入入口
+    DebataDB                   —— debata.db 基础 schema / 版本 / 备份入口
+    DebataArchiveStore         —— debata.db archive_messages 轻量归档仓储
+    DebataEventStore            —— debata.db event_log 轻量事件仓储
+    DebataImportantStore        —— debata.db important_memories 轻量仓储
+    DebataPersonaDB             —— debata.db persona_* legacy domains 仓储
+    DebataRollingSummaryStore   —— debata.db rolling_summary 轻量仓储
+    DebataUsageStatsStore       —— debata.db usage_records 轻量仓储
+    import_legacy_memory_files —— 旧 memory/logs 文件到 debata.db 的同步导入入口
+    import_legacy_memory_files_async —— 旧 memory/logs 文件到 debata.db 的异步导入入口
     RagMemoryService          —— RAG 模式的会话向量检索服务
     *StoreLike                —— 业务门面依赖的仓储协议
     JsonStore / JsonlStore    —— 底层存储实现（如有特殊需求可直接用）
@@ -30,27 +30,27 @@ per-persona 实例化：
 
 from .archive import ArchiveStore
 from .conversation_summary import RollingSummaryStore
-from .diana_db import (
-    DIANA_DB_SCHEMA_VERSION,
-    DianaDB,
-    DianaDBSchemaVersion,
-    DianaDBVersionError,
+from .debata_db import (
+    DEBATA_DB_SCHEMA_VERSION,
+    DebataDB,
+    DebataDBSchemaVersion,
+    DebataDBVersionError,
     backup_existing_database,
 )
-from .diana_importers import (
+from .debata_importers import (
     LegacyImportDomainResult,
     LegacyMemoryImportResult,
     import_legacy_memory_files,
     import_legacy_memory_files_async,
 )
-from .diana_stores import (
-    DianaArchiveStore,
-    DianaEventStore,
-    DianaHistoryStore,
-    DianaImportantStore,
-    DianaPersonaDB,
-    DianaRollingSummaryStore,
-    DianaUsageStatsStore,
+from .debata_stores import (
+    DebataArchiveStore,
+    DebataEventStore,
+    DebataHistoryStore,
+    DebataImportantStore,
+    DebataPersonaDB,
+    DebataRollingSummaryStore,
+    DebataUsageStatsStore,
 )
 from .event_journal import EventJournal
 from .event_store import EventStore
@@ -72,17 +72,17 @@ from .store import (
 
 __all__ = [
     "ArchiveStore",
-    "DIANA_DB_SCHEMA_VERSION",
-    "DianaDB",
-    "DianaArchiveStore",
-    "DianaEventStore",
-    "DianaHistoryStore",
-    "DianaImportantStore",
-    "DianaPersonaDB",
-    "DianaRollingSummaryStore",
-    "DianaUsageStatsStore",
-    "DianaDBSchemaVersion",
-    "DianaDBVersionError",
+    "DEBATA_DB_SCHEMA_VERSION",
+    "DebataDB",
+    "DebataArchiveStore",
+    "DebataEventStore",
+    "DebataHistoryStore",
+    "DebataImportantStore",
+    "DebataPersonaDB",
+    "DebataRollingSummaryStore",
+    "DebataUsageStatsStore",
+    "DebataDBSchemaVersion",
+    "DebataDBVersionError",
     "EventJournal",
     "EventStore",
     "HistoryManager",

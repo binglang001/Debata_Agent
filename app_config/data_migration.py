@@ -156,7 +156,7 @@ def _ensure_root_manifest(
 ) -> bool:
     changed = False
     defaults: dict[str, Any] = {
-        "schema": "diana.data_root.v0",
+        "schema": "debata.data_root.v0",
         "app_version": app_version,
         "created_at": timestamp,
     }
@@ -180,7 +180,7 @@ def _ensure_instance_manifest(
 ) -> bool:
     changed = False
     defaults: dict[str, Any] = {
-        "schema": "diana.data_instance.v0",
+        "schema": "debata.data_instance.v0",
         "app_version": app_version,
         "created_at": timestamp,
         "data_dir": str(target_instance_dir),

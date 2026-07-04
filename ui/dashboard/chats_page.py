@@ -1152,15 +1152,15 @@ def _chat_html_style(theme_name: str) -> str:
 
 def _toggle_item_id_from_url(url: QUrl) -> str | None:
     raw = url.toString()
-    prefix = "diana-chat-toggle:"
-    if not raw.startswith(prefix):
+    prefix = "debata-chat-toggle:"
+    if not raw.lower().startswith(prefix):
         return None
-    item_id = unquote(raw.removeprefix(prefix))
+    item_id = unquote(raw[len(prefix):])
     return item_id or None
 
 
 def _toggle_href(item_id: str) -> str:
-    return f"diana-chat-toggle:{quote(item_id, safe='')}"
+    return f"debata-chat-toggle:{quote(item_id, safe='')}"
 
 
 def _display_item_expand_id(item: DisplayItem) -> str:

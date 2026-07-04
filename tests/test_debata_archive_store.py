@@ -6,29 +6,29 @@ from pathlib import Path
 
 import pytest
 
-from memory.diana_db import DianaDB
-from memory.diana_stores import DianaArchiveStore
+from memory.debata_db import DebataDB
+from memory.debata_stores import DebataArchiveStore
 
 
 @pytest.mark.asyncio
-async def test_diana_archive_store_starts_empty_rejects_empty_persona_and_exports(tmp_path):
-    store = DianaArchiveStore(tmp_path / "diana.db", " yuexi ")
+async def test_debata_archive_store_starts_empty_rejects_empty_persona_and_exports(tmp_path):
+    store = DebataArchiveStore(tmp_path / "debata.db", " yuexi ")
 
     assert await store.load() == []
     assert await store.records() == []
     assert await store.media_records() == []
 
     with pytest.raises(ValueError, match="persona_id must not be empty"):
-        DianaArchiveStore(tmp_path / "diana.db", "  ")
+        DebataArchiveStore(tmp_path / "debata.db", "  ")
 
-    from memory import DianaArchiveStore as PackageDianaArchiveStore
+    from memory import DebataArchiveStore as PackageDebataArchiveStore
 
-    assert PackageDianaArchiveStore is DianaArchiveStore
+    assert PackageDebataArchiveStore is DebataArchiveStore
 
 
 @pytest.mark.asyncio
-async def test_diana_archive_append_many_keeps_real_chat_and_sent_outbound_only(tmp_path):
-    store = DianaArchiveStore(tmp_path / "diana.db", "yuexi")
+async def test_debata_archive_append_many_keeps_real_chat_and_sent_outbound_only(tmp_path):
+    store = DebataArchiveStore(tmp_path / "debata.db", "yuexi")
 
     await store.append_many(
         [
@@ -69,10 +69,10 @@ async def test_diana_archive_append_many_keeps_real_chat_and_sent_outbound_only(
 
 
 @pytest.mark.asyncio
-async def test_diana_archive_persona_scopes_short_ids_and_queries(tmp_path):
-    db_path = tmp_path / "diana.db"
-    yuexi = DianaArchiveStore(db_path, "yuexi")
-    jiu = DianaArchiveStore(db_path, "jiu")
+async def test_debata_archive_persona_scopes_short_ids_and_queries(tmp_path):
+    db_path = tmp_path / "debata.db"
+    yuexi = DebataArchiveStore(db_path, "yuexi")
+    jiu = DebataArchiveStore(db_path, "jiu")
 
     await yuexi.append_many(
         [
@@ -159,10 +159,10 @@ async def test_diana_archive_persona_scopes_short_ids_and_queries(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_diana_archive_duplicate_record_json_is_scoped_by_persona(tmp_path):
-    db_path = tmp_path / "diana.db"
-    yuexi = DianaArchiveStore(db_path, "yuexi")
-    jiu = DianaArchiveStore(db_path, "jiu")
+async def test_debata_archive_duplicate_record_json_is_scoped_by_persona(tmp_path):
+    db_path = tmp_path / "debata.db"
+    yuexi = DebataArchiveStore(db_path, "yuexi")
+    jiu = DebataArchiveStore(db_path, "jiu")
     record = _chat_record(
         "重复图片 [图片 workspace=incoming/dup.jpg]",
         conversation_id="private:1",
@@ -194,10 +194,10 @@ async def test_diana_archive_duplicate_record_json_is_scoped_by_persona(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_diana_archive_filter_fallback_and_media_are_persona_isolated(tmp_path):
-    db_path = tmp_path / "diana.db"
-    yuexi = DianaArchiveStore(db_path, "yuexi")
-    jiu = DianaArchiveStore(db_path, "jiu")
+async def test_debata_archive_filter_fallback_and_media_are_persona_isolated(tmp_path):
+    db_path = tmp_path / "debata.db"
+    yuexi = DebataArchiveStore(db_path, "yuexi")
+    jiu = DebataArchiveStore(db_path, "jiu")
 
     await yuexi.append_many(
         [
@@ -391,7 +391,7 @@ def _runtime_records(conversation_id: str) -> list[dict]:
 
 
 def _archive_rows(db_path: Path, persona_id: str) -> list[sqlite3.Row]:
-    db = DianaDB(db_path)
+    db = DebataDB(db_path)
     try:
         db.load()
         rows = db.connect().execute(

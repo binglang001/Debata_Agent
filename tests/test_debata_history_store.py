@@ -9,14 +9,14 @@ from pathlib import Path
 import orjson
 import pytest
 
-from memory.diana_db import DianaDB
-from memory.diana_stores import DianaHistoryStore
+from memory.debata_db import DebataDB
+from memory.debata_stores import DebataHistoryStore
 
 
 @pytest.mark.asyncio
-async def test_diana_history_store_jsonl_equivalent_operations(tmp_path):
-    db_path = tmp_path / "diana.db"
-    store = DianaHistoryStore(db_path, "yuexi")
+async def test_debata_history_store_jsonl_equivalent_operations(tmp_path):
+    db_path = tmp_path / "debata.db"
+    store = DebataHistoryStore(db_path, "yuexi")
     records = [
         {"role": "user", "content": "one", "conversation_id": "private:1"},
         {"role": "assistant", "content": "two", "conversation_id": "group:2"},
@@ -31,7 +31,7 @@ async def test_diana_history_store_jsonl_equivalent_operations(tmp_path):
     assert await store.get_slice(1) == records[1:]
     assert await store.get_slice(0, 2) == records[:2]
 
-    reloaded = DianaHistoryStore(db_path, "yuexi")
+    reloaded = DebataHistoryStore(db_path, "yuexi")
     assert await reloaded.load(force_reload=True) == records
 
     remaining = await store.truncate_head(1)
@@ -52,10 +52,10 @@ async def test_diana_history_store_jsonl_equivalent_operations(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_diana_history_store_persona_isolation_and_global_stream(tmp_path):
-    db_path = tmp_path / "diana.db"
-    yuexi = DianaHistoryStore(db_path, "yuexi")
-    jiu = DianaHistoryStore(db_path, "jiu")
+async def test_debata_history_store_persona_isolation_and_global_stream(tmp_path):
+    db_path = tmp_path / "debata.db"
+    yuexi = DebataHistoryStore(db_path, "yuexi")
+    jiu = DebataHistoryStore(db_path, "jiu")
     first = {"role": "user", "content": "private", "conversation_id": "private:1"}
     second = {"role": "assistant", "content": "group", "conversation_id": "group:2"}
     other = {"role": "user", "content": "other", "conversation_id": "private:1"}
@@ -74,9 +74,9 @@ async def test_diana_history_store_persona_isolation_and_global_stream(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_diana_history_store_preserves_record_json_and_extracted_columns(tmp_path):
-    db = DianaDB(tmp_path / "diana.db")
-    store = DianaHistoryStore(db, "yuexi")
+async def test_debata_history_store_preserves_record_json_and_extracted_columns(tmp_path):
+    db = DebataDB(tmp_path / "debata.db")
+    store = DebataHistoryStore(db, "yuexi")
     content = [{"type": "text", "text": "你好"}, {"type": "image", "url": "x.png"}]
     record = {
         "role": "assistant",
@@ -106,9 +106,9 @@ async def test_diana_history_store_preserves_record_json_and_extracted_columns(t
 
 
 @pytest.mark.asyncio
-async def test_diana_history_store_infers_conversation_id_from_legacy_metadata(tmp_path):
-    db_path = tmp_path / "diana.db"
-    store = DianaHistoryStore(db_path, "yuexi")
+async def test_debata_history_store_infers_conversation_id_from_legacy_metadata(tmp_path):
+    db_path = tmp_path / "debata.db"
+    store = DebataHistoryStore(db_path, "yuexi")
     record = {
         "role": "user",
         "content": "legacy",
@@ -122,9 +122,9 @@ async def test_diana_history_store_infers_conversation_id_from_legacy_metadata(t
 
 
 @pytest.mark.asyncio
-async def test_diana_history_store_skips_broken_records_on_load(tmp_path):
-    db_path = tmp_path / "diana.db"
-    store = DianaHistoryStore(db_path, "yuexi")
+async def test_debata_history_store_skips_broken_records_on_load(tmp_path):
+    db_path = tmp_path / "debata.db"
+    store = DebataHistoryStore(db_path, "yuexi")
     await store.append({"role": "user", "content": "ok"})
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -144,15 +144,15 @@ async def test_diana_history_store_skips_broken_records_on_load(tmp_path):
             """
         )
 
-    reloaded = DianaHistoryStore(db_path, "yuexi")
+    reloaded = DebataHistoryStore(db_path, "yuexi")
 
     assert await reloaded.load(force_reload=True) == [{"role": "user", "content": "ok"}]
 
 
 @pytest.mark.asyncio
-async def test_diana_history_store_concurrent_append_many_keeps_contiguous_indexes(tmp_path):
-    db_path = tmp_path / "diana.db"
-    store = DianaHistoryStore(db_path, "yuexi")
+async def test_debata_history_store_concurrent_append_many_keeps_contiguous_indexes(tmp_path):
+    db_path = tmp_path / "debata.db"
+    store = DebataHistoryStore(db_path, "yuexi")
 
     await asyncio.gather(
         store.append_many([{"role": "user", "content": f"a-{index}"} for index in range(5)]),
@@ -164,10 +164,10 @@ async def test_diana_history_store_concurrent_append_many_keeps_contiguous_index
     assert await store.length() == 10
 
 
-def test_memory_package_exports_diana_history_store():
-    from memory import DianaHistoryStore as PackageDianaHistoryStore
+def test_memory_package_exports_debata_history_store():
+    from memory import DebataHistoryStore as PackageDebataHistoryStore
 
-    assert PackageDianaHistoryStore is DianaHistoryStore
+    assert PackageDebataHistoryStore is DebataHistoryStore
 
 
 def _history_rows(db_path: Path, persona_id: str) -> list[dict]:

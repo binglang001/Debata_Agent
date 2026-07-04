@@ -1,11 +1,11 @@
-# diana.db v1 契约
+# debata.db v1 契约
 
-本文档定义阶段 2 的 `diana.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DianaHistoryStore` 对 `history_records`、`DianaImportantStore` 对 `important_memories`、`DianaRollingSummaryStore` 对 `rolling_summary`、`DianaUsageStatsStore` 对 `usage_records`、`DianaEventStore` 对 `event_log`、`DianaArchiveStore` 对 `archive_messages` / `archive_message_media`、`DianaPersonaDB` 对 `persona_*` legacy domains 的最小读写；旧文件导入器覆盖 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3` 与 `persona.db`；runtime 已接线到每人格 `memory/<persona>/diana.db`。向量库/RAG 不并入 `diana.db`，运行时使用实例级 `vector/<persona>/rag_memory.sqlite3` 独立文件，随实例目录搬迁。
+本文档定义阶段 2 的 `debata.db` 基础契约：单库位置、版本记录、备份策略、v1 空表结构与索引。当前实现包含建库和版本/备份能力，以及 `DebataHistoryStore` 对 `history_records`、`DebataImportantStore` 对 `important_memories`、`DebataRollingSummaryStore` 对 `rolling_summary`、`DebataUsageStatsStore` 对 `usage_records`、`DebataEventStore` 对 `event_log`、`DebataArchiveStore` 对 `archive_messages` / `archive_message_media`、`DebataPersonaDB` 对 `persona_*` legacy domains 的最小读写；旧文件导入器覆盖 `history.jsonl`、`important.json`、`rolling_summary.json`、`model_usage.jsonl`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3` 与 `persona.db`；runtime 已接线到每人格 `memory/<persona>/<persona>.db`。向量库/RAG 不并入 `debata.db`，运行时使用实例级 `vector/<persona>/rag_memory.sqlite3` 独立文件，随实例目录搬迁。
 
 ## 文件与版本
 
-- 默认目标文件：`DATA_DIR/db/diana.db`。本模块只接收显式路径，不负责解析 `DATA_DIR`。
-- 当前 schema 版本：`1`，由 `memory.diana_db.DIANA_DB_SCHEMA_VERSION` 暴露。
+- 目标文件由调用方显式传入；runtime 使用 `memory/<persona>/<persona>.db`。本模块不负责解析 `DATA_DIR`。
+- 当前 schema 版本：`1`，由 `memory.debata_db.DEBATA_DB_SCHEMA_VERSION` 暴露。
 - SQLite `PRAGMA user_version` 必须等于当前 schema 版本。
 - 内部迁移表：`schema_migrations(version, migration_id, applied_at)`。
 - v1 初始化迁移：`version = 1`，`migration_id = v1_initial_schema`。
@@ -14,7 +14,7 @@
 
 ## 连接 PRAGMA
 
-所有由 `DianaDB.connect()` 创建的连接必须设置：
+所有由 `DebataDB.connect()` 创建的连接必须设置：
 
 - `journal_mode=WAL`
 - `synchronous=NORMAL`
@@ -23,10 +23,10 @@
 
 ## 备份策略
 
-`backup_existing_database()` 在迁移前备份整个 `diana.db` 到同级 `backups/` 目录：
+`backup_existing_database()` 在迁移前备份整个 `debata.db` 到同级 `backups/` 目录：
 
 - 源库不存在时返回 `None`，且不创建空备份。
-- 文件名格式：`diana-v<schema_version>-<UTC timestamp>.db`。
+- 文件名格式：`debata-v<schema_version>-<UTC timestamp>.db`。
 - 时间戳默认格式：`YYYYMMDDTHHMMSSZ`。
 - 如果目标文件已存在，追加 `-1`、`-2` 等后缀，禁止覆盖已有备份。
 - 选定备份目标后必须用独占创建占位文件，避免并发选择同一路径；备份失败时只删除本次函数调用创建的占位/目标。
@@ -60,36 +60,36 @@
 
 ## Runtime 接线约定
 
-- Runtime 对当前人格使用 `paths.memory_dir_for(persona.name) / "diana.db"`，不使用全局 `DATA_DIR/db/diana.db` 默认路径。
-- `Runtime.start()` 在记忆阶段先调用异步导入入口，把旧人格 memory 目录中的 `history.jsonl`、`important.json`、`rolling_summary.json`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3`、`persona.db` 和日志目录中的 `model_usage.jsonl` 导入当前人格的 `diana.db`。旧文件保留，不删除。
-- Runtime 只在旧源存在且对应 diana 目标域为空时触发旧文件导入；已初始化并已有数据的目标域不会再从旧文件整体覆盖。无实际导入需求时不调用 importer，因此不会在每次启动时生成备份。
-- Runtime 保留现有 Manager/门面调用面：`HistoryManager` 注入 `DianaHistoryStore`，`ImportantMemoryManager` 注入 `DianaImportantStore`，`ArchiveStore` 注入 `DianaArchiveStore`，`EventJournal` 包装 `DianaEventStore`，滚动摘要和 usage 分别直接使用 `DianaRollingSummaryStore` 与 `DianaUsageStatsStore`。
-- persona management 启用时，runtime 使用 `DianaPersonaDB(diana_db, persona_id)`，不再新建 `persona.db`，重要记忆仍通过 `DianaImportantStore` 作为运行时主后端。
-- `UsageStatsStore` 的运行时后端是 `DianaUsageStatsStore(diana_db, persona_id)`；旧 usage 导入源由 runtime 显式传入 `paths.LOGS_DIR / "model_usage.jsonl"`。
-- RAG/vector 相关存储由实例级 `paths.vector_dir_for(persona.name) / "rag_memory.sqlite3"` 负责，不在本阶段迁入 `diana.db`，也不由 diana 导入器处理。若旧 `memory/<persona>/rag_memory.sqlite3` 存在且新 vector 文件不存在，runtime 启动 RAG 前会复制旧主库及存在的 `-wal` / `-shm` sidecar 到新目录；旧文件保留，目标已存在时不覆盖。
+- Runtime 对当前人格使用 `paths.memory_dir_for(persona.name) / f"{persona.name}.db"`。
+- `Runtime.start()` 在记忆阶段先调用异步导入入口，把旧人格 memory 目录中的 `history.jsonl`、`important.json`、`rolling_summary.json`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3`、`persona.db` 和日志目录中的 `model_usage.jsonl` 导入当前人格命名库。旧文件保留，不删除。
+- Runtime 只在旧源存在且对应 Debata 目标域为空时触发旧文件导入；已初始化并已有数据的目标域不会再从旧文件整体覆盖。无实际导入需求时不调用 importer，因此不会在每次启动时生成备份。
+- Runtime 保留现有 Manager/门面调用面：`HistoryManager` 注入 `DebataHistoryStore`，`ImportantMemoryManager` 注入 `DebataImportantStore`，`ArchiveStore` 注入 `DebataArchiveStore`，`EventJournal` 包装 `DebataEventStore`，滚动摘要和 usage 分别直接使用 `DebataRollingSummaryStore` 与 `DebataUsageStatsStore`。
+- persona management 启用时，runtime 在当前人格数据库上创建 `DebataPersonaDB`，不再新建 `persona.db`，重要记忆仍通过 `DebataImportantStore` 作为运行时主后端。
+- `UsageStatsStore` 的运行时后端是当前人格数据库上的 `DebataUsageStatsStore`；旧 usage 导入源由 runtime 显式传入 `paths.LOGS_DIR / "model_usage.jsonl"`。
+- RAG/vector 相关存储由实例级 `paths.vector_dir_for(persona.name) / "rag_memory.sqlite3"` 负责，不在本阶段迁入当前人格数据库，也不由 Debata 导入器处理。若旧 `memory/<persona>/rag_memory.sqlite3` 存在且新 vector 文件不存在，runtime 启动 RAG 前会复制旧主库及存在的 `-wal` / `-shm` sidecar 到新目录；旧文件保留，目标已存在时不覆盖。
 
 ## 仓储抽象
 
-代码层统一仓储协议定义在 `memory.store`，并由 `memory` 包公开导出：`JsonStoreLike`、`JsonlStoreLike`、`ArchiveStoreLike`、`RollingSummaryStoreLike`、`EventAppenderLike`、`EventStoreLike` 与 `UsageStatsStoreLike`。业务门面只依赖这些协议形状：`HistoryManager` 注入 `JsonlStoreLike`，事件镜像只依赖 `EventAppenderLike`，`ImportantMemoryManager` 注入 `JsonStoreLike`，`ArchiveStore` 注入 `ArchiveStoreLike`，`EventJournal` 包装 `EventStoreLike`，滚动摘要 store 保持 `RollingSummaryStoreLike` 调用面。旧文件 store 与 `Diana*Store` 按结构实现相同协议，不要求继承共同基类。
+代码层统一仓储协议定义在 `memory.store`，并由 `memory` 包公开导出：`JsonStoreLike`、`JsonlStoreLike`、`ArchiveStoreLike`、`RollingSummaryStoreLike`、`EventAppenderLike`、`EventStoreLike` 与 `UsageStatsStoreLike`。业务门面只依赖这些协议形状：`HistoryManager` 注入 `JsonlStoreLike`，事件镜像只依赖 `EventAppenderLike`，`ImportantMemoryManager` 注入 `JsonStoreLike`，`ArchiveStore` 注入 `ArchiveStoreLike`，`EventJournal` 包装 `EventStoreLike`，滚动摘要 store 保持 `RollingSummaryStoreLike` 调用面。旧文件 store 与 `Debata*Store` 按结构实现相同协议，不要求继承共同基类。
 
 ## 第一批旧文件导入器
 
-`memory.diana_importers.import_legacy_memory_files(db, source_dir, persona_id, *, backup=True, usage_persona_id=None, usage_source_path=None, skip_existing_domains=False)` 是同步导入入口，用于把旧 `memory/` 与 `logs/` 中第一批文件导入已存在的 `diana.db` stores。`memory.diana_importers.import_legacy_memory_files_async(...)` 使用同一参数签名，是等价异步入口，供 `Runtime.start()` 等 running event loop 内调用；同步入口在 running event loop 中仍抛错。参数约定：
+`memory.debata_importers.import_legacy_memory_files(db, source_dir, persona_id, *, backup=True, usage_persona_id=None, usage_source_path=None, skip_existing_domains=False)` 是同步导入入口，用于把旧 `memory/` 与 `logs/` 中第一批文件导入已存在的当前人格数据库 stores。`memory.debata_importers.import_legacy_memory_files_async(...)` 使用同一参数签名，是等价异步入口，供 `Runtime.start()` 等 running event loop 内调用；同步入口在 running event loop 中仍抛错。参数约定：
 
-- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。入口会主动 `load()` 并确保 schema 可用。
+- `db`：`DebataDB` 实例、数据库路径字符串或 `Path`。入口会主动 `load()` 并确保 schema 可用。
 - `source_dir`：旧 `history.jsonl`、`important.json`、`rolling_summary.json`、`events.sqlite3`、`events.sqlite3.append.jsonl`、`archive.sqlite3`、`persona.db` 所在目录。默认 usage 源仍兼容为 `source_dir / "model_usage.jsonl"`。
 - `persona_id`：写入 `history_records`、`important_memories`、`rolling_summary`、`event_log`、`event_projection_state`、`archive_messages`、`archive_message_media` 与 `persona_*` 目标表的目标 persona。
-- `backup=True`：导入前如果目标 `diana.db` 已存在，调用 `backup_existing_database()`；目标库不存在时不创建备份。
+- `backup=True`：导入前如果目标 `debata.db` 已存在，调用 `backup_existing_database()`；目标库不存在时不创建备份。
 - `usage_persona_id=None`：默认跟随 `persona_id` 写入 `usage_records.persona_id`。显式传入空字符串表示全局 usage，写库时 `persona_id` 为 `NULL`。
 - `usage_source_path=None`：默认保持旧行为，从 `source_dir / "model_usage.jsonl"` 读取；runtime 应显式传入 `paths.LOGS_DIR / "model_usage.jsonl"`，因为 usage 旧文件位于 logs 目录而非人格 memory 目录。
-- `skip_existing_domains=False`：默认保持旧导入器行为；runtime 传 `True`，对已有数据的 history/important/rolling/usage/events/archive/persona 域跳过导入，避免旧文件覆盖运行期写入的 diana 数据。
+- `skip_existing_domains=False`：默认保持旧导入器行为；runtime 传 `True`，对已有数据的 history/important/rolling/usage/events/archive/persona 域跳过导入，避免旧文件覆盖运行期写入的 Debata 数据。
 
 返回值是 `LegacyMemoryImportResult`，包含 `backup_path` 以及 `history`、`important`、`rolling_summary`、`usage`、`events`、`archive`、`persona` 七个 `LegacyImportDomainResult(imported, skipped)` 统计，供 runtime 后续展示。`important.imported` 统计最终写入新 `important_memories` 域的 item 数；`important.skipped` 统计损坏/非列表合并源与双源去重丢弃的 item 数。`archive` 统计按归档消息行与归档媒体行合计，`persona` 统计按旧 `persona.db` 导入到 `persona_*` 目标表的行合计。
 
 导入映射：
 
-- `history.jsonl` -> `DianaHistoryStore.replace_all(...)`。
-- `important.json` 与 `persona.db important_memories.memories_json` -> 双源合并后 `DianaImportantStore.write(...)`。`persona.db` 是权威源，输出顺序为 persona 聚合列表项在前、`important.json` 中未被同 ID 覆盖的项在后；缺少 `id` 的 item 使用基于规范化 JSON 的稳定 fallback ID 做跨源去重，但不改写 item 本身。
+- `history.jsonl` -> `DebataHistoryStore.replace_all(...)`。
+- `important.json` 与 `persona.db important_memories.memories_json` -> 双源合并后 `DebataImportantStore.write(...)`。`persona.db` 是权威源，输出顺序为 persona 聚合列表项在前、`important.json` 中未被同 ID 覆盖的项在后；缺少 `id` 的 item 使用基于规范化 JSON 的稳定 fallback ID 做跨源去重，但不改写 item 本身。
 - `rolling_summary.json` -> 直写 `rolling_summary` 单行；查询列按 store 读取契约抽取，`summary_json` 完整保留旧 JSON 对象。
 - `model_usage.jsonl` -> 直接写入 `usage_records`，保留完整 `record_json`，并抽取 usage 常用列；源文件路径由 `usage_source_path` 决定，未传时兼容 `source_dir / "model_usage.jsonl"`。
 - `events.sqlite3` 与 `events.sqlite3.append.jsonl` -> 直接写入 `event_log`；先导入 SQLite 已投影行，再导入 append log 行；保留旧事件自带 `event_id`、`event_uuid`、`schema_version`、`payload_json`、`payload_hash` 与其他事件列，不调用会重新分配 ID 的事件追加接口。导入完成后写入 `event_projection_state(persona_id, "last_projected_event_id")` 为当前 persona 最大 `event_id`。
@@ -99,11 +99,11 @@
 
 - 缺失文件视为该域 `imported=0, skipped=0`，不写入该域。
 - `history`、`important`、`rolling_summary` 采用整体替换或 upsert 语义；重复导入不会追加重复记录。`important` 重跑时继续整体替换当前 persona 的新 `important_memories` 域。
-- `important` 双源合并按 item ID 去重；同 ID 冲突时保留 `persona.db important_memories.memories_json` 中的 persona 项，跳过 `important.json` 中的同 ID 项并计入 `important.skipped`。无 `id` item 使用与 `DianaImportantStore` 相同的稳定 fallback ID 判断跨源重复，避免双源完全相同的无 ID item 重复写入。
+- `important` 双源合并按 item ID 去重；同 ID 冲突时保留 `persona.db important_memories.memories_json` 中的 persona 项，跳过 `important.json` 中的同 ID 项并计入 `important.skipped`。无 `id` item 使用与 `DebataImportantStore` 相同的稳定 fallback ID 判断跨源重复，避免双源完全相同的无 ID item 重复写入。
 - `usage` 按同一 `usage_persona_id` 下的 `record_json` 去重；重复导入同一旧记录时计入 skipped，不新增行。
 - `events` 按同一 `persona_id` 下的 `event_id` 与 `idempotency_key` 去重。相同 `event_id` 且除 `persona_id` 外的事件保真列完整一致视为重复并计入 skipped；相同 `event_id` 但任一事件保真列冲突，或相同 `idempotency_key` 指向不同事件时，记录 warning 并计入 skipped，不覆盖已有行。
 - `archive` 按同一 `persona_id` 下的消息 `rowid`、消息 `archive_id` 与媒体 `id` 去重。相同消息 `rowid` 或 `archive_id` 且除 `persona_id` 外的完整归档消息列一致视为重复并计入 skipped；任一列冲突时记录 warning 并计入 skipped，不覆盖已有行。相同媒体 `id` 且除 `persona_id` 外的完整媒体列一致视为重复并计入 skipped；任一列冲突时记录 warning 并计入 skipped，不覆盖已有行。同一 `archive_id` 可以有多条不同媒体 `id`。
-- `persona` 读取 `source_dir/persona.db`，在 `target_db.load()` 后用直接 SQLite 导入到 `persona_*` 表，不调用 `DianaPersonaDB` 写方法生成新 ID。缺少 `persona.db` 时 `persona.imported=0` 且 `persona.skipped=0`。缺表记录 warning 并跳过该表；源表缺关键主键/必要列时记录 warning，并按该表可数行计入 skipped；单行关键字段缺失或目标 NOT NULL 列无法满足时记录 warning 并跳过该行。
+- `persona` 读取 `source_dir/persona.db`，在 `target_db.load()` 后用直接 SQLite 导入到 `persona_*` 表，不调用 `DebataPersonaDB` 写方法生成新 ID。缺少 `persona.db` 时 `persona.imported=0` 且 `persona.skipped=0`。缺表记录 warning 并跳过该表；源表缺关键主键/必要列时记录 warning，并按该表可数行计入 skipped；单行关键字段缺失或目标 NOT NULL 列无法满足时记录 warning 并跳过该行。
 - `persona` 按同一 `persona_id` 下的目标主键去重。相同主键且除 `persona_id` 外的完整目标列一致视为重复并计入 skipped；相同主键但任一目标列冲突时记录 warning 并计入 skipped，不覆盖已有行。旧 `eat_records` 兼容缺少 `record_id`、`ended_at`、`status` 的库；缺 `record_id` 时按 `record_json.record_id/eat_id/id` 推导，仍无值则使用 `eat_<id>` fallback。
 - JSONL 中空行、损坏行、非对象行会跳过并记录 warning；损坏 JSON 文件会跳过该文件来源并记录 warning，不让整体导入崩溃。`important.json` 损坏时仍保留 warning/skipped；如果 `persona.db important_memories.memories_json` 有有效列表，仍会把 persona 来源项写入新 `important_memories`。
 - `persona.db important_memories.memories_json` 只在解析为 list 时参与新 `important_memories` 合并；非 list、空值或 JSON 损坏时记录 warning 并计入 `important.skipped`，不吸收该来源。无论合并源是否有效，旧 `persona.db important_memories` 到 `persona_important_state_legacy` 的保真复制与 `persona` 统计仍按 persona 导入规则独立处理。
@@ -115,7 +115,7 @@
 
 ### schema_migrations
 
-记录 diana.db 内部迁移状态。
+记录 debata.db 内部迁移状态。
 
 | 列 | 类型 | 约束 |
 |---|---|---|
@@ -150,11 +150,11 @@
 - `idx_history_role(persona_id, role)`
 - `idx_history_content_hash(content_hash)`
 
-#### DianaHistoryStore 接口
+#### DebataHistoryStore 接口
 
-`memory.diana_stores.DianaHistoryStore(db, persona_id)` 是 `history_records` 的轻量仓储，构造参数：
+`memory.debata_stores.DebataHistoryStore(db, persona_id)` 是 `history_records` 的轻量仓储，构造参数：
 
-- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `db`：`DebataDB` 实例、数据库路径字符串或 `Path`。
 - `persona_id`：人格 ID；同一 persona 的历史是一条全局时间线，不按 `conversation_id` 拆分。
 
 异步接口与 `JsonlStore` 对齐：
@@ -201,11 +201,11 @@
 - `idx_important_persona_scope(persona_id, scope)`
 - `idx_important_pinned(persona_id, pinned)`
 
-#### DianaImportantStore 接口
+#### DebataImportantStore 接口
 
-`memory.diana_stores.DianaImportantStore(db, persona_id)` 是 `important_memories` 的轻量仓储，构造参数：
+`memory.debata_stores.DebataImportantStore(db, persona_id)` 是 `important_memories` 的轻量仓储，构造参数：
 
-- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `db`：`DebataDB` 实例、数据库路径字符串或 `Path`。
 - `persona_id`：人格 ID；同一 persona 的重要记忆是一份整体 JSON 列表。
 
 异步接口与 `JsonStore` 对齐：
@@ -220,7 +220,7 @@
 - 同步提取 `id` 到 `memory_id`，提取 `timestamp`、`scope`、`pinned`、`content`、`updated_at` 到同名列供后续查询使用。
 - item 缺少 `id` 时，`memory_id` 使用基于 item 规范化 JSON 的稳定 fallback；同一次写入中若出现重复 fallback 或重复 id，会在后续重复项后追加序号，避免破坏唯一约束。
 - `write()` 使用删除再插入实现整体替换，同一 persona 幂等替换，不影响其他 persona。
-- 非 list 数据按 legacy/raw 单行保存：`memory_id = "__diana_important_raw__"`，`scope = "__legacy_raw__"`，`item_json` 保存原始 JSON；读取该行时返回原始非 list 数据。`ImportantMemoryManager` 主路径会以 `read(default=[])` 读取空表，因此新数据应保持 list。
+- 非 list 数据按 legacy/raw 单行保存：`memory_id = "__debata_important_raw__"`，`scope = "__legacy_raw__"`，`item_json` 保存原始 JSON；读取该行时返回原始非 list 数据。`ImportantMemoryManager` 主路径会以 `read(default=[])` 读取空表，因此新数据应保持 list。
 - 读取时遇到损坏的 `item_json` 会跳过该行并记录 warning；仓储不在读取阶段回写修复数据。
 - 所有数据库写入和读取由仓储锁保护，并通过后台线程执行，避免阻塞事件循环。
 
@@ -237,11 +237,11 @@
 | summary_json | TEXT | NOT NULL DEFAULT '{}' |
 | updated_at | TEXT | NOT NULL |
 
-#### DianaRollingSummaryStore 接口
+#### DebataRollingSummaryStore 接口
 
-`memory.diana_stores.DianaRollingSummaryStore(db, persona_id)` 是 `rolling_summary` 的轻量仓储，构造参数：
+`memory.debata_stores.DebataRollingSummaryStore(db, persona_id)` 是 `rolling_summary` 的轻量仓储，构造参数：
 
-- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `db`：`DebataDB` 实例、数据库路径字符串或 `Path`。
 - `persona_id`：人格 ID；同一 persona 只保存一行滚动摘要。
 
 异步接口与旧 `RollingSummaryStore` 对齐：
@@ -310,11 +310,11 @@
 
 约束：`PRIMARY KEY(persona_id, name)`。
 
-#### DianaEventStore 接口
+#### DebataEventStore 接口
 
-`memory.diana_stores.DianaEventStore(db, persona_id)` 是 `event_log` / `event_projection_state` 的轻量事件仓储，面向 `EventJournal` 的当前调用面实现。构造参数：
+`memory.debata_stores.DebataEventStore(db, persona_id)` 是 `event_log` / `event_projection_state` 的轻量事件仓储，面向 `EventJournal` 的当前调用面实现。构造参数：
 
-- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `db`：`DebataDB` 实例、数据库路径字符串或 `Path`。
 - `persona_id`：人格 ID；去除首尾空白后不能为空。事件 ID、幂等键、读取查询都按 persona 隔离。
 
 异步接口与 `EventJournal` 依赖的 `EventStore` 调用面对齐：
@@ -339,7 +339,7 @@
 - 每个新事件按当前 persona 的 `MAX(event_id) + 1` 分配连续 event_id；不同 persona 的 event_id 序列互不影响。
 - 同批和已有库内的 `idempotency_key` 在同一 persona 内返回已有 event_id，不重复写入；不同 persona 的幂等键空间隔离。
 - 多实例并发时，实例内锁保证同一对象顺序写入；跨实例依赖 SQLite 主键/唯一约束，并在冲突后重查以避免同一 persona 重复 event_id 或重复幂等事件。
-- `payload_json`、`payload_hash`、`schema_version` 使用旧事件归一化逻辑生成并原样写入，不在 diana 仓储层重写 payload。
+- `payload_json`、`payload_hash`、`schema_version` 使用旧事件归一化逻辑生成并原样写入，不在 Debata 仓储层重写 payload。
 
 读取语义：
 
@@ -413,11 +413,11 @@
 
 - `idx_archive_media_archive(persona_id, archive_id)`
 
-#### DianaArchiveStore 接口
+#### DebataArchiveStore 接口
 
-`memory.diana_stores.DianaArchiveStore(db, persona_id)` 是 `archive_messages` / `archive_message_media` 的轻量归档仓储，构造参数：
+`memory.debata_stores.DebataArchiveStore(db, persona_id)` 是 `archive_messages` / `archive_message_media` 的轻量归档仓储，构造参数：
 
-- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `db`：`DebataDB` 实例、数据库路径字符串或 `Path`。
 - `persona_id`：人格 ID；去除首尾空白后不能为空。归档消息、短 ID、媒体 ID、去重和所有查询都按 persona 隔离。
 
 异步接口与旧 `ArchiveStore` 当前调用面对齐：
@@ -442,7 +442,7 @@
 读取语义：
 
 - `records()`、`search()`、`filter_records()`、`get_by_ids()`、`context_around()`、`rag_records()`、`media_records()` 都只返回当前 persona 的真实聊天数据或媒体。
-- `filter_records()` 复用旧 `_filter_sql_plan()`，但 diana 查询会在主 SQL 和 fallback SQL 的基底强制加 `persona_id = ?`；Python residual filter 只接收当前 persona 已筛出的行。
+- `filter_records()` 复用旧 `_filter_sql_plan()`，但 Debata 查询会在主 SQL 和 fallback SQL 的基底强制加 `persona_id = ?`；Python residual filter 只接收当前 persona 已筛出的行。
 - `context_around()` 只在当前 persona 且同一 `conversation_id` 中取上下文。
 - `rag_records()` 返回真实聊天记录，并用 `content_search` 作为 RAG 文本内容，与旧 SQLite 归档行为一致。
 
@@ -475,11 +475,11 @@
 - `idx_usage_agent_operation(agent, operation)`
 - `idx_usage_persona_ts(persona_id, ts)`
 
-#### DianaUsageStatsStore 接口
+#### DebataUsageStatsStore 接口
 
-`memory.diana_stores.DianaUsageStatsStore(db, persona_id=None)` 是 `usage_records` 的轻量仓储，构造参数：
+`memory.debata_stores.DebataUsageStatsStore(db, persona_id=None)` 是 `usage_records` 的轻量仓储，构造参数：
 
-- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `db`：`DebataDB` 实例、数据库路径字符串或 `Path`。
 - `persona_id`：可选人格 ID。`None` 或空白字符串表示全局 usage，写库时 `persona_id` 为 `NULL`；非空值去除首尾空白后保存。
 
 接口与 `core.usage_stats.UsageStatsStore` 对齐：
@@ -507,14 +507,14 @@
 
 Persona state 域使用 `persona_*` 表名前缀复制现 `mind/db_schema.py` 的字段，并补 `persona_id`。原 `important_memories` 表名已被新重要记忆域使用，因此 persona.db 的旧聚合重要记忆表命名为 `persona_important_state_legacy`。
 
-#### DianaPersonaDB 接口
+#### DebataPersonaDB 接口
 
-`memory.diana_stores.DianaPersonaDB(db, persona_id)` 是 `diana.db` 中 `persona_*` legacy domains 的轻量仓储，面向 `mind.db.PersonaDB` 当前公开调用面实现。构造参数：
+`memory.debata_stores.DebataPersonaDB(db, persona_id)` 是 `debata.db` 中 `persona_*` legacy domains 的轻量仓储，面向 `mind.db.PersonaDB` 当前公开调用面实现。构造参数：
 
-- `db`：`DianaDB` 实例、数据库路径字符串或 `Path`。
+- `db`：`DebataDB` 实例、数据库路径字符串或 `Path`。
 - `persona_id`：人格 ID；去除首尾空白后不能为空，空值抛出 `ValueError("persona_id must not be empty")`。
 
-接口覆盖旧 `PersonaDB` 的 state、state log、update audit、effect、todo、cue、profile、inner monologue、daily trajectory、persona arc、sleep/eat record 与旧聚合 important memory 读写方法。`load()` 只确保 diana schema 可用，并在 `persona_schema_version_legacy` 为当前 persona 写入旧 persona.db schema version；不接 runtime，不导入旧数据，不修改 diana schema version。
+接口覆盖旧 `PersonaDB` 的 state、state log、update audit、effect、todo、cue、profile、inner monologue、daily trajectory、persona arc、sleep/eat record 与旧聚合 important memory 读写方法。`load()` 只确保 Debata schema 可用，并在 `persona_schema_version_legacy` 为当前 persona 写入旧 persona.db schema version；不接 runtime，不导入旧数据，不修改 Debata schema version。
 
 旧 `persona.db` 导入映射：
 
@@ -535,9 +535,9 @@ Persona state 域使用 `persona_*` 表名前缀复制现 `mind/db_schema.py` �
 
 写入语义：
 
-- 所有 `SELECT`、`INSERT`、`UPDATE`、`DELETE` 必须按当前 `persona_id` 隔离；同一 `diana.db` 中不同 persona 的记录、删除、过期处理和最近记录查询互不影响。
+- 所有 `SELECT`、`INSERT`、`UPDATE`、`DELETE` 必须按当前 `persona_id` 隔离；同一 `debata.db` 中不同 persona 的记录、删除、过期处理和最近记录查询互不影响。
 - `persona_state`、`persona_important_state_legacy`、`persona_schema_version_legacy` 是每 persona 单行旧聚合表，主键为 `(persona_id, id=1)`。
-- 旧 `AUTOINCREMENT` 表在 diana schema 中改为 `(persona_id, id)` 复合主键；`persona_state_log`、`persona_update_audits`、`persona_inner_monologues`、`persona_daily_trajectories`、`persona_arc`、`persona_eat_records` 的 id 在 `BEGIN IMMEDIATE` 事务内按当前 persona 的 `MAX(id)+1` 分配。
+- 旧 `AUTOINCREMENT` 表在 Debata schema 中改为 `(persona_id, id)` 复合主键；`persona_state_log`、`persona_update_audits`、`persona_inner_monologues`、`persona_daily_trajectories`、`persona_arc`、`persona_eat_records` 的 id 在 `BEGIN IMMEDIATE` 事务内按当前 persona 的 `MAX(id)+1` 分配。
 - effect、todo、cue、profile、sleep record 使用旧记录 ID 与 `persona_id` 组成复合主键；todo partial update、sleep/eat update、expire/missed 行为与旧 `PersonaDB` 对齐。
 - JSON 保真列保存完整记录，读取时继续复用 `mind.db_records` 的 JSON、时间解析、过期判断、排序、ID 归一化和 mind dataclass 适配 helper。
 

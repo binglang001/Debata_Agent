@@ -1,4 +1,4 @@
-"""diana.db 基础 schema、版本与备份契约。"""
+"""debata.db 基础 schema、版本与备份契约。"""
 
 from __future__ import annotations
 
@@ -9,25 +9,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-DIANA_DB_SCHEMA_VERSION = 1
-DIANA_DB_INITIAL_MIGRATION_ID = "v1_initial_schema"
+DEBATA_DB_SCHEMA_VERSION = 1
+DEBATA_DB_INITIAL_MIGRATION_ID = "v1_initial_schema"
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
 
 
 @dataclass(frozen=True, slots=True)
-class DianaDBSchemaVersion:
+class DebataDBSchemaVersion:
     """SQLite PRAGMA 与内部迁移表的版本读数。"""
 
     user_version: int
     migration_version: int | None
 
 
-class DianaDBVersionError(RuntimeError):
-    """当前代码不支持打开更高版本的 diana.db。"""
+class DebataDBVersionError(RuntimeError):
+    """当前代码不支持打开更高版本的 debata.db。"""
 
 
-class DianaDB:
-    """diana.db 的最小连接、schema 初始化与版本读取入口。"""
+class DebataDB:
+    """debata.db 的最小连接、schema 初始化与版本读取入口。"""
 
     def __init__(
         self,
@@ -39,7 +39,7 @@ class DianaDB:
         self.busy_timeout_ms = int(busy_timeout_ms)
         self._conn: sqlite3.Connection | None = None
 
-    def load(self) -> DianaDB:
+    def load(self) -> DebataDB:
         """打开数据库并幂等初始化 v1 schema。"""
 
         conn = self.connect()
@@ -65,27 +65,27 @@ class DianaDB:
         return self._conn
 
     def ensure_schema(self, conn: sqlite3.Connection | None = None) -> None:
-        """创建 diana.db v1 空表契约，并写入统一版本记录。"""
+        """创建 debata.db v1 空表契约，并写入统一版本记录。"""
 
         target = conn if conn is not None else self.connect()
         _raise_if_future_schema(self.schema_version(target))
         with target:
             for statement in _V1_SCHEMA_STATEMENTS:
                 target.execute(statement)
-            target.execute(f"PRAGMA user_version = {DIANA_DB_SCHEMA_VERSION}")
+            target.execute(f"PRAGMA user_version = {DEBATA_DB_SCHEMA_VERSION}")
             target.execute(
                 """
                 INSERT OR IGNORE INTO schema_migrations(version, migration_id, applied_at)
                 VALUES (?, ?, ?)
                 """,
                 (
-                    DIANA_DB_SCHEMA_VERSION,
-                    DIANA_DB_INITIAL_MIGRATION_ID,
+                    DEBATA_DB_SCHEMA_VERSION,
+                    DEBATA_DB_INITIAL_MIGRATION_ID,
                     _utc_timestamp(),
                 ),
             )
 
-    def schema_version(self, conn: sqlite3.Connection | None = None) -> DianaDBSchemaVersion:
+    def schema_version(self, conn: sqlite3.Connection | None = None) -> DebataDBSchemaVersion:
         """读取 PRAGMA user_version 与内部迁移表中的最高版本。"""
 
         target = conn if conn is not None else self.connect()
@@ -96,7 +96,7 @@ class DianaDB:
             migration_version = None
         else:
             migration_version = None if row is None or row[0] is None else int(row[0])
-        return DianaDBSchemaVersion(
+        return DebataDBSchemaVersion(
             user_version=user_version,
             migration_version=migration_version,
         )
@@ -105,10 +105,10 @@ class DianaDB:
 def backup_existing_database(
     db_path: str | Path,
     *,
-    schema_version: int = DIANA_DB_SCHEMA_VERSION,
+    schema_version: int = DEBATA_DB_SCHEMA_VERSION,
     timestamp: str | datetime | None = None,
 ) -> Path | None:
-    """把已存在的 diana.db 备份到同级 backups/；源库不存在时不创建备份。"""
+    """把已存在的 debata.db 备份到同级 backups/；源库不存在时不创建备份。"""
 
     source = Path(db_path)
     if not source.exists():
@@ -163,20 +163,20 @@ def _backup_timestamp(timestamp: str | datetime | None) -> str:
     return timestamp
 
 
-def _raise_if_future_schema(version: DianaDBSchemaVersion) -> None:
+def _raise_if_future_schema(version: DebataDBSchemaVersion) -> None:
     future_parts = []
-    if version.user_version > DIANA_DB_SCHEMA_VERSION:
+    if version.user_version > DEBATA_DB_SCHEMA_VERSION:
         future_parts.append(f"user_version={version.user_version}")
     if (
         version.migration_version is not None
-        and version.migration_version > DIANA_DB_SCHEMA_VERSION
+        and version.migration_version > DEBATA_DB_SCHEMA_VERSION
     ):
         future_parts.append(f"migration_version={version.migration_version}")
     if future_parts:
         details = ", ".join(future_parts)
-        raise DianaDBVersionError(
-            f"diana.db schema version is newer than supported: {details}; "
-            f"supported_version={DIANA_DB_SCHEMA_VERSION}"
+        raise DebataDBVersionError(
+            f"debata.db schema version is newer than supported: {details}; "
+            f"supported_version={DEBATA_DB_SCHEMA_VERSION}"
         )
 
 
@@ -530,9 +530,9 @@ _V1_SCHEMA_STATEMENTS = (
 
 
 __all__ = [
-    "DIANA_DB_SCHEMA_VERSION",
-    "DianaDB",
-    "DianaDBSchemaVersion",
-    "DianaDBVersionError",
+    "DEBATA_DB_SCHEMA_VERSION",
+    "DebataDB",
+    "DebataDBSchemaVersion",
+    "DebataDBVersionError",
     "backup_existing_database",
 ]

@@ -1,6 +1,6 @@
 [project]
 name = "debata_agent"
-version = "0.9.0"
+version = "0.9.0-alpha"
 description = "Debata_Agent —— 让虚拟角色真正活过来的通用聊天智能体框架"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }

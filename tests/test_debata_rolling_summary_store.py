@@ -6,14 +6,14 @@ from pathlib import Path
 import orjson
 import pytest
 
-from memory.diana_db import DianaDB
-from memory.diana_stores import DianaRollingSummaryStore
+from memory.debata_db import DebataDB
+from memory.debata_stores import DebataRollingSummaryStore
 
 
 @pytest.mark.asyncio
-async def test_diana_rolling_summary_store_empty_load_defaults(tmp_path):
-    db_path = tmp_path / "diana.db"
-    store = DianaRollingSummaryStore(db_path, "yuexi")
+async def test_debata_rolling_summary_store_empty_load_defaults(tmp_path):
+    db_path = tmp_path / "debata.db"
+    store = DebataRollingSummaryStore(db_path, "yuexi")
 
     data = await store.load()
 
@@ -24,9 +24,9 @@ async def test_diana_rolling_summary_store_empty_load_defaults(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_diana_rolling_summary_store_update_roundtrip_and_columns(tmp_path):
-    db = DianaDB(tmp_path / "diana.db")
-    store = DianaRollingSummaryStore(db, "yuexi")
+async def test_debata_rolling_summary_store_update_roundtrip_and_columns(tmp_path):
+    db = DebataDB(tmp_path / "debata.db")
+    store = DebataRollingSummaryStore(db, "yuexi")
     archived_until = {
         "history_index": 12,
         "conversation_id": "private:42",
@@ -55,14 +55,14 @@ async def test_diana_rolling_summary_store_update_roundtrip_and_columns(tmp_path
     assert orjson.loads(row["summary_json"]) == expected
     assert row["updated_at"] == "2026-06-18T12:00:00Z"
 
-    reloaded = DianaRollingSummaryStore(db.path, "yuexi")
+    reloaded = DebataRollingSummaryStore(db.path, "yuexi")
     assert await reloaded.load() == expected
 
 
 @pytest.mark.asyncio
-async def test_diana_rolling_summary_store_active_start_index_updates_archived_until(tmp_path):
-    db_path = tmp_path / "diana.db"
-    store = DianaRollingSummaryStore(db_path, "yuexi")
+async def test_debata_rolling_summary_store_active_start_index_updates_archived_until(tmp_path):
+    db_path = tmp_path / "debata.db"
+    store = DebataRollingSummaryStore(db_path, "yuexi")
 
     await store.update(
         "摘要",
@@ -84,11 +84,11 @@ async def test_diana_rolling_summary_store_active_start_index_updates_archived_u
 
 
 @pytest.mark.asyncio
-async def test_diana_rolling_summary_store_wraps_non_dict_archived_until_with_active_start(
+async def test_debata_rolling_summary_store_wraps_non_dict_archived_until_with_active_start(
     tmp_path,
 ):
-    db_path = tmp_path / "diana.db"
-    store = DianaRollingSummaryStore(db_path, "yuexi")
+    db_path = tmp_path / "debata.db"
+    store = DebataRollingSummaryStore(db_path, "yuexi")
 
     await store.update("摘要", archived_until="legacy-marker", active_start_index=5)
 
@@ -109,9 +109,9 @@ async def test_diana_rolling_summary_store_wraps_non_dict_archived_until_with_ac
 
 
 @pytest.mark.asyncio
-async def test_diana_rolling_summary_store_preserves_none_archived_until(tmp_path):
-    db_path = tmp_path / "diana.db"
-    store = DianaRollingSummaryStore(db_path, "yuexi")
+async def test_debata_rolling_summary_store_preserves_none_archived_until(tmp_path):
+    db_path = tmp_path / "debata.db"
+    store = DebataRollingSummaryStore(db_path, "yuexi")
 
     await store.update("摘要", archived_until=None)
 
@@ -124,10 +124,10 @@ async def test_diana_rolling_summary_store_preserves_none_archived_until(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_diana_rolling_summary_store_persona_isolation(tmp_path):
-    db_path = tmp_path / "diana.db"
-    yuexi = DianaRollingSummaryStore(db_path, "yuexi")
-    jiu = DianaRollingSummaryStore(db_path, "jiu")
+async def test_debata_rolling_summary_store_persona_isolation(tmp_path):
+    db_path = tmp_path / "debata.db"
+    yuexi = DebataRollingSummaryStore(db_path, "yuexi")
+    jiu = DebataRollingSummaryStore(db_path, "jiu")
 
     await yuexi.update("月汐摘要", active_start_index=2)
     await jiu.update("玖摘要", active_start_index=9)
@@ -140,12 +140,12 @@ async def test_diana_rolling_summary_store_persona_isolation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_diana_rolling_summary_store_falls_back_when_summary_json_is_broken(
+async def test_debata_rolling_summary_store_falls_back_when_summary_json_is_broken(
     tmp_path,
     caplog,
 ):
-    db_path = tmp_path / "diana.db"
-    db = DianaDB(db_path)
+    db_path = tmp_path / "debata.db"
+    db = DebataDB(db_path)
     try:
         db.load()
         db.connect().execute(
@@ -169,7 +169,7 @@ async def test_diana_rolling_summary_store_falls_back_when_summary_json_is_broke
     finally:
         db.close()
 
-    store = DianaRollingSummaryStore(db_path, "yuexi")
+    store = DebataRollingSummaryStore(db_path, "yuexi")
     with caplog.at_level("WARNING"):
         data = await store.load()
 
@@ -183,8 +183,8 @@ async def test_diana_rolling_summary_store_falls_back_when_summary_json_is_broke
 
 
 @pytest.mark.asyncio
-async def test_diana_rolling_summary_store_merges_empty_summary_json_with_columns(tmp_path):
-    db_path = tmp_path / "diana.db"
+async def test_debata_rolling_summary_store_merges_empty_summary_json_with_columns(tmp_path):
+    db_path = tmp_path / "debata.db"
     _insert_rolling_summary_row(
         db_path,
         persona_id="yuexi",
@@ -195,7 +195,7 @@ async def test_diana_rolling_summary_store_merges_empty_summary_json_with_column
         updated_at="2026-06-18T14:00:00Z",
     )
 
-    store = DianaRollingSummaryStore(db_path, "yuexi")
+    store = DebataRollingSummaryStore(db_path, "yuexi")
 
     assert await store.load() == {
         "summary_text": "列摘要",
@@ -206,8 +206,8 @@ async def test_diana_rolling_summary_store_merges_empty_summary_json_with_column
 
 
 @pytest.mark.asyncio
-async def test_diana_rolling_summary_store_partial_summary_json_overrides_columns(tmp_path):
-    db_path = tmp_path / "diana.db"
+async def test_debata_rolling_summary_store_partial_summary_json_overrides_columns(tmp_path):
+    db_path = tmp_path / "debata.db"
     _insert_rolling_summary_row(
         db_path,
         persona_id="yuexi",
@@ -218,7 +218,7 @@ async def test_diana_rolling_summary_store_partial_summary_json_overrides_column
         updated_at="2026-06-18T15:00:00Z",
     )
 
-    store = DianaRollingSummaryStore(db_path, "yuexi")
+    store = DebataRollingSummaryStore(db_path, "yuexi")
 
     assert await store.load() == {
         "summary_text": "json 摘要",
@@ -229,10 +229,10 @@ async def test_diana_rolling_summary_store_partial_summary_json_overrides_column
     assert store.active_start_index() == 6
 
 
-def test_memory_package_exports_diana_rolling_summary_store():
-    from memory import DianaRollingSummaryStore as PackageDianaRollingSummaryStore
+def test_memory_package_exports_debata_rolling_summary_store():
+    from memory import DebataRollingSummaryStore as PackageDebataRollingSummaryStore
 
-    assert PackageDianaRollingSummaryStore is DianaRollingSummaryStore
+    assert PackageDebataRollingSummaryStore is DebataRollingSummaryStore
 
 
 def _rolling_summary_rows(db_path: Path) -> list[dict]:
@@ -273,7 +273,7 @@ def _insert_rolling_summary_row(
     summary_json: object,
     updated_at: str,
 ) -> None:
-    db = DianaDB(db_path)
+    db = DebataDB(db_path)
     try:
         db.load()
         db.connect().execute(

@@ -4,12 +4,12 @@ import asyncio
 
 import pytest
 
-from memory import DianaHistoryStore, HistoryManager
+from memory import DebataHistoryStore, HistoryManager
 
 
 @pytest.mark.asyncio
-async def test_history_manager_uses_injected_diana_store(tmp_path):
-    store = DianaHistoryStore(tmp_path / "diana.db", "yuexi")
+async def test_history_manager_uses_injected_debata_store(tmp_path):
+    store = DebataHistoryStore(tmp_path / "debata.db", "yuexi")
     history = HistoryManager(tmp_path / "history.jsonl", store=store)
     appended_batches = []
 
@@ -59,7 +59,7 @@ async def test_history_manager_uses_injected_diana_store(tmp_path):
 
     reloaded = HistoryManager(
         tmp_path / "history.jsonl",
-        store=DianaHistoryStore(tmp_path / "diana.db", "yuexi"),
+        store=DebataHistoryStore(tmp_path / "debata.db", "yuexi"),
     )
     assert await reloaded.load(force_reload=True) == expected
     assert not (tmp_path / "history.jsonl").exists()

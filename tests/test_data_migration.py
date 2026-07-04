@@ -146,7 +146,7 @@ def test_legacy_single_root_migration_record_is_compatible(tmp_path):
     root_json.write_text(
         json.dumps(
             {
-                "schema": "diana.data_root.v0",
+                "schema": "debata.data_root.v0",
                 "app_version": "0.9.0",
                 "created_at": "20260102T030405Z",
                 "instances": [{"name": "default", "path": str(default_instance)}],

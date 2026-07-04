@@ -182,13 +182,13 @@ class Runtime:
         stage_t0 = time.monotonic()
         from memory import (
             ArchiveStore,
-            DianaArchiveStore,
-            DianaEventStore,
-            DianaHistoryStore,
-            DianaImportantStore,
-            DianaPersonaDB,
-            DianaRollingSummaryStore,
-            DianaUsageStatsStore,
+            DebataArchiveStore,
+            DebataEventStore,
+            DebataHistoryStore,
+            DebataImportantStore,
+            DebataPersonaDB,
+            DebataRollingSummaryStore,
+            DebataUsageStatsStore,
             EventJournal,
             HistoryManager,
             ImportantMemoryManager,
@@ -197,35 +197,35 @@ class Runtime:
 
         mem_dir = self.paths.memory_dir_for(self.persona.name)
         mem_dir.mkdir(parents=True, exist_ok=True)
-        diana_db_path = mem_dir / "diana.db"
+        runtime_db_path = self._prepare_runtime_memory_db_path(mem_dir, self.persona.name)
         usage_source_path = self.paths.LOGS_DIR / "model_usage.jsonl"
         if self._needs_legacy_memory_import(
-            diana_db_path,
+            runtime_db_path,
             mem_dir,
             self.persona.name,
             usage_source_path,
         ):
             await import_legacy_memory_files_async(
-                diana_db_path,
+                runtime_db_path,
                 mem_dir,
                 self.persona.name,
                 usage_source_path=usage_source_path,
                 skip_existing_domains=True,
             )
-        self.usage_stats = DianaUsageStatsStore(diana_db_path, self.persona.name)
+        self.usage_stats = DebataUsageStatsStore(runtime_db_path, self.persona.name)
         await self.usage_stats.load()
-        event_store = DianaEventStore(diana_db_path, self.persona.name)
+        event_store = DebataEventStore(runtime_db_path, self.persona.name)
         self.event_store = EventJournal(event_store)
         await self.event_store.start()
         self.history = HistoryManager(
             mem_dir / "history.jsonl",
             event_store=self.event_store,
-            store=DianaHistoryStore(diana_db_path, self.persona.name),
+            store=DebataHistoryStore(runtime_db_path, self.persona.name),
         )
         important_path = mem_dir / "important.json"
-        important_store = DianaImportantStore(diana_db_path, self.persona.name)
+        important_store = DebataImportantStore(runtime_db_path, self.persona.name)
         if self._persona_management_enabled():
-            self.persona_db = DianaPersonaDB(diana_db_path, self.persona.name)
+            self.persona_db = DebataPersonaDB(runtime_db_path, self.persona.name)
             await self.persona_db.load()
         self.important = ImportantMemoryManager(
             important_path,
@@ -233,9 +233,9 @@ class Runtime:
         )
         self.archive = ArchiveStore(
             mem_dir / "archive.sqlite3",
-            store=DianaArchiveStore(diana_db_path, self.persona.name),
+            store=DebataArchiveStore(runtime_db_path, self.persona.name),
         )
-        self.rolling_summary = DianaRollingSummaryStore(diana_db_path, self.persona.name)
+        self.rolling_summary = DebataRollingSummaryStore(runtime_db_path, self.persona.name)
         await self.history.load()
         await self.important.load()
         await self.archive.load()
@@ -632,6 +632,9 @@ class Runtime:
         pm_cfg = getattr(self.config, "persona_management", None)
         return bool(getattr(pm_cfg, "enabled", False))
 
+    def _prepare_runtime_memory_db_path(self, mem_dir: Path, persona_id: str) -> Path:
+        return mem_dir / f"{persona_id}.db"
+
     async def _migrate_legacy_important_memory(
         self,
         legacy_path: Path,
@@ -660,12 +663,12 @@ class Runtime:
 
     def _needs_legacy_memory_import(
         self,
-        diana_db_path: Path,
+        runtime_db_path: Path,
         mem_dir: Path,
         persona_id: str,
         usage_source_path: Path,
     ) -> bool:
-        """仅当旧源存在且目标 diana 域为空时才触发旧文件导入。"""
+        """仅当旧源存在且实际运行时库目标域为空时才触发旧文件导入。"""
 
         persona_db_path = mem_dir / "persona.db"
         legacy_sources = {
@@ -685,30 +688,33 @@ class Runtime:
             for path in source_paths
         ):
             return False
-        if not diana_db_path.exists():
+        if not runtime_db_path.exists():
             return True
 
         try:
             import sqlite3
 
-            with sqlite3.connect(diana_db_path) as conn:
+            with sqlite3.connect(runtime_db_path) as conn:
                 for table, source_paths in legacy_sources.items():
                     if not any(path.exists() for path in source_paths):
                         continue
-                    if self._diana_persona_row_count(conn, table, persona_id) == 0:
+                    if self._debata_persona_row_count(conn, table, persona_id) == 0:
                         return True
                 if (
                     persona_db_path.exists()
-                    and self._diana_persona_state_row_count(conn, persona_id) == 0
+                    and self._debata_persona_state_row_count(conn, persona_id) == 0
                 ):
                     return True
         except Exception as e:  # noqa: BLE001
-            logger.warning("检查 diana.db 旧文件导入状态失败，将尝试导入：%s", e)
+            logger.warning(
+                "检查运行时记忆库旧文件导入状态失败，将尝试导入：%s",
+                e,
+            )
             return True
         return False
 
     @staticmethod
-    def _diana_persona_row_count(conn: Any, table: str, persona_id: str) -> int:
+    def _debata_persona_row_count(conn: Any, table: str, persona_id: str) -> int:
         allowed_tables = {
             "history_records",
             "important_memories",
@@ -718,7 +724,7 @@ class Runtime:
             "usage_records",
         }
         if table not in allowed_tables:
-            raise ValueError(f"unsupported diana import gate table: {table}")
+            raise ValueError(f"unsupported debata import gate table: {table}")
         row = conn.execute(
             f"""
             SELECT COUNT(*)
@@ -730,7 +736,7 @@ class Runtime:
         return int(row[0])
 
     @staticmethod
-    def _diana_persona_state_row_count(conn: Any, persona_id: str) -> int:
+    def _debata_persona_state_row_count(conn: Any, persona_id: str) -> int:
         tables = (
             "persona_schema_version_legacy",
             "persona_state",

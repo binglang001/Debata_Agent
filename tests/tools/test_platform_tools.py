@@ -68,7 +68,7 @@ async def test_get_forward_msg_writes_nested_artifact_and_preserves_image_url(tm
                 ]
             return [
                 {
-                    "sender": {"nickname": "Diana", "user_id": 2},
+                    "sender": {"nickname": "Debata", "user_id": 2},
                     "content": [
                         {"type": "text", "data": {"text": "内层消息"}},
                         {

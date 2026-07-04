@@ -1,4 +1,4 @@
-"""diana.db 轻量仓储适配器。"""
+"""debata.db 轻量仓储适配器。"""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ from .archive_sqlite_records import (
     _row_to_record,
     real_chat_archive_records,
 )
-from .diana_db import DianaDB
+from .debata_db import DebataDB
 from .event_store import (
     _clamp_limit,
     _clean_optional,
@@ -62,11 +62,11 @@ from .event_store import (
 logger = logging.getLogger(__name__)
 
 
-class DianaHistoryStore:
-    """使用 diana.db 的 history_records 表实现 JsonlStore 等价接口。"""
+class DebataHistoryStore:
+    """使用 debata.db 的 history_records 表实现 JsonlStore 等价接口。"""
 
-    def __init__(self, db: DianaDB | str | Path, persona_id: str) -> None:
-        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+    def __init__(self, db: DebataDB | str | Path, persona_id: str) -> None:
+        self._db = db if isinstance(db, DebataDB) else DebataDB(db)
         self.persona_id = str(persona_id).strip()
         if not self.persona_id:
             raise ValueError("persona_id must not be empty")
@@ -74,7 +74,7 @@ class DianaHistoryStore:
         self._cache: list[dict] | None = None
 
     @property
-    def db(self) -> DianaDB:
+    def db(self) -> DebataDB:
         return self._db
 
     async def load(self, force_reload: bool = False) -> list[dict]:
@@ -158,7 +158,7 @@ class DianaHistoryStore:
                 record = orjson.loads(row["record_json"])
             except orjson.JSONDecodeError:
                 logger.warning(
-                    "跳过损坏的 diana history record persona_id=%s rowid=%s",
+                    "跳过损坏的 debata history record persona_id=%s rowid=%s",
                     self.persona_id,
                     row["id"],
                 )
@@ -220,7 +220,7 @@ class DianaHistoryStore:
                 conn.commit()
 
     def _connect(self):
-        db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+        db = DebataDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
         db.load()
         return db.connect()
 
@@ -260,18 +260,18 @@ class DianaHistoryStore:
         )
 
 
-class DianaArchiveStore:
-    """使用 diana.db 的 archive_messages 表实现 ArchiveStore 等价接口。"""
+class DebataArchiveStore:
+    """使用 debata.db 的 archive_messages 表实现 ArchiveStore 等价接口。"""
 
-    def __init__(self, db: DianaDB | str | Path, persona_id: str) -> None:
-        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+    def __init__(self, db: DebataDB | str | Path, persona_id: str) -> None:
+        self._db = db if isinstance(db, DebataDB) else DebataDB(db)
         self.persona_id = str(persona_id).strip()
         if not self.persona_id:
             raise ValueError("persona_id must not be empty")
         self._lock = asyncio.Lock()
 
     @property
-    def db(self) -> DianaDB:
+    def db(self) -> DebataDB:
         return self._db
 
     async def load(self, force_reload: bool = False) -> list[dict]:
@@ -318,7 +318,7 @@ class DianaArchiveStore:
             result = await asyncio.to_thread(self._filter_records_sync, query_dict)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "Diana archive filter_records 指标 persona_id=%s limit=%s offset=%s "
+                "Debata archive filter_records 指标 persona_id=%s limit=%s offset=%s "
                 "returned=%s total=%s elapsed_ms=%.3f",
                 self.persona_id,
                 result.get("limit"),
@@ -363,7 +363,7 @@ class DianaArchiveStore:
             return await asyncio.to_thread(self._media_records_sync, archive_id)
 
     def _connect(self) -> sqlite3.Connection:
-        db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+        db = DebataDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
         db.load()
         return db.connect()
 
@@ -721,18 +721,18 @@ class DianaArchiveStore:
         return result
 
 
-class DianaImportantStore:
-    """使用 diana.db 的 important_memories 表实现 JsonStore 等价接口。"""
+class DebataImportantStore:
+    """使用 debata.db 的 important_memories 表实现 JsonStore 等价接口。"""
 
-    def __init__(self, db: DianaDB | str | Path, persona_id: str) -> None:
-        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+    def __init__(self, db: DebataDB | str | Path, persona_id: str) -> None:
+        self._db = db if isinstance(db, DebataDB) else DebataDB(db)
         self.persona_id = str(persona_id).strip()
         if not self.persona_id:
             raise ValueError("persona_id must not be empty")
         self._lock = asyncio.Lock()
 
     @property
-    def db(self) -> DianaDB:
+    def db(self) -> DebataDB:
         return self._db
 
     async def read(self, default: Any = None) -> Any:
@@ -747,7 +747,7 @@ class DianaImportantStore:
                 item = orjson.loads(row["item_json"])
             except orjson.JSONDecodeError:
                 logger.warning(
-                    "跳过损坏的 diana important memory persona_id=%s rowid=%s",
+                    "跳过损坏的 debata important memory persona_id=%s rowid=%s",
                     self.persona_id,
                     row["id"],
                 )
@@ -788,7 +788,7 @@ class DianaImportantStore:
                 conn.commit()
 
     def _connect(self):
-        db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+        db = DebataDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
         db.load()
         return db.connect()
 
@@ -851,8 +851,8 @@ class DianaImportantStore:
         )
 
 
-class DianaPersonaDB:
-    """使用 diana.db persona_* 表实现 mind.db.PersonaDB 等价接口。"""
+class DebataPersonaDB:
+    """使用 debata.db persona_* 表实现 mind.db.PersonaDB 等价接口。"""
 
     _STATE_TYPES = ("PersonaState",)
     _EFFECT_TYPES = ("Effect", "PersonaEffect")
@@ -863,15 +863,15 @@ class DianaPersonaDB:
     _TRAJECTORY_TYPES = ("DailyTrajectory",)
     _MISSING = object()
 
-    def __init__(self, db: DianaDB | str | Path, persona_id: str) -> None:
-        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+    def __init__(self, db: DebataDB | str | Path, persona_id: str) -> None:
+        self._db = db if isinstance(db, DebataDB) else DebataDB(db)
         self.persona_id = str(persona_id).strip()
         if not self.persona_id:
             raise ValueError("persona_id must not be empty")
         self._lock = asyncio.Lock()
 
     @property
-    def db(self) -> DianaDB:
+    def db(self) -> DebataDB:
         return self._db
 
     async def load(self) -> None:
@@ -1213,7 +1213,7 @@ class DianaPersonaDB:
             return await asyncio.to_thread(self._important_count_sync)
 
     def _connect(self) -> sqlite3.Connection:
-        db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+        db = DebataDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
         db.load()
         return db.connect()
 
@@ -1901,11 +1901,11 @@ class DianaPersonaDB:
         )
 
 
-class DianaRollingSummaryStore:
-    """使用 diana.db 的 rolling_summary 表实现 RollingSummaryStore 等价接口。"""
+class DebataRollingSummaryStore:
+    """使用 debata.db 的 rolling_summary 表实现 RollingSummaryStore 等价接口。"""
 
-    def __init__(self, db: DianaDB | str | Path, persona_id: str) -> None:
-        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+    def __init__(self, db: DebataDB | str | Path, persona_id: str) -> None:
+        self._db = db if isinstance(db, DebataDB) else DebataDB(db)
         self.persona_id = str(persona_id).strip()
         if not self.persona_id:
             raise ValueError("persona_id must not be empty")
@@ -1913,7 +1913,7 @@ class DianaRollingSummaryStore:
         self._data: dict[str, Any] = _default_rolling_summary_data()
 
     @property
-    def db(self) -> DianaDB:
+    def db(self) -> DebataDB:
         return self._db
 
     async def load(self) -> dict[str, Any]:
@@ -2024,7 +2024,7 @@ class DianaRollingSummaryStore:
                 conn.commit()
 
     def _connect(self):
-        db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+        db = DebataDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
         db.load()
         return db.connect()
 
@@ -2033,13 +2033,13 @@ class DianaRollingSummaryStore:
             data = orjson.loads(row["summary_json"])
         except orjson.JSONDecodeError:
             logger.warning(
-                "回退读取损坏的 diana rolling summary summary_json persona_id=%s",
+                "回退读取损坏的 debata rolling summary summary_json persona_id=%s",
                 self.persona_id,
             )
             return None
         if not isinstance(data, dict):
             logger.warning(
-                "回退读取非对象 diana rolling summary summary_json persona_id=%s",
+                "回退读取非对象 debata rolling summary summary_json persona_id=%s",
                 self.persona_id,
             )
             return None
@@ -2050,7 +2050,7 @@ class DianaRollingSummaryStore:
             archived_until = orjson.loads(row["archived_until_json"])
         except orjson.JSONDecodeError:
             logger.warning(
-                "回退读取损坏的 diana rolling summary archived_until_json persona_id=%s",
+                "回退读取损坏的 debata rolling summary archived_until_json persona_id=%s",
                 self.persona_id,
             )
             archived_until = None
@@ -2108,22 +2108,22 @@ class DianaRollingSummaryStore:
             return None
 
 
-class DianaUsageStatsStore:
-    """使用 diana.db 的 usage_records 表实现 UsageStatsStore 等价接口。"""
+class DebataUsageStatsStore:
+    """使用 debata.db 的 usage_records 表实现 UsageStatsStore 等价接口。"""
 
     def __init__(
         self,
-        db: DianaDB | str | Path,
+        db: DebataDB | str | Path,
         persona_id: str | None = None,
     ) -> None:
-        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+        self._db = db if isinstance(db, DebataDB) else DebataDB(db)
         persona_text = "" if persona_id is None else str(persona_id).strip()
         self.persona_id = persona_text or None
         self._lock = asyncio.Lock()
         self._records: list[dict[str, Any]] | None = None
 
     @property
-    def db(self) -> DianaDB:
+    def db(self) -> DebataDB:
         return self._db
 
     async def load(self) -> None:
@@ -2216,14 +2216,14 @@ class DianaUsageStatsStore:
                 record = orjson.loads(row["record_json"])
             except orjson.JSONDecodeError:
                 logger.warning(
-                    "跳过损坏的 diana usage record_json persona_id=%s rowid=%s",
+                    "跳过损坏的 debata usage record_json persona_id=%s rowid=%s",
                     row["persona_id"],
                     row["id"],
                 )
                 continue
             if not isinstance(record, dict):
                 logger.warning(
-                    "跳过非对象 diana usage record_json persona_id=%s rowid=%s",
+                    "跳过非对象 debata usage record_json persona_id=%s rowid=%s",
                     row["persona_id"],
                     row["id"],
                 )
@@ -2268,20 +2268,20 @@ class DianaUsageStatsStore:
                 conn.commit()
 
     def _connect(self):
-        db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+        db = DebataDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
         db.load()
         return db.connect()
 
 
-class DianaEventStore:
-    """使用 diana.db 的 event_log 表实现 EventJournal 可用的事件仓储。"""
+class DebataEventStore:
+    """使用 debata.db 的 event_log 表实现 EventJournal 可用的事件仓储。"""
 
     _PROJECTION_STATE_NAME = "last_projected_event_id"
     _schema_lock = threading.Lock()
     _schema_ready_paths: set[Path] = set()
 
-    def __init__(self, db: DianaDB | str | Path, persona_id: str) -> None:
-        self._db = db if isinstance(db, DianaDB) else DianaDB(db)
+    def __init__(self, db: DebataDB | str | Path, persona_id: str) -> None:
+        self._db = db if isinstance(db, DebataDB) else DebataDB(db)
         self._schema_path = self._db.path.expanduser().resolve()
         self.persona_id = str(persona_id).strip()
         if not self.persona_id:
@@ -2294,11 +2294,11 @@ class DianaEventStore:
         self._last_projected_event_id = 0
 
     @property
-    def db(self) -> DianaDB:
+    def db(self) -> DebataDB:
         return self._db
 
     async def start_projection(self) -> None:
-        """兼容 EventStore 入口：diana.db 写入即投影，无后台 worker。"""
+        """兼容 EventStore 入口：debata.db 写入即投影，无后台 worker。"""
 
         await self._ensure_loaded()
 
@@ -2350,7 +2350,7 @@ class DianaEventStore:
         await self._ensure_loaded()
         async with self._lock:
             if self._closed:
-                raise RuntimeError("DianaEventStore is closed")
+                raise RuntimeError("DebataEventStore is closed")
             ids, max_event_id = await asyncio.to_thread(self._append_events_sync, pending)
             self._last_appended_event_id = max_event_id
             self._last_projected_event_id = max_event_id
@@ -2780,7 +2780,7 @@ class DianaEventStore:
         with self._schema_lock:
             if self._schema_path in self._schema_ready_paths and self._schema_path.exists():
                 return
-            db = DianaDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
+            db = DebataDB(self._db.path, busy_timeout_ms=self._db.busy_timeout_ms)
             try:
                 db.load()
             finally:
@@ -2796,7 +2796,7 @@ class DianaEventStore:
         return conn
 
 
-_LEGACY_RAW_IMPORTANT_MEMORY_ID = "__diana_important_raw__"
+_LEGACY_RAW_IMPORTANT_MEMORY_ID = "__debata_important_raw__"
 _LEGACY_RAW_IMPORTANT_SCOPE = "__legacy_raw__"
 
 
@@ -2942,11 +2942,11 @@ def _default_rolling_summary_data() -> dict[str, Any]:
 
 
 __all__ = [
-    "DianaArchiveStore",
-    "DianaEventStore",
-    "DianaHistoryStore",
-    "DianaImportantStore",
-    "DianaPersonaDB",
-    "DianaRollingSummaryStore",
-    "DianaUsageStatsStore",
+    "DebataArchiveStore",
+    "DebataEventStore",
+    "DebataHistoryStore",
+    "DebataImportantStore",
+    "DebataPersonaDB",
+    "DebataRollingSummaryStore",
+    "DebataUsageStatsStore",
 ]

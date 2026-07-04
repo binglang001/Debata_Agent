@@ -531,7 +531,7 @@ def test_chats_single_message_expand_is_per_item(qapp, tmp_paths):
     page._list.addItem("群聊 1")
     page._list.item(0).setData(Qt.ItemDataRole.UserRole, "group:1")
     page._list.setCurrentRow(0)
-    page._on_detail_anchor_clicked(QtCore.QUrl("diana-chat-toggle:group%3A1%0Amsg-1%3Ainbound"))
+    page._on_detail_anchor_clicked(QtCore.QUrl("Debata-chat-toggle:group%3A1%0Amsg-1%3Ainbound"))
     expanded = page._render_conversation(conv)
 
     assert "收起" in expanded
