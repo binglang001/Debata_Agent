@@ -13,11 +13,25 @@ from core.send_manager import _AsyncSendManager
 from memory import EventStore
 
 
-async def _wait_thread_event(event: threading.Event, timeout: float = 1.0) -> None:
-    assert await asyncio.wait_for(
-        asyncio.to_thread(event.wait, timeout),
-        timeout=timeout + 0.2,
-    )
+async def _wait_projection_error(
+    event_store: EventStore,
+    *,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    last_stats: dict[str, Any] = {}
+    while True:
+        last_stats = await event_store.stats()
+        if last_stats["projection_error_count"] >= 1:
+            return last_stats
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            pytest.fail(
+                "projection error was not recorded within "
+                f"{timeout:.1f}s; stats={last_stats!r}"
+            )
+        await asyncio.sleep(min(0.02, remaining))
 
 
 class FakeAdapter:
@@ -40,7 +54,7 @@ class FakePipeline:
     def __init__(self, event_store: Any) -> None:
         self.event_store = event_store
         self.adapter = FakeAdapter()
-        self.persona = SimpleNamespace(name="Diana")
+        self.persona = SimpleNamespace(name="Debata")
         self.chat_timeline = FakeTimeline()
         self.activity_count = 0
         self.outbound_records: list[dict[str, Any]] = []
@@ -305,7 +319,7 @@ async def test_send_runtime_event_projection_failure_does_not_affect_send(tmp_pa
             "send_private_messages",
         )
 
-        await _wait_thread_event(event_store.projection_failed)
+        await _wait_projection_error(event_store)
 
         assert result["status"] == "sent"
         assert pipeline.adapter.sent_texts[0][1] == "事件库失败也要发送"
@@ -340,8 +354,8 @@ async def test_send_runtime_event_projection_lag_backpressures_without_dropping(
     )
 
     try:
-        await _wait_thread_event(event_store.projection_failed)
-        await asyncio.wait_for(event_store.second_append_started.wait(), timeout=1.0)
+        await _wait_projection_error(event_store)
+        await asyncio.wait_for(event_store.second_append_started.wait(), timeout=5.0)
 
         assert not submit_task.done()
         assert pipeline.adapter.sent_texts == []
@@ -349,6 +363,7 @@ async def test_send_runtime_event_projection_lag_backpressures_without_dropping(
         assert stats["last_appended_event_id"] == 1
         assert stats["last_projected_event_id"] == 0
         assert stats["pending_count"] == 1
+        assert stats["projection_error_count"] >= 1
         records = [
             json.loads(line)
             for line in event_store.append_log_path.read_text(encoding="utf-8").splitlines()

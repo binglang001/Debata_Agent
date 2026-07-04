@@ -90,7 +90,8 @@ def test_budget_limit_schema_defaults_load_for_legacy_config():
 
 
 def test_data_config_explicit_budget_defaults_roundtrip(tmp_paths):
-    raw = _minimal_config().model_dump(mode="json", exclude_none=True)
+    save_config(tmp_paths, _minimal_config(), backup=False)
+    raw = yaml.safe_load(tmp_paths.CONFIG_FILE.read_text(encoding="utf-8"))
 
     expected = {
         ("agents", "chat", "tool_loop_final_max_tokens"): 4096,
@@ -152,10 +153,6 @@ def test_data_config_explicit_budget_defaults_roundtrip(tmp_paths):
         assert node == value
 
     RootConfig.model_validate(raw)
-    tmp_paths.CONFIG_FILE.write_text(
-        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
     loaded = load_config(tmp_paths, set_global=False)
     assert loaded.agents.chat.tool_loop_final_max_tokens == 4096
     assert loaded.features.vision.max_tokens == 1024
@@ -337,6 +334,144 @@ def test_proactive_context_budget_defaults_to_4k():
     assert cfg.behavior.proactive_context_token_budget == 4096
 
 
+def test_persona_management_defaults_disabled():
+    cfg = _minimal_config()
+    pm = cfg.persona_management
+
+    assert pm.enabled is False
+    assert pm.persona_agent.provider == ""
+    assert pm.persona_agent.model == ""
+    assert pm.persona_agent.timer_interval_minutes == 30
+    assert pm.persona_agent.min_interval_seconds == 300
+    assert pm.social_agent.enabled is True
+    assert pm.social_agent.provider == ""
+    assert pm.social_agent.model == ""
+    assert pm.social_agent.interval_minutes == 30
+    assert pm.subconscious.enabled is True
+    assert pm.subconscious.provider == ""
+    assert pm.subconscious.model == ""
+    assert pm.subconscious.interval_minutes == 30
+
+    assert pm.physiology.energy.mode == "disabled"
+    assert pm.physiology.energy.decay_per_hour == 1.5
+    assert pm.physiology.energy.recovery_per_hour_sleep == 8.333
+    assert pm.physiology.energy.recovery_per_hour_eat == 15.0
+    assert pm.physiology.energy.long_sleep_threshold_minutes == 120
+    assert pm.physiology.energy.max_sleep_minutes == 720
+    assert pm.physiology.energy.collapse.grace_minutes == 60
+    assert pm.physiology.energy.collapse.sleep_hours == 12
+    assert pm.physiology.energy.collapse.mood_penalty == 20
+    assert pm.physiology.satiety.mode == "disabled"
+    assert pm.physiology.satiety.decay_per_hour == 1.0
+    assert pm.physiology.satiety.recovery_per_minute == 0.5
+    assert pm.physiology.satiety.max_eat_minutes == 60
+    assert pm.mood.decay_per_hour == 0.5
+    assert pm.mood.social_boost == 3.0
+    assert pm.consolidation.daily_fallback_hour == 4
+
+    assert pm.age.default_age is None
+    assert pm.age.overrides == {}
+    assert len(pm.age.brackets) == 6
+    for bracket in pm.age.brackets:
+        assert bracket.name
+        assert bracket.min >= 0
+        assert bracket.energy_decay_mult > 0
+        assert bracket.energy_recovery_mult > 0
+        assert bracket.satiety_decay_mult > 0
+        assert bracket.mood_volatility_mult > 0
+        assert 0 <= bracket.bedtime_hour < 24
+        assert 0 <= bracket.wakeup_hour < 24
+        assert bracket.ideal_sleep_hours > 0
+        assert bracket.monologue_style
+        assert bracket.emotional_hint
+        assert bracket.social_hint
+    first = pm.age.brackets[0]
+    assert first.name == "幼年"
+    assert first.min == 0
+    assert first.max == 5
+    assert first.energy_decay_mult == 1.25
+    assert first.energy_recovery_mult == 1.15
+    assert first.satiety_decay_mult == 1.25
+    assert first.mood_volatility_mult == 1.4
+    assert first.bedtime_hour == 20.0
+    assert first.wakeup_hour == 7.0
+    assert first.ideal_sleep_hours == 11.0
+    assert first.monologue_style
+    assert first.emotional_hint
+    assert first.social_hint
+    assert pm.age.brackets[-1].max is None
+
+
+def test_persona_management_age_brackets_accept_plan_yaml_bounds():
+    cfg = RootConfig.model_validate(
+        {
+            "agents": {"chat": {"provider": "ds", "model": "deepseek-chat"}},
+            "providers": {"ds": {"preset": "deepseek", "api_key_id": "ds_main"}},
+            "persona_management": {
+                "age": {
+                    "brackets": [
+                        {
+                            "name": "unit",
+                            "min": 1,
+                            "max": 2,
+                            "energy_decay_mult": 1.2,
+                            "energy_recovery_mult": 0.9,
+                            "satiety_decay_mult": 1.1,
+                            "mood_volatility_mult": 1.3,
+                            "bedtime_hour": 21,
+                            "wakeup_hour": 6,
+                            "ideal_sleep_hours": 9,
+                            "monologue_style": "unit-style",
+                            "emotional_hint": "unit-emotion",
+                            "social_hint": "unit-social",
+                        }
+                    ]
+                }
+            },
+        }
+    )
+
+    bracket = cfg.persona_management.age.brackets[0]
+    assert bracket.min == 1
+    assert bracket.max == 2
+
+
+def test_persona_management_background_agents_can_inherit_chat_model():
+    cfg = RootConfig.model_validate(
+        {
+            "agents": {"chat": {"provider": "ds", "model": "deepseek-chat"}},
+            "providers": {"ds": {"preset": "deepseek", "api_key_id": "ds_main"}},
+            "persona_management": {
+                "enabled": True,
+                "persona_agent": {"provider": "", "model": ""},
+                "social_agent": {"enabled": True, "provider": "", "model": ""},
+                "subconscious": {"enabled": True, "provider": "", "model": ""},
+            },
+        }
+    )
+
+    assert cfg.persona_management.persona_agent.provider == ""
+    assert cfg.persona_management.persona_agent.model == ""
+    assert cfg.persona_management.social_agent.provider == ""
+    assert cfg.persona_management.subconscious.model == ""
+
+
+def test_persona_management_background_agent_provider_must_exist_when_non_empty():
+    with pytest.raises(
+        ValueError,
+        match=r"persona_management\.persona_agent\.provider .*未在 providers 中定义",
+    ):
+        RootConfig.model_validate(
+            {
+                "agents": {"chat": {"provider": "ds", "model": "deepseek-chat"}},
+                "providers": {"ds": {"preset": "deepseek", "api_key_id": "ds_main"}},
+                "persona_management": {
+                    "persona_agent": {"provider": "missing", "model": "x"},
+                },
+            }
+        )
+
+
 def test_agent_provider_must_exist():
     """chat agent 的 provider 必须在 providers 中定义。"""
     with pytest.raises(ValueError, match="未在 providers 中定义"):
@@ -351,18 +486,30 @@ def test_agent_provider_must_exist():
         )
 
 
-def test_extra_fields_rejected():
-    """unknown 字段应被拒绝（防止拼写错误）。"""
-    with pytest.raises(ValidationError):
-        RootConfig.model_validate(
-            {
-                "agents": {
-                    "chat": {"provider": "ds", "model": "x"},
+def test_extra_fields_ignored():
+    """未知字段应被容忍，但不能被回写到导出配置。"""
+    cfg = RootConfig.model_validate(
+        {
+            "agents": {
+                "chat": {
+                    "provider": "ds",
+                    "model": "x",
+                    "unknown_chat_field": "ignored",
                 },
-                "providers": {"ds": {"preset": "deepseek"}},
-                "unknown_field": "boom",
-            }
-        )
+            },
+            "providers": {"ds": {"preset": "deepseek"}},
+            "behavior": {
+                "unknown_behavior_field": "ignored",
+            },
+            "unknown_field": "ignored",
+        }
+    )
+
+    dumped = cfg.model_dump()
+
+    assert "unknown_field" not in dumped
+    assert "unknown_behavior_field" not in dumped["behavior"]
+    assert "unknown_chat_field" not in dumped["agents"]["chat"]
 
 
 def test_custom_provider_requires_protocol_and_url():
@@ -474,10 +621,12 @@ def test_save_creates_backup(tmp_paths, fake_keyring):
     save_config(tmp_paths, cfg, backup=False)
     assert tmp_paths.CONFIG_FILE.exists()
 
-    # 第二次保存应生成 .bak
+    # 第二次保存应生成版本化备份。
     save_config(tmp_paths, cfg, backup=True)
-    backup_path = tmp_paths.CONFIG_FILE.with_suffix(".yaml.bak")
-    assert backup_path.exists()
+    backup_dir = tmp_paths.DATA_DIR / "config_backups"
+    backups = list(backup_dir.glob("config-*-v2.yaml"))
+    assert len(backups) == 1
+    assert not tmp_paths.CONFIG_FILE.with_suffix(".yaml.bak").exists()
 
 
 def test_optional_agents_default_none(tmp_paths, fake_keyring):

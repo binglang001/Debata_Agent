@@ -123,6 +123,8 @@ class PipelineTurnsMixin:
         task_phase: str = "normal",
         tool_policy: dict[str, Any] | None = None,
         tool_denylist: set[str] | frozenset[str] | None = None,
+        trigger_inbound_seq: int = 0,
+        seen_inbound_seq: int | None = None,
     ) -> None:
         """通用单轮 Agent 入口：注入 task_context，跑一轮，处理 collected。
 
@@ -137,6 +139,8 @@ class PipelineTurnsMixin:
             task_phase: 本轮运行阶段，保留给日志归类和未来策略扩展。
             tool_policy: 本轮工具策略所需的结构化上下文。
             tool_denylist: 本轮不允许调用的工具名集合。schema 仍保持暴露，调用时返回 denied。
+            trigger_inbound_seq: 触发本轮的入站消息 seq；主动轮没有单条触发消息时可为 0。
+            seen_inbound_seq: 本轮开始时已复核到的入站 seq，用于发送工具的默认复核锚点。
         """
         self.mark_activity()
         record_conversation_id = history_conversation_id or conversation_id
@@ -146,9 +150,25 @@ class PipelineTurnsMixin:
                 conversation_id=record_conversation_id,
             )
 
+        if await self._should_buffer_inbound_for_resting_persona():
+            await self.history.add_system_note(
+                f"{get_time()} 系统轮跳过：persona_resting，当前人格处于休息状态。",
+                conversation_id=record_conversation_id or "system:global",
+            )
+            logger.info(
+                "人格休息中，跳过 run_one_turn 模型调用 conversation_id=%s phase=%s",
+                conversation_id,
+                task_phase,
+            )
+            return
+
         ctx = self._build_tool_context(
             default_target=default_target,
             conversation_id=conversation_id,
+            trigger_inbound_seq=trigger_inbound_seq,
+            seen_inbound_seq=(
+                seen_inbound_seq if seen_inbound_seq is not None else trigger_inbound_seq
+            ),
             task_phase=task_phase,
             tool_policy=tool_policy,
         )
@@ -179,8 +199,16 @@ class PipelineTurnsMixin:
             executor = _guarded_executor
 
         async def _rebuild_messages() -> list[dict[str, Any]]:
+            member_qqs: set[int] | None = None
+            if conversation_id and conversation_id.startswith("group:"):
+                group_id = conversation_id.split(":", 1)[1]
+                member_qqs = await self._resolve_group_member_qqs(group_id)
+
             history_window = await self._select_working_history(conversation_id)
-            important_text = await self._important_memory_text(conversation_id)
+            important_text = await self._important_memory_text(
+                conversation_id,
+                member_qqs=member_qqs,
+            )
             rag_context_text = await self._rag_context_text(
                 conversation_id,
                 query=user_event or task_context,
@@ -195,10 +223,11 @@ class PipelineTurnsMixin:
                 current_context=task_context,
                 memory_mode=self.features_cfg.long_term_memory.mode,
                 user_event=user_event,
+                **self._build_messages_persona_tool_kwargs(build_messages),
             )
 
         budget_result = await self._prepare_main_prompt_for_model(
-            conversation_id=conversation_id,
+            conversation_id=record_conversation_id or conversation_id,
             phase=f"run_one_turn:{task_phase}",
             tools_schema=tools_schema,
             rebuild_messages=_rebuild_messages,
@@ -242,9 +271,53 @@ class PipelineTurnsMixin:
             if ctx.collected:
                 await self._execute_collected(ctx.collected)
             self.mark_activity()
+            self._schedule_persona_after_turn(
+                conversation_id=(conversation_id or "system:global"),
+                participants=self._run_one_turn_persona_participants(
+                    conversation_id=conversation_id,
+                    default_target=default_target,
+                    tool_policy=tool_policy,
+                ),
+                chat_summary=self._run_one_turn_chat_summary(
+                    user_event=user_event,
+                    task_context=task_context,
+                    records=result.records or [],
+                ),
+            )
 
         if lock_already_held:
             await _run_locked()
         else:
             async with self.reply_lock:
                 await _run_locked()
+
+    def _run_one_turn_persona_participants(
+        self,
+        *,
+        conversation_id: str | None,
+        default_target: Target | None,
+        tool_policy: dict[str, Any] | None,
+    ) -> list[dict[str, str]]:
+        user_ids: list[str] = []
+        if conversation_id and conversation_id.startswith("private:"):
+            user_ids.append(conversation_id.split(":", 1)[1])
+        if default_target is not None and default_target.scope == "private":
+            user_ids.append(str(default_target.target_id))
+        if isinstance(tool_policy, dict):
+            for key in ("focus_user_id", "target_user_id", "user_id"):
+                value = tool_policy.get(key)
+                if value:
+                    user_ids.append(str(value))
+            for key in ("focus_user_ids", "target_user_ids"):
+                value = tool_policy.get(key)
+                if isinstance(value, list):
+                    user_ids.extend(str(item) for item in value if item)
+        participants: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for user_id in user_ids:
+            text = str(user_id or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            participants.append({"user_id": text})
+        return participants

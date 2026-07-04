@@ -10,7 +10,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QRegularExpression, Qt, QTimer
+from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -115,6 +116,13 @@ class PersonaCreatorStepView(BaseStepView):
         layout.addWidget(self._field_label("性别"))
         layout.addWidget(self._hint_label("本项为可选。若不填，则 AI 会根据其他信息自动推断，保存时不会硬编码称谓。"))
         layout.addWidget(self._gender_combo)
+
+        self._age_edit = QLineEdit()
+        self._age_edit.setValidator(QRegularExpressionValidator(QRegularExpression(r"\d*"), self._age_edit))
+        self._age_edit.setPlaceholderText("不指定")
+        layout.addWidget(self._field_label("年龄"))
+        layout.addWidget(self._hint_label("本项为可选。若不填，则不会启用年龄设定。"))
+        layout.addWidget(self._age_edit)
 
         layout.addWidget(self._field_label("熟悉的人（管理员）"))
         layout.addWidget(
@@ -361,6 +369,7 @@ class PersonaCreatorStepView(BaseStepView):
         return PersonaBrief(
             name=self._name_edit.text().strip(),
             gender=self._gender_combo.currentData() or "",
+            age=int(self._age_edit.text().strip()) if self._age_edit.text().strip() else None,
             admins=admins,
             admin_name=primary_admin.get("name", ""),
             admin_qq=primary_admin.get("qq", ""),
@@ -623,6 +632,7 @@ class PersonaCreatorStepView(BaseStepView):
             self._name_edit.setText(p.brief.name)
             gender_idx = self._gender_combo.findData(p.brief.gender)
             self._gender_combo.setCurrentIndex(gender_idx if gender_idx >= 0 else 0)
+            self._age_edit.setText("" if p.brief.age is None else str(p.brief.age))
             admins = p.brief.admins or [
                 {"name": p.brief.admin_name or self.context.admin_name, "qq": p.brief.admin_qq or self.context.admin_qq, "relation": ""}
             ]

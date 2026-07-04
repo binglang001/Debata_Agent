@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -72,6 +73,11 @@ _ROUTER_RUNTIME_CONTEXT_KINDS = frozenset(
     }
 )
 _ROLE_PREFIX_PATTERN = re.compile(r"\[(?:assistant|tool|system)\]\s*", re.IGNORECASE)
+_PROACTIVE_PERSONA_CONTEXT_METHODS = (
+    "get_context_for_proactive",
+    "get_proactive_context",
+    "get_context_for_chat",
+)
 
 
 def _router_tool_shrink_ctx(behavior_cfg: BehaviorConfig) -> SimpleNamespace:
@@ -302,6 +308,48 @@ def _fit_router_suffix(text: str, limit: int, estimator: TokenEstimator) -> str:
     return best.lstrip()
 
 
+async def _persona_proactive_context(persona_agent: Any) -> str:
+    if persona_agent is None:
+        return ""
+    for name in _PROACTIVE_PERSONA_CONTEXT_METHODS:
+        method = getattr(persona_agent, name, None)
+        if method is None:
+            continue
+        try:
+            context = _call_persona_context_method(method)
+            if inspect.isawaitable(context):
+                context = await context
+        except Exception:
+            logger.debug("获取人格主动上下文失败: %s", name, exc_info=True)
+            continue
+        text = str(context or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _call_persona_context_method(method: Any) -> Any:
+    if not callable(method):
+        return method
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        try:
+            return method(None)
+        except TypeError:
+            return method()
+    required_positionals = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.default is inspect.Parameter.empty
+        and parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if required_positionals:
+        return method(None)
+    return method()
+
+
 class ProactiveLoop:
     """主动思考循环。"""
 
@@ -311,9 +359,10 @@ class ProactiveLoop:
         pipeline: MessagePipeline,
         proactive_agent: ProactiveRouterAgent | None,
         behavior_cfg: BehaviorConfig,
+        social_agent: Any | None = None,
     ) -> None:
         self.pipeline = pipeline
-        self.proactive_agent = proactive_agent
+        self.proactive_agent = social_agent or proactive_agent
         self.behavior_cfg = behavior_cfg
         self._task: asyncio.Task | None = None
         self._stopping = False
@@ -323,6 +372,10 @@ class ProactiveLoop:
         if self.proactive_agent is None:
             logger.info("ProactiveLoop 未启用（proactive agent 未配置）")
             return
+        if self._task is not None and not self._task.done():
+            logger.info("ProactiveLoop 已在运行，跳过重复启动")
+            return
+        self._stopping = False
         self._task = asyncio.create_task(self._loop())
         logger.info(
             f"ProactiveLoop 已启动，间隔 {self.behavior_cfg.proactive_think_interval_seconds}s"
@@ -387,7 +440,16 @@ class ProactiveLoop:
                         router_history,
                         self.behavior_cfg,
                     )
+                    persona_proactive_context = await _persona_proactive_context(
+                        getattr(self.pipeline, "persona_agent", None)
+                    )
                     router_context_parts: list[str] = []
+                    if persona_proactive_context:
+                        router_context_parts.append(
+                            '<persona_proactive_context priority="high">\n'
+                            f"{persona_proactive_context}\n"
+                            "</persona_proactive_context>"
+                        )
                     important_memory = await self.pipeline._important_memory_text(
                         None,
                         token_budget=self.behavior_cfg.proactive_context_token_budget,
@@ -459,6 +521,9 @@ class ProactiveLoop:
                     return
             else:
                 action_reason = "后台空闲，按合适时机判断是否主动联系"
+                persona_proactive_context = await _persona_proactive_context(
+                    getattr(self.pipeline, "persona_agent", None)
+                )
 
             reason_text = (
                 action_reason.strip()
@@ -466,10 +531,14 @@ class ProactiveLoop:
                 else "后台空闲，按合适时机判断是否主动联系"
             )
 
-            task_context = (
+            task_context_parts = []
+            if persona_proactive_context:
+                task_context_parts.append(persona_proactive_context)
+            task_context_parts.append(
                 f"现在是{now}。本轮由系统后台主动思考触发，不是用户刚发来的新消息。\n"
                 "近期上下文、重要记忆、滚动摘要和未完成事项已在历史与上下文中提供。"
             )
+            task_context = "\n\n".join(task_context_parts)
             user_event = (
                 "[系统事件 · 非用户消息] 后台主动思考触发，不是用户新消息。\n"
                 f"触发理由：{reason_text}\n"
@@ -479,11 +548,16 @@ class ProactiveLoop:
                 "如果这是合适的主动问候时机，可以按系统提示中的自然开场习惯起一个话头。\n"
                 "不要延续或重复最近对话里已经完成的话题；需要联系用户就调用发送工具，没有合适的事就调用 no_action。"
             )
+            seen_inbound_seq = int(getattr(self.pipeline, "_inbound_seq", 0) or 0)
             await self.pipeline.run_one_turn(
                 task_context,
                 user_event=user_event,
                 lock_already_held=True,
+                conversation_id=None,
                 history_conversation_id="system:proactive",
+                task_phase="proactive",
+                trigger_inbound_seq=seen_inbound_seq,
+                seen_inbound_seq=seen_inbound_seq,
                 tool_denylist=_OUT_OF_BAND_DENIED_TOOLS,
             )
         finally:

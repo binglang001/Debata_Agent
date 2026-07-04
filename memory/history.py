@@ -19,9 +19,8 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
 
-from .store import JsonlStore
+from .store import EventAppenderLike, JsonlStore, JsonlStoreLike
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +45,13 @@ HISTORY_JOURNAL_SCHEMA_VERSION = 1
 class HistoryManager:
     """对话历史管理器。一个 persona 对应一个实例。"""
 
-    def __init__(self, history_path: Path, event_store: Any = None) -> None:
-        self._store = JsonlStore(history_path)
+    def __init__(
+        self,
+        history_path: Path,
+        event_store: EventAppenderLike | None = None,
+        store: JsonlStoreLike | None = None,
+    ) -> None:
+        self._store = store if store is not None else JsonlStore(history_path)
         self._event_store = event_store
         self._mutation_lock = asyncio.Lock()
         self._append_callbacks: list[AppendCallback] = []
@@ -73,7 +77,7 @@ class HistoryManager:
             task.add_done_callback(self._notify_tasks.discard)
 
     async def _append_records_and_mirror(self, records: list[dict]) -> None:
-        """先写完整 JSONL，再把轻量索引镜像到事件库。"""
+        """先写完整 JSONL，再把完整记录镜像到事件库。"""
         if not records:
             return
         history_start = await self._store.length()
@@ -114,7 +118,7 @@ class HistoryManager:
             logger.warning(f"history EventStore 截断镜像失败: {e}", exc_info=True)
 
     async def _record_system_note_event(self, record: dict) -> None:
-        """记录 system note 专用轻量事件，失败不影响 JSONL 历史。"""
+        """记录 system note 专用事件，失败不影响 JSONL 历史。"""
         if self._event_store is None:
             return
         try:
@@ -131,6 +135,8 @@ class HistoryManager:
                     "history_index": history_index,
                     "history_offset": history_index,
                     "conversation_id": conversation_id,
+                    "content": content,
+                    "record": record,
                     "content_hash": content_hash,
                     "content_length": content_length,
                     "record_keys": [str(key) for key in record.keys()],
@@ -353,6 +359,7 @@ def _history_record_event_payload(
         "conversation_id": conversation_id,
         "tool_call_id": _optional_text(record.get("tool_call_id")),
         "tool_call_ids": _tool_call_ids(record),
+        "record": record,
         "content_hash": content_hash,
         "content_length": content_length,
         "record_keys": [str(key) for key in record.keys()],

@@ -59,7 +59,7 @@ def _assert_runner_error_envelope(
 
 
 @pytest.mark.asyncio
-async def test_runner_tool_runtime_events_started_then_result_lightweight():
+async def test_runner_tool_runtime_events_started_then_result_full_payload(tmp_path):
     raw_args = '{"path": "result.md", "content": "done"}'
     full_tool_result = {
         "ok": True,
@@ -68,13 +68,21 @@ async def test_runner_tool_runtime_events_started_then_result_lightweight():
         "result_format": "structured_json",
         "brief": "write_file 已完成。",
         "path": "result.md",
-        "content": "完整工具返回不能进入事件 payload",
+        "content": "完整工具返回必须进入事件 payload",
         "stop_after_tool": True,
     }
     events: list[dict[str, Any]] = []
+    event_store = EventStore(tmp_path / "events.sqlite3")
 
     async def runtime_event_callback(event: dict[str, Any]) -> None:
         events.append(event)
+        await event_store.append_event(
+            event_type=event["event_type"],
+            conversation_id="private:runtime",
+            source=event.get("source"),
+            tool_call_id=event.get("tool_call_id"),
+            payload=event["payload"],
+        )
 
     async def executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
         assert name == "write_file"
@@ -116,11 +124,16 @@ async def test_runner_tool_runtime_events_started_then_result_lightweight():
     assert started["source"] == "agent_runner"
     assert started["tool_call_id"] == "tc-write"
     assert started["payload"]["tool_name"] == "write_file"
+    assert started["payload"]["args"] == {"path": "result.md", "content": "done"}
+    assert started["payload"]["raw_arguments"] == raw_args
     assert started["payload"]["args_keys"] == ["content", "path"]
     assert started["payload"]["args_length"] > 0
     assert started["payload"]["loop"] == 1
     assert started["payload"]["step"] == 1
     assert received["payload"]["ok"] is True
+    assert received["payload"]["args"] == {"path": "result.md", "content": "done"}
+    assert received["payload"]["raw_arguments"] == raw_args
+    assert received["payload"]["result"] == full_tool_result
     assert received["payload"]["result_keys"] == [
         "brief",
         "content",
@@ -135,10 +148,20 @@ async def test_runner_tool_runtime_events_started_then_result_lightweight():
     assert len(started["payload"]["args_preview"]) <= 80
     assert len(received["payload"]["result_preview"]) <= 80
     event_json = json.dumps(events, ensure_ascii=False)
-    assert raw_args not in event_json
-    assert '"content": "done"' not in event_json
-    assert "result.md" not in event_json
-    assert "完整工具返回不能进入事件 payload" not in event_json
+    assert '"content": "done"' in event_json
+    assert "result.md" in event_json
+    assert "完整工具返回必须进入事件 payload" in event_json
+
+    assert await event_store.wait_projected(timeout=1.0)
+    stored_events = await event_store.iter_events(limit=10)
+    stored_started = stored_events[0]["payload"]
+    stored_received = stored_events[1]["payload"]
+    assert stored_started["args"] == {"path": "result.md", "content": "done"}
+    assert stored_started["raw_arguments"] == raw_args
+    assert stored_received["args"] == {"path": "result.md", "content": "done"}
+    assert stored_received["raw_arguments"] == raw_args
+    assert stored_received["result"] == full_tool_result
+    await event_store.shutdown()
 
     assistant_record = result.records[0]
     tool_record = result.records[1]
@@ -204,13 +227,18 @@ async def test_runner_runtime_event_records_argument_parse_failure_result():
     bad_payload = bad_events[0]["payload"]
     assert bad_payload["ok"] is False
     assert bad_payload["error_type"] == "JSONDecodeError"
+    assert bad_payload["raw_arguments"] == "{bad json"
+    assert "args" not in bad_payload
     assert bad_payload["args_keys"] == []
     assert bad_payload["args_length"] == len("{bad json")
     assert bad_payload["result_hash"]
+    assert bad_payload["result"]["ok"] is False
+    assert bad_payload["result"]["tool"] == "bad_tool"
     assert executor_calls == ["no_action"]
     assert result.finish_reason == "no_action"
     first_tool_record = next(record for record in result.records if record["role"] == "tool")
     parse_result = json.loads(first_tool_record["content"])
+    assert bad_payload["result"] == parse_result
     _assert_runner_error_envelope(
         parse_result,
         tool="bad_tool",

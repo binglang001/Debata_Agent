@@ -11,6 +11,7 @@
                            summarize_conversation / recall_history
     agent_task_tools    —— start_agent_task 后台子 Agent 资料处理
     control_tools       —— no_action / schedule_wakeup
+    persona_tools       —— eat / sleep 人格生理状态工具
     feature_tools       —— describe_image / web_search / get_weather
 
 公开 API：
@@ -34,6 +35,7 @@ from . import (  # noqa: F401
     group_admin_tools,
     memory_tools,
     messaging,
+    persona_tools,
     platform_tools,
     qq_action_tools,
     tool_search_tools,
@@ -168,8 +170,16 @@ FULL_SCHEMA_TOOLS: set[str] = {
     "run_python",
     "web_search",
     "get_weather",
+    "eat",
+    "sleep",
 }
 """常驻完整 schema 工具。"""
+
+
+_PERSONA_CONDITIONAL_TOOLS: dict[str, tuple[str, str]] = {
+    "sleep": ("energy", "tool"),
+    "eat": ("satiety", "tool"),
+}
 
 
 STUB_SCHEMA_TOOLS: set[str] = {
@@ -235,9 +245,23 @@ def build_default_registry(config) -> ToolRegistry:
     specs = list(get_default_specs())
     memory_mode = config.features.long_term_memory.mode
     features = config.features
+    persona_management = getattr(config, "persona_management", None)
+    persona_enabled = bool(getattr(persona_management, "enabled", False))
+    physiology = getattr(persona_management, "physiology", None)
+    energy_mode = _persona_physiology_mode(physiology, "energy")
+    satiety_mode = _persona_physiology_mode(physiology, "satiety")
+    persona_modes = {
+        "energy": energy_mode,
+        "satiety": satiety_mode,
+    }
 
     enabled: list[ToolSpec] = []
     for spec in specs:
+        if spec.name in _PERSONA_CONDITIONAL_TOOLS:
+            mode_name, required_mode = _PERSONA_CONDITIONAL_TOOLS[spec.name]
+            if not persona_enabled or persona_modes[mode_name] != required_mode:
+                continue
+
         configured = spec
         if spec.name in STUB_SCHEMA_TOOLS:
             configured = replace(
@@ -257,6 +281,16 @@ def build_default_registry(config) -> ToolRegistry:
         f"(memory_mode={memory_mode}, "
         f"vision={features.vision.enabled}, "
         f"web_search={features.web_search.enabled}, "
-        f"weather={features.weather.enabled})"
+        f"weather={features.weather.enabled}, "
+        f"persona_management={persona_enabled}, "
+        f"energy_mode={energy_mode}, "
+        f"satiety_mode={satiety_mode})"
     )
     return registry
+
+
+def _persona_physiology_mode(physiology, name: str) -> str:
+    item = physiology.get(name) if isinstance(physiology, dict) else getattr(physiology, name, None)
+    if isinstance(item, dict):
+        return str(item.get("mode") or "disabled")
+    return str(getattr(item, "mode", "disabled") or "disabled")

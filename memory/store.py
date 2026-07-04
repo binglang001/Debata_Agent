@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import aiofiles
 import orjson
@@ -24,6 +25,189 @@ logger = logging.getLogger(__name__)
 
 class StoreError(Exception):
     """存储层异常。"""
+
+
+@runtime_checkable
+class JsonStoreLike(Protocol):
+    """整体 JSON 仓储协议。"""
+
+    async def read(self, default: Any = None) -> Any: ...
+
+    async def write(self, data: Any) -> None: ...
+
+
+@runtime_checkable
+class JsonlStoreLike(Protocol):
+    """JSONL/历史流仓储协议。"""
+
+    async def load(self, force_reload: bool = False) -> list[dict]: ...
+
+    async def append(self, record: dict) -> None: ...
+
+    async def append_many(self, records: list[dict]) -> None: ...
+
+    async def length(self) -> int: ...
+
+    async def get_slice(self, start: int = 0, end: int | None = None) -> list[dict]: ...
+
+    async def truncate_head(self, cut_point: int) -> int: ...
+
+    async def replace_all(self, records: list[dict]) -> None: ...
+
+    async def clear(self) -> None: ...
+
+
+@runtime_checkable
+class ArchiveStoreLike(Protocol):
+    """归档仓储协议。"""
+
+    async def load(self, force_reload: bool = False) -> list[dict]: ...
+
+    async def append_many(self, records: list[dict[str, Any]]) -> None: ...
+
+    async def records(self) -> list[dict]: ...
+
+    async def search(
+        self,
+        *,
+        conversation_id: str | None = None,
+        keyword: str | None = None,
+        time_range: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]: ...
+
+    async def filter_records(self, query: Any) -> dict[str, Any]: ...
+
+    async def get_by_ids(self, archive_ids: list[str]) -> list[dict]: ...
+
+    async def context_around(
+        self,
+        archive_id: str,
+        before: int,
+        after: int,
+    ) -> list[dict]: ...
+
+    async def rag_records(self) -> list[dict]: ...
+
+    async def media_records(self, archive_id: str | None = None) -> list[dict[str, Any]]: ...
+
+
+@runtime_checkable
+class RollingSummaryStoreLike(Protocol):
+    """滚动摘要仓储协议。"""
+
+    async def load(self) -> dict[str, Any]: ...
+
+    def text(self) -> str: ...
+
+    def active_start_index(self) -> int: ...
+
+    async def update(
+        self,
+        summary_text: str,
+        *,
+        archived_until: Any = None,
+        updated_at: str = "",
+        active_start_index: int | None = None,
+    ) -> None: ...
+
+
+@runtime_checkable
+class EventAppenderLike(Protocol):
+    """事件追加协议，供历史镜像等轻量调用方使用。"""
+
+    async def append_event(
+        self,
+        *,
+        event_type: str,
+        payload: Any,
+        event_uuid: str | None = None,
+        conversation_id: str | None = None,
+        session_id: str | None = None,
+        turn_id: str | int | None = None,
+        source: str | None = None,
+        external_id: str | None = None,
+        tool_call_id: str | None = None,
+        parent_event_id: int | None = None,
+        idempotency_key: str | None = None,
+        timestamp_unix: float | int | None = None,
+        created_at_unix: float | int | None = None,
+        schema_version: int = 1,
+    ) -> int: ...
+
+    async def append_events(self, events: list[Mapping[str, Any]]) -> list[int]: ...
+
+
+@runtime_checkable
+class EventStoreLike(EventAppenderLike, Protocol):
+    """事件仓储协议。"""
+
+    async def start_projection(self) -> None: ...
+
+    async def shutdown(self, *, timeout: float | None = 5.0) -> bool: ...
+
+    async def wait_projected(
+        self,
+        event_id: int | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> bool: ...
+
+    async def stats(self) -> dict[str, Any]: ...
+
+    async def get_event(self, event_id: int) -> dict[str, Any] | None: ...
+
+    async def get_events(self, event_ids: list[int]) -> list[dict[str, Any] | None]: ...
+
+    async def iter_events(
+        self,
+        *,
+        limit: int = 100,
+        after_event_id: int | None = None,
+        before_event_id: int | None = None,
+        order: str = "asc",
+    ) -> list[dict[str, Any]]: ...
+
+    async def events_for_conversation(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        before_event_id: int | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    async def events_by_type(
+        self,
+        event_type: str,
+        *,
+        limit: int = 100,
+        after_event_id: int | None = None,
+        before_event_id: int | None = None,
+        order: str = "asc",
+    ) -> list[dict[str, Any]]: ...
+
+
+@runtime_checkable
+class UsageStatsStoreLike(Protocol):
+    """用量统计仓储协议。"""
+
+    async def load(self) -> None: ...
+
+    async def record(
+        self,
+        usage: Any,
+        *,
+        provider: str = "",
+        model: str = "",
+        agent: str = "",
+        operation: str = "",
+        extra: dict[str, Any] | None = None,
+    ) -> None: ...
+
+    def summarize(self, range_name: Any = "today") -> Any: ...
+
+    @property
+    def count(self) -> int: ...
 
 
 class JsonStore:

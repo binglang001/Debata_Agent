@@ -84,7 +84,9 @@ class MediaPipelineMixin:
                         text = f"{text} {placeholder}".strip()
                 elif seg.type == MediaType.FILE:
                     url: str | None = seg.url
+                    tried_file_url_ids: set[str] = set()
                     if not url and seg.file_id:
+                        tried_file_url_ids.add(seg.file_id)
                         try:
                             url = await self.adapter.get_file_url(seg.file_id)
                         except NotImplementedError:
@@ -99,6 +101,27 @@ class MediaPipelineMixin:
                             suggested_name=seg.name
                             or f"file_{event.message_id}",
                         )
+                    if not ws_path:
+                        for candidate in self._file_url_fallback_candidates(seg, source):
+                            if candidate in tried_file_url_ids:
+                                continue
+                            tried_file_url_ids.add(candidate)
+                            try:
+                                fallback_source = await self.adapter.get_file_url(candidate)
+                            except NotImplementedError:
+                                break
+                            except Exception as e:
+                                logger.warning(f"获取文件 URL 失败 file_id={candidate}: {e}")
+                                continue
+                            if not fallback_source or fallback_source == source:
+                                continue
+                            ws_path = await self._save_media_to_workspace(
+                                fallback_source,
+                                suggested_name=seg.name
+                                or f"file_{event.message_id}",
+                            )
+                            if ws_path:
+                                break
                     suffix_parts = []
                     if source:
                         suffix_parts.append(f"url={source}")
@@ -111,11 +134,130 @@ class MediaPipelineMixin:
                         else "[文件: 获取URL失败]"
                     )
                     text = text.replace("[文件]", replacement, 1)
+                elif seg.type == MediaType.FORWARD:
+                    replacement = await self._forward_media_text(seg)
+                    text = self._replace_or_append_forward_text(text, seg, replacement)
             except Exception as e:
                 # 单段媒体抽取失败不应阻塞主链路
                 logger.exception(f"媒体段处理失败 type={seg.type}: {e}")
 
         return text
+
+    @staticmethod
+    def _file_url_fallback_candidates(
+        seg: MediaSegment,
+        source: str | None,
+    ) -> list[str]:
+        """文件原始路径不可读时，用保守线索向适配器查询真实来源。"""
+        from urllib.parse import unquote, urlparse
+
+        candidates = [seg.file_id, seg.name]
+        if source:
+            parsed = urlparse(source)
+            path = unquote(parsed.path) if parsed.scheme else source
+            basename = Path(path).name
+            candidates.append(basename)
+
+        out: list[str] = []
+        seen: set[str] = set()
+        original = (source or "").strip()
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if not value or value == original or value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        return out
+
+    async def _forward_media_text(self, seg: MediaSegment) -> str:
+        """合并转发要让模型看到可展开线索，能读到时附带短预览。"""
+        label = self._forward_media_label(seg)
+        forward_id = (seg.file_id or "").strip()
+        if not forward_id:
+            return f"{label}：缺少 forward_id，无法自动读取内容。"
+
+        adapter = getattr(self, "adapter", None)
+        if adapter is None or not hasattr(adapter, "get_forward_msg"):
+            return f"{label}：未自动读取内容；可调用 get_forward_msg(forward_id=\"{forward_id}\") 获取完整内容。"
+
+        try:
+            from tools.platform_tools import build_forward_tree, forward_tree_to_markdown
+
+            tree = await build_forward_tree(
+                adapter,
+                forward_id,
+                recursive=True,
+                max_depth=2,
+            )
+        except NotImplementedError:
+            return f"{label}：当前适配器不支持自动读取；可调用 get_forward_msg(forward_id=\"{forward_id}\") 尝试获取。"
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"自动读取合并转发失败 forward_id={forward_id}: {e}")
+            error = self._trim_forward_text(str(e), limit=120)
+            return f"{label}：自动读取失败（{error}）；可调用 get_forward_msg(forward_id=\"{forward_id}\") 重试。"
+
+        if tree.get("status") != "ok":
+            error = self._trim_forward_text(str(tree.get("error") or "未知错误"), limit=120)
+            return f"{label}：自动读取失败（{error}）；可调用 get_forward_msg(forward_id=\"{forward_id}\") 重试。"
+
+        preview = self._trim_forward_preview(forward_tree_to_markdown(tree))
+        if not preview:
+            count = int(tree.get("message_count") or 0)
+            return f"{label}：已读取 {count} 条，但预览为空；可调用 get_forward_msg(forward_id=\"{forward_id}\") 获取完整内容。"
+        return (
+            f"{label}\n节点预览：\n{preview}\n"
+            f"如需完整内容，调用 get_forward_msg(forward_id=\"{forward_id}\")。"
+        )
+
+    @staticmethod
+    def _forward_media_label(seg: MediaSegment) -> str:
+        forward_id = (seg.file_id or "").strip()
+        parts = [f"id={forward_id}"] if forward_id else ["id="]
+        title = MediaPipelineMixin._forward_media_title(seg)
+        if title:
+            parts.append(f"title={title}")
+        return "[合并转发 " + " ".join(parts) + "]"
+
+    @staticmethod
+    def _forward_media_title(seg: MediaSegment) -> str:
+        extra = seg.extra if isinstance(seg.extra, dict) else {}
+        for key in ("title", "summary", "name", "content"):
+            value = extra.get(key)
+            if value not in (None, ""):
+                return MediaPipelineMixin._trim_forward_text(str(value), limit=80)
+        if seg.name:
+            return MediaPipelineMixin._trim_forward_text(seg.name, limit=80)
+        return ""
+
+    @staticmethod
+    def _replace_or_append_forward_text(
+        text: str,
+        seg: MediaSegment,
+        replacement: str,
+    ) -> str:
+        forward_id = (seg.file_id or "").strip()
+        candidates = [
+            MediaPipelineMixin._forward_media_label(seg),
+            f"[合并转发 id={forward_id}]",
+        ]
+        for candidate in candidates:
+            if candidate and candidate in text:
+                return text.replace(candidate, replacement, 1)
+        if replacement in text:
+            return text
+        return f"{text} {replacement}".strip()
+
+    @staticmethod
+    def _trim_forward_preview(markdown: str, *, limit: int = 1200) -> str:
+        text = "\n".join(line.rstrip() for line in str(markdown or "").splitlines()).strip()
+        return MediaPipelineMixin._trim_forward_text(text, limit=limit)
+
+    @staticmethod
+    def _trim_forward_text(text: str, *, limit: int) -> str:
+        clean = " ".join(str(text or "").split())
+        if len(clean) <= limit:
+            return clean
+        return clean[:limit].rstrip() + "...（截断）"
 
     async def _image_media_source(self, seg: MediaSegment) -> str | None:
         """优先用平台 file_id 换本地图片路径，普通 URL 只做兜底。"""
@@ -124,7 +266,23 @@ class MediaPipelineMixin:
             try:
                 source = await resolver(seg.file_id)
                 if source:
-                    return source
+                    import re
+                    from urllib.parse import unquote, urlparse
+
+                    source = str(source).strip()
+                    if re.match(r"^[A-Za-z]:[\\/]", source) and Path(source).is_file():
+                        return source
+                    parsed = urlparse(source)
+                    if parsed.scheme in ("http", "https"):
+                        return source
+                    if parsed.scheme == "file":
+                        file_path = unquote(parsed.path)
+                        if file_path.startswith("/") and len(file_path) > 3 and file_path[2] == ":":
+                            file_path = file_path[1:]
+                        if Path(file_path).is_file():
+                            return source
+                    elif not parsed.scheme and Path(source).is_file():
+                        return source
             except (AttributeError, NotImplementedError):
                 pass
             except Exception as e:  # noqa: BLE001

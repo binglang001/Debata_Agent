@@ -9,17 +9,30 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import logging
 import time
-from collections import deque
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from adapters.types import Target
 from utils import get_time
 
+from . import send_receipts as _send_receipts
+from .send_helpers import (
+    _accepted_items,
+    _attempted_items,
+    _inbound_to_receipt_message,
+    _preflight_message,
+    _sent_item,
+    _text_mentions_self_or_role,
+    _unsent_items,
+)
+from .send_state import (
+    _InboundRef,
+    _SendAttempt,
+    _SendConversationState,
+    _SendJob,
+)
 from .state import PendingMessageItem
 
 if TYPE_CHECKING:
@@ -27,85 +40,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("core.message_pipeline")
 
-
-def _text_mentions_self_or_role(text: str, self_id: str, role_name: str) -> bool:
-    content = str(text or "")
-    cleaned_self_id = str(self_id or "").strip()
-    if cleaned_self_id:
-        tokens = (
-            f"@{cleaned_self_id}",
-            f"@QQ{cleaned_self_id}",
-            f"[CQ:at,qq={cleaned_self_id}]",
-        )
-        if any(token in content for token in tokens):
-            return True
-    cleaned_role = str(role_name or "").strip()
-    return bool(cleaned_role and f"@{cleaned_role}" in content)
-
-
-@dataclass(slots=True)
-class _InboundRef:
-    seq: int
-    conversation_id: str
-    message_id: str
-    user_id: str
-    nickname: str
-    text: str
-    reply_to: str | None
-    self_id: str
-    received_at: float
-
-
-@dataclass(slots=True)
-class _SendJob:
-    send_id: str
-    conversation_id: str
-    actions: list[dict[str, Any]]
-    source_tool: str
-    interrupt_policy: str
-    ignore_review_interrupts: bool
-    trigger_message_id: str | None
-    trigger_inbound_seq: int
-    trigger_user_id: str | None
-    created_at: float
-
-
-@dataclass(slots=True)
-class _SendConversationState:
-    queue: deque[_SendJob] = field(default_factory=deque)
-    worker: asyncio.Task | None = None
-    interrupt_event: asyncio.Event = field(default_factory=asyncio.Event)
-    interrupt_messages: list[dict[str, Any]] = field(default_factory=list)
-    recall_events: list[dict[str, Any]] = field(default_factory=list)
-    pending_receipts: list[dict[str, Any]] = field(default_factory=list)
-    needs_resync: bool = False
-    in_flight: bool = False
-    active_interrupt_policy: str = "interrupt_all"
-    active_ignore_review_interrupts: bool = False
-    deferred_queue_interrupt_pending: bool = False
-    active_trigger_user_id: str | None = None
-    active_trigger_message_id: str | None = None
-
-
-@dataclass(slots=True)
-class _SendAttempt:
-    send_attempt_id: str
-    conversation_ids: list[str]
-    actions: list[dict[str, Any]]
-    source_tool: str
-    trigger_message_id: str | None
-    trigger_inbound_seq: int
-    trigger_user_id: str | None
-    focus_user_ids: list[str]
-    trigger_message_ids: list[str]
-    reviewed_until_seq: int
-    review_policy: str
-    delivery_interrupt_policy: str
-    tool_call_id: str | None
-    reason: str | None
-    created_at: float
-    revision: int = 1
-    consumed: bool = False
+_action_content_fingerprint = _send_receipts._action_content_fingerprint
+_drop_none = _send_receipts._drop_none
+_list_count = _send_receipts._list_count
+_optional_text = _send_receipts._optional_text
+_safe_int = _send_receipts._safe_int
+_send_action_counts = _send_receipts._send_action_counts
+_send_message_payload = _send_receipts._send_message_payload
+_send_receipt_counts = _send_receipts._send_receipt_counts
+_send_receipt_event_status = _send_receipts._send_receipt_event_status
+_single_conversation_id = _send_receipts._single_conversation_id
 
 
 class _AsyncSendManager:
@@ -989,19 +933,7 @@ class _AsyncSendManager:
             break
         return list(dict.fromkeys(reasons))
 
-    @staticmethod
-    def _preflight_message(ref: _InboundRef) -> dict[str, Any]:
-        return {
-            "conversation_id": ref.conversation_id,
-            "seq": ref.seq,
-            "time": get_time(),
-            "nickname": ref.nickname,
-            "user_id": ref.user_id,
-            "text": ref.text,
-            "msg_id": ref.message_id,
-            "reply_to": ref.reply_to,
-            "qq_visible": True,
-        }
+    _preflight_message = staticmethod(_preflight_message)
 
     def _create_send_attempt(
         self,
@@ -1432,72 +1364,10 @@ class _AsyncSendManager:
         )
         return msg_id
 
-    @staticmethod
-    def _sent_item(action: dict[str, Any], msg_id: str | None) -> dict[str, Any]:
-        target_scope = action.get("target_scope")
-        target_id = action.get("target_id")
-        item: dict[str, Any] = {
-            "conversation_id": f"{target_scope}:{target_id}",
-            "order": int(action.get("order", 0)),
-            "target_type": target_scope,
-            "target_id": target_id,
-            "msg_id": str(msg_id) if msg_id is not None else None,
-            "content": action.get("label") or action.get("content") or "",
-            "delay": float(action.get("delay") or 0.0),
-            "time": get_time(),
-            "qq_visible": True,
-        }
-        if target_scope == "private":
-            item["target_qq"] = target_id
-        if target_scope == "group":
-            item["group_id"] = target_id
-        return item
-
-    @staticmethod
-    def _unsent_items(actions: list[dict[str, Any]], send_id: str) -> list[dict[str, Any]]:
-        return [
-            {
-                "send_id": send_id,
-                "conversation_id": f"{action.get('target_scope')}:{action.get('target_id')}",
-                "order": int(action.get("order", 0)),
-                "target_type": action.get("target_scope"),
-                "target_id": action.get("target_id"),
-                "content": action.get("label") or action.get("content") or "",
-                "delay": float(action.get("delay") or 0.0),
-                "qq_visible": False,
-            }
-            for action in actions
-        ]
-
-    @staticmethod
-    def _attempted_items(actions: list[dict[str, Any]], send_id: str) -> list[dict[str, Any]]:
-        return [
-            {
-                "send_id": send_id,
-                "conversation_id": f"{action.get('target_scope')}:{action.get('target_id')}",
-                "target_type": action.get("target_scope"),
-                "target_id": action.get("target_id"),
-                "order": int(action.get("order", 0)),
-                "content": action.get("label") or action.get("content") or "",
-                "delay": float(action.get("delay") or 0.0),
-                "qq_visible": False,
-            }
-            for action in actions
-        ]
-
-    @staticmethod
-    def _accepted_items(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [
-            {
-                "conversation_id": f"{action.get('target_scope')}:{action.get('target_id')}",
-                "target_type": action.get("target_scope"),
-                "target_id": action.get("target_id"),
-                "order": int(action.get("order", 0)),
-                "content": action.get("label") or action.get("content") or "",
-                "delay": float(action.get("delay") or 0.0),
-            }
-            for action in actions
-        ]
+    _sent_item = staticmethod(_sent_item)
+    _unsent_items = staticmethod(_unsent_items)
+    _attempted_items = staticmethod(_attempted_items)
+    _accepted_items = staticmethod(_accepted_items)
 
     def _flush_queued_unsent(self, state: _SendConversationState) -> list[dict[str, Any]]:
         unsent: list[dict[str, Any]] = []
@@ -1543,122 +1413,4 @@ class _AsyncSendManager:
         state.pending_receipts.append(receipt)
         return receipt
 
-    @staticmethod
-    def _inbound_to_receipt_message(ref: _InboundRef) -> dict[str, Any]:
-        return {
-            "conversation_id": ref.conversation_id,
-            "seq": ref.seq,
-            "time": get_time(),
-            "nickname": ref.nickname,
-            "user_id": ref.user_id,
-            "text": ref.text,
-            "msg_id": ref.message_id,
-            "qq_visible": True,
-        }
-
-
-def _send_message_payload(
-    send_id: str,
-    action: dict[str, Any],
-    *,
-    status: str,
-) -> dict[str, Any]:
-    content_length, content_hash = _action_content_fingerprint(action)
-    target_scope = _optional_text(action.get("target_scope"))
-    target_id = _optional_text(action.get("target_id"))
-    payload = {
-        "source": "send_manager",
-        "send_id": send_id,
-        "status": status,
-        "order": _safe_int(action.get("order"), default=0),
-        "target_scope": target_scope,
-        "target_id": target_id,
-        "target_conversation_id": (
-            f"{target_scope}:{target_id}" if target_scope and target_id else None
-        ),
-        "kind": _optional_text(action.get("kind")) or "text",
-        "content_hash": content_hash,
-        "content_length": content_length,
-    }
-    return _drop_none(payload)
-
-
-def _action_content_fingerprint(action: dict[str, Any]) -> tuple[int, str]:
-    text = str(action.get("label") or action.get("content") or "")
-    return len(text), hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _send_action_counts(
-    actions: list[dict[str, Any]],
-    conversation_ids: list[str],
-) -> dict[str, int]:
-    return {
-        "messages": len(actions),
-        "conversations": len(conversation_ids),
-        "text": sum(1 for action in actions if action.get("kind", "text") == "text"),
-        "voice": sum(1 for action in actions if action.get("kind") == "voice"),
-        "image": sum(1 for action in actions if action.get("kind") in {"image", "emoji"}),
-    }
-
-
-def _send_receipt_counts(receipt: dict[str, Any]) -> dict[str, int]:
-    return {
-        "sent": _list_count(receipt.get("sent")),
-        "unsent": _list_count(receipt.get("unsent")),
-        "new_messages": _list_count(receipt.get("new_messages")),
-        "recalled_messages": _list_count(receipt.get("recalled_messages")),
-        "errors": _list_count(receipt.get("errors")),
-        "accepted_messages": _list_count(receipt.get("accepted_messages")),
-        "attempted_messages": _list_count(receipt.get("attempted_messages")),
-        "forced_unseen_messages": _list_count(receipt.get("forced_unseen_messages")),
-        "unseen_messages": _list_count(receipt.get("unseen_messages")),
-        "priority_interrupts": _list_count(receipt.get("priority_interrupts")),
-    }
-
-
-def _send_receipt_event_status(
-    receipt: dict[str, Any],
-    counts: dict[str, int],
-) -> str:
-    status = _optional_text(receipt.get("status"))
-    if status:
-        return status
-    if receipt.get("interrupted"):
-        return "interrupted"
-    if counts["errors"] and counts["sent"]:
-        return "partial"
-    if counts["errors"]:
-        return "failed"
-    if counts["unsent"] and counts["sent"]:
-        return "partial"
-    if counts["unsent"]:
-        return "unsent"
-    if counts["sent"]:
-        return "succeeded"
-    return "empty"
-
-
-def _single_conversation_id(conversation_ids: list[str]) -> str | None:
-    return conversation_ids[0] if len(conversation_ids) == 1 else None
-
-
-def _list_count(value: Any) -> int:
-    return len(value) if isinstance(value, list) else 0
-
-
-def _safe_int(value: Any, *, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _optional_text(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _drop_none(payload: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in payload.items() if value is not None}
+    _inbound_to_receipt_message = staticmethod(_inbound_to_receipt_message)

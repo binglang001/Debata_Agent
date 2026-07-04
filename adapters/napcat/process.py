@@ -162,6 +162,13 @@ class NapCatProcessManager:
             return [shell, "/c", str(self.executable), *self.args]
         return [str(self.executable), *self.args]
 
+    def _is_windows_command_launcher(self) -> bool:
+        """Windows bat/cmd 通常只是启动器，退出不代表 NapCat 子进程崩溃。"""
+        return sys.platform == "win32" and self.executable.suffix.lower() in {
+            ".bat",
+            ".cmd",
+        }
+
     async def _pipe_logs(self, stream: asyncio.StreamReader) -> None:
         """把 NapCat 输出转发到日志系统。"""
         while True:
@@ -187,8 +194,18 @@ class NapCatProcessManager:
                 logger.info(f"NapCat 进程已退出（手动停止）: rc={rc}")
                 return
 
-            logger.warning(f"NapCat 进程意外退出: rc={rc}")
             self._process = None
+
+            if self._is_windows_command_launcher():
+                log = logger.info if rc == 0 else logger.warning
+                log(
+                    "NapCat 启动器进程已退出: rc=%s；按一次性启动器处理，不自动重启，"
+                    "避免重复拉起 NapCat/QQ",
+                    rc,
+                )
+                return
+
+            logger.warning(f"NapCat 进程意外退出: rc={rc}")
 
             if not self.auto_restart:
                 logger.info("auto_restart=False，不重启")

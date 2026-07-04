@@ -1,0 +1,935 @@
+"""人格状态 SQLite 存储。"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sqlite3
+from collections.abc import Iterable, Mapping
+from pathlib import Path
+from typing import Any
+
+from mind import db_records as _db_records
+from mind import db_schema as _db_schema
+
+logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = _db_schema.SCHEMA_VERSION
+_MISSING = object()
+
+_ensure_column = _db_schema._ensure_column
+_column_exists = _db_schema._column_exists
+_current_schema_version = _db_schema._current_schema_version
+_backfill_eat_record_ids = _db_schema._backfill_eat_record_ids
+_validate_table_name = _db_schema._validate_table_name
+
+_STATE_TYPES = ("PersonaState",)
+_STATE_LOG_TYPES = ("PersonaStateLog", "StateLogEntry")
+_EFFECT_TYPES = ("Effect", "PersonaEffect")
+_TODO_TYPES = ("Todo", "PersonaTodo")
+_CUE_TYPES = ("Cue", "PersonaCue")
+_PROFILE_TYPES = ("UserProfile", "PersonaUserProfile")
+_MONOLOGUE_TYPES = ("InnerMonologue",)
+_TRAJECTORY_TYPES = ("DailyTrajectory",)
+_ARC_TYPES = ("PersonaArcEvent", "PersonaArc")
+_SLEEP_TYPES = ("SleepRecord",)
+_EAT_TYPES = ("EatRecord",)
+
+_record_to_dict = _db_records._record_to_dict
+_adapt_record = _db_records._adapt_record
+_prepare_dataclass_data = _db_records._prepare_dataclass_data
+_first_value = _db_records._first_value
+_text_from = _db_records._text_from
+_float_from = _db_records._float_from
+_int_from = _db_records._int_from
+_time_from = _db_records._time_from
+_optional_time_from = _db_records._optional_time_from
+_text_list_from = _db_records._text_list_from
+_text_list_value = _db_records._text_list_value
+_find_mind_type = _db_records._find_mind_type
+_ensure_record_id = _db_records._ensure_record_id
+_optional_text = _db_records._optional_text
+_record_active = _db_records._record_active
+_record_completed = _db_records._record_completed
+_todo_readable_sort_key = _db_records._todo_readable_sort_key
+_explicit_completed_value = _db_records._explicit_completed_value
+_is_expired = _db_records._is_expired
+_compare_time = _db_records._compare_time
+_time_sort_value = _db_records._time_sort_value
+_time_value = _db_records._time_value
+_normalize_iso_time_text = _db_records._normalize_iso_time_text
+_now_value = _db_records._now_value
+_now_text = _db_records._now_text
+_json_dumps = _db_records._json_dumps
+_json_loads = _db_records._json_loads
+_clean_ids = _db_records._clean_ids
+_clamp_int = _db_records._clamp_int
+
+
+class PersonaDB:
+    """人格系统 sqlite3 后端。
+
+    连接按操作打开，所有阻塞 sqlite3 调用通过 asyncio.to_thread 执行，并用
+    asyncio.Lock 串行化写入与读取。
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._lock = asyncio.Lock()
+
+    async def load(self) -> None:
+        """初始化数据库 schema。"""
+        async with self._lock:
+            await asyncio.to_thread(self._load_sync)
+
+    async def close(self) -> None:
+        """按操作连接，无常驻连接需要关闭。"""
+        return None
+
+    async def get_state(self, default: Any = _MISSING) -> Any:
+        async with self._lock:
+            data = await asyncio.to_thread(self._get_state_sync, default)
+        if data is _MISSING:
+            return _adapt_record({}, _STATE_TYPES)
+        if data is default:
+            return default
+        return _adapt_record(data, _STATE_TYPES)
+
+    async def save_state(self, state: Any) -> None:
+        data = _record_to_dict(state)
+        async with self._lock:
+            await asyncio.to_thread(self._save_state_sync, data)
+
+    async def append_state_log(self, entry: Any) -> int:
+        data = _record_to_dict(entry)
+        async with self._lock:
+            return await asyncio.to_thread(self._append_state_log_sync, data)
+
+    async def append_update_audit(self, entry: Any) -> int:
+        data = _record_to_dict(entry)
+        async with self._lock:
+            return await asyncio.to_thread(self._append_update_audit_sync, data)
+
+    async def recent_update_audits(
+        self,
+        limit: int = 20,
+        conversation_id: str | None = None,
+        user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._recent_update_audits_sync,
+                limit,
+                conversation_id,
+                user_id,
+            )
+
+    async def add_effect(self, effect: Any) -> str:
+        data = _record_to_dict(effect)
+        effect_id = _ensure_record_id(data, ("effect_id", "id"), "effect")
+        async with self._lock:
+            await asyncio.to_thread(self._upsert_effect_sync, effect_id, data)
+        return effect_id
+
+    async def get_active_effects(self, now: Any = None) -> list[Any]:
+        async with self._lock:
+            rows = await asyncio.to_thread(self._get_active_effects_sync, _now_value(now))
+        return [_adapt_record(row, _EFFECT_TYPES) for row in rows]
+
+    async def remove_effects(self, ids: str | Iterable[str]) -> int:
+        effect_ids = _clean_ids(ids)
+        if not effect_ids:
+            return 0
+        async with self._lock:
+            return await asyncio.to_thread(self._delete_by_ids_sync, "effects", "effect_id", effect_ids)
+
+    async def expire_effects(self, now: Any = None) -> int:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._expire_records_sync,
+                "effects",
+                "effect_id",
+                "effect_json",
+                _now_value(now),
+            )
+
+    async def get_todos(self, include_completed: bool = True) -> list[Any]:
+        async with self._lock:
+            rows = await asyncio.to_thread(self._get_todos_sync, include_completed)
+        return [_adapt_record(row, _TODO_TYPES) for row in rows]
+
+    async def upsert_todo(self, todo: Any) -> str:
+        data = _record_to_dict(todo)
+        todo_id = _ensure_record_id(data, ("todo_id", "id"), "todo")
+        async with self._lock:
+            await asyncio.to_thread(self._upsert_todo_sync, todo_id, data)
+        return todo_id
+
+    async def mark_expired_todos_missed(self, now: Any = None) -> int:
+        async with self._lock:
+            return await asyncio.to_thread(self._mark_expired_todos_missed_sync, _now_value(now))
+
+    async def remove_todos(self, ids: str | Iterable[str]) -> int:
+        todo_ids = _clean_ids(ids)
+        if not todo_ids:
+            return 0
+        async with self._lock:
+            return await asyncio.to_thread(self._delete_by_ids_sync, "todos", "todo_id", todo_ids)
+
+    async def get_cues(self, now: Any = None) -> list[Any]:
+        async with self._lock:
+            rows = await asyncio.to_thread(self._get_cues_sync, _now_value(now))
+        return [_adapt_record(row, _CUE_TYPES) for row in rows]
+
+    async def upsert_cue(self, cue: Any) -> str:
+        data = _record_to_dict(cue)
+        cue_id = _ensure_record_id(data, ("cue_id", "id"), "cue")
+        async with self._lock:
+            await asyncio.to_thread(self._upsert_cue_sync, cue_id, data)
+        return cue_id
+
+    async def remove_cues(self, ids: str | Iterable[str]) -> int:
+        cue_ids = _clean_ids(ids)
+        if not cue_ids:
+            return 0
+        async with self._lock:
+            return await asyncio.to_thread(self._delete_by_ids_sync, "cues", "cue_id", cue_ids)
+
+    async def expire_cues(self, now: Any = None) -> int:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._expire_records_sync,
+                "cues",
+                "cue_id",
+                "cue_json",
+                _now_value(now),
+            )
+
+    async def get_profile(self, user_id: str) -> Any | None:
+        clean_user_id = str(user_id or "").strip()
+        if not clean_user_id:
+            return None
+        async with self._lock:
+            data = await asyncio.to_thread(self._get_profile_sync, clean_user_id)
+        return _adapt_record(data, _PROFILE_TYPES) if data is not None else None
+
+    async def upsert_profile(self, profile: Any) -> str:
+        data = _record_to_dict(profile)
+        user_id = _optional_text(data, ("user_id", "profile_id", "id"))
+        if not user_id:
+            raise ValueError("user profile requires user_id/profile_id/id")
+        data.setdefault("user_id", user_id)
+        async with self._lock:
+            await asyncio.to_thread(self._upsert_profile_sync, user_id, data)
+        return user_id
+
+    async def all_profiles(self) -> list[Any]:
+        async with self._lock:
+            rows = await asyncio.to_thread(self._all_profiles_sync)
+        return [_adapt_record(row, _PROFILE_TYPES) for row in rows]
+
+    async def add_monologue(self, monologue: Any) -> int:
+        data = _record_to_dict(monologue)
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._insert_json_row_sync,
+                "inner_monologues",
+                "monologue_json",
+                data,
+            )
+
+    async def recent_monologues(self, limit: int = 20) -> list[Any]:
+        async with self._lock:
+            rows = await asyncio.to_thread(
+                self._recent_json_rows_sync,
+                "inner_monologues",
+                "monologue_json",
+                limit,
+            )
+        return [_adapt_record(row, _MONOLOGUE_TYPES) for row in rows]
+
+    async def add_trajectory(self, trajectory: Any) -> int:
+        data = _record_to_dict(trajectory)
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._insert_json_row_sync,
+                "daily_trajectories",
+                "trajectory_json",
+                data,
+            )
+
+    async def recent_trajectories(self, limit: int = 20) -> list[Any]:
+        async with self._lock:
+            rows = await asyncio.to_thread(
+                self._recent_json_rows_sync,
+                "daily_trajectories",
+                "trajectory_json",
+                limit,
+            )
+        return [_adapt_record(row, _TRAJECTORY_TYPES) for row in rows]
+
+    async def add_arc_event(self, event: Any) -> int:
+        data = _record_to_dict(event)
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._insert_json_row_sync,
+                "persona_arc",
+                "event_json",
+                data,
+            )
+
+    async def recent_arc_events(self, limit: int = 20) -> list[dict]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._recent_json_rows_desc_sync,
+                "persona_arc",
+                "event_json",
+                limit,
+            )
+
+    async def add_sleep_record(self, record: Any) -> str:
+        data = _record_to_dict(record)
+        record_id = _ensure_record_id(data, ("record_id", "sleep_id", "id"), "sleep")
+        async with self._lock:
+            await asyncio.to_thread(self._upsert_sleep_record_sync, record_id, data)
+        return record_id
+
+    async def recent_sleep_records(self, limit: int = 20) -> list[dict]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._recent_json_rows_desc_sync,
+                "sleep_records",
+                "record_json",
+                limit,
+                "created_at",
+                "rowid",
+            )
+
+    async def update_sleep_record(
+        self,
+        record_id_or_record: str | Any,
+        updates: Mapping[str, Any] | None = None,
+        **fields_to_update: Any,
+    ) -> bool:
+        if isinstance(record_id_or_record, str):
+            record_id = record_id_or_record.strip()
+            new_data = dict(updates or {})
+            new_data.update(fields_to_update)
+        else:
+            new_data = _record_to_dict(record_id_or_record)
+            if updates:
+                new_data.update(dict(updates))
+            new_data.update(fields_to_update)
+            record_id = _optional_text(new_data, ("record_id", "sleep_id", "id")) or ""
+        if not record_id:
+            return False
+        async with self._lock:
+            return await asyncio.to_thread(self._update_sleep_record_sync, record_id, new_data)
+
+    async def add_eat_record(self, record: Any) -> int:
+        data = _record_to_dict(record)
+        async with self._lock:
+            return await asyncio.to_thread(self._add_eat_record_sync, data)
+
+    async def update_eat_record(
+        self,
+        record_id_or_record: str | Any,
+        updates: Mapping[str, Any] | None = None,
+        **fields_to_update: Any,
+    ) -> bool:
+        if isinstance(record_id_or_record, str):
+            record_id = record_id_or_record.strip()
+            new_data = dict(updates or {})
+            new_data.update(fields_to_update)
+        else:
+            new_data = _record_to_dict(record_id_or_record)
+            if updates:
+                new_data.update(dict(updates))
+            new_data.update(fields_to_update)
+            record_id = _optional_text(new_data, ("record_id", "eat_id", "id")) or ""
+        if not record_id:
+            return False
+        async with self._lock:
+            return await asyncio.to_thread(self._update_eat_record_sync, record_id, new_data)
+
+    async def recent_eat_records(self, limit: int = 20) -> list[dict]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._recent_json_rows_desc_sync,
+                "eat_records",
+                "record_json",
+                limit,
+            )
+
+    async def recent_state_logs(self, limit: int = 50) -> list[dict]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._recent_json_rows_desc_sync,
+                "persona_state_log",
+                "state_json",
+                limit,
+            )
+
+    async def read_important(self, default: Any = None) -> Any:
+        async with self._lock:
+            return await asyncio.to_thread(self._read_important_sync, default)
+
+    async def write_important(self, data: Any) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._write_important_sync, data)
+
+    async def important_count(self) -> int:
+        async with self._lock:
+            return await asyncio.to_thread(self._important_count_sync)
+
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        self._ensure_schema(conn)
+        return conn
+
+    def _load_sync(self) -> None:
+        with self._connect():
+            return None
+
+    @staticmethod
+    def _ensure_schema(conn: sqlite3.Connection) -> None:
+        _db_schema._ensure_schema(conn)
+
+    def _get_state_sync(self, default: Any) -> Any:
+        with self._connect() as conn:
+            row = conn.execute("SELECT state_json FROM persona_state WHERE id = 1").fetchone()
+        if row is None:
+            return default
+        return _json_loads(row["state_json"], default={})
+
+    def _save_state_sync(self, data: dict[str, Any]) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO persona_state (id, state_json, updated_at)
+                VALUES (1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+                """,
+                (_json_dumps(data), _now_text()),
+            )
+            conn.commit()
+
+    def _append_state_log_sync(self, data: dict[str, Any]) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO persona_state_log (state_json, created_at)
+                VALUES (?, ?)
+                """,
+                (_json_dumps(data), _now_text()),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def _append_update_audit_sync(self, data: dict[str, Any]) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO persona_update_audits (
+                    audit_json, "trigger", conversation_id, user_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    _json_dumps(data),
+                    _optional_text(data, ("trigger",)),
+                    _optional_text(data, ("conversation_id",)),
+                    _optional_text(data, ("user_id",)),
+                    _now_text(),
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def _recent_update_audits_sync(
+        self,
+        limit: int,
+        conversation_id: str | None,
+        user_id: str | None,
+    ) -> list[dict[str, Any]]:
+        limit = _clamp_int(limit, default=20, minimum=1, maximum=500)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if conversation_id is not None and (text := str(conversation_id).strip()):
+            clauses.append("conversation_id = ?")
+            params.append(text)
+        if user_id is not None and (text := str(user_id).strip()):
+            clauses.append("user_id = ?")
+            params.append(text)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT audit_json
+                FROM persona_update_audits
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [
+            record for row in rows
+            if isinstance(record := _json_loads(row["audit_json"], default={}), dict)
+        ]
+
+    def _upsert_effect_sync(self, effect_id: str, data: dict[str, Any]) -> None:
+        now = _now_text()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO effects (effect_id, effect_json, expires_at, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(effect_id) DO UPDATE SET
+                    effect_json = excluded.effect_json,
+                    expires_at = excluded.expires_at,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    effect_id,
+                    _json_dumps(data),
+                    _optional_text(data, ("expires_at", "expire_at", "until", "end_at")),
+                    1 if _record_active(data) else 0,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def _get_active_effects_sync(self, now: Any) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT effect_json FROM effects
+                WHERE active = 1
+                ORDER BY created_at ASC, effect_id ASC
+                """
+            ).fetchall()
+        records = [_json_loads(row["effect_json"], default={}) for row in rows]
+        return [
+            record for record in records
+            if isinstance(record, dict) and _record_active(record) and not _is_expired(record, now)
+        ]
+
+    def _get_todos_sync(self, include_completed: bool) -> list[dict[str, Any]]:
+        where = "" if include_completed else "WHERE completed = 0"
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT todo_json FROM todos
+                {where}
+                ORDER BY expires_at IS NULL ASC, expires_at ASC, created_at ASC, todo_id ASC
+                """
+            ).fetchall()
+        records = [
+            record for row in rows
+            if isinstance(record := _json_loads(row["todo_json"], default={}), dict)
+        ]
+        if include_completed:
+            return sorted(records, key=_todo_readable_sort_key)
+        now = _now_value(None)
+        open_records = [
+            record for record in records
+            if not _is_expired(record, now)
+        ]
+        return sorted(open_records, key=_todo_readable_sort_key)
+
+    def _upsert_todo_sync(self, todo_id: str, data: dict[str, Any]) -> None:
+        now = _now_text()
+        with self._connect() as conn:
+            existing_row = conn.execute(
+                "SELECT todo_json FROM todos WHERE todo_id = ?",
+                (todo_id,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = _json_loads(existing_row["todo_json"], default={})
+                if isinstance(existing, dict):
+                    data = {**existing, **data}
+                    data["id"] = todo_id
+            conn.execute(
+                """
+                INSERT INTO todos (todo_id, todo_json, completed, expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(todo_id) DO UPDATE SET
+                    todo_json = excluded.todo_json,
+                    completed = excluded.completed,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    todo_id,
+                    _json_dumps(data),
+                    1 if _record_completed(data) else 0,
+                    _optional_text(data, ("expires_at", "expire_at", "until", "end_at")),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def _mark_expired_todos_missed_sync(self, now: Any) -> int:
+        updated = 0
+        updated_at = _now_text()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT todo_id, todo_json FROM todos
+                WHERE completed = 0
+                """
+            ).fetchall()
+            for row in rows:
+                record = _json_loads(row["todo_json"], default={})
+                if not isinstance(record, dict) or not _is_expired(record, now):
+                    continue
+                missed = {**record, "id": str(row["todo_id"]), "status": "missed", "completed": True}
+                cur = conn.execute(
+                    """
+                    UPDATE todos
+                    SET todo_json = ?, completed = 1, updated_at = ?
+                    WHERE todo_id = ? AND completed = 0
+                    """,
+                    (_json_dumps(missed), updated_at, str(row["todo_id"])),
+                )
+                updated += int(cur.rowcount)
+            if updated:
+                conn.commit()
+            return updated
+
+    def _get_cues_sync(self, now: Any) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT cue_json FROM cues
+                WHERE active = 1
+                ORDER BY created_at ASC, cue_id ASC
+                """
+            ).fetchall()
+        records = [_json_loads(row["cue_json"], default={}) for row in rows]
+        return [
+            record for record in records
+            if isinstance(record, dict) and _record_active(record) and not _is_expired(record, now)
+        ]
+
+    def _upsert_cue_sync(self, cue_id: str, data: dict[str, Any]) -> None:
+        now = _now_text()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO cues (cue_id, cue_json, expires_at, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cue_id) DO UPDATE SET
+                    cue_json = excluded.cue_json,
+                    expires_at = excluded.expires_at,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    cue_id,
+                    _json_dumps(data),
+                    _optional_text(data, ("expires_at", "expire_at", "until", "end_at")),
+                    1 if _record_active(data) else 0,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def _get_profile_sync(self, user_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT profile_json FROM user_profiles WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        data = _json_loads(row["profile_json"], default={})
+        return data if isinstance(data, dict) else {}
+
+    def _upsert_profile_sync(self, user_id: str, data: dict[str, Any]) -> None:
+        now = _now_text()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_profiles (user_id, profile_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    profile_json = excluded.profile_json,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, _json_dumps(data), now, now),
+            )
+            conn.commit()
+
+    def _all_profiles_sync(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT profile_json FROM user_profiles ORDER BY user_id ASC"
+            ).fetchall()
+        return [
+            record for row in rows
+            if isinstance(record := _json_loads(row["profile_json"], default={}), dict)
+        ]
+
+    def _insert_json_row_sync(
+        self,
+        table: str,
+        json_column: str,
+        data: dict[str, Any],
+    ) -> int:
+        _validate_table_name(table)
+        _validate_table_name(json_column)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"""
+                INSERT INTO {table} ({json_column}, created_at)
+                VALUES (?, ?)
+                """,
+                (_json_dumps(data), _now_text()),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def _recent_json_rows_sync(
+        self,
+        table: str,
+        json_column: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        _validate_table_name(table)
+        _validate_table_name(json_column)
+        limit = _clamp_int(limit, default=20, minimum=1, maximum=500)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {json_column}
+                FROM (
+                    SELECT id, {json_column} FROM {table}
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            record for row in rows
+            if isinstance(record := _json_loads(row[json_column], default={}), dict)
+        ]
+
+    def _recent_json_rows_desc_sync(
+        self,
+        table: str,
+        json_column: str,
+        limit: int,
+        order_column: str = "id",
+        tie_breaker_column: str = "id",
+    ) -> list[dict[str, Any]]:
+        _validate_table_name(table)
+        _validate_table_name(json_column)
+        _validate_table_name(order_column)
+        _validate_table_name(tie_breaker_column)
+        limit = _clamp_int(limit, default=20, minimum=1, maximum=500)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {json_column}
+                FROM {table}
+                ORDER BY {order_column} DESC, {tie_breaker_column} DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            record for row in rows
+            if isinstance(record := _json_loads(row[json_column], default={}), dict)
+        ]
+
+    def _upsert_sleep_record_sync(self, record_id: str, data: dict[str, Any]) -> None:
+        now = _now_text()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sleep_records (
+                    record_id, record_json, started_at, ended_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(record_id) DO UPDATE SET
+                    record_json = excluded.record_json,
+                    started_at = excluded.started_at,
+                    ended_at = excluded.ended_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record_id,
+                    _json_dumps(data),
+                    _optional_text(data, ("started_at", "start_at", "start")),
+                    _optional_text(data, ("ended_at", "end_at", "end")),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def _update_sleep_record_sync(self, record_id: str, updates: dict[str, Any]) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT record_json FROM sleep_records WHERE record_id = ?",
+                (record_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            data = _json_loads(row["record_json"], default={})
+            if not isinstance(data, dict):
+                data = {}
+            data.update(updates)
+            data.setdefault("id", record_id)
+            data.setdefault("record_id", record_id)
+            conn.execute(
+                """
+                UPDATE sleep_records
+                SET record_json = ?,
+                    started_at = ?,
+                    ended_at = ?,
+                    updated_at = ?
+                WHERE record_id = ?
+                """,
+                (
+                    _json_dumps(data),
+                    _optional_text(data, ("started_at", "start_at", "start")),
+                    _optional_text(data, ("ended_at", "end_at", "end")),
+                    _now_text(),
+                    record_id,
+                ),
+            )
+            conn.commit()
+            return True
+
+    def _add_eat_record_sync(self, data: dict[str, Any]) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO eat_records (record_id, record_json, ended_at, status, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    _optional_text(data, ("record_id", "eat_id", "id")),
+                    _json_dumps(data),
+                    _optional_text(data, ("ended_at", "end_at", "end")),
+                    _optional_text(data, ("status",)),
+                    _now_text(),
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def _update_eat_record_sync(self, record_id: str, updates: dict[str, Any]) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, record_json FROM eat_records WHERE record_id = ? ORDER BY id DESC LIMIT 1",
+                (record_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            data = _json_loads(row["record_json"], default={})
+            if not isinstance(data, dict):
+                data = {}
+            data.update(updates)
+            data.setdefault("id", record_id)
+            data.setdefault("record_id", record_id)
+            conn.execute(
+                """
+                UPDATE eat_records
+                SET record_json = ?,
+                    ended_at = ?,
+                    status = ?
+                WHERE id = ?
+                """,
+                (
+                    _json_dumps(data),
+                    _optional_text(data, ("ended_at", "end_at", "end")),
+                    _optional_text(data, ("status",)),
+                    row["id"],
+                ),
+            )
+            conn.commit()
+            return True
+
+    def _delete_by_ids_sync(self, table: str, id_column: str, ids: list[str]) -> int:
+        _validate_table_name(table)
+        _validate_table_name(id_column)
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE {id_column} IN ({placeholders})",
+                ids,
+            )
+            conn.commit()
+            return int(cur.rowcount)
+
+    def _expire_records_sync(
+        self,
+        table: str,
+        id_column: str,
+        json_column: str,
+        now: Any,
+    ) -> int:
+        _validate_table_name(table)
+        _validate_table_name(id_column)
+        _validate_table_name(json_column)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {id_column}, {json_column} FROM {table}"
+            ).fetchall()
+            expired_ids: list[str] = []
+            for row in rows:
+                record = _json_loads(row[json_column], default={})
+                if isinstance(record, dict) and _is_expired(record, now):
+                    expired_ids.append(str(row[id_column]))
+            if not expired_ids:
+                return 0
+            placeholders = ",".join("?" for _ in expired_ids)
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE {id_column} IN ({placeholders})",
+                expired_ids,
+            )
+            conn.commit()
+            return int(cur.rowcount)
+
+    def _read_important_sync(self, default: Any) -> Any:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT memories_json FROM important_memories WHERE id = 1"
+            ).fetchone()
+        if row is None:
+            return default if default is not None else []
+        return _json_loads(row["memories_json"], default=default if default is not None else [])
+
+    def _write_important_sync(self, data: Any) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO important_memories (id, memories_json, updated_at)
+                VALUES (1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    memories_json = excluded.memories_json,
+                    updated_at = excluded.updated_at
+                """,
+                (_json_dumps(data), _now_text()),
+            )
+            conn.commit()
+
+    def _important_count_sync(self) -> int:
+        data = self._read_important_sync(default=[])
+        return len(data) if isinstance(data, list) else 0

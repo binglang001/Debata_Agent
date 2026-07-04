@@ -32,7 +32,7 @@ Debata_Agent doesn't come with a fixed personality. You give it one, and it beco
 
 | | Typical AI bot | Debata_Agent |
 |---|---|---|
-| Context | Per-conversation | **Unified timeline across all chats** |
+| Context | Per-conversation | **Unified timeline plus state and relationship context** |
 | Replies | One long message | 3-7 short messages, 60% under 12 characters |
 | Timing | Always instant | Can "miss" messages, reply hours later |
 | Tone | "Of course! 😊" | "?" / "nah" / "6" / "whatever" |
@@ -66,6 +66,10 @@ python main.py --no-gui     # Headless mode for servers
 
 - **Real human chat patterns** — distilled from 30+ real chat logs: short messages, split-send, no goodbyes, no customer-service tone
 - **Relationship matrix** — one persona, four tones depending on who's talking
+- **Persona state management** — age brackets and age hints, energy, satiety, mood, social needs, sleep/meal-end recovery estimates with formula fallback, and configurable background maintenance that defaults to 30 minutes
+- **Structured mind context** — events, bounded episode fragments, current state, user profiles, profile audits, short-term effects, clues, todos, and relevant long-term memory are passed into chat decisions
+- **Auditability** — background maintenance, recovery source, and persona state changes can be inspected from the UI and audit records
+- **Persona settings** — the settings page covers persona management enablement, current persona age override, energy/satiety modes, fallback decay/recovery parameters, and Persona/Social/Subconscious background agent options
 - **Imperfection by design** — going off-topic, changing mind, forgetting things isn't a bug
 - **13 LLM providers** — OpenAI / Anthropic Claude / DeepSeek / GLM / Qwen / Volcengine / Gemini / Moonshot / SiliconFlow / OpenRouter / Groq / Together / xAI
 - **Per-agent model config** — chat, proactive thinking, and summarization can each use different models
@@ -89,6 +93,27 @@ python main.py
 ```bash
 pip install -e .
 python main.py --no-gui
+```
+
+## Project layout
+
+```
+Debata_Agent/
+├── adapters/        Channel adapters, currently NapCat
+├── providers/       LLM providers with presets and guides
+├── agents/          Chat, proactive thinking, summarization, persona creation, persona state management
+├── mind/            Persona state, user profiles, closeness, short-term clues/todos, audit storage
+├── memory/          Conversation history and long-term memory
+├── tools/           AI tools and decorator-based registration
+├── features/        Vision, TTS, weather, search, embedding
+├── core/            Event bus, message pipeline, runtime lifecycle
+├── app_config/      Configuration and encrypted secrets
+├── ui/              PySide6 GUI, setup wizard, dashboard, tray
+├── plugins/         Local model plugins
+├── personas/        Persona files
+├── docs/            Developer documentation
+├── tests/           Unit and integration tests
+└── main.py          Entry point
 ```
 
 systemd service example (`/etc/systemd/system/debata.service`):
