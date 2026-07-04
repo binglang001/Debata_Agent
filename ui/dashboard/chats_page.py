@@ -8,17 +8,14 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import re
 import time
 import weakref
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
-from datetime import datetime
+from collections.abc import Callable
 from typing import Any, Literal
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QTextCursor
@@ -38,6 +35,452 @@ from PySide6.QtWidgets import (
 
 from ..theme import Spacing, palette_for_theme, resolve_theme_name
 from ..wizard.components import EmptyState
+from .chats.display_items import (
+    _CQ_MEDIA_RE as _CQ_MEDIA_RE,
+)
+from .chats.display_items import (
+    _MEDIA_OR_FILE_EXT_RE as _MEDIA_OR_FILE_EXT_RE,
+)
+from .chats.display_items import (
+    _MEDIA_TOOL_NAMES as _MEDIA_TOOL_NAMES,
+)
+from .chats.display_items import (
+    CHAT_SORT_LAYER_RANK as CHAT_SORT_LAYER_RANK,
+)
+from .chats.display_items import (
+    _accepted_message_conversation_id as _accepted_message_conversation_id,
+)
+from .chats.display_items import (
+    _display_item_categories as _display_item_categories,
+)
+from .chats.display_items import (
+    _display_item_has_media_or_file as _display_item_has_media_or_file,
+)
+from .chats.display_items import (
+    _display_item_matches_filters as _display_item_matches_filters,
+)
+from .chats.display_items import (
+    _display_item_record as _display_item_record,
+)
+from .chats.display_items import (
+    _display_item_record_order as _display_item_record_order,
+)
+from .chats.display_items import (
+    _display_item_search_text as _display_item_search_text,
+)
+from .chats.display_items import (
+    _display_item_sort_key as _display_item_sort_key,
+)
+from .chats.display_items import (
+    _display_item_sort_ts as _display_item_sort_ts,
+)
+from .chats.display_items import (
+    _filter_display_items as _filter_display_items,
+)
+from .chats.display_items import (
+    _is_generated_outbound as _is_generated_outbound,
+)
+from .chats.display_items import (
+    _parse_float_value as _parse_float_value,
+)
+from .chats.display_items import (
+    _parse_timestamp_value as _parse_timestamp_value,
+)
+from .chats.display_items import (
+    _raw_send_order as _raw_send_order,
+)
+from .chats.display_items import (
+    _record_has_media_or_file as _record_has_media_or_file,
+)
+from .chats.display_items import (
+    _record_send_id as _record_send_id,
+)
+from .chats.display_items import (
+    _record_send_order as _record_send_order,
+)
+from .chats.display_items import (
+    _record_sort_layer as _record_sort_layer,
+)
+from .chats.display_items import (
+    _record_sort_value_for_layer as _record_sort_value_for_layer,
+)
+from .chats.display_items import (
+    _record_timestamp_sort_value as _record_timestamp_sort_value,
+)
+from .chats.display_items import (
+    _remember_generated_outbound as _remember_generated_outbound,
+)
+from .chats.display_items import (
+    _should_attach_tool_result_to_call as _should_attach_tool_result_to_call,
+)
+from .chats.display_items import (
+    _should_skip_generated_outbound as _should_skip_generated_outbound,
+)
+from .chats.display_items import (
+    _sort_display_items as _sort_display_items,
+)
+from .chats.display_items import (
+    _text_has_media_or_file as _text_has_media_or_file,
+)
+from .chats.display_items import (
+    _unique_item_id as _unique_item_id,
+)
+from .chats.grouping import (
+    _LEGACY_HEADER_LINE_RE as _LEGACY_HEADER_LINE_RE,
+)
+from .chats.grouping import (
+    _LEGACY_HEADER_RE as _LEGACY_HEADER_RE,
+)
+from .chats.grouping import (
+    _accepted_messages_for_send_id as _accepted_messages_for_send_id,
+)
+from .chats.grouping import (
+    _conversation_info as _conversation_info,
+)
+from .chats.grouping import (
+    _conversation_info_from_id as _conversation_info_from_id,
+)
+from .chats.grouping import (
+    _conversation_infos_from_payload as _conversation_infos_from_payload,
+)
+from .chats.grouping import (
+    _conversation_list_signature as _conversation_list_signature,
+)
+from .chats.grouping import (
+    _group_records_by_conversation as _group_records_by_conversation,
+)
+from .chats.grouping import (
+    _group_target_info as _group_target_info,
+)
+from .chats.grouping import (
+    _private_target_info as _private_target_info,
+)
+from .chats.grouping import (
+    _record_cache_blob as _record_cache_blob,
+)
+from .chats.grouping import (
+    _record_role as _record_role,
+)
+from .chats.grouping import (
+    _records_cache_signature as _records_cache_signature,
+)
+from .chats.grouping import (
+    _remember_send_id_targets as _remember_send_id_targets,
+)
+from .chats.grouping import (
+    _send_receipt_sent_fallback_records as _send_receipt_sent_fallback_records,
+)
+from .chats.grouping import (
+    _system_conversation_label as _system_conversation_label,
+)
+from .chats.grouping import (
+    _targeted_tool_calls_for_record as _targeted_tool_calls_for_record,
+)
+from .chats.grouping import (
+    _tool_call_target_infos as _tool_call_target_infos,
+)
+from .chats.grouping import (
+    _tool_result_target_infos as _tool_result_target_infos,
+)
+from .chats.grouping import (
+    _unique_conversation_infos as _unique_conversation_infos,
+)
+from .chats.models import (
+    ConversationDisplayCache,
+    DisplayItem,
+    DisplaySeverity,
+    SendDisplayContext,
+)
+from .chats.models import (
+    DisplayKind as DisplayKind,
+)
+from .chats.records import (
+    ARCHIVE_FETCH_PAGE_SIZE as ARCHIVE_FETCH_PAGE_SIZE,
+)
+from .chats.records import (
+    EVENT_STORE_CHAT_PAGE_EVENT_TYPES as EVENT_STORE_CHAT_PAGE_EVENT_TYPES,
+)
+from .chats.records import (
+    EVENT_STORE_QQ_FETCH_LIMIT as EVENT_STORE_QQ_FETCH_LIMIT,
+)
+from .chats.records import (
+    QQ_VISIBLE_EVENT_TYPES as QQ_VISIBLE_EVENT_TYPES,
+)
+from .chats.records import (
+    RUNTIME_EVENT_TYPES as RUNTIME_EVENT_TYPES,
+)
+from .chats.records import (
+    _chat_timeline_message_to_record as _chat_timeline_message_to_record,
+)
+from .chats.records import (
+    _dedupe_event_store_records as _dedupe_event_store_records,
+)
+from .chats.records import (
+    _dedupe_records_by_real_identity as _dedupe_records_by_real_identity,
+)
+from .chats.records import (
+    _duplicate_identity_text as _duplicate_identity_text,
+)
+from .chats.records import (
+    _event_id as _event_id,
+)
+from .chats.records import (
+    _event_sort_id as _event_sort_id,
+)
+from .chats.records import (
+    _event_store_event_to_record as _event_store_event_to_record,
+)
+from .chats.records import (
+    _event_store_record_duplicate_identity as _event_store_record_duplicate_identity,
+)
+from .chats.records import (
+    _event_store_runtime_duplicate_identities as _event_store_runtime_duplicate_identities,
+)
+from .chats.records import (
+    _event_type_is_runtime as _event_type_is_runtime,
+)
+from .chats.records import (
+    _event_type_visible_on_chat_page as _event_type_visible_on_chat_page,
+)
+from .chats.records import (
+    _first_payload_text as _first_payload_text,
+)
+from .chats.records import (
+    _full_archive_records_for_page as _full_archive_records_for_page,
+)
+from .chats.records import (
+    _history_runtime_event_records as _history_runtime_event_records,
+)
+from .chats.records import (
+    _light_archive_result_to_record as _light_archive_result_to_record,
+)
+from .chats.records import (
+    _load_archive_records_paged as _load_archive_records_paged,
+)
+from .chats.records import (
+    _load_chat_page_records as _load_chat_page_records,
+)
+from .chats.records import (
+    _load_chat_timeline_records as _load_chat_timeline_records,
+)
+from .chats.records import (
+    _load_event_store_records as _load_event_store_records,
+)
+from .chats.records import (
+    _merge_chat_page_records as _merge_chat_page_records,
+)
+from .chats.records import (
+    _optional_record_text as _optional_record_text,
+)
+from .chats.records import (
+    _payload_list as _payload_list,
+)
+from .chats.records import (
+    _qq_event_conversation_id as _qq_event_conversation_id,
+)
+from .chats.records import (
+    _qq_event_timestamp as _qq_event_timestamp,
+)
+from .chats.records import (
+    _qq_visible_event_to_record as _qq_visible_event_to_record,
+)
+from .chats.records import (
+    _real_record_identity as _real_record_identity,
+)
+from .chats.records import (
+    _recent_chat_page_events as _recent_chat_page_events,
+)
+from .chats.records import (
+    _record_conversation_id_for_display as _record_conversation_id_for_display,
+)
+from .chats.records import (
+    _record_display_base_id as _record_display_base_id,
+)
+from .chats.records import (
+    _record_event_id as _record_event_id,
+)
+from .chats.records import (
+    _record_event_payload as _record_event_payload,
+)
+from .chats.records import (
+    _record_is_qq_visible_outbound as _record_is_qq_visible_outbound,
+)
+from .chats.records import (
+    _record_message_id as _record_message_id,
+)
+from .chats.records import (
+    _record_timestamp as _record_timestamp,
+)
+from .chats.records import (
+    _record_with_sort_layer as _record_with_sort_layer,
+)
+from .chats.records import (
+    _runtime_event_conversation_id as _runtime_event_conversation_id,
+)
+from .chats.records import (
+    _runtime_event_detail as _runtime_event_detail,
+)
+from .chats.records import (
+    _runtime_event_summary as _runtime_event_summary,
+)
+from .chats.records import (
+    _runtime_event_summary_parts as _runtime_event_summary_parts,
+)
+from .chats.records import (
+    _runtime_event_summary_text as _runtime_event_summary_text,
+)
+from .chats.records import (
+    _runtime_event_title as _runtime_event_title,
+)
+from .chats.records import (
+    _runtime_event_to_record as _runtime_event_to_record,
+)
+from .chats.records import (
+    _runtime_event_tool_call_id as _runtime_event_tool_call_id,
+)
+from .chats.records import (
+    _runtime_event_tool_name as _runtime_event_tool_name,
+)
+from .chats.records import (
+    _runtime_payload_subset as _runtime_payload_subset,
+)
+from .chats.records import (
+    _runtime_record_duplicate_identities as _runtime_record_duplicate_identities,
+)
+from .chats.records import (
+    _runtime_record_severity as _runtime_record_severity,
+)
+from .chats.records import (
+    _runtime_record_tool_call_identity as _runtime_record_tool_call_identity,
+)
+from .chats.records import (
+    _runtime_tool_call_arguments as _runtime_tool_call_arguments,
+)
+from .chats.records import (
+    _runtime_tool_call_for_record as _runtime_tool_call_for_record,
+)
+from .chats.records import (
+    _runtime_tool_result_payload as _runtime_tool_result_payload,
+)
+from .chats.records import (
+    _send_runtime_duplicate_ids as _send_runtime_duplicate_ids,
+)
+from .chats.records import (
+    _send_runtime_primary_duplicate_id as _send_runtime_primary_duplicate_id,
+)
+from .chats.records import (
+    _sort_unique_chat_page_events as _sort_unique_chat_page_events,
+)
+from .chats.records import (
+    _system_note_duplicate_identity as _system_note_duplicate_identity,
+)
+from .chats.records import (
+    _tag_record_order as _tag_record_order,
+)
+from .chats.records import (
+    _tool_call_name as _tool_call_name,
+)
+from .chats.records import (
+    _unique_text_parts as _unique_text_parts,
+)
+from .chats.text_format import (
+    INLINE_PREVIEW_LIMIT as INLINE_PREVIEW_LIMIT,
+)
+from .chats.text_format import (
+    _compact_inline_tokens,
+    _escape,
+    _escape_attr,
+    _extract_tag_text,
+    _first_nonempty_line,
+    _format_send_receipt_summary,
+    _format_send_status_summary,
+    _format_tool_call_for_display,
+    _format_tool_result_summary,
+    _parse_json_object,
+    _send_receipt_sent_items,
+    _send_status_info,
+)
+from .chats.text_format import (
+    _compact_json_blob as _compact_json_blob,
+)
+from .chats.text_format import (
+    _compact_path as _compact_path,
+)
+from .chats.text_format import (
+    _compact_url as _compact_url,
+)
+from .chats.text_format import (
+    _compact_workspace_path as _compact_workspace_path,
+)
+from .chats.text_format import (
+    _extract_tag_json as _extract_tag_json,
+)
+from .chats.text_format import (
+    _format_commit_send_attempt_args as _format_commit_send_attempt_args,
+)
+from .chats.text_format import (
+    _format_generic_tool_args as _format_generic_tool_args,
+)
+from .chats.text_format import (
+    _format_group_send_args as _format_group_send_args,
+)
+from .chats.text_format import (
+    _format_message_list_summary as _format_message_list_summary,
+)
+from .chats.text_format import (
+    _format_private_send_args as _format_private_send_args,
+)
+from .chats.text_format import (
+    _format_send_receipt_text_summary as _format_send_receipt_text_summary,
+)
+from .chats.text_format import (
+    _format_tool_arg_value as _format_tool_arg_value,
+)
+from .chats.text_format import (
+    _format_upload_args as _format_upload_args,
+)
+from .chats.text_format import (
+    _message_list_sample as _message_list_sample,
+)
+from .chats.text_format import (
+    _message_with_delay as _message_with_delay,
+)
+from .chats.text_format import (
+    _parse_send_receipt_text_sent_items as _parse_send_receipt_text_sent_items,
+)
+from .chats.text_format import (
+    _parse_send_receipt_text_sent_line as _parse_send_receipt_text_sent_line,
+)
+from .chats.text_format import (
+    _parse_tool_arguments as _parse_tool_arguments,
+)
+from .chats.text_format import (
+    _send_receipt_text_field_value as _send_receipt_text_field_value,
+)
+from .chats.text_format import (
+    _send_receipt_text_is_section_heading as _send_receipt_text_is_section_heading,
+)
+from .chats.text_format import (
+    _send_receipt_text_section_count as _send_receipt_text_section_count,
+)
+from .chats.text_format import (
+    _send_receipt_text_section_lines as _send_receipt_text_section_lines,
+)
+from .chats.text_format import (
+    _send_receipt_text_send_id as _send_receipt_text_send_id,
+)
+from .chats.text_format import (
+    _send_receipt_text_sent_items as _send_receipt_text_sent_items,
+)
+from .chats.text_format import (
+    _send_status_payload_completed as _send_status_payload_completed,
+)
+from .chats.text_format import (
+    _send_status_text_completed as _send_status_text_completed,
+)
+from .chats.text_format import (
+    _short_text as _short_text,
+)
 from .copy import DASHBOARD_COPY
 from .tool_display import format_tool_call, format_tool_result
 
@@ -45,82 +488,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_VISIBLE_RECORD_LIMIT = 300
 VISIBLE_RECORD_STEP = 300
-ARCHIVE_FETCH_PAGE_SIZE = 500
-EVENT_STORE_QQ_FETCH_LIMIT = 500
 COMPACT_TEXT_LIMIT = 1800
-INLINE_PREVIEW_LIMIT = 80
-QQ_VISIBLE_EVENT_TYPES = ("qq_message_received", "qq_message_sent")
-RUNTIME_EVENT_TYPES = (
-    "tool_call_started",
-    "tool_result_received",
-    "system_note_recorded",
-    "history_truncated",
-    "send_attempt_recorded",
-    "send_batch_accepted",
-    "send_message_started",
-    "send_message_succeeded",
-    "send_receipt_recorded",
-)
-EVENT_STORE_CHAT_PAGE_EVENT_TYPES = (*QQ_VISIBLE_EVENT_TYPES, *RUNTIME_EVENT_TYPES)
 CHAT_REFRESH_DEBOUNCE_MS = 100
 CHAT_SEARCH_DEBOUNCE_MS = 150
-CHAT_SORT_LAYER_RANK = {
-    "archive": 0,
-    "event_store": 1,
-    "timeline": 2,
-    "history": 3,
-    "fallback": 4,
-}
-
-DisplayKind = Literal[
-    "inbound_message",
-    "outbound_message",
-    "assistant_note",
-    "tool_call",
-    "tool_result",
-    "system_event",
-    "runtime_receipt",
-    "reasoning",
-]
-DisplaySeverity = Literal["normal", "info", "warning", "error"]
-
-
-@dataclass(slots=True)
-class DisplayItem:
-    item_id: str
-    conversation_id: str
-    timestamp: str | None
-    kind: DisplayKind
-    speaker_label: str | None
-    speaker_id: str | None
-    role_label: str
-    text: str
-    summary: str
-    raw: dict[str, Any]
-    related_tool_call_id: str | None = None
-    related_message_id: str | None = None
-    collapsed_by_default: bool = False
-    severity: DisplaySeverity = "normal"
-    tool_results: list[DisplayItem] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class SendDisplayContext:
-    accepted_by_send_id: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    real_msg_ids: set[str] = field(default_factory=set)
-    real_send_orders: set[tuple[str, int]] = field(default_factory=set)
-    generated_msg_ids: set[str] = field(default_factory=set)
-    generated_send_orders: set[tuple[str, int]] = field(default_factory=set)
-
-
-@dataclass(slots=True)
-class ConversationDisplayCache:
-    conversation_key: str
-    records_signature: tuple[int, str]
-    persona_name: str
-    normalized_items: list[DisplayItem]
-    filter_signature: tuple[str, bool, bool, bool, bool] | None = None
-    filtered_items: list[DisplayItem] = field(default_factory=list)
 
 
 class ChatsPage(QWidget):
@@ -203,6 +573,11 @@ class ChatsPage(QWidget):
         self._show_tools_cb.stateChanged.connect(self._on_filter_changed)
         filters.addWidget(self._show_tools_cb)
 
+        self._show_reasoning_cb = QCheckBox("思考")
+        self._show_reasoning_cb.setChecked(True)
+        self._show_reasoning_cb.stateChanged.connect(self._on_filter_changed)
+        filters.addWidget(self._show_reasoning_cb)
+
         self._media_only_cb = QCheckBox("只看图片/文件")
         self._media_only_cb.setChecked(False)
         self._media_only_cb.stateChanged.connect(self._on_filter_changed)
@@ -278,6 +653,17 @@ class ChatsPage(QWidget):
 
         self._sync_chat_timeline_subscription()
         self.refresh()
+
+    def on_shown(self) -> None:
+        self._sync_chat_timeline_subscription()
+        if not self._timer.isActive():
+            self._timer.start()
+        self.refresh()
+
+    def on_hidden(self) -> None:
+        self._timer.stop()
+        self._refresh_debounce_timer.stop()
+        self._search_debounce_timer.stop()
 
     def refresh(self) -> None:
         self._sync_chat_timeline_subscription()
@@ -570,12 +956,13 @@ class ChatsPage(QWidget):
         else:
             bar.setValue(min(value, bar.maximum()))
 
-    def _display_filter_signature(self) -> tuple[str, bool, bool, bool, bool]:
+    def _display_filter_signature(self) -> tuple[str, bool, bool, bool, bool, bool]:
         return (
             self._search_text,
             self._show_chat_cb.isChecked(),
             self._show_system_cb.isChecked(),
             self._show_tools_cb.isChecked(),
+            self._show_reasoning_cb.isChecked(),
             self._media_only_cb.isChecked(),
         )
 
@@ -616,6 +1003,7 @@ class ChatsPage(QWidget):
                 show_chat=self._show_chat_cb.isChecked(),
                 show_system=self._show_system_cb.isChecked(),
                 show_tools=self._show_tools_cb.isChecked(),
+                show_reasoning=self._show_reasoning_cb.isChecked(),
                 media_only=self._media_only_cb.isChecked(),
             )
             cache.filter_signature = filter_signature
@@ -764,408 +1152,19 @@ def _chat_html_style(theme_name: str) -> str:
 
 def _toggle_item_id_from_url(url: QUrl) -> str | None:
     raw = url.toString()
-    prefix = "diana-chat-toggle:"
-    if not raw.startswith(prefix):
+    prefix = "debata-chat-toggle:"
+    if not raw.lower().startswith(prefix):
         return None
-    item_id = unquote(raw.removeprefix(prefix))
+    item_id = unquote(raw[len(prefix):])
     return item_id or None
 
 
 def _toggle_href(item_id: str) -> str:
-    return f"diana-chat-toggle:{quote(item_id, safe='')}"
+    return f"debata-chat-toggle:{quote(item_id, safe='')}"
 
 
 def _display_item_expand_id(item: DisplayItem) -> str:
     return f"{item.conversation_id}\n{item.item_id}"
-
-
-_LEGACY_HEADER_RE = re.compile(
-    r"^【(?P<timestamp>.*?) (?P<location>群聊 (?P<group_id>\S+)|私聊) "
-    r"(?P<nickname>.*?)\((?P<user_id>.*?)\) msg_id=(?P<message_id>.*?)】",
-    re.S,
-)
-_LEGACY_HEADER_LINE_RE = re.compile(
-    r"(?m)^【(?P<timestamp>[^\n】]*?) (?P<location>群聊 (?P<group_id>\S+)|私聊) "
-    r"(?P<nickname>.*?)\((?P<user_id>.*?)\) msg_id=(?P<message_id>.*?)】"
-)
-_URL_RE = re.compile(r"https?://[^\s<>'\"]+")
-_WINDOWS_PATH_RE = re.compile(r"(?i)\b[A-Z]:\\[^\s<>'\"|?*]+")
-_WORKSPACE_PATH_RE = re.compile(r"\b(?:workspace=)?(?:incoming|workspace|outgoing)[/\\][^\s\]]+")
-_CQ_MEDIA_RE = re.compile(r"\[CQ:(?:image|file|record|video)\b", re.I)
-_MEDIA_OR_FILE_EXT_RE = re.compile(
-    r"(?i)(?:^|[\s\"'=:/\\])[\w.\-()[\]/\\]+"
-    r"\.(?:png|jpe?g|gif|webp|bmp|svg|mp4|mov|mkv|webm|mp3|wav|ogg|flac|"
-    r"pdf|docx?|xlsx?|pptx?|txt|md|zip|7z|rar|tar|gz|json|csv)\b"
-)
-_MEDIA_TOOL_NAMES = {
-    "describe_image",
-    "send_group_image",
-    "send_private_image",
-    "send_emoji",
-    "upload_file",
-    "read_file",
-    "write_file",
-    "edit_file",
-    "get_forward_msg",
-}
-
-
-def _group_records_by_conversation(records: list[dict]) -> list[dict]:
-    """把线性 history 分组成会话。
-
-    新记录优先读 metadata；旧记录从 MessagePipeline 写入的正文头部解析。
-    优先使用 record.conversation_id；无会话 ID 的 system/tool 归入系统记录。
-    旧记录没有 conversation_id 时，assistant 仅在紧跟用户消息时归入最近会话，
-    避免后台/撤回等系统轮次漂移到普通会话。
-    """
-    conversations: dict[str, dict] = {}
-    order: list[str] = []
-    current_key: str | None = None
-    send_id_targets: dict[str, list[dict[str, str]]] = {}
-
-    def _ensure(key: str, label: str) -> dict:
-        if key not in conversations:
-            conversations[key] = {
-                "key": key,
-                "label": label,
-                "records": [],
-                "preview": "",
-            }
-            order.append(key)
-        return conversations[key]
-
-    def _append(info: dict[str, str], rec: dict) -> None:
-        conv = _ensure(info["key"], info["label"])
-        conv["records"].append(rec)
-        content = (rec.get("content") or "").strip()
-        if content:
-            conv["preview"] = content
-
-    for rec in records:
-        role = _record_role(rec)
-        if role == "tool":
-            _remember_send_id_targets(rec, send_id_targets)
-
-        explicit_cid = rec.get("conversation_id")
-        explicit_key = explicit_cid if isinstance(explicit_cid, str) else ""
-        for info, fallback_record in _send_receipt_sent_fallback_records(
-            rec,
-            explicit_key=explicit_key,
-        ):
-            _append(info, fallback_record)
-
-        send_status = _send_status_info(str(rec.get("content") or ""))
-        if send_status and send_status.get("completed"):
-            send_id = send_status.get("send_id") or ""
-            targets = send_id_targets.get(send_id, [])
-            if targets:
-                accepted = _accepted_messages_for_send_id(records, send_id)
-                for info in targets:
-                    clone = {
-                        **rec,
-                        "_display_conversation_id": info["key"],
-                        "_accepted_messages_for_send_status": accepted,
-                    }
-                    _append(info, clone)
-
-        if isinstance(explicit_cid, str) and explicit_cid:
-            info = _conversation_info_from_id(explicit_cid)
-            if (
-                send_status
-                and send_status.get("completed")
-                and info["key"] in {target["key"] for target in send_id_targets.get(send_id, [])}
-            ):
-                continue
-            current_key = info["key"] if role == "user" else current_key
-            _append(info, rec)
-        elif role == "user":
-            info = _conversation_info(rec)
-            current_key = info["key"]
-            _append(info, rec)
-        elif role in {"system", "tool"}:
-            _append({"key": "system:global", "label": "系统记录"}, rec)
-        else:
-            if current_key is None:
-                _append({"key": "unknown:history", "label": "未标记来源"}, rec)
-            else:
-                _append(
-                    {
-                        "key": current_key,
-                        "label": "系统记录" if current_key.startswith("system:") else current_key,
-                    },
-                    rec,
-                )
-
-    # 最近活跃的会话排前面。
-    return [conversations[k] for k in reversed(order)]
-
-
-def _targeted_tool_calls_for_record(
-    rec: dict,
-) -> tuple[list[tuple[dict[str, str], list[dict]]], dict[str, list[dict[str, str]]]]:
-    by_conversation: dict[str, tuple[dict[str, str], list[dict]]] = {}
-    call_targets: dict[str, list[dict[str, str]]] = {}
-    for tool_call in rec.get("tool_calls") or []:
-        if not isinstance(tool_call, dict):
-            continue
-        targets = _tool_call_target_infos(tool_call)
-        if not targets:
-            continue
-        tool_call_id = str(tool_call.get("id") or "").strip()
-        if tool_call_id:
-            call_targets[tool_call_id] = targets
-        for info in targets:
-            entry = by_conversation.setdefault(info["key"], (info, []))
-            entry[1].append(tool_call)
-    return list(by_conversation.values()), call_targets
-
-
-def _tool_call_target_infos(tool_call: dict) -> list[dict[str, str]]:
-    func = tool_call.get("function") if isinstance(tool_call, dict) else None
-    if not isinstance(func, dict):
-        return []
-    name = str(func.get("name") or "").strip()
-    args = _parse_tool_arguments(func.get("arguments"))
-    if name == "send_private_messages":
-        targets = args.get("targets")
-        if not isinstance(targets, list):
-            targets = [args]
-        return _unique_conversation_infos(
-            _private_target_info(target)
-            for target in targets
-            if isinstance(target, dict)
-        )
-    if name == "send_group_message":
-        return _unique_conversation_infos([_group_target_info(args)])
-    return _conversation_infos_from_payload(args)
-
-
-def _tool_result_target_infos(
-    rec: dict,
-    tool_call_targets: dict[str, list[dict[str, str]]],
-) -> list[dict[str, str]]:
-    targets: list[dict[str, str]] = []
-    payload = _parse_json_object(str(rec.get("content") or ""))
-    if payload:
-        targets.extend(_conversation_infos_from_payload(payload))
-        for key in ("sent", "accepted_messages", "accepted", "queued"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        targets.extend(_conversation_infos_from_payload(item))
-    tool_call_id = str(rec.get("tool_call_id") or "").strip()
-    if tool_call_id:
-        targets.extend(tool_call_targets.get(tool_call_id, []))
-    return _unique_conversation_infos(targets)
-
-
-def _remember_send_id_targets(
-    rec: dict,
-    send_id_targets: dict[str, list[dict[str, str]]],
-) -> None:
-    payload = _parse_json_object(str(rec.get("content") or ""))
-    if not payload:
-        return
-    send_id = str(payload.get("send_id") or "").strip()
-    if not send_id:
-        return
-    targets: list[dict[str, str]] = []
-    for key in ("accepted_messages", "sent"):
-        value = payload.get(key)
-        if not isinstance(value, list):
-            continue
-        for item in value:
-            if isinstance(item, dict):
-                targets.extend(_conversation_infos_from_payload(item))
-    if targets:
-        send_id_targets[send_id] = _unique_conversation_infos(
-            [*send_id_targets.get(send_id, []), *targets]
-        )
-
-
-def _send_receipt_sent_fallback_records(
-    rec: dict[str, Any],
-    *,
-    explicit_key: str,
-) -> list[tuple[dict[str, str], dict[str, Any]]]:
-    result: list[tuple[dict[str, str], dict[str, Any]]] = []
-    for sent in _send_receipt_sent_items(str(rec.get("content") or "")):
-        text = str(sent.get("content") or sent.get("label") or "").strip()
-        if not text:
-            continue
-        for info in _conversation_infos_from_payload(sent):
-            if info["key"] == explicit_key:
-                continue
-            fallback = {
-                **sent,
-                "role": "assistant",
-                "direction": "outbound",
-                "content": text,
-                "conversation_id": info["key"],
-                "_display_conversation_id": info["key"],
-                "qq_visible": sent.get("qq_visible", True),
-                "_synthetic_source": "send_receipt",
-                "_record_order": rec.get("_record_order"),
-            }
-            timestamp = sent.get("time") or rec.get("timestamp") or rec.get("created_at")
-            if timestamp and not fallback.get("timestamp"):
-                fallback["timestamp"] = timestamp
-            result.append((info, fallback))
-    return result
-
-
-def _accepted_messages_for_send_id(records: list[dict], send_id: str) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
-    for rec in records:
-        payload = _parse_json_object(str(rec.get("content") or ""))
-        if not payload or str(payload.get("send_id") or "").strip() != send_id:
-            continue
-        accepted = payload.get("accepted_messages")
-        if isinstance(accepted, list):
-            messages.extend(dict(item) for item in accepted if isinstance(item, dict))
-    return messages
-
-
-def _conversation_infos_from_payload(payload: dict[str, Any]) -> list[dict[str, str]]:
-    infos: list[dict[str, str]] = []
-    conversation_id = str(payload.get("conversation_id") or "").strip()
-    if conversation_id:
-        infos.append(_conversation_info_from_id(conversation_id))
-    scope = str(payload.get("scope") or payload.get("target_type") or "").strip()
-    if scope == "group":
-        infos.append(_group_target_info(payload))
-    elif scope in {"private", "user"}:
-        infos.append(_private_target_info(payload))
-    elif payload.get("group_id"):
-        infos.append(_group_target_info(payload))
-    elif payload.get("target_qq") or payload.get("user_id") or payload.get("target_id"):
-        infos.append(_private_target_info(payload))
-    return _unique_conversation_infos(infos)
-
-
-def _private_target_info(payload: dict[str, Any]) -> dict[str, str] | None:
-    target_id = str(
-        payload.get("target_qq")
-        or payload.get("user_id")
-        or payload.get("target_id")
-        or payload.get("sender_id")
-        or ""
-    ).strip()
-    if not target_id:
-        return None
-    return _conversation_info_from_id(f"private:{target_id}")
-
-
-def _group_target_info(payload: dict[str, Any]) -> dict[str, str] | None:
-    group_id = str(payload.get("group_id") or payload.get("target_id") or "").strip()
-    if not group_id:
-        return None
-    return _conversation_info_from_id(f"group:{group_id}")
-
-
-def _unique_conversation_infos(infos: Iterable[dict[str, str] | None]) -> list[dict[str, str]]:
-    result: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for info in infos:
-        if not info:
-            continue
-        key = str(info.get("key") or "").strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        result.append({"key": key, "label": str(info.get("label") or key)})
-    return result
-
-
-def _parse_json_object(content: str) -> dict[str, Any] | None:
-    try:
-        value = json.loads(content)
-    except json.JSONDecodeError:
-        return None
-    return value if isinstance(value, dict) else None
-
-
-def _conversation_info(rec: dict) -> dict[str, str]:
-    meta_messages = (rec.get("metadata") or {}).get("messages") or []
-    first = meta_messages[0] if meta_messages else None
-    if isinstance(first, dict):
-        scope = first.get("scope") or "private"
-        if scope == "group":
-            group_id = str(first.get("group_id") or first.get("target_id") or "未知群")
-            return {"key": f"group:{group_id}", "label": f"群聊 {group_id}"}
-        user_id = str(first.get("user_id") or first.get("target_id") or "未知用户")
-        nickname = str(first.get("nickname") or "私聊")
-        return {"key": f"private:{user_id}", "label": f"私聊 {nickname}({user_id})"}
-
-    content = rec.get("content") or ""
-    match = _LEGACY_HEADER_RE.match(content)
-    if match:
-        if match.group("group_id"):
-            group_id = match.group("group_id")
-            return {"key": f"group:{group_id}", "label": f"群聊 {group_id}"}
-        user_id = match.group("user_id")
-        nickname = match.group("nickname")
-        return {"key": f"private:{user_id}", "label": f"私聊 {nickname}({user_id})"}
-    return {"key": "unknown:history", "label": "未标记来源"}
-
-
-def _conversation_info_from_id(conversation_id: str) -> dict[str, str]:
-    if ":" not in conversation_id:
-        return {"key": conversation_id, "label": conversation_id}
-    scope, target_id = conversation_id.split(":", 1)
-    if scope == "group":
-        return {"key": conversation_id, "label": f"群聊 {target_id}"}
-    if scope == "private":
-        return {"key": conversation_id, "label": f"私聊 {target_id}"}
-    if scope == "system":
-        return {"key": conversation_id, "label": _system_conversation_label(target_id)}
-    return {"key": conversation_id, "label": conversation_id}
-
-
-def _system_conversation_label(target_id: str) -> str:
-    labels = {
-        "global": "系统记录 · 全局",
-        "proactive": "系统记录 · 主动思考",
-        "wakeup": "系统记录 · 定时唤醒",
-        "agent_task": "系统记录 · 后台任务",
-        "request": "系统记录 · 请求处理",
-    }
-    return labels.get(target_id, f"系统记录 · {target_id}")
-
-
-def _conversation_list_signature(conversations: list[dict]) -> list[tuple[str, int, str]]:
-    signature: list[tuple[str, int, str]] = []
-    for conv in conversations:
-        signature.append(
-            (
-                str(conv.get("key") or ""),
-                len(conv.get("records") or []),
-                str(conv.get("preview") or ""),
-            )
-        )
-    return signature
-
-
-def _records_cache_signature(records: list[dict]) -> tuple[int, str]:
-    digest = hashlib.sha256()
-    for record in records:
-        digest.update(_record_cache_blob(record).encode("utf-8"))
-        digest.update(b"\0")
-    return len(records), digest.hexdigest()
-
-
-def _record_cache_blob(record: dict) -> str:
-    try:
-        return json.dumps(
-            record,
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-            separators=(",", ":"),
-        )
-    except (TypeError, ValueError):
-        return repr(record)
 
 
 def _filter_visible_records(
@@ -1308,53 +1307,6 @@ def _record_matches_display_filters(
     return not query or query in _record_search_text(record).casefold()
 
 
-def _record_has_media_or_file(record: dict) -> bool:
-    content = str(record.get("content") or "")
-    if _text_has_media_or_file(content):
-        return True
-
-    meta = record.get("metadata")
-    if isinstance(meta, dict) and _text_has_media_or_file(json.dumps(meta, ensure_ascii=False)):
-        return True
-
-    for tool_call in record.get("tool_calls") or []:
-        func = tool_call.get("function") if isinstance(tool_call, dict) else None
-        if not isinstance(func, dict):
-            continue
-        name = str(func.get("name") or "")
-        if name in _MEDIA_TOOL_NAMES:
-            return True
-        if _text_has_media_or_file(json.dumps(_parse_tool_arguments(func.get("arguments")), ensure_ascii=False)):
-            return True
-    return False
-
-
-def _text_has_media_or_file(text: str) -> bool:
-    if not text:
-        return False
-    if _CQ_MEDIA_RE.search(text):
-        return True
-    if "[图片" in text or "[文件" in text or "[视频" in text or "[语音" in text:
-        return True
-    if _MEDIA_OR_FILE_EXT_RE.search(text):
-        return True
-    lowered = text.casefold()
-    return any(
-        marker in lowered
-        for marker in (
-            "workspace=incoming/",
-            "workspace=incoming\\",
-            "image_ref",
-            "image_path",
-            "image_url",
-            "file_path",
-            "file_name",
-            "file_id",
-            "forward_id",
-        )
-    )
-
-
 def _record_display_categories(record: dict) -> set[str]:
     role = _record_role(record)
     content = str(record.get("content") or "")
@@ -1436,17 +1388,6 @@ def normalize_history_records(
             items.append(item)
             _remember_generated_outbound(item, send_context)
     return _sort_display_items(items)
-
-
-def _should_attach_tool_result_to_call(item: DisplayItem) -> bool:
-    if item.kind != "tool_result" or not item.related_tool_call_id:
-        return False
-    raw = item.raw if isinstance(item.raw, dict) else {}
-    record = raw.get("record") if isinstance(raw.get("record"), dict) else raw
-    return not (
-        record.get("_source") == "event_store"
-        and record.get("_runtime_event_type") == "tool_result_received"
-    )
 
 
 def _build_send_display_context(records: list[dict]) -> SendDisplayContext:
@@ -1537,76 +1478,6 @@ def _send_status_outbound_items(
             )
         )
     return items
-
-
-def _accepted_message_conversation_id(message: dict[str, Any], *, fallback: str) -> str:
-    conversation_id = str(message.get("conversation_id") or "").strip()
-    if conversation_id:
-        return conversation_id
-    infos = _conversation_infos_from_payload(message)
-    if infos:
-        return infos[0]["key"]
-    return fallback
-
-
-def _should_skip_generated_outbound(item: DisplayItem, context: SendDisplayContext) -> bool:
-    if item.kind != "outbound_message" or not _is_generated_outbound(item):
-        return False
-    if item.related_message_id and (
-        item.related_message_id in context.real_msg_ids
-        or item.related_message_id in context.generated_msg_ids
-    ):
-        return True
-    send_id = str(item.raw.get("send_id") or "").strip()
-    order = _raw_send_order(item.raw)
-    return bool(
-        send_id
-        and order is not None
-        and ((send_id, order) in context.real_send_orders or (send_id, order) in context.generated_send_orders)
-    )
-
-
-def _remember_generated_outbound(item: DisplayItem, context: SendDisplayContext) -> None:
-    if item.kind != "outbound_message" or not _is_generated_outbound(item):
-        return
-    if item.related_message_id:
-        context.generated_msg_ids.add(item.related_message_id)
-    send_id = str(item.raw.get("send_id") or "").strip()
-    order = _raw_send_order(item.raw)
-    if send_id and order is not None:
-        context.generated_send_orders.add((send_id, order))
-
-
-def _is_generated_outbound(item: DisplayItem) -> bool:
-    return bool(item.raw.get("_synthetic_source"))
-
-
-def _record_send_id(rec: dict[str, Any]) -> str | None:
-    value = rec.get("send_id")
-    if value:
-        return str(value)
-    meta = rec.get("metadata")
-    if isinstance(meta, dict) and meta.get("send_id"):
-        return str(meta.get("send_id"))
-    return None
-
-
-def _record_send_order(rec: dict[str, Any]) -> int | None:
-    for source in (rec, rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}):
-        order = _raw_send_order(source)
-        if order is not None:
-            return order
-    return None
-
-
-def _raw_send_order(raw: dict[str, Any]) -> int | None:
-    for key in ("send_order", "order", "message_index", "index"):
-        value = raw.get(key)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.strip().isdigit():
-            return int(value.strip())
-    return None
 
 
 def normalize_history_record(
@@ -1860,155 +1731,6 @@ def normalize_history_record(
     ]
 
 
-def _unique_item_id(item_id: str, record_index: int, seen_ids: set[str]) -> str:
-    if item_id not in seen_ids:
-        seen_ids.add(item_id)
-        return item_id
-    unique = f"{item_id}:{record_index}"
-    suffix = 1
-    while unique in seen_ids:
-        suffix += 1
-        unique = f"{item_id}:{record_index}:{suffix}"
-    seen_ids.add(unique)
-    return unique
-
-
-def _sort_display_items(items: list[DisplayItem]) -> list[DisplayItem]:
-    return [
-        item
-        for _, item in sorted(
-            enumerate(items),
-            key=lambda pair: _display_item_sort_key(pair[1], pair[0]),
-        )
-    ]
-
-
-def _display_item_sort_key(item: DisplayItem, fallback_order: int) -> tuple[int, int, float, int, int]:
-    record = _display_item_record(item)
-    layer = _record_sort_layer(record)
-    record_order = _display_item_record_order(item, fallback_order=fallback_order)
-    if layer is not None:
-        sort_value = _record_sort_value_for_layer(record, layer)
-        if sort_value is None:
-            return CHAT_SORT_LAYER_RANK[layer], 1, 0.0, record_order, fallback_order
-        return CHAT_SORT_LAYER_RANK[layer], 0, sort_value, record_order, fallback_order
-    sort_ts = _display_item_sort_ts(item)
-    if sort_ts is None:
-        return CHAT_SORT_LAYER_RANK["fallback"], 1, 0.0, record_order, fallback_order
-    return CHAT_SORT_LAYER_RANK["fallback"], 0, sort_ts, record_order, fallback_order
-
-
-def _display_item_record(item: DisplayItem) -> dict[str, Any]:
-    raw = item.raw if isinstance(item.raw, dict) else {}
-    return raw.get("record") if isinstance(raw.get("record"), dict) else raw
-
-
-def _record_sort_layer(record: dict[str, Any]) -> str | None:
-    layer = str(record.get("_sort_layer") or "").strip()
-    if layer in CHAT_SORT_LAYER_RANK:
-        return layer
-    source = str(record.get("_source") or "").strip()
-    if source == "event_store":
-        return "event_store"
-    if source == "chat_timeline":
-        return "timeline"
-    if source == "archive" or record.get("archive_id"):
-        return "archive"
-    return None
-
-
-def _record_sort_value_for_layer(record: dict[str, Any], layer: str) -> float | None:
-    if layer == "event_store":
-        sort_value = _parse_float_value(record.get("_sort_value"))
-        if sort_value is not None:
-            return sort_value
-        return _parse_float_value(record.get("event_id"))
-    if layer in {"archive", "timeline", "history"}:
-        sort_value = _parse_float_value(record.get("_sort_value"))
-        if sort_value is not None:
-            return sort_value
-        return _record_timestamp_sort_value(record)
-    return _parse_float_value(record.get("_sort_value"))
-
-
-def _display_item_sort_ts(item: DisplayItem) -> float | None:
-    record = _display_item_record(item)
-    for value in (
-        record.get("_sort_ts"),
-        record.get("timestamp"),
-        record.get("time"),
-        record.get("created_at"),
-        item.timestamp,
-    ):
-        parsed = _parse_timestamp_value(value)
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def _display_item_record_order(item: DisplayItem, *, fallback_order: int) -> int:
-    raw = item.raw
-    record = raw.get("record") if isinstance(raw.get("record"), dict) else raw
-    value = record.get("_record_order")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
-    return fallback_order
-
-
-def _record_timestamp_sort_value(record: dict[str, Any]) -> float | None:
-    for value in (
-        record.get("_sort_ts"),
-        record.get("timestamp"),
-        record.get("time"),
-        record.get("created_at"),
-    ):
-        parsed = _parse_timestamp_value(value)
-        if parsed is not None:
-            return parsed
-    meta = record.get("metadata")
-    if isinstance(meta, dict):
-        parsed = _parse_timestamp_value(meta.get("date"))
-        if parsed is not None:
-            return parsed
-    content = str(record.get("content") or "")
-    match = _LEGACY_HEADER_RE.match(content)
-    if match:
-        return _parse_timestamp_value(match.group("timestamp"))
-    return None
-
-
-def _parse_float_value(value: Any) -> float | None:
-    if isinstance(value, int | float):
-        return float(value)
-    if isinstance(value, str) and value.strip():
-        try:
-            return float(value.strip())
-        except ValueError:
-            return None
-    return None
-
-
-def _parse_timestamp_value(value: Any) -> float | None:
-    if isinstance(value, int | float):
-        return float(value)
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    if text.isdigit():
-        return float(text)
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
-        try:
-            return datetime.strptime(text, fmt).timestamp()
-        except ValueError:
-            pass
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-
-
 def _build_display_items(
     records: list[dict],
     *,
@@ -2017,6 +1739,7 @@ def _build_display_items(
     show_chat: bool,
     show_system: bool,
     show_tools: bool,
+    show_reasoning: bool = True,
     media_only: bool = False,
 ) -> list[DisplayItem]:
     return _filter_display_items(
@@ -2025,95 +1748,9 @@ def _build_display_items(
         show_chat=show_chat,
         show_system=show_system,
         show_tools=show_tools,
+        show_reasoning=show_reasoning,
         media_only=media_only,
     )
-
-
-def _filter_display_items(
-    items: list[DisplayItem],
-    *,
-    search_text: str,
-    show_chat: bool,
-    show_system: bool,
-    show_tools: bool,
-    media_only: bool = False,
-) -> list[DisplayItem]:
-    query = search_text.strip().casefold()
-    return [
-        item
-        for item in items
-        if _display_item_matches_filters(
-            item,
-            query=query,
-            show_chat=show_chat,
-            show_system=show_system,
-            show_tools=show_tools,
-            media_only=media_only,
-        )
-    ]
-
-
-def _display_item_matches_filters(
-    item: DisplayItem,
-    *,
-    query: str,
-    show_chat: bool,
-    show_system: bool,
-    show_tools: bool,
-    media_only: bool,
-) -> bool:
-    categories = _display_item_categories(item)
-    if not show_chat and "chat" in categories:
-        categories.discard("chat")
-    if not show_system and "system" in categories:
-        categories.discard("system")
-    if not show_tools and "tool" in categories:
-        categories.discard("tool")
-    if not categories:
-        return False
-    if media_only and not _display_item_has_media_or_file(item):
-        return False
-    if not query:
-        return True
-    if query in _display_item_search_text(item).casefold():
-        return True
-    return item.kind == "tool_call" and any(
-        query in _display_item_search_text(result).casefold()
-        for result in item.tool_results
-    )
-
-
-def _display_item_categories(item: DisplayItem) -> set[str]:
-    if item.kind in {"inbound_message", "outbound_message"}:
-        return {"chat"}
-    if item.kind in {"tool_call", "tool_result"}:
-        return {"tool"}
-    return {"system"}
-
-
-def _display_item_has_media_or_file(item: DisplayItem) -> bool:
-    if _text_has_media_or_file(item.text) or _text_has_media_or_file(item.summary):
-        return True
-    if _text_has_media_or_file(json.dumps(item.raw, ensure_ascii=False, default=str)):
-        return True
-    return any(_display_item_has_media_or_file(result) for result in item.tool_results)
-
-
-def _display_item_search_text(item: DisplayItem) -> str:
-    parts = [
-        item.kind,
-        item.speaker_label or "",
-        item.speaker_id or "",
-        item.role_label,
-        item.text,
-        item.summary,
-        item.related_tool_call_id or "",
-        item.related_message_id or "",
-        json.dumps(item.raw, ensure_ascii=False, default=str),
-    ]
-    for result in item.tool_results:
-        parts.append(_display_item_search_text(result))
-    return "\n".join(parts)
 
 
 def _render_display_item(
@@ -2417,92 +2054,6 @@ def _chat_item_meta(item: DisplayItem) -> str:
     return " · ".join(parts)
 
 
-def _record_role(rec: dict[str, Any]) -> str:
-    role = str(rec.get("role") or "").strip()
-    direction = str(rec.get("direction") or "").strip()
-    if role in {"system", "tool"}:
-        return role
-    if direction == "outbound":
-        return "assistant"
-    if direction == "inbound":
-        return "user"
-    if role:
-        return role
-    if str(rec.get("conversation_id") or "").startswith("system:"):
-        return "system"
-    return "user"
-
-
-def _record_conversation_id_for_display(rec: dict[str, Any]) -> str:
-    display = rec.get("_display_conversation_id")
-    if isinstance(display, str) and display:
-        return display
-    direct = rec.get("conversation_id")
-    if isinstance(direct, str) and direct:
-        return direct
-    if _record_role(rec) == "user":
-        return _conversation_info(rec)["key"]
-    return "system:global" if _record_role(rec) in {"system", "tool"} else "unknown:history"
-
-
-def _record_timestamp(rec: dict[str, Any]) -> str | None:
-    for key in ("timestamp", "time", "created_at"):
-        value = rec.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    meta = rec.get("metadata")
-    if isinstance(meta, dict):
-        date = meta.get("date")
-        if isinstance(date, str) and date.strip():
-            return date.strip()
-    content = str(rec.get("content") or "")
-    match = _LEGACY_HEADER_RE.match(content)
-    if match:
-        return match.group("timestamp")
-    return None
-
-
-def _record_display_base_id(rec: dict[str, Any], *, conversation_id: str, role: str) -> str:
-    for key in ("archive_id", "id", "message_id", "msg_id", "tool_call_id"):
-        value = rec.get(key)
-        if value:
-            return str(value)
-    content = str(rec.get("content") or "")
-    return f"{conversation_id}:{role}:{_record_timestamp(rec) or ''}:{len(content)}"
-
-
-def _record_message_id(rec: dict[str, Any]) -> str | None:
-    for key in ("message_id", "msg_id", "original_msg_id"):
-        value = rec.get(key)
-        if value:
-            return str(value)
-    meta = rec.get("metadata")
-    if isinstance(meta, dict):
-        for key in ("original_msg_id", "message_id", "msg_id"):
-            value = meta.get(key)
-            if value:
-                return str(value)
-    content = str(rec.get("content") or "")
-    match = _LEGACY_HEADER_RE.match(content)
-    if match:
-        return match.group("message_id")
-    return None
-
-
-def _record_is_qq_visible_outbound(rec: dict[str, Any]) -> bool:
-    if str(rec.get("direction") or "") == "outbound":
-        return rec.get("qq_visible") is not False
-    if rec.get("qq_visible") is True:
-        return True
-    meta = rec.get("metadata")
-    if isinstance(meta, dict):
-        if str(meta.get("direction") or "") == "outbound":
-            return meta.get("qq_visible") is not False
-        if meta.get("qq_visible") is True:
-            return True
-    return False
-
-
 def _user_record_sender_id(rec: dict[str, Any]) -> str | None:
     meta_messages = (rec.get("metadata") or {}).get("messages") or []
     first = meta_messages[0] if meta_messages else None
@@ -2579,1096 +2130,6 @@ def _tool_call_severity(tool_call: dict[str, Any]) -> DisplaySeverity:
     return "info"
 
 
-def _tool_call_name(tool_call: dict[str, Any]) -> str:
-    func = tool_call.get("function") if isinstance(tool_call, dict) else None
-    if not isinstance(func, dict):
-        return ""
-    return str(func.get("name") or "")
-
-
-def _runtime_tool_call_for_record(rec: dict[str, Any], *, base_id: str) -> dict[str, Any]:
-    for tool_call in rec.get("tool_calls") or []:
-        if isinstance(tool_call, dict):
-            return tool_call
-    payload = rec.get("metadata", {}).get("event_payload") if isinstance(rec.get("metadata"), dict) else {}
-    if not isinstance(payload, dict):
-        payload = {}
-    tool_call_id = str(rec.get("tool_call_id") or f"{base_id}:tool").strip()
-    return {
-        "id": tool_call_id,
-        "type": "function",
-        "function": {
-            "name": _runtime_event_tool_name(payload),
-            "arguments": json.dumps(
-                _runtime_tool_call_arguments(payload),
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            ),
-        },
-    }
-
-
-def _runtime_record_severity(rec: dict[str, Any]) -> DisplaySeverity:
-    payload = rec.get("metadata", {}).get("event_payload") if isinstance(rec.get("metadata"), dict) else {}
-    blob = json.dumps(payload if isinstance(payload, dict) else rec, ensure_ascii=False, default=str).casefold()
-    if any(token in blob for token in ("failed", "failure", "error", "stale", "失败", "错误", "过期")):
-        return "warning"
-    if isinstance(payload, dict) and payload.get("ok") is False:
-        return "warning"
-    return "info"
-
-
-async def _load_chat_page_records(runtime: Any) -> list[dict]:
-    started_at = time.perf_counter()
-    step_started_at = started_at
-    history = getattr(runtime, "history", None)
-    history_records = list(await history.records() or []) if history is not None else []
-    history_elapsed_ms = (time.perf_counter() - step_started_at) * 1000
-
-    step_started_at = time.perf_counter()
-    event_records = await _load_event_store_records(runtime)
-    event_elapsed_ms = (time.perf_counter() - step_started_at) * 1000
-
-    step_started_at = time.perf_counter()
-    timeline_records = _load_chat_timeline_records(runtime)
-    timeline_elapsed_ms = (time.perf_counter() - step_started_at) * 1000
-
-    archive = getattr(runtime, "archive", None)
-    archive_records: list[dict] = []
-    step_started_at = time.perf_counter()
-    if archive is None:
-        archive_elapsed_ms = (time.perf_counter() - step_started_at) * 1000
-    else:
-        try:
-            archive_records = list(await _load_archive_records_paged(archive) or [])
-        except Exception as e:
-            logger.warning(f"加载 archive 失败，仅显示实时聊天和运行时事件: {e}")
-            archive_records = []
-        archive_elapsed_ms = (time.perf_counter() - step_started_at) * 1000
-
-    step_started_at = time.perf_counter()
-    records = _tag_record_order(
-        _merge_chat_page_records(
-            archive_records=archive_records,
-            event_records=event_records,
-            timeline_records=timeline_records,
-            history_records=history_records,
-        )
-    )
-    merge_elapsed_ms = (time.perf_counter() - step_started_at) * 1000
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "对话页记录加载指标 history_ms=%.3f event_store_ms=%.3f timeline_ms=%.3f "
-            "archive_ms=%.3f merge_tag_ms=%.3f total_ms=%.3f history_records=%d "
-            "event_store_records=%d timeline_records=%d archive_records=%d total_records=%d",
-            history_elapsed_ms,
-            event_elapsed_ms,
-            timeline_elapsed_ms,
-            archive_elapsed_ms,
-            merge_elapsed_ms,
-            (time.perf_counter() - started_at) * 1000,
-            len(history_records),
-            len(event_records),
-            len(timeline_records),
-            len(archive_records),
-            len(records),
-        )
-    return records
-
-
-async def _load_event_store_records(runtime: Any) -> list[dict[str, Any]]:
-    event_store = getattr(runtime, "event_store", None)
-    if event_store is None:
-        return []
-    try:
-        events = await _recent_chat_page_events(event_store)
-    except Exception as e:
-        logger.warning(f"加载 EventStore 对话页事件失败，回退到实时/归档/历史记录: {e}")
-        return []
-
-    records: list[dict[str, Any]] = []
-    for event in events:
-        record = _event_store_event_to_record(event)
-        if record is not None:
-            records.append(record)
-    return records
-
-
-async def _recent_chat_page_events(event_store: Any) -> list[dict[str, Any]]:
-    events_by_type = getattr(event_store, "events_by_type", None)
-    if callable(events_by_type):
-        events: list[dict[str, Any]] = []
-        for event_type in EVENT_STORE_CHAT_PAGE_EVENT_TYPES:
-            page = await events_by_type(
-                event_type,
-                limit=EVENT_STORE_QQ_FETCH_LIMIT,
-                order="desc",
-            )
-            if isinstance(page, list):
-                events.extend(item for item in page if isinstance(item, dict))
-        iter_events = getattr(event_store, "iter_events", None)
-        if callable(iter_events):
-            try:
-                page = await iter_events(limit=EVENT_STORE_QQ_FETCH_LIMIT, order="desc")
-            except Exception as e:
-                logger.debug(f"补充扫描 EventStore 最近事件失败，已使用按类型查询结果: {e}")
-            else:
-                if isinstance(page, list):
-                    events.extend(item for item in page if isinstance(item, dict))
-        return _sort_unique_chat_page_events(events)
-
-    iter_events = getattr(event_store, "iter_events", None)
-    if not callable(iter_events):
-        return []
-    page = await iter_events(limit=EVENT_STORE_QQ_FETCH_LIMIT, order="desc")
-    if not isinstance(page, list):
-        return []
-    return _sort_unique_chat_page_events(item for item in page if isinstance(item, dict))
-
-
-def _sort_unique_chat_page_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_event_id: dict[int, dict[str, Any]] = {}
-    for event in events:
-        if not _event_type_visible_on_chat_page(str(event.get("event_type") or "")):
-            continue
-        event_id = _event_id(event)
-        if event_id is None or event_id in by_event_id:
-            continue
-        by_event_id[event_id] = event
-    return sorted(by_event_id.values(), key=_event_sort_id)
-
-
-def _event_type_visible_on_chat_page(event_type: str) -> bool:
-    return event_type in QQ_VISIBLE_EVENT_TYPES or _event_type_is_runtime(event_type)
-
-
-def _event_type_is_runtime(event_type: str) -> bool:
-    return event_type in RUNTIME_EVENT_TYPES or event_type.startswith("send_")
-
-
-def _event_store_event_to_record(event: dict[str, Any]) -> dict[str, Any] | None:
-    event_type = str(event.get("event_type") or "")
-    if event_type in QQ_VISIBLE_EVENT_TYPES:
-        return _qq_visible_event_to_record(event)
-    if _event_type_is_runtime(event_type):
-        return _runtime_event_to_record(event)
-    return None
-
-
-def _qq_visible_event_to_record(event: dict[str, Any]) -> dict[str, Any] | None:
-    event_type = event.get("event_type")
-    if event_type not in QQ_VISIBLE_EVENT_TYPES:
-        return None
-    event_id = _event_id(event)
-    if event_id is None:
-        return None
-    payload_value = event.get("payload")
-    payload = payload_value if isinstance(payload_value, dict) else {}
-    direction = "outbound" if event_type == "qq_message_sent" else "inbound"
-    conversation_id = _qq_event_conversation_id(event, payload)
-    if not conversation_id:
-        return None
-    content = _first_payload_text(payload, ("content", "text", "label", "raw_message"))
-    msg_id = _first_payload_text(payload, ("msg_id", "message_id")) or _optional_record_text(
-        event.get("external_id")
-    )
-    timestamp = _qq_event_timestamp(event, payload)
-    user_id = _optional_record_text(payload.get("user_id"))
-    self_id = _optional_record_text(payload.get("self_id"))
-    sender_id = (
-        _first_payload_text(payload, ("sender_id",))
-        or (self_id if direction == "outbound" else user_id)
-    )
-    sender_name = _first_payload_text(payload, ("sender_name", "nickname"))
-
-    return {
-        "id": f"event:{event_id}",
-        "event_id": event_id,
-        "event_type": event_type,
-        "role": "assistant" if direction == "outbound" else "user",
-        "direction": direction,
-        "qq_visible": True,
-        "conversation_id": conversation_id,
-        "content": content,
-        "msg_id": msg_id,
-        "message_id": msg_id,
-        "timestamp": timestamp,
-        "_sort_layer": "event_store",
-        "_sort_value": float(event_id),
-        "_sort_kind": "event_id",
-        "_source": "event_store",
-        "source": _optional_record_text(payload.get("source"))
-        or _optional_record_text(event.get("source")),
-        "sender_name": sender_name,
-        "sender_id": sender_id,
-        "user_id": user_id,
-        "target_id": _optional_record_text(payload.get("target_id")),
-        "target_scope": _optional_record_text(payload.get("target_scope")),
-        "group_id": _optional_record_text(payload.get("group_id")),
-        "self_id": self_id,
-        "raw_message": _first_payload_text(payload, ("raw_message", "text", "content")),
-        "reply_to": _optional_record_text(payload.get("reply_to")),
-        "attachments": _payload_list(payload, "attachments", "media"),
-        "cq_segments": _payload_list(payload, "cq_segments"),
-    }
-
-
-def _runtime_event_to_record(event: dict[str, Any]) -> dict[str, Any] | None:
-    event_type = str(event.get("event_type") or "")
-    if not _event_type_is_runtime(event_type):
-        return None
-    event_id = _event_id(event)
-    if event_id is None:
-        return None
-    payload_value = event.get("payload")
-    payload = payload_value if isinstance(payload_value, dict) else {}
-    conversation_id = _runtime_event_conversation_id(event, payload)
-    timestamp = _qq_event_timestamp(event, payload)
-    title = _runtime_event_title(event_type, payload)
-    summary = _runtime_event_summary_text(event_type, payload, event)
-    detail = _runtime_event_detail(event_type, payload, event)
-    base = {
-        "id": f"event:{event_id}",
-        "event_id": event_id,
-        "event_type": event_type,
-        "_runtime_event_type": event_type,
-        "_runtime_title": title,
-        "_runtime_summary": summary,
-        "_runtime_detail": detail,
-        "_source": "event_store",
-        "source": _optional_record_text(payload.get("source"))
-        or _optional_record_text(event.get("source")),
-        "conversation_id": conversation_id,
-        "timestamp": timestamp,
-        "_sort_layer": "event_store",
-        "_sort_value": float(event_id),
-        "_sort_kind": "event_id",
-        "metadata": {"event_payload": payload},
-    }
-
-    if event_type == "tool_call_started":
-        tool_call_id = _runtime_event_tool_call_id(event, payload, fallback=f"event:{event_id}")
-        tool_name = _runtime_event_tool_name(payload)
-        tool_call = {
-            "id": tool_call_id,
-            "type": "function",
-            "function": {
-                "name": tool_name,
-                "arguments": json.dumps(
-                    _runtime_tool_call_arguments(payload),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                ),
-            },
-        }
-        return {
-            **base,
-            "role": "assistant",
-            "content": "",
-            "tool_call_id": tool_call_id,
-            "tool_calls": [tool_call],
-        }
-
-    if event_type == "tool_result_received":
-        tool_call_id = _runtime_event_tool_call_id(event, payload, fallback="")
-        return {
-            **base,
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": json.dumps(
-                _runtime_tool_result_payload(payload, event),
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            ),
-        }
-
-    return {
-        **base,
-        "role": "system",
-        "content": detail,
-    }
-
-
-def _runtime_event_conversation_id(event: dict[str, Any], payload: dict[str, Any]) -> str:
-    direct = (
-        _optional_record_text(payload.get("conversation_id"))
-        or _optional_record_text(event.get("conversation_id"))
-        or _optional_record_text(payload.get("target_conversation_id"))
-    )
-    if direct:
-        return direct
-    conversation_ids = payload.get("conversation_ids")
-    if isinstance(conversation_ids, list) and len(conversation_ids) == 1:
-        value = _optional_record_text(conversation_ids[0])
-        if value:
-            return value
-    target_scope = _optional_record_text(payload.get("target_scope"))
-    target_id = _optional_record_text(payload.get("target_id"))
-    if target_scope and target_id:
-        return f"{target_scope}:{target_id}"
-    return "system:global"
-
-
-def _runtime_event_tool_call_id(
-    event: dict[str, Any],
-    payload: dict[str, Any],
-    *,
-    fallback: str,
-) -> str:
-    return (
-        _optional_record_text(payload.get("tool_call_id"))
-        or _optional_record_text(event.get("tool_call_id"))
-        or fallback
-    )
-
-
-def _runtime_event_tool_name(payload: dict[str, Any]) -> str:
-    return (
-        _optional_record_text(payload.get("tool_name"))
-        or _optional_record_text(payload.get("name"))
-        or "未知工具"
-    )
-
-
-def _runtime_tool_call_arguments(payload: dict[str, Any]) -> dict[str, Any]:
-    return _runtime_payload_subset(
-        payload,
-        (
-            "tool_name",
-            "args_keys",
-            "args_length",
-            "args_preview",
-            "loop",
-            "step",
-            "status",
-            "error_type",
-        ),
-    )
-
-
-def _runtime_tool_result_payload(
-    payload: dict[str, Any],
-    event: dict[str, Any],
-) -> dict[str, Any]:
-    result = _runtime_payload_subset(
-        payload,
-        (
-            "tool_name",
-            "tool_call_id",
-            "ok",
-            "status",
-            "error_type",
-            "args_keys",
-            "args_length",
-            "result_keys",
-            "result_length",
-            "result_hash",
-            "result_preview",
-            "loop",
-            "step",
-        ),
-    )
-    if "tool_call_id" not in result:
-        tool_call_id = _optional_record_text(event.get("tool_call_id"))
-        if tool_call_id:
-            result["tool_call_id"] = tool_call_id
-    return result or {"event_type": "tool_result_received"}
-
-
-def _runtime_payload_subset(payload: dict[str, Any], keys: Iterable[str]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key in keys:
-        if key in payload and payload.get(key) is not None:
-            result[key] = payload.get(key)
-    return result
-
-
-def _runtime_event_title(event_type: str, payload: dict[str, Any] | None = None) -> str:
-    payload = payload or {}
-    if event_type == "tool_call_started":
-        return f"工具调用：{_runtime_event_tool_name(payload)}"
-    if event_type == "tool_result_received":
-        tool_name = _runtime_event_tool_name(payload)
-        return f"工具返回：{tool_name}" if tool_name != "未知工具" else "工具返回"
-    labels = {
-        "system_note_recorded": "系统消息记录",
-        "history_truncated": "历史截断",
-        "send_attempt_recorded": "发送尝试",
-        "send_batch_accepted": "发送批次已接受",
-        "send_message_started": "发送消息开始",
-        "send_message_succeeded": "发送消息成功",
-        "send_receipt_recorded": "发送回执记录",
-    }
-    return labels.get(event_type, "发送状态" if event_type.startswith("send_") else event_type)
-
-
-def _runtime_event_summary_text(
-    event_type: str,
-    payload: dict[str, Any],
-    event: dict[str, Any],
-) -> str:
-    parts = _runtime_event_summary_parts(payload)
-    if not parts:
-        external_id = _optional_record_text(event.get("external_id"))
-        if external_id:
-            parts.append(f"id={external_id}")
-    if not parts:
-        parts.append(event_type)
-    return "；".join(parts)
-
-
-def _runtime_event_detail(
-    event_type: str,
-    payload: dict[str, Any],
-    event: dict[str, Any],
-) -> str:
-    parts = [f"{_runtime_event_title(event_type, payload)}"]
-    event_id = _event_id(event)
-    if event_id is not None:
-        parts.append(f"event_id={event_id}")
-    tool_call_id = _runtime_event_tool_call_id(event, payload, fallback="")
-    if tool_call_id:
-        parts.append(f"tool_call_id={tool_call_id}")
-    parts.extend(_runtime_event_summary_parts(payload, include_preview=True))
-    if not payload:
-        parts.append("payload 为空")
-    return "；".join(_unique_text_parts(parts))
-
-
-def _runtime_event_summary_parts(
-    payload: dict[str, Any],
-    *,
-    include_preview: bool = False,
-) -> list[str]:
-    parts: list[str] = []
-    for key, label in (
-        ("tool_name", "工具"),
-        ("status", "状态"),
-        ("send_id", "send_id"),
-        ("send_attempt_id", "send_attempt_id"),
-        ("attempt_id", "attempt_id"),
-        ("msg_id", "msg_id"),
-        ("delivery", "投递"),
-        ("source_tool", "来源工具"),
-        ("kind", "类型"),
-        ("target_conversation_id", "目标会话"),
-        ("conversation_id", "会话"),
-        ("error_type", "错误类型"),
-    ):
-        value = _optional_record_text(payload.get(key))
-        if value:
-            parts.append(f"{label}={value}" if label.endswith("_id") else f"{label} {value}")
-    if "ok" in payload:
-        parts.append("成功" if payload.get("ok") is True else "失败")
-    for key, label in (
-        ("count", "数量"),
-        ("order", "顺序"),
-        ("loop", "loop"),
-        ("step", "step"),
-        ("args_length", "参数长度"),
-        ("result_length", "结果长度"),
-        ("content_length", "内容长度"),
-        ("cut_point", "截断点"),
-        ("remaining_count", "剩余"),
-    ):
-        value = payload.get(key)
-        if isinstance(value, int | float | str) and str(value).strip():
-            parts.append(f"{label} {value}")
-    counts = payload.get("counts")
-    if isinstance(counts, dict) and counts:
-        count_parts = [
-            f"{key}={value}"
-            for key, value in counts.items()
-            if isinstance(value, int | float | str) and str(value).strip()
-        ]
-        if count_parts:
-            parts.append("counts " + ", ".join(count_parts[:8]))
-    for key, label in (
-        ("args_keys", "参数键"),
-        ("result_keys", "结果键"),
-        ("conversation_ids", "会话"),
-    ):
-        value = payload.get(key)
-        if isinstance(value, list) and value:
-            shown = ", ".join(str(item) for item in value[:6])
-            if len(value) > 6:
-                shown = f"{shown}, +{len(value) - 6}"
-            parts.append(f"{label} [{shown}]")
-    for key, label in (
-        ("content_hash", "内容hash"),
-        ("result_hash", "结果hash"),
-    ):
-        value = _optional_record_text(payload.get(key))
-        if value:
-            parts.append(f"{label}={value}")
-    if include_preview:
-        for key, label in (
-            ("preview", "预览"),
-            ("args_preview", "参数预览"),
-            ("result_preview", "结果预览"),
-        ):
-            value = _optional_record_text(payload.get(key))
-            if value:
-                parts.append(f"{label}：{_compact_inline_tokens(value)}")
-    return parts
-
-
-def _unique_text_parts(parts: Iterable[str]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for part in parts:
-        text = str(part).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result
-
-
-def _event_id(event: dict[str, Any]) -> int | None:
-    for key in ("event_id", "id"):
-        value = event.get(key)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.strip().isdigit():
-            return int(value.strip())
-    return None
-
-
-def _event_sort_id(event: dict[str, Any]) -> int:
-    return _event_id(event) or 0
-
-
-def _qq_event_conversation_id(event: dict[str, Any], payload: dict[str, Any]) -> str | None:
-    direct = _optional_record_text(payload.get("conversation_id")) or _optional_record_text(
-        event.get("conversation_id")
-    )
-    if direct:
-        return direct
-    group_id = _optional_record_text(payload.get("group_id"))
-    if group_id:
-        return f"group:{group_id}"
-    target_id = _optional_record_text(payload.get("target_id"))
-    target_scope = _optional_record_text(payload.get("target_scope"))
-    if target_id:
-        return f"group:{target_id}" if target_scope == "group" else f"private:{target_id}"
-    user_id = _optional_record_text(payload.get("user_id"))
-    if user_id:
-        return f"private:{user_id}"
-    return None
-
-
-def _qq_event_timestamp(event: dict[str, Any], payload: dict[str, Any]) -> str | None:
-    text = _first_payload_text(payload, ("time_text", "timestamp", "time", "created_at"))
-    if text:
-        return text
-    for value in (payload.get("timestamp_unix"), event.get("timestamp_unix")):
-        try:
-            return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M:%S")
-        except (TypeError, ValueError, OSError):
-            pass
-    return None
-
-
-def _first_payload_text(payload: dict[str, Any], keys: Iterable[str]) -> str:
-    for key in keys:
-        text = _optional_record_text(payload.get(key))
-        if text:
-            return text
-    return ""
-
-
-def _payload_list(payload: dict[str, Any], *keys: str) -> list[Any]:
-    for key in keys:
-        value = payload.get(key)
-        if isinstance(value, list):
-            return list(value)
-    return []
-
-
-def _optional_record_text(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _load_chat_timeline_records(runtime: Any) -> list[dict[str, Any]]:
-    pipeline = getattr(runtime, "pipeline", None)
-    timeline = getattr(pipeline, "chat_timeline", None)
-    snapshot = getattr(timeline, "snapshot", None)
-    if not callable(snapshot):
-        return []
-    try:
-        conversations = snapshot()
-    except Exception as e:
-        logger.warning(f"加载实时聊天时间线失败: {e}")
-        return []
-    records: list[dict[str, Any]] = []
-    if not isinstance(conversations, dict):
-        return records
-    for conversation_id, messages in conversations.items():
-        if not isinstance(messages, list):
-            continue
-        for message in messages:
-            records.append(_chat_timeline_message_to_record(str(conversation_id), message))
-    return records
-
-
-def _chat_timeline_message_to_record(conversation_id: str, message: Any) -> dict[str, Any]:
-    direction = str(getattr(message, "direction", "") or "")
-    text = str(getattr(message, "text", "") or "")
-    raw_message = str(getattr(message, "raw_message", "") or "")
-    content = text or raw_message
-    timestamp = getattr(message, "timestamp", None)
-    try:
-        sort_ts = float(timestamp)
-    except (TypeError, ValueError):
-        sort_ts = None
-    return {
-        "role": "assistant" if direction == "outbound" else "user",
-        "direction": direction,
-        "content": content,
-        "conversation_id": conversation_id,
-        "timestamp": str(getattr(message, "time_text", "") or "") or None,
-        "_sort_ts": sort_ts,
-        "_sort_layer": "timeline",
-        "_sort_value": sort_ts,
-        "_sort_kind": "timestamp",
-        "_source": "chat_timeline",
-        "qq_visible": True,
-        "sender_name": getattr(message, "sender_name", None),
-        "sender_id": getattr(message, "sender_id", None),
-        "target_id": getattr(message, "target_id", None),
-        "group_id": getattr(message, "group_id", None),
-        "msg_id": getattr(message, "msg_id", None),
-        "raw_message": raw_message,
-        "reply_to": getattr(message, "reply_to", None),
-        "attachments": list(getattr(message, "attachments", []) or []),
-        "cq_segments": list(getattr(message, "cq_segments", []) or []),
-    }
-
-
-def _merge_chat_page_records(
-    *,
-    archive_records: list[dict],
-    event_records: list[dict],
-    timeline_records: list[dict],
-    history_records: list[dict],
-) -> list[dict]:
-    event_unique = _dedupe_event_store_records(event_records)
-    event_real_ids = {
-        identity
-        for record in event_unique
-        if (identity := _real_record_identity(record)) is not None
-    }
-    event_runtime_identities = _event_store_runtime_duplicate_identities(event_unique)
-    timeline_unique = [
-        record
-        for record in timeline_records
-        if _real_record_identity(record) not in event_real_ids
-    ]
-    visible_real_ids = {
-        identity
-        for record in [*event_records, *timeline_unique]
-        if (identity := _real_record_identity(record)) is not None
-    }
-    archive_unique = [
-        record
-        for record in archive_records
-        if _real_record_identity(record) not in visible_real_ids
-    ]
-    return [
-        *[_record_with_sort_layer(record, "archive") for record in archive_unique],
-        *[_record_with_sort_layer(record, "event_store") for record in event_unique],
-        *[_record_with_sort_layer(record, "timeline") for record in timeline_unique],
-        *[
-            _record_with_sort_layer(record, "history")
-            for record in _history_runtime_event_records(
-                history_records,
-                skip_runtime_identities=event_runtime_identities,
-            )
-        ],
-    ]
-
-
-def _dedupe_event_store_records(records: list[dict]) -> list[dict]:
-    seen_event_ids: set[int] = set()
-    seen_real: set[tuple[str, str, str]] = set()
-    seen_runtime: set[tuple[str, ...]] = set()
-    result: list[dict] = []
-    for record in records:
-        event_id = _record_event_id(record)
-        if event_id is not None:
-            if event_id in seen_event_ids:
-                continue
-            seen_event_ids.add(event_id)
-        real_identity = _real_record_identity(record)
-        if real_identity is not None:
-            if real_identity in seen_real:
-                continue
-            seen_real.add(real_identity)
-        runtime_identity = _event_store_record_duplicate_identity(record)
-        if runtime_identity is not None:
-            if runtime_identity in seen_runtime:
-                continue
-            seen_runtime.add(runtime_identity)
-        result.append(record)
-    return result
-
-
-def _dedupe_records_by_real_identity(records: list[dict]) -> list[dict]:
-    seen: set[tuple[str, str, str]] = set()
-    result: list[dict] = []
-    for record in records:
-        identity = _real_record_identity(record)
-        if identity is not None:
-            if identity in seen:
-                continue
-            seen.add(identity)
-        result.append(record)
-    return result
-
-
-def _record_event_id(record: dict[str, Any]) -> int | None:
-    value = record.get("event_id")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
-
-
-def _event_store_record_duplicate_identity(record: dict[str, Any]) -> tuple[str, ...] | None:
-    if record.get("_source") != "event_store":
-        return None
-    event_type = str(record.get("_runtime_event_type") or record.get("event_type") or "")
-    if event_type == "tool_call_started":
-        tool_call_id = _runtime_record_tool_call_identity(record)
-        return ("tool_call_started", tool_call_id) if tool_call_id else None
-    if event_type == "tool_result_received":
-        tool_call_id = str(record.get("tool_call_id") or "").strip()
-        return ("tool_result_received", tool_call_id) if tool_call_id else None
-    if event_type == "system_note_recorded":
-        identity = _system_note_duplicate_identity(record)
-        return ("system_note_recorded", *identity) if identity else None
-    if event_type == "history_truncated":
-        payload = _record_event_payload(record)
-        return (
-            "history_truncated",
-            _duplicate_identity_text(payload.get("cut_point")),
-            _duplicate_identity_text(payload.get("remaining_count")),
-        )
-    if event_type.startswith("send_"):
-        send_id = _send_runtime_primary_duplicate_id(record)
-        if not send_id:
-            return None
-        if event_type in {"send_message_started", "send_message_succeeded"}:
-            payload = _record_event_payload(record)
-            return (
-                event_type,
-                send_id,
-                _duplicate_identity_text(payload.get("order"), record.get("order")),
-                _duplicate_identity_text(
-                    payload.get("target_conversation_id"),
-                    record.get("conversation_id"),
-                ),
-                _duplicate_identity_text(payload.get("msg_id"), record.get("msg_id")),
-            )
-        return (event_type, send_id)
-    return None
-
-
-def _duplicate_identity_text(*values: Any) -> str:
-    for value in values:
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            return text
-    return ""
-
-
-def _runtime_record_tool_call_identity(record: dict[str, Any]) -> str | None:
-    tool_call_id = str(record.get("tool_call_id") or "").strip()
-    if tool_call_id:
-        return tool_call_id
-    for tool_call in record.get("tool_calls") or []:
-        if not isinstance(tool_call, dict):
-            continue
-        tool_call_id = str(tool_call.get("id") or "").strip()
-        if tool_call_id:
-            return tool_call_id
-    return None
-
-
-def _send_runtime_primary_duplicate_id(record: dict[str, Any]) -> str | None:
-    payload = _record_event_payload(record)
-    for source in (payload, record):
-        for key in ("send_id", "send_attempt_id", "attempt_id"):
-            value = _optional_record_text(source.get(key))
-            if value:
-                return value
-    return None
-
-
-def _record_event_payload(record: dict[str, Any]) -> dict[str, Any]:
-    meta = record.get("metadata")
-    if isinstance(meta, dict):
-        payload = meta.get("event_payload")
-        if isinstance(payload, dict):
-            return payload
-    return {}
-
-
-def _record_with_sort_layer(record: dict[str, Any], layer: str) -> dict[str, Any]:
-    tagged = dict(record)
-    tagged["_sort_layer"] = layer
-    if layer == "event_store":
-        tagged.pop("_sort_ts", None)
-        tagged["_sort_kind"] = "event_id"
-        if tagged.get("_sort_value") is None:
-            event_id = _parse_float_value(tagged.get("event_id"))
-            if event_id is not None:
-                tagged["_sort_value"] = event_id
-    else:
-        tagged["_sort_kind"] = "timestamp"
-        if tagged.get("_sort_value") is None:
-            timestamp = _record_timestamp_sort_value(tagged)
-            if timestamp is not None:
-                tagged["_sort_value"] = timestamp
-    return tagged
-
-
-def _history_runtime_event_records(
-    records: list[dict],
-    *,
-    skip_runtime_identities: set[tuple[str, ...]] | None = None,
-) -> list[dict]:
-    skip_runtime_identities = skip_runtime_identities or set()
-    result: list[dict] = []
-    for record in records:
-        if _history_runtime_record_has_duplicate(record, skip_runtime_identities):
-            continue
-        role = _record_role(record)
-        content = str(record.get("content") or "")
-        if role in {"system", "tool"} or _runtime_event_summary(content) is not None:
-            result.append(record)
-            continue
-        if role == "assistant" and not _record_is_qq_visible_outbound(record):
-            if content.strip() or record.get("tool_calls") or record.get("reasoning_content"):
-                result.append(record)
-    return result
-
-
-def _event_store_runtime_duplicate_identities(records: list[dict]) -> set[tuple[str, ...]]:
-    result: set[tuple[str, ...]] = set()
-    for record in records:
-        if record.get("_source") != "event_store":
-            continue
-        event_type = str(record.get("_runtime_event_type") or "")
-        if not event_type:
-            continue
-        result.update(_runtime_record_duplicate_identities(record))
-    return result
-
-
-def _history_runtime_record_has_duplicate(
-    record: dict[str, Any],
-    skip_runtime_identities: set[tuple[str, ...]],
-) -> bool:
-    if not skip_runtime_identities:
-        return False
-    role = _record_role(record)
-    if role == "assistant" and record.get("tool_calls"):
-        call_ids = [
-            str(tool_call.get("id") or "").strip()
-            for tool_call in record.get("tool_calls") or []
-            if isinstance(tool_call, dict) and str(tool_call.get("id") or "").strip()
-        ]
-        return bool(call_ids) and all(("tool_call", call_id) in skip_runtime_identities for call_id in call_ids)
-    return bool(_runtime_record_duplicate_identities(record) & skip_runtime_identities)
-
-
-def _runtime_record_duplicate_identities(record: dict[str, Any]) -> set[tuple[str, ...]]:
-    result: set[tuple[str, ...]] = set()
-    event_type = str(record.get("_runtime_event_type") or "")
-    role = _record_role(record)
-    if event_type == "tool_call_started" or (role == "assistant" and record.get("tool_calls")):
-        for tool_call in record.get("tool_calls") or []:
-            if not isinstance(tool_call, dict):
-                continue
-            tool_call_id = str(tool_call.get("id") or "").strip()
-            if tool_call_id:
-                result.add(("tool_call", tool_call_id))
-    if event_type == "tool_result_received" or role == "tool":
-        tool_call_id = str(record.get("tool_call_id") or "").strip()
-        if tool_call_id:
-            result.add(("tool_result", tool_call_id))
-    if event_type == "system_note_recorded" or (not event_type and role == "system"):
-        identity = _system_note_duplicate_identity(record)
-        if identity:
-            result.add(identity)
-    for send_id in _send_runtime_duplicate_ids(record):
-        result.add(("send", send_id))
-    return result
-
-
-def _system_note_duplicate_identity(record: dict[str, Any]) -> tuple[str, ...] | None:
-    payload = record.get("metadata", {}).get("event_payload") if isinstance(record.get("metadata"), dict) else {}
-    conversation_id = _record_conversation_id_for_display(record)
-    if isinstance(payload, dict):
-        content_hash = _optional_record_text(payload.get("content_hash"))
-        content_length = _optional_record_text(payload.get("content_length"))
-        payload_conversation_id = _optional_record_text(payload.get("conversation_id"))
-        if content_hash and content_length:
-            return (
-                "system_note",
-                payload_conversation_id or conversation_id,
-                content_hash,
-                content_length,
-            )
-    if _record_role(record) != "system":
-        return None
-    content = str(record.get("content") or "")
-    if not content:
-        return None
-    return (
-        "system_note",
-        conversation_id,
-        hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        str(len(content)),
-    )
-
-
-def _send_runtime_duplicate_ids(record: dict[str, Any]) -> set[str]:
-    ids: set[str] = set()
-    payload = record.get("metadata", {}).get("event_payload") if isinstance(record.get("metadata"), dict) else {}
-    if isinstance(payload, dict):
-        for key in ("send_id", "send_attempt_id", "attempt_id"):
-            value = _optional_record_text(payload.get(key))
-            if value:
-                ids.add(value)
-    for key in ("send_id", "send_attempt_id", "attempt_id"):
-        value = _optional_record_text(record.get(key))
-        if value:
-            ids.add(value)
-    content = str(record.get("content") or "")
-    send_status = _send_status_info(content)
-    if send_status and send_status.get("send_id"):
-        ids.add(str(send_status["send_id"]))
-    for tag in ("send_receipt", "send_status"):
-        tag_payload = _extract_tag_json(content, tag)
-        if not tag_payload:
-            continue
-        for key in ("send_id", "send_attempt_id", "attempt_id"):
-            value = _optional_record_text(tag_payload.get(key))
-            if value:
-                ids.add(value)
-    for pattern in (r"\bsend_id=([^\s,;，。]+)", r"\bsend_attempt_id=([^\s,;，。]+)", r"\battempt_id=([^\s,;，。]+)"):
-        for match in re.finditer(pattern, content):
-            ids.add(match.group(1).strip())
-    payload_content = _parse_json_object(content)
-    if payload_content:
-        for key in ("send_id", "send_attempt_id", "attempt_id"):
-            value = _optional_record_text(payload_content.get(key))
-            if value:
-                ids.add(value)
-    return ids
-
-
-def _tag_record_order(records: list[dict]) -> list[dict]:
-    return [{**record, "_record_order": index} for index, record in enumerate(records)]
-
-
-def _real_record_identity(record: dict[str, Any]) -> tuple[str, str, str] | None:
-    msg_id = _record_message_id(record)
-    if not msg_id:
-        return None
-    conversation_id = _record_conversation_id_for_display(record)
-    if not conversation_id:
-        return None
-    direction = str(record.get("direction") or "")
-    if not direction:
-        direction = "outbound" if _record_role(record) == "assistant" else "inbound"
-    return conversation_id, direction, msg_id
-
-
-async def _load_archive_records_paged(archive: Any) -> list[dict]:
-    filter_records = getattr(archive, "filter_records", None)
-    if not callable(filter_records):
-        return list(await archive.records() or [])
-
-    records: list[dict] = []
-    offset = 0
-    total: int | None = None
-    while total is None or offset < total:
-        page = await filter_records(
-            {
-                "limit": ARCHIVE_FETCH_PAGE_SIZE,
-                "offset": offset,
-                "order": "asc",
-            }
-        )
-        if not isinstance(page, dict):
-            break
-        raw_results = page.get("results") or []
-        results = [item for item in raw_results if isinstance(item, dict)]
-        if not results:
-            break
-        records.extend(await _full_archive_records_for_page(archive, results))
-        offset += len(results)
-        total_value = page.get("total")
-        total = int(total_value) if isinstance(total_value, int | str) and str(total_value).isdigit() else offset
-    return records
-
-
-async def _full_archive_records_for_page(archive: Any, results: list[dict]) -> list[dict]:
-    ids = [str(item.get("id") or "").strip() for item in results if item.get("id")]
-    get_by_ids = getattr(archive, "get_by_ids", None)
-    if ids and callable(get_by_ids):
-        try:
-            full_records = await get_by_ids(ids)
-        except Exception as e:
-            logger.warning(f"按归档 ID 还原完整记录失败，使用轻量记录: {e}")
-        else:
-            by_id = {
-                str(item.get("archive_id") or item.get("id") or ""): item
-                for item in full_records or []
-                if isinstance(item, dict)
-            }
-            ordered = [by_id[archive_id] for archive_id in ids if archive_id in by_id]
-            if len(ordered) == len(ids):
-                return ordered
-    return [_light_archive_result_to_record(item) for item in results]
-
-
-def _light_archive_result_to_record(item: dict[str, Any]) -> dict[str, Any]:
-    direction = str(item.get("direction") or "")
-    role = "assistant" if direction == "outbound" else "user"
-    conversation_id = item.get("conversation_id")
-    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-    return {
-        "role": role,
-        "content": str(item.get("content") or ""),
-        "conversation_id": str(conversation_id) if conversation_id else None,
-        "archive_id": item.get("id"),
-        "timestamp": item.get("time"),
-        "direction": direction,
-        "sender_id": item.get("sender_id"),
-        "sender_name": item.get("sender_name"),
-        "metadata": {
-            **metadata,
-            "direction": direction,
-            "sender_id": item.get("sender_id"),
-            "sender_name": item.get("sender_name"),
-        },
-    }
-
-
 def _render_record_html(
     rec: dict,
     *,
@@ -3676,6 +2137,7 @@ def _render_record_html(
     show_chat: bool = True,
     show_system: bool = True,
     show_tools: bool = True,
+    show_reasoning: bool = True,
 ) -> str:
     bubbles = _render_record_bubbles(
         rec,
@@ -3683,6 +2145,7 @@ def _render_record_html(
         show_chat=show_chat,
         show_system=show_system,
         show_tools=show_tools,
+        show_reasoning=show_reasoning,
     )
     return "".join(bubbles)
 
@@ -3694,6 +2157,7 @@ def _render_record_bubbles(
     show_chat: bool = True,
     show_system: bool = True,
     show_tools: bool = True,
+    show_reasoning: bool = True,
     attached_tool_results: dict[str, list[dict]] | None = None,
 ) -> list[str]:
     items = normalize_history_record(rec, persona_name=persona_name)
@@ -3713,6 +2177,7 @@ def _render_record_bubbles(
         show_chat=show_chat,
         show_system=show_system,
         show_tools=show_tools,
+        show_reasoning=show_reasoning,
     )
     return [_render_display_item(item) for item in visible]
 
@@ -3842,339 +2307,6 @@ def _split_legacy_header_messages(content: str) -> list[dict[str, str]]:
     return messages
 
 
-def _runtime_event_summary(content: str) -> tuple[str, str] | None:
-    if not content:
-        return None
-    if "<send_receipt_task" in content:
-        return "发送回执任务", _compact_inline_tokens(_first_nonempty_line(content))
-    if "<send_status" in content:
-        return "发送状态", _format_send_status_summary(content)
-    if "<send_receipt" in content:
-        return "发送回执", _format_send_receipt_summary(content)
-    if "<task_context" in content:
-        return "运行时上下文", _format_task_context_summary(content)
-    return None
-
-
-def _format_send_status_summary(content: str) -> str:
-    body = _extract_tag_text(content, "send_status") or content
-    lines = [
-        line.strip()
-        for line in body.splitlines()
-        if line.strip() and "不是用户新发言" not in line
-    ]
-    summary = lines[-1] if lines else _first_nonempty_line(body)
-    return _compact_inline_tokens(summary) or "发送状态"
-
-
-def _send_status_info(content: str) -> dict[str, Any] | None:
-    if "<send_status" not in content and "send_id" not in content:
-        return None
-    body = _extract_tag_text(content, "send_status") or content
-    payload = _parse_json_object(body)
-    if payload:
-        send_id = str(payload.get("send_id") or "").strip()
-        msg_ids = payload.get("msg_ids") or payload.get("message_ids")
-        if not isinstance(msg_ids, list):
-            msg_ids = []
-        parsed_msg_ids = [str(item).strip() for item in msg_ids if str(item).strip()]
-        return {
-            "send_id": send_id,
-            "msg_ids": parsed_msg_ids,
-            "completed": _send_status_payload_completed(payload, parsed_msg_ids),
-        } if send_id else None
-
-    send_id_match = re.search(r"\bsend_id=([^\s,;，。]+)", body)
-    if not send_id_match:
-        return None
-    msg_ids: list[str] = []
-    list_match = re.search(r"\bmsg_ids=\[([^\]]*)\]", body)
-    if list_match:
-        msg_ids = [
-            part.strip().strip("'\"")
-            for part in list_match.group(1).split(",")
-            if part.strip().strip("'\"")
-        ]
-    else:
-        single_match = re.search(r"\bmsg_id=([^\s,;，。]+)", body)
-        if single_match:
-            msg_ids = [single_match.group(1).strip().strip("'\"")]
-    return {
-        "send_id": send_id_match.group(1).strip(),
-        "msg_ids": msg_ids,
-        "completed": _send_status_text_completed(body, msg_ids),
-    }
-
-
-def _send_status_payload_completed(payload: dict[str, Any], msg_ids: list[str]) -> bool:
-    status = str(payload.get("status") or payload.get("delivery") or "").strip().casefold()
-    if status in {"sent", "done", "completed", "complete", "success", "succeeded"}:
-        return True
-    if status in {"pending", "queued", "accepted", "needs_review", "failed", "stale"}:
-        return False
-    if payload.get("ok") is True and msg_ids:
-        return True
-    return bool(msg_ids and status not in {"failed", "stale"})
-
-
-def _send_status_text_completed(body: str, msg_ids: list[str]) -> bool:
-    if not msg_ids:
-        return False
-    lowered = body.casefold()
-    if any(token in lowered for token in ("失败", "过期", "stale", "failed", "pending", "等待")):
-        return False
-    return any(token in body for token in ("发送完成", "发送成功", "已发送", "投递完成")) or "sent" in lowered
-
-
-def _format_send_receipt_summary(content: str) -> str:
-    payload = _extract_tag_json(content, "send_receipt")
-    if not payload:
-        return _format_send_receipt_text_summary(content)
-    status = payload.get("status")
-    ok = payload.get("ok")
-    sent = payload.get("sent") or []
-    unsent = payload.get("unsent") or []
-    attempted = payload.get("attempted_messages") or []
-    new_messages = payload.get("new_messages") or payload.get("new_visible_messages") or []
-    recalled = payload.get("recalled_messages") or []
-    parts = []
-    if status:
-        parts.append(f"状态 {status}")
-    elif ok is not None:
-        parts.append("成功" if ok else "未完成")
-    if sent:
-        parts.append(f"已发送 {len(sent)} 条")
-    if unsent:
-        parts.append(f"未发送 {len(unsent)} 条")
-    if attempted:
-        parts.append(f"待发送/尝试 {len(attempted)} 条")
-    accepted = payload.get("accepted") or payload.get("queued") or []
-    if accepted:
-        parts.append(f"排队/待确认 {len(accepted)} 条")
-    if new_messages:
-        parts.append(f"新消息 {len(new_messages)} 条")
-    if recalled:
-        parts.append(f"撤回 {len(recalled)} 条")
-    delivery = payload.get("delivery")
-    if delivery:
-        parts.append(f"投递 {delivery}")
-    if payload.get("qq_visible") == "pending":
-        parts.append("QQ 可见性待确认")
-    note = str(payload.get("note") or payload.get("next") or "").strip()
-    if note:
-        parts.append(_compact_inline_tokens(note))
-    return "；".join(parts) if parts else "发送回执"
-
-
-def _format_send_receipt_text_summary(content: str) -> str:
-    body = _extract_tag_text(content, "send_receipt") or content
-    lines = [line.strip() for line in body.splitlines() if line.strip()]
-    parts: list[str] = []
-    for line in lines:
-        match = re.match(r"^状态[:：]\s*(.+?)\s*$", line)
-        if match:
-            status = match.group(1).strip().rstrip("。.")
-            if status:
-                parts.append(f"状态 {status}")
-            break
-    for source, label in (
-        ("已发送", "已发送"),
-        ("未发送", "未发送"),
-        ("新消息", "新消息"),
-        ("撤回消息", "撤回"),
-        ("错误", "错误"),
-    ):
-        count = _send_receipt_text_section_count(lines, source)
-        if count > 0:
-            parts.append(f"{label} {count} 条")
-    if parts:
-        return "；".join(parts)
-    first = _first_nonempty_line(body)
-    return _compact_inline_tokens(first) if first else "发送回执"
-
-
-def _send_receipt_sent_items(content: str) -> list[dict[str, Any]]:
-    payload = _extract_tag_json(content, "send_receipt")
-    if not payload:
-        return _send_receipt_text_sent_items(content)
-    sent = payload.get("sent")
-    if not isinstance(sent, list):
-        return []
-    send_id = str(payload.get("send_id") or "").strip()
-    result: list[dict[str, Any]] = []
-    for order, item in enumerate(sent):
-        if not isinstance(item, dict) or item.get("qq_visible") is False:
-            continue
-        enriched = {
-            **item,
-            "send_order": item.get("send_order", order),
-            "_synthetic_source": "send_receipt",
-        }
-        if send_id and not enriched.get("send_id"):
-            enriched["send_id"] = send_id
-        result.append(enriched)
-    return result
-
-
-def _send_receipt_text_sent_items(content: str) -> list[dict[str, Any]]:
-    body = _extract_tag_text(content, "send_receipt")
-    if not body:
-        return []
-    try:
-        return _parse_send_receipt_text_sent_items(body)
-    except (AttributeError, TypeError, ValueError):
-        return []
-
-
-def _parse_send_receipt_text_sent_items(body: str) -> list[dict[str, Any]]:
-    lines = [line.strip() for line in body.splitlines() if line.strip()]
-    send_id = _send_receipt_text_send_id(lines)
-    start = -1
-    declared_count = 0
-    for index, line in enumerate(lines):
-        count = _send_receipt_text_section_count([line], "已发送")
-        if count >= 0:
-            start = index + 1
-            declared_count = count
-            break
-    if start < 0 or declared_count <= 0:
-        return []
-
-    result: list[dict[str, Any]] = []
-    for order, line in enumerate(_send_receipt_text_section_lines(lines, start)):
-        match = re.match(r"^\s*\d+[\.\)、]\s*(.+?)\s*$", line)
-        if not match:
-            continue
-        item = _parse_send_receipt_text_sent_line(
-            match.group(1),
-            fallback_send_id=send_id,
-            fallback_order=order,
-        )
-        if item:
-            result.append(item)
-    return result
-
-
-def _send_receipt_text_send_id(lines: list[str]) -> str:
-    for line in lines:
-        match = re.match(r"^发送回执[:：]\s*(\S+)\s*$", line)
-        if match:
-            value = match.group(1).strip()
-            return "" if value == "无" else value
-    return ""
-
-
-def _send_receipt_text_section_count(lines: list[str], title: str) -> int:
-    pattern = rf"^{re.escape(title)}\s*(\d+)\s*条[:：]?\s*$"
-    for line in lines:
-        match = re.match(pattern, line)
-        if match:
-            return int(match.group(1))
-    return -1
-
-
-def _send_receipt_text_section_lines(lines: list[str], start: int) -> list[str]:
-    result: list[str] = []
-    for line in lines[start:]:
-        if _send_receipt_text_is_section_heading(line) or line.startswith("处理要求"):
-            break
-        result.append(line)
-    return result
-
-
-def _send_receipt_text_is_section_heading(line: str) -> bool:
-    return bool(
-        re.match(
-            r"^(已发送|未发送|新消息|撤回消息|错误|attempted|accepted|待发送/尝试|排队/待确认|已接受消息)\s*\d+\s*条[:：]?\s*$",
-            line,
-        )
-    )
-
-
-def _parse_send_receipt_text_sent_line(
-    text: str,
-    *,
-    fallback_send_id: str,
-    fallback_order: int,
-) -> dict[str, Any] | None:
-    parts = [part.strip() for part in re.split(r"[；;](?=[A-Za-z_][\w-]*=)", text) if part.strip()]
-    if not parts:
-        return None
-    item: dict[str, Any] = {}
-    content_parts: list[str] = []
-    for part in parts:
-        match = re.match(r"^([A-Za-z_][\w-]*)=(.*)$", part)
-        if not match:
-            content_parts.append(part)
-            continue
-        key = match.group(1).strip()
-        value = match.group(2).strip()
-        if value and value != "无":
-            item[key] = _send_receipt_text_field_value(key, value)
-    content = str(item.get("content") or "；".join(content_parts)).strip()
-    if not content:
-        return None
-    if item.get("qq_visible") is False:
-        return None
-    item["content"] = content
-    item.setdefault("qq_visible", True)
-    item.setdefault("send_order", item.get("order", fallback_order))
-    if fallback_send_id:
-        item.setdefault("send_id", fallback_send_id)
-    item["_synthetic_source"] = "send_receipt"
-    return item
-
-
-def _send_receipt_text_field_value(key: str, value: str) -> Any:
-    lowered = value.casefold()
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    if key in {"order", "send_order", "message_index", "index"} and value.isdigit():
-        return int(value)
-    return value
-
-
-def _format_task_context_summary(content: str) -> str:
-    parts = ["本轮系统上下文"]
-    conv_match = re.search(r"当前会话：([^。\n]+)", content)
-    if conv_match:
-        parts.append(f"当前会话 {conv_match.group(1).strip()}")
-    recent_count = len(re.findall(r"<recent_group_messages\b", content))
-    if recent_count:
-        parts.append("包含最近群聊窗口")
-    if "可用表情" in content:
-        parts.append("包含可用表情提示")
-    return "；".join(parts)
-
-
-def _extract_tag_json(content: str, tag: str) -> dict[str, Any] | None:
-    match = re.search(rf"<{tag}>\s*(.*?)\s*</{tag}>", content, re.S)
-    if not match:
-        return None
-    raw = match.group(1).strip()
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError:
-        json_start = raw.find("{")
-        json_end = raw.rfind("}")
-        if json_start < 0 or json_end <= json_start:
-            return None
-        try:
-            value = json.loads(raw[json_start:json_end + 1])
-        except json.JSONDecodeError:
-            return None
-    return value if isinstance(value, dict) else None
-
-
-def _extract_tag_text(content: str, tag: str) -> str | None:
-    match = re.search(rf"<{tag}\b[^>]*>\s*(.*?)\s*</{tag}>", content, re.S)
-    if not match:
-        return None
-    return match.group(1).strip()
-
-
 def _render_tool_result_content(
     content: str,
     *,
@@ -4191,71 +2323,6 @@ def _render_tool_result_content(
             collapsed_label="点击展开",
         )
     return f"<pre class='chat-pre'>{_escape(display.detail)}</pre>"
-
-
-def _format_tool_result_summary(content: str) -> str:
-    return format_tool_result(content).summary
-
-
-def _format_message_list_summary(value: Any, *, head: str, noun: str) -> str:
-    if not isinstance(value, list) or not value:
-        return ""
-    details: list[str] = []
-    times = [
-        str(item.get("time") or item.get("timestamp") or item.get("created_at") or "").strip()
-        for item in value
-        if isinstance(item, dict)
-    ]
-    times = [item for item in times if item]
-    if times:
-        details.append(times[0] if times[0] == times[-1] else f"{times[0]}-{times[-1]}")
-    sources = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        source = str(
-            item.get("conversation_id")
-            or item.get("source")
-            or item.get("group_id")
-            or item.get("target_id")
-            or ""
-        ).strip()
-        if source and source not in sources:
-            sources.append(source)
-    if sources:
-        shown = "、".join(sources[:2])
-        if len(sources) > 2:
-            shown = f"{shown} 等 {len(sources)} 个来源"
-        details.append(f"来源 {shown}")
-    sample = _message_list_sample(value)
-    if sample:
-        details.append(f"样例：{sample}")
-    suffix = f"（{'；'.join(details)}）" if details else ""
-    return f"{head} {len(value)} 条{noun}{suffix}"
-
-
-def _message_list_sample(value: list[Any]) -> str:
-    first = next((item for item in value if isinstance(item, dict)), None)
-    if first is None:
-        return ""
-    sender = str(
-        first.get("sender_name")
-        or first.get("nickname")
-        or first.get("user_id")
-        or first.get("sender_id")
-        or ""
-    ).strip()
-    text = str(
-        first.get("text")
-        or first.get("content")
-        or first.get("message")
-        or first.get("raw_message")
-        or ""
-    ).strip()
-    text = _short_text(_compact_inline_tokens(text), limit=48)
-    if sender and text:
-        return f"{sender}: {text}"
-    return sender or text
 
 
 def _render_collapsed_content(
@@ -4336,199 +2403,6 @@ def _render_text_block(
             )
         )
     return "".join(parts)
-
-
-def _compact_inline_tokens(content: str) -> str:
-    json_compact = _compact_json_blob(content)
-    if json_compact != content:
-        return json_compact
-    compact = _URL_RE.sub(lambda m: _compact_url(m.group(0)), content)
-    compact = _WINDOWS_PATH_RE.sub(lambda m: _compact_path(m.group(0)), compact)
-    compact = _WORKSPACE_PATH_RE.sub(lambda m: _compact_workspace_path(m.group(0)), compact)
-    return compact
-
-
-def _compact_json_blob(content: str) -> str:
-    stripped = content.strip()
-    if len(stripped) <= INLINE_PREVIEW_LIMIT:
-        return content
-    if not (
-        (stripped.startswith("{") and stripped.endswith("}"))
-        or (stripped.startswith("[") and stripped.endswith("]"))
-    ):
-        return content
-    try:
-        value = json.loads(stripped)
-    except json.JSONDecodeError:
-        return content
-    kind = "JSON对象" if isinstance(value, dict) else "JSON数组"
-    if isinstance(value, dict):
-        preview_keys = "、".join(str(key) for key in list(value)[:4])
-        suffix = f" · {preview_keys}" if preview_keys else ""
-    elif isinstance(value, list):
-        suffix = f" · {len(value)} 项"
-    else:
-        suffix = ""
-    return f"[{kind}{suffix} · {len(stripped)}字，已折叠]"
-
-
-def _compact_url(value: str) -> str:
-    if len(value) <= INLINE_PREVIEW_LIMIT:
-        return value
-    parsed = urlsplit(value)
-    host = parsed.netloc or "url"
-    tail = parsed.path.rsplit("/", 1)[-1] or parsed.path.strip("/") or "link"
-    tail = tail[:24] + "..." if len(tail) > 27 else tail
-    return f"[URL {host}/{tail} · {len(value)}字]"
-
-
-def _compact_path(value: str) -> str:
-    if len(value) <= INLINE_PREVIEW_LIMIT:
-        return value
-    tail = value.replace("/", "\\").rsplit("\\", 1)[-1] or "path"
-    return f"[路径 {tail} · {len(value)}字]"
-
-
-def _compact_workspace_path(value: str) -> str:
-    if len(value) <= INLINE_PREVIEW_LIMIT:
-        return value
-    cleaned = value.removeprefix("workspace=")
-    tail = cleaned.replace("\\", "/").rsplit("/", 1)[-1] or "workspace"
-    return f"[workspace {tail} · {len(value)}字]"
-
-
-def _first_nonempty_line(content: str) -> str:
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped:
-            return stripped
-    return ""
-
-
-def _format_tool_call_for_display(tool_call: dict) -> str:
-    return format_tool_call(tool_call).summary
-
-
-def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, dict):
-        return raw
-    if not isinstance(raw, str) or not raw.strip():
-        return {}
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"raw": raw}
-    return value if isinstance(value, dict) else {"value": value}
-
-
-def _format_private_send_args(args: dict[str, Any]) -> str:
-    targets = args.get("targets")
-    if not isinstance(targets, list):
-        targets = []
-    lines = []
-    for target in targets:
-        if not isinstance(target, dict):
-            continue
-        qq = target.get("target_qq") or target.get("target_id") or "默认私聊"
-        lines.append(f"向 {qq} 发送消息：{_message_with_delay(target)}")
-    return "；".join(lines) or "发送私聊消息"
-
-
-def _format_group_send_args(args: dict[str, Any]) -> str:
-    group_id = args.get("group_id") or args.get("target_id") or "默认群"
-    targets = args.get("targets")
-    if not isinstance(targets, list):
-        targets = []
-    messages = [
-        _message_with_delay(target)
-        for target in targets
-        if isinstance(target, dict)
-    ]
-    joined = "；".join(messages) if messages else "(空消息)"
-    return f"在群 {group_id} 发送消息：{joined}"
-
-
-def _message_with_delay(target: dict[str, Any]) -> str:
-    content = str(target.get("content") or "")
-    delay = target.get("delay")
-    if delay in (None, 0, 0.0, ""):
-        return content
-    return f"{content}（{delay}s）"
-
-
-def _format_commit_send_attempt_args(args: dict[str, Any]) -> str:
-    parts = []
-    attempt_id = str(args.get("send_attempt_id") or "").strip()
-    if attempt_id:
-        parts.append(f"send_attempt_id={attempt_id}")
-    if args.get("reviewed_until_seq") is not None:
-        parts.append(f"已复核到 seq {args.get('reviewed_until_seq')}")
-    policy = str(args.get("delivery_interrupt_policy") or "").strip()
-    if policy:
-        parts.append(f"中断策略 {policy}")
-    reply_to = str(args.get("reply_to_message_id") or "").strip()
-    if reply_to:
-        parts.append(f"引用 msg_id={reply_to}")
-    if args.get("ignore_review_interrupts") is True:
-        parts.append("忽略复核打断")
-    reason = str(args.get("reason") or "").strip()
-    if reason:
-        parts.append(f"原因：{_short_text(_compact_inline_tokens(reason), limit=60)}")
-    detail = "；".join(parts) if parts else "无参数"
-    return f"提交发送尝试：{detail}"
-
-
-def _format_generic_tool_args(name: str, args: dict[str, Any]) -> str:
-    if not args:
-        return f"{name}：无参数"
-    parts = []
-    for key, value in args.items():
-        parts.append(f"{key}={_format_tool_arg_value(value)}")
-        if len(parts) >= 5:
-            break
-    if len(args) > len(parts):
-        parts.append(f"另有 {len(args) - len(parts)} 项")
-    return f"{name}：{'；'.join(parts)}"
-
-
-def _format_tool_arg_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if value is None:
-        return "null"
-    if isinstance(value, list):
-        sample = _message_list_sample(value)
-        suffix = f"，样例：{sample}" if sample else ""
-        return f"{len(value)} 项{suffix}"
-    if isinstance(value, dict):
-        keys = "、".join(str(key) for key in list(value)[:4])
-        return f"对象({keys})" if keys else "对象"
-    return _short_text(_compact_inline_tokens(str(value)), limit=80)
-
-
-def _format_upload_args(args: dict[str, Any]) -> str:
-    target_type = args.get("target_type") or "-"
-    target_id = args.get("target_id") or "-"
-    path = args.get("file_path") or args.get("path") or "-"
-    return f"上传文件到 {target_type}:{target_id}：{path}"
-
-
-def _escape(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
-def _escape_attr(s: str) -> str:
-    return _escape(s).replace('"', "&quot;").replace("'", "&#x27;")
-
-
-def _short_text(value: str, *, limit: int) -> str:
-    if len(value) <= limit:
-        return value
-    return f"{value[:limit]}..."
 
 
 def _scrollbar_near_bottom(bar: Any, threshold: int = 24) -> bool:

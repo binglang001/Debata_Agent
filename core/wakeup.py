@@ -12,8 +12,12 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
+import itertools
 import logging
+import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -25,6 +29,16 @@ WakeFireCallback = Callable[
     [str, dict[str, Any] | None, str, str | None],
     Awaitable[None],
 ]
+
+
+@dataclass(order=True)
+class _ScheduledWakeup:
+    due_at: float
+    seq: int
+    reminder: str = field(compare=False)
+    target: dict[str, Any] | None = field(compare=False)
+    mode: str = field(compare=False)
+    message_text: str | None = field(compare=False)
 
 
 class WakeupScheduler:
@@ -40,7 +54,11 @@ class WakeupScheduler:
 
     def __init__(self, on_fire: WakeFireCallback) -> None:
         self._on_fire = on_fire
-        self._tasks: set[asyncio.Task] = set()
+        self._queue: list[_ScheduledWakeup] = []
+        self._seq = itertools.count()
+        self._runner_task: asyncio.Task[None] | None = None
+        self._changed = asyncio.Event()
+        self._closed = False
 
     async def schedule(
         self,
@@ -60,36 +78,78 @@ class WakeupScheduler:
             )
             return
 
-        async def _runner():
-            try:
-                await asyncio.sleep(delay_seconds)
-                logger.info(f"定时唤醒触发: {reminder!r}")
-                await self._on_fire(reminder, target, mode, message_text)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.exception(f"定时唤醒执行失败: {e}")
-
-        task = asyncio.create_task(_runner())
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        if self._closed:
+            logger.warning("WakeupScheduler 已关闭，跳过新增定时任务")
+            return
+        item = _ScheduledWakeup(
+            due_at=time.monotonic() + delay_seconds,
+            seq=next(self._seq),
+            reminder=reminder,
+            target=target,
+            mode=mode,
+            message_text=message_text,
+        )
+        heapq.heappush(self._queue, item)
+        self._ensure_runner()
+        self._changed.set()
         logger.info(f"已注册定时任务 +{delay_seconds}s mode={mode}: {reminder!r}")
 
     def pending_count(self) -> int:
-        return sum(1 for t in self._tasks if not t.done())
+        return len(self._queue)
 
     async def cancel_all(self) -> None:
         """关闭所有未触发的任务（用于 shutdown）。"""
-        tasks = list(self._tasks)
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        for t in tasks:
+        count = len(self._queue)
+        self._queue.clear()
+        self._closed = True
+        self._changed.set()
+        task = self._runner_task
+        self._runner_task = None
+        if task is not None and not task.done():
+            task.cancel()
             try:
-                await t
+                await task
             except asyncio.CancelledError:
                 pass
             except Exception as e:
                 logger.warning(f"WakeupScheduler 取消任务异常: {e}")
-        self._tasks.clear()
-        logger.info(f"WakeupScheduler 已取消 {len(tasks)} 个待触发任务")
+        logger.info(f"WakeupScheduler 已取消 {count} 个待触发任务")
+
+    def _ensure_runner(self) -> None:
+        if self._runner_task is None or self._runner_task.done():
+            self._runner_task = asyncio.create_task(self._runner(), name="wakeup-scheduler")
+
+    async def _runner(self) -> None:
+        while not self._closed:
+            if not self._queue:
+                self._changed.clear()
+                await self._changed.wait()
+                continue
+
+            next_item = self._queue[0]
+            delay = max(0.0, next_item.due_at - time.monotonic())
+            if delay > 0:
+                self._changed.clear()
+                try:
+                    await asyncio.wait_for(self._changed.wait(), timeout=delay)
+                    continue
+                except asyncio.TimeoutError:
+                    pass
+
+            now = time.monotonic()
+            due: list[_ScheduledWakeup] = []
+            while self._queue and self._queue[0].due_at <= now:
+                due.append(heapq.heappop(self._queue))
+            for item in due:
+                try:
+                    logger.info(f"定时唤醒触发: {item.reminder!r}")
+                    await self._on_fire(
+                        item.reminder,
+                        item.target,
+                        item.mode,
+                        item.message_text,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.exception(f"定时唤醒执行失败: {e}")

@@ -194,6 +194,15 @@ class ToolContext:
     agent_task_cb: AgentTaskCallback | None = None
     """start_agent_task 工具触发时调用，创建后台子 Agent 任务。"""
 
+    persona_agent: Any | None = None
+    """人格管理 Agent。eat/sleep 等人格工具通过它触发状态变更。"""
+
+    subconscious_agent: Any | None = None
+    """潜意识后台 Agent，供人格相关工具或后续工具层注入使用。"""
+
+    persona_db: Any | None = None
+    """人格状态数据库句柄。工具层默认不直接写入，仅保留依赖注入口。"""
+
     collected: list[dict[str, Any]] = field(default_factory=list)
     """遗留发送动作兜底队列。
     每条结构：{"action": "private"|"group", "target": str, "content": str,

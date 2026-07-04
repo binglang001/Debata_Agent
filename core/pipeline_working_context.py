@@ -82,6 +82,7 @@ class PipelineWorkingContextMixin:
         conversation_id: str | None,
         *,
         token_budget: int | None = None,
+        member_qqs: set[int] | None = None,
     ) -> str:
         """按当前会话选择重要记忆注入文本，不受 RAG 开关影响。"""
         estimator = self._token_estimator()
@@ -90,6 +91,7 @@ class PipelineWorkingContextMixin:
             conversation_id,
             token_budget=budget,
             estimator=estimator,
+            member_qqs=member_qqs,
         )
 
     async def _rag_context_text(

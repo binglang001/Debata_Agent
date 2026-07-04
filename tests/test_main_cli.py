@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +12,131 @@ import pytest
 import main as app_main
 from app_config.loader import load_config
 from app_config.secrets import SecretsManager
+
+_QT_APP = None
+
+
+class _FakeHandle:
+    def __init__(self, callback):
+        self._callback = callback
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _run(self) -> None:
+        self._callback()
+
+
+def _make_patched_simple_timer():
+    pytest.importorskip("PySide6.QtCore", exc_type=ImportError)
+    _qt_app()
+
+    class FakeQasync:
+        class _SimpleTimer:
+            pass
+
+    app_main._install_qasync_timer_multiplexer(FakeQasync)
+    return FakeQasync._SimpleTimer()
+
+
+def _qt_app():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qt_widgets = pytest.importorskip("PySide6.QtWidgets", exc_type=ImportError)
+    global _QT_APP
+    _QT_APP = qt_widgets.QApplication.instance() or _QT_APP or qt_widgets.QApplication([])
+    return _QT_APP
+
+
+def _wait_for_qt(condition, timeout_ms: int = 500) -> None:
+    qt_core = pytest.importorskip("PySide6.QtCore", exc_type=ImportError)
+    app = _qt_app()
+    deadline = time.monotonic() + timeout_ms / 1000
+
+    while not condition() and time.monotonic() < deadline:
+        loop = qt_core.QEventLoop()
+        qt_core.QTimer.singleShot(5, loop.quit)
+        loop.exec()
+        app.processEvents()
+
+    assert condition()
+
+
+def test_gui_instance_lock_blocks_second_instance(tmp_path):
+    pytest.importorskip("PySide6.QtCore", exc_type=ImportError)
+
+    lock_path = tmp_path / "debata.gui.lock"
+    first = app_main._acquire_gui_instance_lock(lock_path)
+    try:
+        assert first is not None
+        second = app_main._acquire_gui_instance_lock(lock_path)
+        assert second is None
+    finally:
+        if first is not None:
+            first.unlock()
+
+    third = app_main._acquire_gui_instance_lock(lock_path)
+    try:
+        assert third is not None
+    finally:
+        if third is not None:
+            third.unlock()
+
+
+def test_install_qasync_timer_multiplexer_is_idempotent():
+    pytest.importorskip("PySide6.QtCore", exc_type=ImportError)
+
+    class FakeQasync:
+        class _SimpleTimer:
+            pass
+
+    app_main._install_qasync_timer_multiplexer(FakeQasync)
+    first = FakeQasync._SimpleTimer
+    app_main._install_qasync_timer_multiplexer(FakeQasync)
+
+    assert FakeQasync._SimpleTimer is first
+    assert FakeQasync._debata_timer_multiplexer_installed is True
+
+
+def test_qasync_timer_multiplexer_runs_zero_and_short_delay_callbacks():
+    timer = _make_patched_simple_timer()
+    calls: list[str] = []
+
+    try:
+        assert timer.add_callback(_FakeHandle(lambda: calls.append("zero")), delay=0) is not None
+        timer.add_callback(_FakeHandle(lambda: calls.append("short")), delay=0.01)
+
+        _wait_for_qt(lambda: calls == ["zero", "short"])
+    finally:
+        timer.stop()
+
+
+def test_qasync_timer_multiplexer_skips_cancelled_callbacks():
+    timer = _make_patched_simple_timer()
+    calls: list[str] = []
+    cancelled = _FakeHandle(lambda: calls.append("cancelled"))
+
+    try:
+        timer.add_callback(cancelled, delay=0)
+        cancelled.cancel()
+        timer.add_callback(_FakeHandle(lambda: calls.append("active")), delay=0)
+
+        _wait_for_qt(lambda: calls == ["active"])
+    finally:
+        timer.stop()
+
+
+def test_qasync_timer_multiplexer_uses_single_qtimer_for_many_delays():
+    qt_core = pytest.importorskip("PySide6.QtCore", exc_type=ImportError)
+    timer = _make_patched_simple_timer()
+
+    try:
+        for _ in range(500):
+            timer.add_callback(_FakeHandle(lambda: None), delay=60)
+
+        assert len(timer.findChildren(qt_core.QTimer)) == 1
+    finally:
+        timer.stop()
 
 
 @pytest.mark.asyncio

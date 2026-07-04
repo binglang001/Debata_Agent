@@ -175,6 +175,28 @@ def test_parse_message_string_file_cq_with_local_path():
     assert event.media[0].url == "D:\\QQ_data\\Tencent Files\\NapCat\\temp\\问卷.pdf"
 
 
+def test_parse_message_string_file_cq_with_only_url_extracts_name():
+    raw = {
+        "post_type": "message",
+        "message_type": "private",
+        "message_id": 1,
+        "user_id": 1001,
+        "self_id": 9999,
+        "time": 1,
+        "raw_message": "[CQ:file,url=/app/.config/QQ/NapCat/temp/AI 研究路线.md]",
+        "message": "[CQ:file,url=/app/.config/QQ/NapCat/temp/AI 研究路线.md]",
+        "sender": {"user_id": 1001, "nickname": "Alice"},
+    }
+
+    event = parse_napcat_event("nc", raw)
+
+    assert event is not None
+    assert event.media[0].type == MediaType.FILE
+    assert event.media[0].file_id is None
+    assert event.media[0].name == "AI 研究路线.md"
+    assert event.media[0].url == "/app/.config/QQ/NapCat/temp/AI 研究路线.md"
+
+
 def test_parse_message_with_reply():
     raw = {
         "post_type": "message",
@@ -192,6 +214,57 @@ def test_parse_message_with_reply():
     }
     event = parse_napcat_event("nc", raw)
     assert event.reply_to == "999"
+
+
+def test_parse_message_structured_forward_when_raw_message_empty():
+    raw = {
+        "post_type": "message",
+        "message_type": "private",
+        "message_id": 1,
+        "user_id": 1001,
+        "self_id": 9999,
+        "time": 1,
+        "raw_message": "",
+        "message": [
+            {
+                "type": "forward",
+                "data": {"id": "fwd123", "title": "聊天记录"},
+            }
+        ],
+        "sender": {"user_id": 1001, "nickname": "Alice"},
+    }
+
+    event = parse_napcat_event("nc", raw)
+
+    assert isinstance(event, IncomingMessage)
+    assert event.text == "[合并转发 id=fwd123 title=聊天记录]"
+    assert len(event.media) == 1
+    assert event.media[0].type == MediaType.FORWARD
+    assert event.media[0].file_id == "fwd123"
+    assert event.media[0].extra["title"] == "聊天记录"
+
+
+def test_parse_message_string_forward_cq_extracts_media_and_title():
+    raw = {
+        "post_type": "message",
+        "message_type": "private",
+        "message_id": 1,
+        "user_id": 1001,
+        "self_id": 9999,
+        "time": 1,
+        "raw_message": "[CQ:forward,id=fwd123,title=聊天记录]",
+        "message": "[CQ:forward,id=fwd123,title=聊天记录]",
+        "sender": {"user_id": 1001, "nickname": "Alice"},
+    }
+
+    event = parse_napcat_event("nc", raw)
+
+    assert isinstance(event, IncomingMessage)
+    assert event.text == "[合并转发 id=fwd123]"
+    assert len(event.media) == 1
+    assert event.media[0].type == MediaType.FORWARD
+    assert event.media[0].file_id == "fwd123"
+    assert event.media[0].extra["title"] == "聊天记录"
 
 
 def test_parse_message_missing_fields_returns_none():

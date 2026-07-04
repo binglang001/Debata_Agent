@@ -26,7 +26,7 @@ class SettingsSoftwareMixin:
     def _build_software_behavior_section(self) -> SectionCard:
         card = SectionCard(
             title="软件行为",
-            subtitle="界面主题、消息合并、主动思考和陌生人限速。常用项在上方，高风险项保持收起前的简洁说明。",
+            subtitle="界面主题、消息合并、社交决策和陌生人限速。常用项在上方，高风险项保持收起前的简洁说明。",
         )
         card.add_content(self._build_appearance_section())
 
@@ -66,11 +66,11 @@ class SettingsSoftwareMixin:
         card.add_layout(form)
 
         proactive_section = CollapsibleSection(
-            "主动思考",
+            "社交决策",
             "后台定时判断是否需要主动开口。频率越高，成本越高。",
             expanded=False,
         )
-        proactive_hint = QLabel("主动思考会定时判断是否需要主动开口。频率越高，成本越高。")
+        proactive_hint = QLabel("社交决策会定时判断是否需要主动开口。频率越高，成本越高。")
         proactive_hint.setProperty("role", "secondary")
         proactive_hint.setWordWrap(True)
         proactive_section.add_content(proactive_hint)
@@ -84,23 +84,23 @@ class SettingsSoftwareMixin:
         proactive_spin.editingFinished.connect(
             lambda: self._on_behavior_field("proactive_think_interval_seconds", proactive_spin.value())
         )
-        proactive_form.addRow(QLabel("主动思考间隔"), unit_spinbox(proactive_spin, "秒"))
+        proactive_form.addRow(QLabel("主动社交间隔"), unit_spinbox(proactive_spin, "秒"))
 
         proactive_budget = QSpinBox()
         proactive_budget.setRange(1024, 65536)
         proactive_budget.setSingleStep(1024)
         proactive_budget.setValue(b.proactive_context_token_budget)
-        proactive_budget.setToolTip("主动思考路由器读取近期上下文和记忆的预算。默认 4K。")
+        proactive_budget.setToolTip("社交决策读取近期上下文和记忆的预算。默认 4K。")
         proactive_budget.editingFinished.connect(
             lambda: self._on_behavior_field("proactive_context_token_budget", proactive_budget.value())
         )
-        proactive_form.addRow(QLabel("主动思考上下文"), unit_spinbox(proactive_budget, "token"))
+        proactive_form.addRow(QLabel("社交决策上下文"), unit_spinbox(proactive_budget, "token"))
         proactive_section.add_layout(proactive_form)
         card.add_content(proactive_section)
 
         proactive_budget_section = CollapsibleSection(
-            "主动思考预算",
-            "控制主动路由器读取文本、工具结果、摘要和历史的预算。",
+            "社交决策预算",
+            "控制社交决策读取文本、工具结果、摘要和历史的预算。",
             expanded=False,
         )
         proactive_budget_form = QFormLayout()

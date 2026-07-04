@@ -32,7 +32,7 @@ from uuid import uuid4
 
 from utils.token_budget import TokenEstimator
 
-from .store import JsonStore
+from .store import JsonStore, JsonStoreLike
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +75,13 @@ def scope_from_conversation_id(conversation_id: str | None) -> str | None:
 class ImportantMemoryManager:
     """重要记忆管理器。"""
 
-    def __init__(self, path: Path, now_fn: Callable[[], str] | None = None) -> None:
-        self._store = JsonStore(path)
+    def __init__(
+        self,
+        path: Path,
+        now_fn: Callable[[], str] | None = None,
+        store: JsonStoreLike | None = None,
+    ) -> None:
+        self._store = store if store is not None else JsonStore(path)
         self._items: list[dict] = []
         self._cached_text: str = ""
         self._loaded: bool = False
@@ -210,14 +215,18 @@ class ImportantMemoryManager:
         *,
         token_budget: int | None = None,
         estimator: TokenEstimator | None = None,
+        member_qqs: set[int] | None = None,
     ) -> str:
         """按当前会话 scope 选择要注入的记忆文本。
 
         记忆仍是一份全局存储；scope 只影响本轮优先 surface 哪些条目。
         pinned 条目永远注入，其余条目只注入 global 与当前 scope 匹配项。
+
+        群聊中可传入 member_qqs，让 user:QQ 范围的记忆在该用户所在群里也可见。
+        None 保持旧行为；空集合表示已确认群成员为空或不包含相关用户。
         """
         scope = scope_from_conversation_id(conversation_id)
-        selected = self._select_for_scope(scope)
+        selected = self._select_for_scope(scope, member_qqs=member_qqs)
         return self._format_items(selected, token_budget=token_budget, estimator=estimator)
 
     def items(self) -> list[dict]:
@@ -540,18 +549,47 @@ class ImportantMemoryManager:
                 return item_id
         return None
 
-    def _scope_matches(self, item_scope: str | None, current_scope: str | None) -> bool:
+    def _scope_matches(
+        self,
+        item_scope: str | None,
+        current_scope: str | None,
+        *,
+        member_qqs: set[int] | None = None,
+    ) -> bool:
         scope = normalize_scope(item_scope)
         if scope == GLOBAL_SCOPE:
             return True
-        return bool(current_scope and scope == current_scope)
+        if current_scope and scope == current_scope:
+            return True
+        if (
+            member_qqs is not None
+            and current_scope
+            and current_scope.startswith("group:")
+            and scope.startswith("user:")
+        ):
+            try:
+                qq = int(scope.split(":", 1)[1])
+            except (ValueError, IndexError):
+                return False
+            return qq in member_qqs
+        return False
 
-    def _select_for_scope(self, current_scope: str | None) -> list[dict[str, Any]]:
+    def _select_for_scope(
+        self,
+        current_scope: str | None,
+        *,
+        member_qqs: set[int] | None = None,
+    ) -> list[dict[str, Any]]:
         pinned = [item for item in self._items if item.get("pinned")]
         regular = [
             item
             for item in self._items
-            if not item.get("pinned") and self._scope_matches(item.get("scope"), current_scope)
+            if not item.get("pinned")
+            and self._scope_matches(
+                item.get("scope"),
+                current_scope,
+                member_qqs=member_qqs,
+            )
         ]
 
         def sort_key(item: dict[str, Any]) -> tuple[int, str]:

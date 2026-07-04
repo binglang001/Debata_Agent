@@ -93,9 +93,9 @@ def test_tool_display_formats_unknown_tool_call_without_raw_json():
 
     assert display.title == "调用工具：custom_tool"
     assert "工具调用：custom_tool" in display.detail
-    assert "keyword 为 alpha" in display.detail
-    assert "items 为列表 3 项" in display.detail
-    assert "options 为对象，包含 mode、limit" in display.detail
+    assert "关键词为 alpha" in display.detail
+    assert "条目为列表，共 3 项" in display.detail
+    assert "options为对象，包含 mode、数量上限" in display.detail
     assert "[{" not in display.detail
 
 
@@ -112,10 +112,60 @@ def test_tool_display_formats_unknown_tool_result_without_raw_json():
     )
 
     assert display.title == "工具返回"
-    assert "工具返回：状态 done" in display.detail
-    assert "items 为列表 2 项" in display.detail
-    assert "payload 为对象，包含 ok、count" in display.detail
+    assert "工具返回：状态 完成" in display.detail
+    assert "条目为列表，共 2 项" in display.detail
+    assert "载荷为对象，包含 结果、数量" in display.detail
     assert '"items"' not in display.detail
+
+
+def test_tool_display_maps_common_fields_to_readable_chinese():
+    call_display = format_tool_call(
+        {
+            "function": {
+                "name": "custom_tool",
+                "arguments": json.dumps(
+                    {
+                        "tool_name": "write_file",
+                        "target_id": "10001",
+                        "stop_after_tool": True,
+                        "content": None,
+                        "args": {"path": "note.md", "content": "正文"},
+                        "result_format": "markdown",
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        }
+    )
+    result_display = format_tool_result(
+        json.dumps(
+            {
+                "ok": False,
+                "status": "failed",
+                "error_type": "PermissionError",
+                "content": "写入失败",
+                "result": {"path": "note.md"},
+                "count": 3,
+                "items": [1, 2, 3],
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    assert "工具为 write_file" in call_display.detail
+    assert "目标 ID为 10001" in call_display.detail
+    assert "工具后停止为 是" in call_display.detail
+    assert "内容为 无" in call_display.detail
+    assert "参数为对象，包含 路径、内容" in call_display.detail
+    assert "结果格式为 markdown" in call_display.detail
+    assert "失败" in result_display.detail
+    assert "错误类型为 PermissionError" in result_display.detail
+    assert "内容为 写入失败" in result_display.detail
+    assert "结果为对象，包含 路径" in result_display.detail
+    assert "数量为 3" in result_display.detail
+    assert "条目为列表，共 3 项" in result_display.detail
+    assert "true" not in call_display.detail
+    assert "null" not in call_display.detail
 
 
 def test_tool_display_reuses_cached_tool_result_json_parse(monkeypatch):
@@ -168,8 +218,8 @@ def test_tool_display_tool_call_cache_key_changes_after_argument_mutation():
     args["keyword"] = "beta"
     second = format_tool_call(tool_call)
 
-    assert "keyword 为 alpha" in first.detail
-    assert "keyword 为 beta" in second.detail
+    assert "关键词为 alpha" in first.detail
+    assert "关键词为 beta" in second.detail
 
 
 def test_tool_display_cache_evicts_old_entries(monkeypatch):

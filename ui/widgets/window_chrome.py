@@ -356,6 +356,13 @@ def position_size_grip(window: QWidget, grip: QSizeGrip | None) -> None:
 def fade_in_window(window: QWidget, duration_ms: int = 140) -> None:
     """轻量窗口淡入；失败时静默回退到无动画。"""
     try:
+        old_anim = getattr(window, "_fade_animation", None)
+        if old_anim is not None:
+            try:
+                old_anim.stop()
+                old_anim.deleteLater()
+            except RuntimeError:
+                pass
         window.setWindowOpacity(0.0)
         anim = QPropertyAnimation(window, b"windowOpacity", window)
         anim.setDuration(duration_ms)
@@ -363,6 +370,20 @@ def fade_in_window(window: QWidget, duration_ms: int = 140) -> None:
         anim.setEndValue(1.0)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         window._fade_animation = anim  # type: ignore[attr-defined]
+
+        def finish_animation() -> None:
+            try:
+                window.setWindowOpacity(1.0)
+            except RuntimeError:
+                pass
+            if getattr(window, "_fade_animation", None) is anim:
+                window._fade_animation = None  # type: ignore[attr-defined]
+            try:
+                anim.deleteLater()
+            except RuntimeError:
+                pass
+
+        anim.finished.connect(finish_animation)
         anim.start()
     except Exception:
         try:

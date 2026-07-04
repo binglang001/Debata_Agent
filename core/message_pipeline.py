@@ -204,6 +204,11 @@ class MessagePipeline(
         tts: Any = None,
         rag_memory: Any = None,
         event_store: Any = None,
+        persona_agent: Any = None,
+        subconscious_agent: Any = None,
+        persona_db: Any = None,
+        eat_tool: bool = False,
+        sleep_tool: bool = False,
     ) -> None:
         self.adapter = adapter
         self.chat_agent = chat_agent
@@ -235,6 +240,11 @@ class MessagePipeline(
         self.event_store = (
             event_store if event_store is not None else getattr(history, "_event_store", None)
         )
+        self.persona_agent = persona_agent
+        self.subconscious_agent = subconscious_agent
+        self.persona_db = persona_db
+        self.eat_tool = bool(eat_tool)
+        self.sleep_tool = bool(sleep_tool)
 
         self.batch = MessageBatch()
         self.reply_lock = asyncio.Lock()
@@ -248,8 +258,13 @@ class MessagePipeline(
         self._send_manager = _AsyncSendManager(self)
         self._send_receipt_tasks: dict[str, asyncio.Task] = {}
         self._agent_task_meta: dict[str, dict[str, Any]] = {}
+        self._persona_after_turn_tasks: set[asyncio.Task[Any]] = set()
         self.chat_timeline = ChatTimelineStore(max_per_conversation=1000)
         self._self_id_by_conversation: dict[str, str] = {}
+        # group_id -> (monotonic timestamp, member QQ set). Used only to surface
+        # user-scoped important memories in group prompts.
+        self._group_members_cache: dict[str, tuple[float, set[int]]] = {}
+        self._group_members_ttl_seconds: float = 300.0
         self._warn_context_compaction_invariants()
 
     def mark_activity(self) -> None:
@@ -258,6 +273,25 @@ class MessagePipeline(
 
     def idle_seconds(self) -> float:
         return max(0.0, time.monotonic() - self.last_activity_at)
+
+    async def _resolve_group_member_qqs(self, group_id: str) -> set[int]:
+        """Return cached group member QQ ids; failure falls back to stale cache or empty."""
+        now = time.monotonic()
+        cached = self._group_members_cache.get(group_id)
+        if cached is not None:
+            ts, qqs = cached
+            if now - ts < self._group_members_ttl_seconds:
+                return set(qqs)
+        try:
+            members = await self.adapter.list_group_members(group_id)
+            qqs = {int(member.user_id) for member in members if member.user_id}
+        except Exception:
+            logger.debug("群成员缓存刷新失败 group_id=%s", group_id, exc_info=True)
+            if cached is not None:
+                return set(cached[1])
+            return set()
+        self._group_members_cache[group_id] = (now, qqs)
+        return set(qqs)
 
     async def _process_batch(self, items: list[PendingMessageItem]) -> bool:
         """处理一批消息。返回 True 表示发送被中断（需要重循环）。
@@ -273,10 +307,22 @@ class MessagePipeline(
         now = get_time()
         user_record = self._build_user_record(items, now)
         conversation_id = user_record.get("conversation_id") or "legacy:unknown"
+        resting_before_main = await self._should_buffer_inbound_for_resting_persona()
+        if resting_before_main:
+            metadata = user_record.setdefault("metadata", {})
+            if isinstance(metadata, dict):
+                metadata["suppressed_reason"] = "persona_resting"
         stage_t0 = time.monotonic()
         await self.history.add_records([user_record], conversation_id=conversation_id)
         _log_slow_batch_stage("history_add_user", stage_t0, conversation_id=conversation_id)
         logger.info(f"合并处理 {len(items)} 条消息")
+        if resting_before_main:
+            logger.info(
+                "人格休息中，跳过普通入站批次主模型调用 conversation_id=%s items=%s",
+                conversation_id,
+                len(items),
+            )
+            return False
 
         # 构造给 LLM 的 messages（emoji_hint / pending_requests 已在 _build_task_context 内拼装）
         stage_t0 = time.monotonic()
@@ -329,15 +375,24 @@ class MessagePipeline(
             )
             estimator = self._token_estimator()
 
+            member_qqs: set[int] | None = None
+            if conversation_id.startswith("group:"):
+                group_id = conversation_id.split(":", 1)[1]
+                member_qqs = await self._resolve_group_member_qqs(group_id)
+
             stage_t0 = time.monotonic()
             important_text = await self._important_memory_text(
                 conversation_id,
+                member_qqs=member_qqs,
             )
             _log_slow_batch_stage(
                 "important_memory_text",
                 stage_t0,
                 conversation_id=conversation_id,
-                extra=f"memory_len={len(important_text)}",
+                extra=(
+                    f"memory_len={len(important_text)} "
+                    f"group_members={'yes' if member_qqs else 'no'}"
+                ),
             )
 
             stage_t0 = time.monotonic()
@@ -378,6 +433,7 @@ class MessagePipeline(
                 rolling_summary_text=rolling_summary_text,
                 current_context_record=task_context_record,
                 memory_mode=self.features_cfg.long_term_memory.mode,
+                **self._build_messages_persona_tool_kwargs(build_messages),
             )
             _log_slow_batch_stage(
                 "build_messages",
@@ -464,6 +520,14 @@ class MessagePipeline(
             await self._execute_collected(ctx.collected)
             self._calibrate_tokens(estimated_prompt_tokens, result.prompt_tokens)
             self.mark_activity()
+            self._schedule_persona_after_turn(
+                conversation_id=conversation_id,
+                participants=self._participants_from_pending_items(items),
+                chat_summary=self._batch_chat_summary(
+                    latest_user_text,
+                    result.records or [],
+                ),
+            )
 
         self._schedule_summarize()
         logger.debug(
@@ -511,6 +575,7 @@ class MessagePipeline(
 
     async def shutdown(self) -> None:
         """优雅停止：先排空发送后台任务，再取消批处理任务。"""
+        await self._stop_subconscious_agent()
         await self._send_manager.shutdown(timeout=_SHUTDOWN_SEND_TIMEOUT_SECONDS)
         await self._drain_send_receipt_tasks(timeout=_SHUTDOWN_SEND_TIMEOUT_SECONDS)
         await self._send_manager.shutdown(timeout=_SHUTDOWN_SEND_TIMEOUT_SECONDS)

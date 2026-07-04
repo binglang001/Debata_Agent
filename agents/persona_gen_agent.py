@@ -108,6 +108,9 @@ class PersonaBrief:
     gender: str = ""
     """性别：female/male/other/空。不用于硬编码称谓，只作为用户明确给出的设定信息。"""
 
+    age: int | None = None
+    """年龄。None 表示用户未填写，不启用年龄设定。"""
+
     extra_notes: str = ""
     """其它任何用户想补充的"""
 
@@ -116,6 +119,7 @@ class PersonaBrief:
         sections: list[tuple[str, str]] = [
             ("角色名", self.name),
             ("性别", _gender_text(self.gender)),
+            ("年龄", _age_text(self.age)),
             ("用户描述的性格", self.personality),
             ("背景故事", self.background),
             ("用户给的说话样本", self.voice_samples),
@@ -158,6 +162,12 @@ def _gender_text(gender: str) -> str:
         "other": "非二元或其他。请尊重用户描述，避免强行套用二元性别称谓。",
     }
     return mapping.get(gender, "")
+
+
+def _age_text(age: int | None) -> str:
+    if age is None:
+        return ""
+    return f"{age} 岁。用户明确给出了这个字段；生成时应作为角色的年龄设定使用。"
 
 
 def _admin_info(
@@ -702,6 +712,8 @@ def render_persona_file(
     }
     if brief.gender:
         persona_vars["gender"] = brief.gender
+    if brief.age is not None:
+        persona_vars["age"] = brief.age
     vars_text = _format_python_literal(persona_vars, indent=4)
     return (
         '"""自动生成的人格档案。可手动调整。"""\n\n'

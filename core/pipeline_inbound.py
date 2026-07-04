@@ -8,6 +8,7 @@ formatting while moving methods.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import sys
 import time
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 # 速率超限时的提示模板（占位符运行时替换）
 _RATE_LIMIT_REPLY_TEMPLATE = "已超出速率限制（{window_seconds} 秒内最多 {max_messages} 条），请添加机器人为好友后继续使用"
+_RESTING_ACTIONS = frozenset({"sleeping", "eating", "collapsing"})
 _SAFE_PAYLOAD_MAX_STRING_LENGTH = 2000
 _SAFE_PAYLOAD_MAX_DEPTH = 3
 _SAFE_PAYLOAD_MAX_ITEMS = 30
@@ -77,6 +79,7 @@ class PipelineInboundMixin:
 
         # 重建可读文本（CQ 码 + 媒体）
         text = await self._build_readable_text(event)
+        await self._notify_subconscious_inbound(event, text)
         self._inbound_seq += 1
         inbound_seq = self._inbound_seq
         received_at = time.monotonic()
@@ -113,6 +116,15 @@ class PipelineInboundMixin:
             text=text,
             received_at=received_at,
         )
+        if await self._should_buffer_inbound_for_resting_persona():
+            await self._record_resting_inbound_item(item)
+            logger.info(
+                "人格休息中，入站消息仅记录/潜意识缓冲 conversation_id=%s msg_id=%s",
+                conversation_id,
+                event.message_id,
+            )
+            return
+
         await self.batch.append(item)
         self._send_manager.notify_inbound(item)
         logger.debug(
@@ -211,6 +223,92 @@ class PipelineInboundMixin:
                 external_id,
                 (time.perf_counter() - write_started_at) * 1000,
             )
+
+    async def _notify_subconscious_inbound(
+        self,
+        event: IncomingMessage,
+        text: str,
+    ) -> None:
+        subconscious_agent = getattr(self, "subconscious_agent", None)
+        if subconscious_agent is None:
+            return
+        try:
+            active = getattr(subconscious_agent, "is_active", None)
+            if active is None:
+                active = getattr(subconscious_agent, "active", False)
+            if callable(active):
+                active = active()
+            if inspect.isawaitable(active):
+                active = await active
+            if not active:
+                return
+            on_message = getattr(subconscious_agent, "on_message", None)
+            if on_message is None:
+                return
+            result = on_message(text, event.user_id, 0.0)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("潜意识入站消息通知失败", exc_info=True)
+
+    async def _should_buffer_inbound_for_resting_persona(self) -> bool:
+        """普通入站消息不应在人格休息时直接唤起主聊天模型。"""
+
+        persona_agent = getattr(self, "persona_agent", None)
+        if persona_agent is None:
+            return False
+        is_resting = getattr(persona_agent, "is_resting", None)
+        if is_resting is not None:
+            try:
+                resting = is_resting() if callable(is_resting) else is_resting
+                if inspect.isawaitable(resting):
+                    resting = await resting
+                return bool(resting)
+            except Exception:
+                logger.debug("读取人格休息状态失败，继续尝试 current_action", exc_info=True)
+        action = await self._persona_current_action(persona_agent)
+        return action in _RESTING_ACTIONS
+
+    async def _persona_current_action(self, persona_agent: Any) -> str:
+        for name in ("current_action", "action"):
+            if not hasattr(persona_agent, name):
+                continue
+            try:
+                value = getattr(persona_agent, name)
+                if callable(value):
+                    value = value()
+                if inspect.isawaitable(value):
+                    value = await value
+            except Exception:
+                logger.debug("读取人格动作状态失败 name=%s", name, exc_info=True)
+                continue
+            text = str(value or "").strip().lower()
+            if text:
+                return text
+
+        snapshot_getter = getattr(persona_agent, "get_state_snapshot", None)
+        if snapshot_getter is None:
+            return ""
+        try:
+            snapshot = snapshot_getter() if callable(snapshot_getter) else snapshot_getter
+            if inspect.isawaitable(snapshot):
+                snapshot = await snapshot
+        except Exception:
+            logger.debug("读取人格状态快照失败", exc_info=True)
+            return ""
+        return str(_read_nested_field(snapshot, "current_action", "action") or "").strip().lower()
+
+    async def _record_resting_inbound_item(self, item: PendingMessageItem) -> None:
+        """休息期间的消息只进历史/事件，不进入主批处理。"""
+
+        user_record = self._build_user_record([item])
+        metadata = user_record.setdefault("metadata", {})
+        if isinstance(metadata, dict):
+            metadata["suppressed_reason"] = "persona_resting"
+        await self.history.add_records(
+            [user_record],
+            conversation_id=item.conversation_id,
+        )
 
     async def _batch_loop(self, return_target: Target) -> None:
         """合并窗口循环：等待 → 取一批 → 处理 → 若被中断则重循环。
@@ -459,3 +557,14 @@ def _enum_or_text(value: Any) -> str | None:
     if enum_value is not None:
         value = enum_value
     return _optional_text(value)
+
+
+def _read_nested_field(source: Any, *names: str) -> Any:
+    for name in names:
+        if source is None:
+            return None
+        if isinstance(source, dict) and name in source:
+            return source.get(name)
+        if hasattr(source, name):
+            return getattr(source, name)
+    return None

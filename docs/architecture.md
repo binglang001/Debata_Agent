@@ -132,7 +132,7 @@ IAdapter.send_text() → 用户收到消息
 `features.long_term_memory.mode`：
 
 - **`file`**（默认）：AI 通过显式 `save_important_memory` / `update_important_memory` 工具维护重要记忆。零额外向量开销、完全透明。
-- **`rag`**：同样保存重要记忆，并给新条目维护向量索引；上下文注入时按语义检索相关条目。需要 `features.embedding` 启用。
+- **`rag`**：同样保存重要记忆，并为会话历史维护向量索引；上下文注入时按语义检索相关历史。需要 `features.embedding` 启用。
 
 切换模式时，`build_tool_use_protocol(memory_mode)` 会动态注入不同的工具说明，区分文件直写与 RAG 语义检索的使用方式。
 
@@ -150,13 +150,14 @@ IAdapter.send_text() → 用户收到消息
 ```
 features.embedding.provider → 复用现有 LLM provider 的 base_url
                             → OpenAICompatEmbeddingService(base_url, key, model)
-mem_dir / rag.jsonl         → RagStore（cosine top-k 检索）
-ImportantMemoryManager.attach_rag(svc, store)
+vector/<persona>/rag_memory.sqlite3
+                            → SqliteVectorStore（cosine top-k 检索）
+RagMemoryService            → 监听 HistoryManager 追加并启动归档/活跃历史 bootstrap
 ```
 
-之后 `ImportantMemoryManager.save()` 会自动给新条目算 embedding 并存 rag.jsonl。
+向量库是实例级独立文件，不并入 `memory/<persona>/<persona>.db`；旧 `memory/<persona>/rag_memory.sqlite3` 首次启用 RAG 时会复制到新路径，旧文件保留。
 `message_pipeline` 拼上下文时用最后一条用户消息当 query 调 `retrieve_for_query()`：
-先按当前 scope 过滤候选，再做 cosine top-k，最后合并 pinned 常驻记忆，省 token 且减少跨群/私聊误召回。
+先按当前 `conversation_id` 过滤候选，再做 cosine top-k，最后与重要记忆上下文合并，省 token 且减少跨群/私聊误召回。
 
 向量算法（`memory/rag_store.cosine_similarity`）固定用余弦相似度；
 不做归一化（外面传进来的向量保留原长度，cosine 公式自带归一化）。

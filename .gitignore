@@ -71,7 +71,6 @@ Desktop.ini
 .cursor*
 # 项目级 AI 接续指南（私有，不上传）
 CLAUDE.md
-AGENTS.md
 # DeepSeek 写 UI 前的 config 备份
 data/config.yaml.before-p0-fix
 

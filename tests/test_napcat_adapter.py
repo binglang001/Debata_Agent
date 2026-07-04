@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -112,6 +113,349 @@ class FakeConnection(NapCatConnection):
         await self._dispatch(data)
 
 
+@pytest.mark.asyncio
+async def test_napcat_dispatch_queue_preserves_report_order():
+    conn = FakeConnection()
+    received: list[int] = []
+
+    async def handler(data: dict) -> None:
+        await asyncio.sleep(0)
+        received.append(data["seq"])
+
+    conn.on_message(handler)
+
+    for seq in range(20):
+        await conn._dispatch_received({"post_type": "message", "seq": seq})
+
+    assert conn._dispatch_queue is not None
+    await asyncio.wait_for(conn._dispatch_queue.join(), timeout=1.0)
+
+    assert received == list(range(20))
+    await conn._stop_dispatch_worker(drain=False)
+
+
+@pytest.mark.asyncio
+async def test_napcat_dispatch_worker_can_restart_after_stop():
+    conn = FakeConnection()
+    received: list[int] = []
+
+    async def handler(data: dict) -> None:
+        received.append(data["seq"])
+
+    conn.on_message(handler)
+
+    await conn._dispatch_received({"post_type": "message", "seq": 1})
+    assert conn._dispatch_queue is not None
+    assert conn._dispatch_task is not None
+    first_task = conn._dispatch_task
+    await asyncio.wait_for(conn._dispatch_queue.join(), timeout=1.0)
+    await conn._stop_dispatch_worker(drain=False)
+
+    assert first_task.done()
+    assert conn._dispatch_task is None
+    assert conn._dispatch_queue is None
+
+    await conn._dispatch_received({"post_type": "message", "seq": 2})
+    assert conn._dispatch_queue is not None
+    assert conn._dispatch_task is not None
+    assert conn._dispatch_task is not first_task
+    await asyncio.wait_for(conn._dispatch_queue.join(), timeout=1.0)
+    await conn._stop_dispatch_worker(drain=False)
+
+    assert conn._dispatch_task is None
+    assert received == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_napcat_dispatch_queue_high_watermark_logs_warning_without_blocking(caplog):
+    conn = FakeConnection()
+    conn._dispatch_queue_warn_size = 2
+    conn._dispatch_queue_warning_interval_seconds = 60.0
+    started = asyncio.Event()
+    release = asyncio.Event()
+    received: list[int] = []
+
+    async def handler(data: dict) -> None:
+        started.set()
+        await release.wait()
+        received.append(data["seq"])
+
+    conn.on_message(handler)
+
+    await conn._dispatch_received({"post_type": "message", "seq": 1})
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    with caplog.at_level(logging.WARNING, logger="adapters.napcat.connection"):
+        await asyncio.wait_for(
+            conn._dispatch_received({"post_type": "message", "seq": 2}), timeout=1.0
+        )
+        await asyncio.wait_for(
+            conn._dispatch_received({"post_type": "message", "seq": 3}), timeout=1.0
+        )
+
+    assert "NapCat 消息分发队列积压较多" in caplog.text
+
+    release.set()
+    assert conn._dispatch_queue is not None
+    await asyncio.wait_for(conn._dispatch_queue.join(), timeout=1.0)
+    await conn._stop_dispatch_worker(drain=False)
+
+    assert received == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_napcat_echo_dispatch_bypasses_report_backlog_and_unlocks_consumer():
+    conn = FakeConnection()
+    conn._dispatch_queue_warn_size = 2
+    waiting_for_echo = asyncio.Event()
+    echo_seen = asyncio.Event()
+    release_first_report = asyncio.Event()
+    received_reports: list[int] = []
+
+    async def handler(data: dict) -> None:
+        if data.get("echo") == "reply-1":
+            echo_seen.set()
+            release_first_report.set()
+            return
+        received_reports.append(data["seq"])
+        if data["seq"] == 1:
+            waiting_for_echo.set()
+            await release_first_report.wait()
+
+    conn.on_message(handler)
+
+    await conn._dispatch_received({"post_type": "message", "seq": 1})
+    await asyncio.wait_for(waiting_for_echo.wait(), timeout=1.0)
+    for seq in range(2, 20):
+        await asyncio.wait_for(
+            conn._dispatch_received({"post_type": "message", "seq": seq}),
+            timeout=1.0,
+        )
+
+    await asyncio.wait_for(
+        conn._dispatch_received({"echo": "reply-1", "status": "ok", "retcode": 0}),
+        timeout=1.0,
+    )
+
+    assert echo_seen.is_set()
+    assert conn._dispatch_queue is not None
+    await asyncio.wait_for(conn._dispatch_queue.join(), timeout=1.0)
+    await conn._stop_dispatch_worker(drain=False)
+
+    assert received_reports == list(range(1, 20))
+
+
+@pytest.mark.asyncio
+async def test_napcat_dispatch_worker_drains_queued_reports_on_disconnect():
+    conn = FakeConnection()
+    received: list[int] = []
+
+    async def handler(data: dict) -> None:
+        await asyncio.sleep(0)
+        received.append(data["seq"])
+
+    conn.on_message(handler)
+
+    for seq in range(5):
+        await conn._dispatch_received({"post_type": "message", "seq": seq})
+
+    await conn._stop_dispatch_worker(drain=True)
+
+    assert received == list(range(5))
+    assert conn._dispatch_task is None
+    assert conn._dispatch_queue is None
+
+
+@pytest.mark.asyncio
+async def test_napcat_dispatch_worker_drain_timeout_warns_and_cancels(caplog):
+    conn = FakeConnection()
+    conn._dispatch_drain_timeout_seconds = 0.01
+    started = asyncio.Event()
+
+    async def handler(data: dict) -> None:
+        started.set()
+        await asyncio.sleep(10)
+
+    conn.on_message(handler)
+
+    await conn._dispatch_received({"post_type": "message", "seq": 1})
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    with caplog.at_level(logging.WARNING, logger="adapters.napcat.connection"):
+        await asyncio.wait_for(conn._stop_dispatch_worker(drain=True), timeout=1.0)
+
+    assert "NapCat 消息分发队列 drain 超时" in caplog.text
+    assert conn._dispatch_task is None
+    assert conn._dispatch_queue is None
+
+
+@pytest.mark.asyncio
+async def test_reverse_connection_stop_event_skips_dispatch_drain(monkeypatch):
+    conn = ReverseWSConnection(
+        "ws://127.0.0.1:3001",
+        initial_connect_timeout=0,
+        reconnect_interval=0,
+        max_reconnect_attempts=1,
+        reconnect_jitter=0,
+    )
+    conn._dispatch_drain_timeout_seconds = 10.0
+    started = asyncio.Event()
+
+    async def handler(data: dict) -> None:
+        started.set()
+        await asyncio.sleep(10)
+
+    conn.on_message(handler)
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._sent:
+                self._sent = True
+                return '{"post_type":"message","seq":1}'
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            conn._stop_event.set()
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            return None
+
+    class FakeConnect:
+        async def __aenter__(self):
+            return FakeWebSocket()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_connect(*args, **kwargs):
+        return FakeConnect()
+
+    monkeypatch.setattr("adapters.napcat.connection.websockets.connect", fake_connect)
+
+    await asyncio.wait_for(conn._run_forever(), timeout=1.0)
+
+    assert started.is_set()
+    assert conn._dispatch_task is None
+    assert conn._dispatch_queue is None
+
+
+@pytest.mark.asyncio
+async def test_reverse_connection_start_is_idempotent_and_restarts_after_stop(monkeypatch):
+    conn = ReverseWSConnection(
+        "ws://127.0.0.1:3001",
+        initial_connect_timeout=0.1,
+        reconnect_interval=10,
+        max_reconnect_attempts=0,
+        reconnect_jitter=0,
+    )
+    close_events: list[asyncio.Event] = []
+    connect_calls = 0
+
+    class FakeWebSocket:
+        def __init__(self, close_event: asyncio.Event) -> None:
+            self._close_event = close_event
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await self._close_event.wait()
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            self._close_event.set()
+
+    class FakeConnect:
+        async def __aenter__(self):
+            nonlocal connect_calls
+            connect_calls += 1
+            close_event = asyncio.Event()
+            close_events.append(close_event)
+            return FakeWebSocket(close_event)
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_connect(*args, **kwargs):
+        return FakeConnect()
+
+    monkeypatch.setattr("adapters.napcat.connection.websockets.connect", fake_connect)
+
+    await conn.start()
+    first_task = conn._loop_task
+    assert first_task is not None
+    assert conn.is_connected
+    assert conn._connected_event.is_set()
+
+    await conn.start()
+
+    assert conn._loop_task is first_task
+    assert connect_calls == 1
+    assert conn._connected_event.is_set()
+
+    await conn.stop()
+    assert first_task.done()
+
+    await conn.start()
+    second_task = conn._loop_task
+
+    assert second_task is not None
+    assert second_task is not first_task
+    assert not second_task.done()
+    assert connect_calls == 2
+
+    await conn.stop()
+
+
+@pytest.mark.asyncio
+async def test_forward_connection_stopping_skips_dispatch_drain():
+    conn = ForwardWSConnection()
+    conn._stopping = True
+    conn._dispatch_drain_timeout_seconds = 10.0
+    started = asyncio.Event()
+
+    async def handler(data: dict) -> None:
+        started.set()
+        await asyncio.sleep(10)
+
+    conn.on_message(handler)
+
+    class FakeRequest:
+        path = "/onebot/v11/ws"
+        headers: dict[str, str] = {}
+
+    class FakeWebSocket:
+        request = FakeRequest()
+        remote_address = ("127.0.0.1", 3001)
+
+        def __init__(self) -> None:
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._sent:
+                await asyncio.wait_for(started.wait(), timeout=1.0)
+                raise StopAsyncIteration
+            self._sent = True
+            return '{"post_type":"message","seq":1}'
+
+        async def close(self, *args, **kwargs) -> None:
+            return None
+
+    await asyncio.wait_for(conn._handle_client(FakeWebSocket()), timeout=1.0)  # type: ignore[arg-type]
+
+    assert started.is_set()
+    assert conn._dispatch_task is None
+    assert conn._dispatch_queue is None
+
+
 def test_process_manager_uses_cmd_for_windows_bat(tmp_path, monkeypatch):
     script = tmp_path / "start.bat"
     script.write_text("@echo off\n", encoding="utf-8")
@@ -126,6 +470,69 @@ def test_process_manager_uses_cmd_for_windows_bat(tmp_path, monkeypatch):
         str(script),
         "--demo",
     ]
+
+
+@pytest.mark.asyncio
+async def test_process_manager_does_not_restart_windows_bat_launcher(tmp_path, monkeypatch):
+    script = tmp_path / "start.bat"
+    script.write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setattr("adapters.napcat.process.sys.platform", "win32")
+    manager = NapCatProcessManager(script, restart_delay=0.01)
+    spawn_count = 0
+
+    class FakeProcess:
+        returncode = 0
+        pid = 4321
+        stdout = None
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_spawn_once():
+        nonlocal spawn_count
+        spawn_count += 1
+        manager._process = FakeProcess()  # type: ignore[assignment]
+
+    monkeypatch.setattr(manager, "_spawn_once", fake_spawn_once)
+
+    await manager.start()
+    assert manager._monitor_task is not None
+    await asyncio.wait_for(manager._monitor_task, timeout=1.0)
+
+    assert spawn_count == 1
+    assert manager._process is None
+
+
+@pytest.mark.asyncio
+async def test_process_manager_still_restarts_windows_executable(tmp_path, monkeypatch):
+    script = tmp_path / "NapCatWinBootMain.exe"
+    script.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr("adapters.napcat.process.sys.platform", "win32")
+    manager = NapCatProcessManager(script, restart_delay=0.01)
+    spawn_count = 0
+
+    class FakeProcess:
+        returncode = 1
+        pid = 4321
+        stdout = None
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_spawn_once():
+        nonlocal spawn_count
+        spawn_count += 1
+        manager._process = FakeProcess()  # type: ignore[assignment]
+        if spawn_count >= 2:
+            manager._stop_requested.set()
+
+    monkeypatch.setattr(manager, "_spawn_once", fake_spawn_once)
+
+    await manager.start()
+    assert manager._monitor_task is not None
+    await asyncio.wait_for(manager._monitor_task, timeout=1.0)
+
+    assert spawn_count == 2
 
 
 @pytest.mark.asyncio
@@ -357,6 +764,58 @@ def test_adapter_from_config_server_loopback_binds_all_interfaces():
     assert conn.host == "0.0.0.0"
     assert conn.port == 8082
     assert conn.path == "/"
+
+
+@pytest.mark.asyncio
+async def test_reverse_ws_connection_connect_disables_environment_proxy(monkeypatch):
+    captured_calls: list[dict[str, Any]] = []
+    conn = ReverseWSConnection(
+        "ws://127.0.0.1:3001",
+        access_token="secret-token",
+        ping_interval=1.5,
+        ping_timeout=2.5,
+        initial_connect_timeout=0,
+        reconnect_interval=0,
+        max_reconnect_attempts=1,
+        reconnect_jitter=0,
+    )
+
+    class FakeWebSocket:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            return None
+
+    class FakeConnect:
+        def __init__(self, *args, **kwargs) -> None:
+            captured_calls.append({"args": args, "kwargs": kwargs})
+
+        async def __aenter__(self):
+            conn._stop_event.set()
+            return FakeWebSocket()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_connect(*args, **kwargs):
+        return FakeConnect(*args, **kwargs)
+
+    monkeypatch.setattr("adapters.napcat.connection.websockets.connect", fake_connect)
+
+    await conn._run_forever()
+
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["args"] == ("ws://127.0.0.1:3001",)
+    kwargs = captured_calls[0]["kwargs"]
+    assert kwargs["proxy"] is None
+    assert kwargs["additional_headers"] == {"Authorization": "Bearer secret-token"}
+    assert kwargs["ping_interval"] == 1.5
+    assert kwargs["ping_timeout"] == 2.5
+    assert kwargs["max_size"] == 2**24
 
 
 # ============================================================

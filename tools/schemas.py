@@ -123,7 +123,9 @@ class SendPrivateArgs(_ToolArgs):
         default=None,
         description=(
             "可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用。"
-            "只在需要锚定原消息时填；没有可靠 msg_id 不要编造。"
+            "私聊/群聊都适用。延迟回复、吃饭睡觉后接旧话、主动思考接旧话、"
+            "复核旧 attempt、回复非最新消息，或短回复可能看不出回谁时优先填写；"
+            "没有可靠 msg_id 不要编造，改用点名或自然语言锚定。"
         ),
     )
     reason: str | None = Field(
@@ -224,9 +226,10 @@ class SendGroupArgs(_ToolArgs):
         default=None,
         description=(
             "可选：这次发送要引用回复的消息 ID；程序会在第一条文本消息前补 CQ 引用。"
-            "群聊中回复对象不是紧邻上一条、多人连续插话、回答被引用的消息、"
+            "私聊/群聊都适用。延迟回复、吃饭睡觉后接旧话、主动思考接旧话、"
+            "回复对象不是紧邻上一条、多人连续插话、回答被引用的消息、"
             "复核后继续提交旧 attempt，或“行/OK/可以/知道了/不要”等短回复可能看不出回谁时，"
-            "优先填写。普通顺序闲聊不要机械每条都填；没有可靠 msg_id 不要编造。"
+            "优先填写。普通顺序闲聊不要机械每条都填；没有可靠 msg_id 不要编造，改用点名或自然语言锚定。"
         ),
     )
     reason: str | None = Field(
@@ -259,8 +262,10 @@ class CommitSendAttemptArgs(_ToolArgs):
         default=None,
         description=(
             "可选：确认发送时给第一条文本消息补引用。提交旧 attempt 前先复核旧回复是否需要补引用；"
-            "群聊复核后提交旧 attempt、中间已有多人插话、回答被引用的消息，"
-            "或短确认会看不出回谁时优先填写；普通顺序闲聊不要机械每条都填，没有可靠 msg_id 不要编造。"
+            "私聊/群聊都适用。延迟回复、吃饭睡觉后接旧话、主动思考接旧话、"
+            "复核后提交旧 attempt、中间已有多人插话、回答被引用的消息、回复非最新消息，"
+            "或短确认会看不出回谁时优先填写；普通顺序闲聊不要机械每条都填，"
+            "没有可靠 msg_id 不要编造，改用点名或自然语言锚定。"
         ),
     )
     ignore_review_interrupts: bool = Field(
@@ -465,7 +470,11 @@ class SaveMemoryArgs(_ToolArgs):
     scope: str | None = Field(
         default=None,
         description=(
-            "记忆适用范围。默认由当前会话自动推断；可填 global、user:QQ号 或 group:群号。"
+            "必填：按语义显式选择记忆适用范围，只能填 global、user:QQ号 或 group:群号。"
+            "不会按当前会话自动推断；不要填 private:QQ。global=跨场景都应参考的事实、"
+            "长期目标或项目；user:QQ号=只适用于该用户本人的身份、偏好、私聊约定；"
+            "group:群号=只适用于该群的群规、群内约定或群内梗。"
+            "提到某用户不等于 user scope；例如“冰狼正在做短中期项目”这种跨场景事实应为 global。"
         ),
     )
     pinned: bool = Field(
@@ -521,7 +530,11 @@ class UpdateMemoryArgs(_ToolArgs):
     )
     scope: str | None = Field(
         default=None,
-        description="可选：同时更新记忆适用范围。可填 global、user:QQ号 或 group:群号；不填则保留原 scope。",
+        description=(
+            "可选：同时更新记忆适用范围。修改 memory_text 时要重新判断语义范围；"
+            "仍适用原范围可不填，跨场景事实填 global，只适用于某用户本人填 user:QQ号，"
+            "只适用于某群填 group:群号；不要填 private:QQ，也不要因为正文提到某用户就自动选 user scope。"
+        ),
     )
     pinned: bool | None = Field(
         default=None,
@@ -618,7 +631,10 @@ class GetRecentChatMessagesArgs(_ToolArgs):
     )
     since_msg_id: str | None = Field(
         default=None,
-        description="只读取此 msg_id 之后的消息；用于 stale/回执后确认当前真实聊天状态。",
+        description=(
+            "只读取此 msg_id 之后的消息；用于 stale/回执后确认当前真实聊天状态，"
+            "也用于私聊或群聊延迟接旧话前确认旧消息之后发生了什么。"
+        ),
     )
     before_msg_id: str | None = Field(
         default=None,
@@ -977,8 +993,9 @@ class DescribeImageArgs(_ToolArgs):
         ...,
         min_length=1,
         description=(
-            "图片 URL 或 workspace 中的图片路径。从用户消息的 [图片 url=...]、"
+            "图片 URL 或 workspace 中已存在的图片路径。从用户消息的 [图片 url=...]、"
             "[图片 workspace=...] 标记中获取；收到图片时先用此工具理解内容。"
+            "不要根据 msg_id 猜 incoming/img_*.jpg；只能使用消息里实际出现的 workspace 路径或 URL。"
         ),
     )
     prompt: str | None = Field(
@@ -1139,3 +1156,18 @@ class RunPythonArgs(_ToolArgs):
     timeout_seconds: int = Field(
         default=30, ge=1, le=120, description="超时秒数（1-120）"
     )
+
+
+class EatArgs(_ToolArgs):
+    """eat 工具参数。"""
+
+    meal_type: str = Field(..., min_length=1, description="饮食类型或餐次")
+    duration_minutes: int = Field(..., ge=1, le=60, description="进食耗时分钟数，1-60")
+    description: str = Field(..., min_length=1, description="饮食内容描述")
+
+
+class SleepArgs(_ToolArgs):
+    """sleep 工具参数。"""
+
+    duration_minutes: int = Field(..., ge=1, le=720, description="睡眠或休息分钟数，1-720")
+    reason: str = Field(..., min_length=1, description="睡眠或休息原因")

@@ -89,7 +89,8 @@ class MemoryPage(QWidget):
         metadata_row.addWidget(self._scope_edit, 1)
         self._pinned_check = QCheckBox("置顶")
         metadata_row.addWidget(self._pinned_check)
-        self._metadata_btn = QPushButton("保存范围")
+        self._metadata_btn_default_text = "保存范围"
+        self._metadata_btn = QPushButton(self._metadata_btn_default_text)
         self._metadata_btn.setProperty("role", "secondary")
         self._metadata_btn.clicked.connect(self._on_update_metadata)
         metadata_row.addWidget(self._metadata_btn)
@@ -205,24 +206,20 @@ class MemoryPage(QWidget):
         self._rag_empty.setVisible(on and self._current_view() == "rag")
 
     def _add_memory_item(self, item: dict, *, rag_mode: bool = False) -> None:
-        ts = item.get("timestamp", "")
-        content = item.get("content", "")
-        scope = item.get("scope", "global")
-        pinned = bool(item.get("pinned"))
-        flags = f"[{scope}{' / 置顶' if pinned else ''}]"
-        line = f"{ts}  ·  {flags}  {content}" if ts else f"{flags}  {content}"
-        li = QListWidgetItem(line)
+        li = QListWidgetItem()
         if rag_mode:
             li.setToolTip("RAG 模式下编辑原始重要记忆的 scope / pinned，保存后会重建索引。")
         li.setData(
             Qt.ItemDataRole.UserRole,
             {
                 "id": str(item.get("id") or item.get("timestamp") or ""),
-                "content": content,
-                "scope": scope,
-                "pinned": pinned,
+                "timestamp": item.get("timestamp", ""),
+                "content": item.get("content", ""),
+                "scope": item.get("scope", "global"),
+                "pinned": bool(item.get("pinned")),
             },
         )
+        self._refresh_memory_item_text(li)
         self._list.addItem(li)
 
     def _add_rag_entry(self, entry: Any) -> None:
@@ -257,6 +254,38 @@ class MemoryPage(QWidget):
         self._scope_edit.setEnabled(has_item)
         self._pinned_check.setEnabled(has_item)
         self._metadata_btn.setEnabled(has_item)
+        self._metadata_btn.setText(self._metadata_btn_default_text)
+
+    def _refresh_memory_item_text(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.ItemDataRole.UserRole) or {}
+        ts = data.get("timestamp", "")
+        content = data.get("content", "")
+        scope = data.get("scope", "global")
+        pinned = bool(data.get("pinned"))
+        flags = f"[{scope}{' / 置顶' if pinned else ''}]"
+        item.setText(f"{ts}  ·  {flags}  {content}" if ts else f"{flags}  {content}")
+
+    def _update_selected_memory_metadata(self, item_id: str, scope: str, pinned: bool) -> bool:
+        item = self._select_memory_item(item_id)
+        if item is None:
+            return False
+        data = item.data(Qt.ItemDataRole.UserRole) or {}
+        data["scope"] = scope or "global"
+        data["pinned"] = bool(pinned)
+        item.setData(Qt.ItemDataRole.UserRole, data)
+        self._refresh_memory_item_text(item)
+        self._scope_edit.setText(data["scope"])
+        self._pinned_check.setChecked(data["pinned"])
+        return True
+
+    def _select_memory_item(self, item_id: str) -> QListWidgetItem | None:
+        for index in range(self._list.count()):
+            item = self._list.item(index)
+            data = item.data(Qt.ItemDataRole.UserRole) or {}
+            if data.get("id") == item_id:
+                self._list.setCurrentItem(item)
+                return item
+        return None
 
     def _on_delete(self) -> None:
         item = self._list.currentItem()
@@ -338,6 +367,8 @@ class MemoryPage(QWidget):
         if not item_id:
             show_message(self, "无法保存", "这条记忆缺少唯一时间戳，请刷新后再试。")
             return
+        scope = self._scope_edit.text().strip()
+        pinned = self._pinned_check.isChecked()
         rt = self._runtime
         if rt is None or rt.important is None:
             return
@@ -348,20 +379,26 @@ class MemoryPage(QWidget):
 
         async def _do() -> None:
             self._set_busy(True)
+            ok = False
             try:
                 ok = await rt.important.update_metadata(
                     item_id,
-                    scope=self._scope_edit.text().strip(),
-                    pinned=self._pinned_check.isChecked(),
+                    scope=scope,
+                    pinned=pinned,
                 )
                 if not ok:
                     show_message(self, "没有保存", "未找到这条记忆，可能已经被刷新。")
+                else:
+                    self._update_selected_memory_metadata(item_id, scope, pinned)
             except Exception as e:
                 logger.warning(f"更新重要记忆元数据失败: {e}")
                 show_message(self, "保存失败", str(e), is_danger=True)
             finally:
                 self._set_busy(False)
                 self.refresh()
+                if ok:
+                    self._select_memory_item(item_id)
+                    self._metadata_btn.setText("已保存")
 
         loop.create_task(_do())
 

@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
     description=(
         "理解图片内容。传入图片 URL 和可选的提示词，返回图片的文字描述。"
         "当用户发送图片时，先调用此工具获取图片内容再回复。"
-        "可直接传消息里的 workspace 相对路径（如 incoming/a.jpg），工具会自动转成 base64。"
+        "可直接传消息里真实出现且已存在的 workspace 相对路径（如 incoming/a.jpg），工具会自动转成 base64。"
+        "不要根据 msg_id 猜 incoming/img_*.jpg；没有可用 workspace 路径时传消息里的真实 URL。"
         "可根据场景自定义 prompt，如识别文字、分析表情、判断场景等。"
     ),
     args_model=DescribeImageArgs,
@@ -66,6 +67,10 @@ async def describe_image(args: DescribeImageArgs, ctx: ToolContext) -> dict:
         image_url = await _normalize_image_input(args.image_url, ctx)
         question = (args.question or args.prompt or "").strip()
         raw = await ctx.vision.describe(image_url, question)
+    except ImageInputError as e:
+        short_error = str(e)
+        ctx.extras["vision_unavailable_this_turn"] = short_error
+        return _image_input_failure_result(args.image_url, args.question or args.prompt, short_error)
     except Exception as e:
         short_error = _short_image_error(e)
         ctx.extras["vision_unavailable_this_turn"] = short_error
@@ -122,6 +127,10 @@ async def describe_image(args: DescribeImageArgs, ctx: ToolContext) -> dict:
     return result
 
 
+class ImageInputError(ValueError):
+    """图片入参在调用视觉 provider 前即判定不可用。"""
+
+
 async def _normalize_image_input(image_url: str, ctx: ToolContext) -> str:
     """把 workspace 图片路径转换成视觉模型可接受的 data URL。"""
     value = _image_ref_value(image_url)
@@ -137,10 +146,10 @@ async def _normalize_image_input(image_url: str, ctx: ToolContext) -> str:
 
     try:
         path = resolve_in_workspace(value, ctx.workspace_dir)
-    except WorkspaceError:
-        return value or image_url
+    except WorkspaceError as e:
+        raise ImageInputError(_unavailable_workspace_image_error(value, image_url, ctx)) from e
     if not path.is_file():
-        return value or image_url
+        raise ImageInputError(_missing_workspace_image_error(value, image_url))
 
     mime = mimetypes.guess_type(str(path))[0] or "image/png"
     raw = path.read_bytes()
@@ -151,11 +160,22 @@ async def _normalize_image_input(image_url: str, ctx: ToolContext) -> str:
 _IMAGE_REF_FIELD_RE = re.compile(r"(?:^|[\s\[])(workspace|url)=([^\]\s]+)")
 
 
+def _image_ref_fields(image_url: str) -> dict[str, str]:
+    value = unescape((image_url or "").strip())
+    if not value:
+        return {}
+    return {
+        m.group(1): m.group(2).strip()
+        for m in _IMAGE_REF_FIELD_RE.finditer(value)
+        if m.group(2).strip()
+    }
+
+
 def _image_ref_value(image_url: str) -> str:
     value = unescape((image_url or "").strip())
     if not value:
         return ""
-    fields = {m.group(1): m.group(2) for m in _IMAGE_REF_FIELD_RE.finditer(value)}
+    fields = _image_ref_fields(value)
     if fields.get("workspace"):
         return fields["workspace"].strip()
     if fields.get("url"):
@@ -165,6 +185,63 @@ def _image_ref_value(image_url: str) -> str:
     if value.startswith("url="):
         return value.split("=", 1)[1].strip()
     return value.strip("[] ")
+
+
+def _unavailable_workspace_image_error(value: str, image_ref: str, ctx: ToolContext) -> str:
+    hint = _image_retry_hint(image_ref)
+    if ctx.workspace_dir is None:
+        return (
+            f"workspace 未配置，无法读取相对图片路径 {value!r}。"
+            f"{hint}"
+        )
+    return (
+        f"图片路径 {value!r} 不能作为可用 workspace 图片读取。"
+        f"{hint}"
+    )
+
+
+def _missing_workspace_image_error(value: str, image_ref: str) -> str:
+    hint = _image_retry_hint(image_ref)
+    return f"workspace 图片不存在：{value!r}。{hint}"
+
+
+def _image_retry_hint(image_ref: str) -> str:
+    fields = _image_ref_fields(image_ref)
+    if fields.get("url") and fields.get("workspace"):
+        return (
+            "消息标记同时包含 url= 和 workspace= 时，本工具按现有语义优先使用 workspace=；"
+            "该路径不可用时，请改为直接传消息中真实出现的 url= 图片 URL，"
+            "或传一个已经存在的 workspace 路径。不要根据 msg_id 猜 incoming/img_*.jpg。"
+        )
+    return (
+        "请使用消息中真实出现的 [图片 url=...]，或一个已经存在的 workspace 路径；"
+        "不要根据 msg_id 猜 incoming/img_*.jpg。"
+    )
+
+
+def _image_input_failure_result(image_ref: str, prompt: str | None, error: str) -> dict:
+    question = (prompt or "").strip() or None
+    fields = _image_ref_fields(image_ref)
+    data: dict[str, Any] = {
+        "image_ref": _compact_image_ref(image_ref),
+        "question": question,
+        "retry_hint": (
+            "改用用户消息里真实出现的 [图片 url=...]，或确认 workspace 路径存在后再调用 describe_image。"
+        ),
+    }
+    if fields.get("url"):
+        data["message_url"] = fields["url"]
+    if fields.get("workspace"):
+        data["workspace_path"] = fields["workspace"]
+
+    return {
+        "ok": False,
+        "status": "failed",
+        "brief": "图片引用不可用。",
+        "error": error,
+        "summary": "图片识别失败",
+        "data": data,
+    }
 
 
 def _should_localize_remote_image(value: str) -> bool:

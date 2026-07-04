@@ -313,7 +313,7 @@ async def test_event_journal_projection_failure_does_not_fail_append(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_history_manager_with_event_journal_keeps_records_shape_and_light_mirror(tmp_path):
+async def test_history_manager_with_event_journal_keeps_records_shape_and_full_mirror(tmp_path):
     journal = EventJournal(EventStore(tmp_path / "events.sqlite3"))
     await journal.start()
     try:
@@ -353,9 +353,13 @@ async def test_history_manager_with_event_journal_keeps_records_shape_and_light_
         assert [event["event_id"] for event in events] == [1, 2]
         assert [event["payload"]["role"] for event in events] == ["user", "assistant"]
         assert events[0]["payload"]["content_length"] == len(large_content)
-        assert "record" not in events[0]["payload"]
-        assert "record" not in events[1]["payload"]
-        assert "content" not in events[0]["payload"]
+        assert events[0]["payload"]["content_hash"]
+        assert events[0]["payload"]["record"] == records[0]
+        assert events[1]["payload"]["record"] == records[1]
+        assert events[0]["payload"]["record"]["content"] == large_content
+        assert events[1]["payload"]["record"]["tool_calls"] == [
+            {"id": "call-1", "type": "function"}
+        ]
         assert events[0]["payload"]["record_keys"] == [
             "role",
             "content",

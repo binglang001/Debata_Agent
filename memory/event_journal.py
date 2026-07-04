@@ -8,7 +8,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
-from .event_store import EventStore
+from .store import EventStoreLike
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class EventJournal:
     """保持旧调用入口，append 只等待 EventStore durable append log。"""
 
-    def __init__(self, store: EventStore) -> None:
+    def __init__(self, store: EventStoreLike) -> None:
         self._store = store
         self._state_lock = asyncio.Lock()
         self._append_lock = asyncio.Lock()
@@ -24,7 +24,7 @@ class EventJournal:
         self._shutting_down = False
 
     @property
-    def store(self) -> EventStore:
+    def store(self) -> EventStoreLike:
         return self._store
 
     async def start(self) -> None:
