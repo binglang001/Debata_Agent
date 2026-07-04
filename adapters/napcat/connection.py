@@ -284,6 +284,21 @@ class ReverseWSConnection(NapCatConnection):
         return self.is_connected
 
     async def start(self) -> None:
+        if self._loop_task is not None and not self._loop_task.done():
+            logger.info("NapCat WS 重连循环已在运行: %s", self.ws_url)
+            if self.initial_connect_timeout <= 0:
+                return
+            try:
+                await asyncio.wait_for(
+                    self._connected_event.wait(), timeout=self.initial_connect_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"NapCat 初次连接 {self.initial_connect_timeout}s 内未成功，"
+                    f"重连循环已在后台运行"
+                )
+            return
+
         self._stop_event.clear()
         self._connected_event.clear()
         self._loop_task = asyncio.create_task(self._run_forever(), name="napcat-reverse-ws")

@@ -345,6 +345,74 @@ async def test_reverse_connection_stop_event_skips_dispatch_drain(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reverse_connection_start_is_idempotent_and_restarts_after_stop(monkeypatch):
+    conn = ReverseWSConnection(
+        "ws://127.0.0.1:3001",
+        initial_connect_timeout=0.1,
+        reconnect_interval=10,
+        max_reconnect_attempts=0,
+        reconnect_jitter=0,
+    )
+    close_events: list[asyncio.Event] = []
+    connect_calls = 0
+
+    class FakeWebSocket:
+        def __init__(self, close_event: asyncio.Event) -> None:
+            self._close_event = close_event
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await self._close_event.wait()
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            self._close_event.set()
+
+    class FakeConnect:
+        async def __aenter__(self):
+            nonlocal connect_calls
+            connect_calls += 1
+            close_event = asyncio.Event()
+            close_events.append(close_event)
+            return FakeWebSocket(close_event)
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_connect(*args, **kwargs):
+        return FakeConnect()
+
+    monkeypatch.setattr("adapters.napcat.connection.websockets.connect", fake_connect)
+
+    await conn.start()
+    first_task = conn._loop_task
+    assert first_task is not None
+    assert conn.is_connected
+    assert conn._connected_event.is_set()
+
+    await conn.start()
+
+    assert conn._loop_task is first_task
+    assert connect_calls == 1
+    assert conn._connected_event.is_set()
+
+    await conn.stop()
+    assert first_task.done()
+
+    await conn.start()
+    second_task = conn._loop_task
+
+    assert second_task is not None
+    assert second_task is not first_task
+    assert not second_task.done()
+    assert connect_calls == 2
+
+    await conn.stop()
+
+
+@pytest.mark.asyncio
 async def test_forward_connection_stopping_skips_dispatch_drain():
     conn = ForwardWSConnection()
     conn._stopping = True

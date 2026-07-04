@@ -25,6 +25,200 @@ import main_cli as _main_cli
 logger = logging.getLogger(__name__)
 
 
+def _gui_instance_lock_path(paths: Any) -> Path:
+    """返回当前数据实例的 GUI 单实例锁文件。"""
+    return paths.INSTANCE_DIR / "debata.gui.lock"
+
+
+def _acquire_gui_instance_lock(lock_path: Path) -> Any | None:
+    """尝试获取 GUI 单实例锁；失败表示该数据实例已有 GUI 在运行。"""
+    from PySide6.QtCore import QLockFile
+
+    lock = QLockFile(str(lock_path))
+    if lock.tryLock(100):
+        return lock
+    return None
+
+
+def _notify_gui_instance_running(lock_path: Path) -> None:
+    """提示用户已有实例运行；避免为了提示再启动完整 Qt 应用。"""
+    message = f"Debata_Agent 已有一个 GUI 实例在运行。\n\n实例锁：{lock_path}"
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, message, "Debata_Agent", 0x40)
+            return
+        except Exception:
+            pass
+    print(message, file=sys.stderr)
+
+
+def _install_qasync_timer_multiplexer(qasync_module: Any) -> None:
+    """把 qasync 的每回调一个 Qt timer 改成单 Qt timer 多路复用。
+
+    qasync 默认会把每个 asyncio.call_later/asyncio.sleep 映射成一个
+    QObject.startTimer()。业务里存在大量延时任务时，Windows 会先打到
+    Qt 原生 timer 上限并刷 registerTimer 失败。这里保留 qasync 接口，
+    但内部只持有一个 QTimer。
+    """
+    if getattr(qasync_module, "_debata_timer_multiplexer_installed", False):
+        return
+    if not hasattr(qasync_module, "_SimpleTimer"):
+        logger.warning("qasync 未暴露 _SimpleTimer，跳过 timer 多路复用补丁")
+        return
+
+    import heapq
+    import itertools
+    import math
+    import time as _time
+
+    from PySide6 import QtCore
+
+    class _MultiplexTimer(QtCore.QObject):
+        _MAX_NATIVE_TIMER_MS = 60_000
+        _COMPACT_CANCELLED_THRESHOLD = 100
+        _COMPACT_HEAP_RATIO = 2
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.__callbacks: dict[int, Any] = {}
+            self.__heap: list[tuple[float, int, int]] = []
+            self.__seq = itertools.count()
+            self.__ids = itertools.count(1)
+            self.__stopped = False
+            self.__debug_enabled = False
+            self.__cancelled_since_compact = 0
+            self.__next_compact_scan_at = self._COMPACT_CANCELLED_THRESHOLD * 2
+            self.__timer = QtCore.QTimer(self)
+            self.__timer.setSingleShot(True)
+            self.__timer.timeout.connect(self.__run_due)
+            self._logger = logging.getLogger(f"{qasync_module.__name__}._SimpleTimer")
+
+        def add_callback(self, handle: Any, delay: float = 0) -> Any:
+            if self.__stopped:
+                return handle
+            callback_id = next(self.__ids)
+            deadline = _time.monotonic() + max(0.0, float(delay))
+            self.__callbacks[callback_id] = handle
+            heapq.heappush(self.__heap, (deadline, next(self.__seq), callback_id))
+            self.__schedule_next()
+            return handle
+
+        def stop(self) -> None:
+            self.__log_debug("Stopping timers")
+            self.__stopped = True
+            self.__timer.stop()
+            self.__callbacks.clear()
+            self.__heap.clear()
+
+        def set_debug(self, enabled: bool) -> None:
+            self.__debug_enabled = enabled
+
+        def __discard_cancelled_head(self) -> None:
+            while self.__heap:
+                _deadline, _seq, callback_id = self.__heap[0]
+                handle = self.__callbacks.get(callback_id)
+                if handle is None:
+                    heapq.heappop(self.__heap)
+                    continue
+                if getattr(handle, "_cancelled", False):
+                    self.__log_debug("Handle %s cancelled", handle)
+                    heapq.heappop(self.__heap)
+                    self.__callbacks.pop(callback_id, None)
+                    self.__cancelled_since_compact += 1
+                    continue
+                break
+
+        def __compact_heap_if_needed(self) -> None:
+            should_scan = (
+                self.__cancelled_since_compact >= self._COMPACT_CANCELLED_THRESHOLD
+                or len(self.__heap) >= self.__next_compact_scan_at
+            )
+            if not should_scan:
+                return
+            active_heap = [
+                item
+                for item in self.__heap
+                if (handle := self.__callbacks.get(item[2])) is not None
+                and not getattr(handle, "_cancelled", False)
+            ]
+            if len(self.__heap) <= len(active_heap) * self._COMPACT_HEAP_RATIO:
+                self.__cancelled_since_compact = 0
+                self.__next_compact_scan_at = max(
+                    len(self.__heap) * 2,
+                    self._COMPACT_CANCELLED_THRESHOLD * 2,
+                )
+                return
+            self.__heap = active_heap
+            heapq.heapify(self.__heap)
+            self.__callbacks = {callback_id: self.__callbacks[callback_id] for _, _, callback_id in self.__heap}
+            self.__cancelled_since_compact = 0
+            self.__next_compact_scan_at = max(
+                len(self.__heap) * 2,
+                self._COMPACT_CANCELLED_THRESHOLD * 2,
+            )
+
+        def __schedule_next(self) -> None:
+            if self.__stopped:
+                return
+            self.__discard_cancelled_head()
+            self.__compact_heap_if_needed()
+            if not self.__heap:
+                self.__timer.stop()
+                return
+            deadline, _seq, _callback_id = self.__heap[0]
+            delay_ms = max(0, math.ceil((deadline - _time.monotonic()) * 1000))
+            self.__timer.start(min(delay_ms, self._MAX_NATIVE_TIMER_MS))
+
+        def __run_due(self) -> None:
+            if self.__stopped:
+                return
+            now = _time.monotonic()
+            due: list[tuple[float, int, int]] = []
+            while self.__heap and self.__heap[0][0] <= now:
+                due.append(heapq.heappop(self.__heap))
+            for _deadline, _seq, callback_id in due:
+                handle = self.__callbacks.pop(callback_id, None)
+                if handle is None or getattr(handle, "_cancelled", False):
+                    self.__cancelled_since_compact += 1
+                    continue
+                if self.__debug_enabled:
+                    loop = asyncio.get_event_loop()
+                    try:
+                        loop._current_handle = handle
+                        self._logger.debug("Calling handle %s", handle)
+                        started_at = _time.time()
+                        handle._run()
+                        duration = _time.time() - started_at
+                        if duration >= loop.slow_callback_duration:
+                            self._logger.warning(
+                                "Executing %s took %.3f seconds",
+                                self.__format_handle(handle),
+                                duration,
+                            )
+                    finally:
+                        loop._current_handle = None
+                else:
+                    handle._run()
+            self.__schedule_next()
+
+        def __log_debug(self, *args: Any, **kwargs: Any) -> None:
+            if self.__debug_enabled:
+                self._logger.debug(*args, **kwargs)
+
+        @staticmethod
+        def __format_handle(handle: asyncio.Handle) -> str:
+            callback = getattr(handle, "_callback", None)
+            if isinstance(getattr(callback, "__self__", None), asyncio.tasks.Task):
+                return repr(callback.__self__)
+            return str(handle)
+
+    qasync_module._SimpleTimer = _MultiplexTimer
+    qasync_module._debata_timer_multiplexer_installed = True
+    logger.info("已启用 qasync timer 多路复用补丁")
+
+
 def setup_logging(
     level: str = "INFO",
     *,
@@ -162,12 +356,26 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
     import signal as _signal
     from pathlib import Path
 
+    from app_config import AppPaths, SecretsManager, initialize_runtime_data
+
+    paths = AppPaths(project_root=project_root, config_file=config_file)
+    paths.ensure_data_dirs()
+    initialize_runtime_data(paths, project_root=project_root)
+
+    lock_path = _gui_instance_lock_path(paths)
+    instance_lock = _acquire_gui_instance_lock(lock_path)
+    if instance_lock is None:
+        logger.warning("已有 Debata GUI 实例在运行，拒绝重复启动：%s", lock_path)
+        _notify_gui_instance_running(lock_path)
+        return
+
     import qasync  # type: ignore
     from PySide6.QtCore import QTimer
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
-    from app_config import AppPaths, SecretsManager, initialize_runtime_data
+    _install_qasync_timer_multiplexer(qasync)
+
     from core import Runtime
     from ui.dashboard.main_window import DashboardWindow
     from ui.theme import cached_qss, palette_for_theme
@@ -188,10 +396,6 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
 
     loop = qasync.QEventLoop(app)
     _asyncio.set_event_loop(loop)
-
-    paths = AppPaths(project_root=project_root, config_file=config_file)
-    paths.ensure_data_dirs()
-    initialize_runtime_data(paths, project_root=project_root)
 
     state: dict = {
         "rt": None,
@@ -432,8 +636,14 @@ def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Pa
     sigint_timer.timeout.connect(_check_sigint)
     sigint_timer.start()
 
-    with loop:
-        loop.run_forever()
+    try:
+        with loop:
+            loop.run_forever()
+    finally:
+        try:
+            instance_lock.unlock()
+        except Exception:
+            logger.debug("释放 GUI 单实例锁失败", exc_info=True)
 
 
 # ============================================================

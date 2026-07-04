@@ -62,6 +62,40 @@ class FakeProactiveRouter:
 
 
 @pytest.mark.asyncio
+async def test_proactive_loop_start_is_idempotent_and_restarts(build_pipeline):
+    pipeline, _, _, _, _ = await build_pipeline([])
+    router = FakeProactiveRouter(False)
+    loop = ProactiveLoop(
+        pipeline=pipeline,
+        proactive_agent=router,
+        behavior_cfg=pipeline.behavior_cfg,
+    )
+
+    await loop.start()
+    first_task = loop._task
+    assert first_task is not None
+    assert not first_task.done()
+
+    await loop.start()
+
+    assert loop._task is first_task
+    assert not first_task.done()
+
+    await loop.shutdown()
+    assert first_task.done()
+
+    await loop.start()
+    second_task = loop._task
+
+    assert second_task is not None
+    assert second_task is not first_task
+    assert not second_task.done()
+    assert loop._stopping is False
+
+    await loop.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_proactive_skips_until_idle_threshold(build_pipeline):
     pipeline, _, _, _, _ = await build_pipeline([])
     router = FakeProactiveRouter(True)

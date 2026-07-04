@@ -304,6 +304,23 @@ class DashboardWindow(QMainWindow):
         except Exception:
             logger.warning(f"页面 {key} 隐藏处理失败", exc_info=True)
 
+    def _pause_live_timers(self) -> None:
+        """窗口隐藏到托盘时暂停仍会刷新 UI 的定时器。"""
+        if self._status_timer.isActive():
+            self._status_timer.stop()
+        page = self._pages.get(self._current_page_key or "")
+        if page is not None:
+            self._notify_page_hidden(self._current_page_key or "", page)
+
+    def _resume_live_timers(self) -> None:
+        """窗口重新显示时恢复当前页和顶栏刷新。"""
+        if not self._status_timer.isActive():
+            self._status_timer.start()
+        self._refresh_topbar()
+        page = self._pages.get(self._current_page_key or "")
+        if page is not None:
+            self._notify_page_shown(self._current_page_key or "", page)
+
     def _refresh_topbar(self) -> None:
         rt = self._runtime
         if rt is None:
@@ -509,7 +526,12 @@ class DashboardWindow(QMainWindow):
         super().showEvent(event)
         from ..widgets import fade_in_window
 
+        self._resume_live_timers()
         fade_in_window(self)
+
+    def closeEvent(self, event) -> None:
+        self._pause_live_timers()
+        super().closeEvent(event)
 
     def nativeEvent(self, eventType, message):  # type: ignore[override]
         from ..widgets import native_resize_hit_test

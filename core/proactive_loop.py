@@ -372,6 +372,10 @@ class ProactiveLoop:
         if self.proactive_agent is None:
             logger.info("ProactiveLoop 未启用（proactive agent 未配置）")
             return
+        if self._task is not None and not self._task.done():
+            logger.info("ProactiveLoop 已在运行，跳过重复启动")
+            return
+        self._stopping = False
         self._task = asyncio.create_task(self._loop())
         logger.info(
             f"ProactiveLoop 已启动，间隔 {self.behavior_cfg.proactive_think_interval_seconds}s"

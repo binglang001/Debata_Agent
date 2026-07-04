@@ -192,6 +192,37 @@ def test_dashboard_switching_stops_hidden_timers_and_releases_animations(qapp, t
         _close_dashboard_window(window, qapp)
 
 
+def test_dashboard_close_pauses_and_show_resumes_live_timers(qapp, tmp_paths):
+    window = DashboardWindow(dashboard_runtime(tmp_paths))
+    try:
+        window.show()
+        qapp.processEvents()
+        window._switch_to("settings")
+        qapp.processEvents()
+        timer_count = len(window.findChildren(QtCore.QTimer))
+
+        assert window._status_timer.isActive()
+        assert window._pages["settings"]._provider_status_timer.isActive()
+
+        window.close()
+        for _ in range(3):
+            qapp.processEvents()
+
+        assert len(window.findChildren(QtCore.QTimer)) == timer_count
+        assert not window._status_timer.isActive()
+        assert not window._pages["settings"]._provider_status_timer.isActive()
+
+        window.show()
+        for _ in range(3):
+            qapp.processEvents()
+
+        assert len(window.findChildren(QtCore.QTimer)) == timer_count
+        assert window._status_timer.isActive()
+        assert window._pages["settings"]._provider_status_timer.isActive()
+    finally:
+        _close_dashboard_window(window, qapp)
+
+
 def test_window_resize_edges_cover_all_sides(qapp):
     window = QWidget()
     try:
