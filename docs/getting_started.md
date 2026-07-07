@@ -4,7 +4,7 @@
 
 ---
 
-## 1. 安装 NapCat
+## 1.安装 NapCat
 
 Debata 通过 [NapCat](https://napneko.github.io/guide/start-install) 接入 QQ。先到 NapCat 官网下载安装，按教程跑起来。
 
@@ -12,7 +12,7 @@ NapCat 启动后，记下它的 WebSocket 地址和 token（如果设了的话�
 
 ---
 
-## 2. 安装 Debata
+## 2.安装 Debata
 
 ```bash
 git clone https://github.com/binglang001/Debata_Agent.git
@@ -40,7 +40,7 @@ CLI 向导覆盖主模型、子 Agent、图片理解、天气、TTS、RAG、NapC
 
 ---
 
-## 3. 走完向导
+## 3.走完向导
 
 推荐路径 7 步，约 5 分钟。每一步都可以"上一步"回去改。
 
@@ -100,33 +100,33 @@ CLI 向导覆盖主模型、子 Agent、图片理解、天气、TTS、RAG、NapC
 
 ![确认](https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/wizard_summary.png)
 
-检查配置没问题，点「启动」。以后在 [设置页](#改配置) 随时能改。
+检查配置没问题，点「启动」。以后在设置页随时能改。
 
 ---
 
-## 4. 仪表盘
+## 4.仪表盘
 
 ![总览](https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/dashboard_overview.png)
 
 左边 7 个导航：
 
-| 页面 | 做什么 |
-|------|--------|
-| 总览 | 渠道状态、模型健康、用量、KV 缓存命中率 |
-| 对话 | 看历史对话，展开 AI 的思考过程 |
-| 记忆 | 管理 Debata 记住的事（scope / pinned / 编辑 / 删除） |
-| 日志 | 实时日志流，按等级和模块过滤 |
-| 角色 | 切换、新建、修改、导入导出人格 |
-| 模型管理 | 本地模型安装状态和指引 |
-| 设置 | 所有配置实时保存 |
+| 页面   | 做什么                                      |
+|------|------------------------------------------|
+| 总览   | 渠道状态、模型健康、用量、KV 缓存命中率                    |
+| 对话   | 看历史对话，展开 AI 的思考过程                        |
+| 记忆   | 管理 Debata 记住的事（scope / pinned / 编辑 / 删除） |
+| 日志   | 实时日志流，按等级和模块过滤                           |
+| 角色   | 切换、新建、修改、导入导出人格                          |
+| 模型管理 | 本地模型安装状态和指引                              |
+| 设置   | 所有配置实时保存                                 |
 
 ---
 
-## 5. 常见操作
+## 5.常见操作
 
 ### 切换人格
 
-[角色页](#仪表盘) → 选中目标 → 点「切换为当前」→ 重启 Debata。
+角色页 → 选中目标 → 点「切换为当前」→ 重启 Debata。
 
 ### 加表情包
 
@@ -152,7 +152,19 @@ CLI 向导覆盖主模型、子 Agent、图片理解、天气、TTS、RAG、NapC
 
 ---
 
-## 6. 常见问题
+## 6.一份默认人格的快速演示
+
+`personas/debata/`, 一个完整人格档案: 17岁女孩、慢热又毒舌、对长辈尊敬、对死党随便、对陌生人冷淡.这是项目最初的样品, 也是「关系矩阵 + 真人聊天」方法论的验证.你可以:
+
+- **直接用 debata**: 首次配置时选默认人格
+- **AI 现场捏一个**: 向导里描述「我想要一个 25 岁的程序员、嘴硬心软、爱猫」, 等几秒看 AI 写出来
+- **手写**: 照 `personas/debata/persona_prompt.py` 葫芦画瓢, 放到 `personas/{你的名字}/`
+
+#### 每个 persona 都有自己独立的 `data/memory/{name}/` 目录存历史与重要记忆, 互不干扰.
+
+---
+
+## 常见问题
 
 **NapCat 连不上？**
 确认 NapCat 是否在跑，WS 地址和端口是否正确。设置页的「测试连接」可以诊断。
